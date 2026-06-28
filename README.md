@@ -157,6 +157,27 @@
    > [!NOTE]
    > 請將 command 欄位中的路徑替換成您的實際家目錄絕對路徑（可執行 `echo $HOME` 查詢）。
 
+### 💡 Status Line 實際顯示效果
+
+當您設定好 `statusLine` 並在終端機中與 AI 助理（Google Antigravity CLI 或 GitHub Copilot CLI）進行對話時，終端機畫面最下方（或狀態欄）會即時顯示目前會話的 Token 統計資訊。
+
+**畫面效果範例：**
+```text
+🤖 gemini-1.5-pro • #3 • ↑ 12.3k • c 4.5k/0 • ↓ 1.2k • r 500 • total 18.5k • +2.1k • last 1.5k/200 • ctx 15%
+```
+
+**欄位說明：**
+* 🤖 **模型名稱**：目前會話所使用的 LLM 模型。
+* **#回合數** (`#3`)：當前會話已進行的問答回合數。
+* **↑ 輸入 Token** (`↑ 12.3k`)：目前為止累計輸入的 Token 數（`k` 代表千，`m` 代表百萬）。
+* **c 快取命中率/寫入** (`c 4.5k/0`)：累計快取讀取（Cache Read）與快取寫入（Cache Write）的 Token 數。
+* **↓ 輸出 Token** (`↓ 1.2k`)：目前為止累計輸出的 Token 數。
+* **r 推理 Token** (`r 500`)：累計推理用的 Token 數。
+* **total 總 Token** (`total 18.5k`)：該會話累計消耗的總 Token 數。
+* **+增量 Token** (`+2.1k`)：本次對話所額外消耗的 Token 數量。
+* **last 上次呼叫** (`last 1.5k/200`)：上一次 API 請求的輸入/輸出 Token 數。
+* **ctx 上下文佔用率** (`ctx 15%` 或 `from <舊模型>`): 目前上下文窗口的使用百分比；若更換模型，則會顯示類似 `• from gemini-1.5-flash` 的模型更換提示。
+
 ---
 
 ## 🚀 啟動與常駐服務

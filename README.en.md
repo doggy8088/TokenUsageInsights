@@ -157,6 +157,27 @@ Since this project is local-first, follow these steps to configure data collecti
    > [!NOTE]
    > Replace the `command` path with your actual home directory path (run `echo $HOME` in terminal to find it).
 
+### 💡 Status Line Display Effect
+
+Once you have configured the `statusLine` and interact with your AI assistant (Google Antigravity CLI or GitHub Copilot CLI), a real-time token statistics status line will be displayed at the bottom of your terminal.
+
+**Visual Example:**
+```text
+🤖 gemini-1.5-pro • #3 • ↑ 12.3k • c 4.5k/0 • ↓ 1.2k • r 500 • total 18.5k • +2.1k • last 1.5k/200 • ctx 15%
+```
+
+**Field Breakdown:**
+* 🤖 **Model Name**: The LLM model currently being used for the session.
+* **# Turn Number** (`#3`): The number of conversation turns in the current session.
+* **↑ Input Tokens** (`↑ 12.3k`): Total cumulative input tokens (`k` for thousand, `m` for million).
+* **c Cache Read/Write** (`c 4.5k/0`): Cumulative cache read tokens / cache write tokens.
+* **↓ Output Tokens** (`↓ 1.2k`): Total cumulative output tokens.
+* **r Reasoning Tokens** (`r 500`): Cumulative reasoning tokens.
+* **total Total Tokens** (`total 18.5k`): Total cumulative tokens consumed in the current session.
+* **+ Delta Tokens** (`+2.1k`): Tokens consumed by the most recent prompt/turn.
+* **last Last API Call** (`last 1.5k/200`): Input/output tokens of the last API request.
+* **ctx Context Usage** (`ctx 15%` or `from <old_model>`): Percentage of the context window size used; or a model switch indicator (e.g., `• from gemini-1.5-flash`) if the model changes.
+
 ---
 
 ## 🚀 Setup & Launch
