@@ -13,6 +13,7 @@ let currentSessionOutputTokens = 0;
 let currentSessionReasoningTokens = 0;
 let currentSessionCwd = '';
 let currentSessionModel = '';
+let currentSessionAssistantType = '';
 let availableDates = [];
 let pricingRules = [];
 
@@ -45,12 +46,12 @@ let currentMonthlyData = null;
 
 const i18n = {
   'zh-TW': {
-    title: 'Token Usage Insights',
+    title: 'AI CLI Token 看板',
     select_assistant: '選擇 Agent 類型',
     assistant_all: '🌟 全部 Agent (總覽)',
-    assistant_antigravity: '🤖 Antigravity CLI',
-    assistant_copilot: '🐱 GitHub Copilot CLI',
-    assistant_codex: '⚡ Codex CLI',
+    assistant_antigravity: '<img class="assistant-logo" src="/static/antigravity.webp" alt="Antigravity" /> Antigravity CLI',
+    assistant_copilot: '<img class="assistant-logo" src="/static/githubcopilot.webp" alt="Copilot" /> GitHub Copilot CLI',
+    assistant_codex: '<img class="assistant-logo" src="/static/codex.webp" alt="Codex" /> Codex CLI',
     col_assistant: 'Agent',
     tab_daily: '📊 每日即時',
     tab_monthly: '📅 月度彙整',
@@ -214,13 +215,13 @@ const i18n = {
     placeholder_no_daily_summary: '本月無每日彙總數據',
     no_data_for_date: '此 Agent 於當日無資料',
     no_data_for_date_desc: '{agent} 在 {date} 沒有任何使用記錄。您可以選擇其他日期，或切換至其他 Agent 查看。',
-    antigravity_title: 'Google Antigravity CLI Token Insights 看板',
+    antigravity_title: 'Antigravity CLI Token 看板',
     antigravity_header_description: '本地監控與分析您的 Google Antigravity CLI 的 Token 消耗與會話詳細數據',
     antigravity_pricing_sheet_title: '💰 Google Antigravity 費用標準表',
     antigravity_setup_modal_title: '⚙️ Google Antigravity CLI 前置設定與啟用教學',
     antigravity_empty_title: '歡迎使用 Google Antigravity CLI Token Insights Dashboard',
     antigravity_empty_desc: '我們偵測到您的 <code>~/.antigravity</code> 本地目錄中目前沒有使用數據。這是因為您還沒有啟用 Google Antigravity CLI 的 Status Line 並部署數據收集腳本。請點選下方按鈕查看啟用教學！',
-    copilot_title: 'GitHub Copilot CLI Token Insights 看板',
+    copilot_title: 'GitHub Copilot CLI Token 看板',
     copilot_header_description: '本地監控與分析您的 GitHub Copilot CLI 的 Token 消耗與會話詳細數據',
     copilot_pricing_sheet_title: '💰 GitHub Copilot 費用標準表',
     copilot_setup_modal_title: '⚙️ GitHub Copilot CLI 前置設定與啟用教學',
@@ -232,7 +233,7 @@ const i18n = {
     copilot_setup_step_4: '<span>4️⃣</span> 4. 重開 Copilot CLI',
     copilot_setup_step_4_desc: '設定完成並存檔後，請<strong>退出目前的 Copilot CLI 聊天會話，並重新進入</strong>以套用全新設定。',
     copilot_setup_step_5_desc: '進入 Copilot CLI 會話聊天後，畫面底部應該會看到由本專案腳本收集並精緻渲染出的狀態列，如：',
-    codex_title: 'Codex CLI Token Insights 看板',
+    codex_title: 'Codex CLI Token 看板',
     codex_header_description: '本地監控與分析您的 Codex CLI 的 Token 消耗與會話詳細數據',
     codex_pricing_sheet_title: '💰 Codex 費用標準表',
     codex_setup_modal_title: '⚙️ Codex CLI 前置說明與使用指南',
@@ -240,12 +241,12 @@ const i18n = {
     codex_empty_desc: '我們偵測到您的 <code>~/.codex</code> 本地目錄中目前沒有使用數據。這是因為您尚未啟用 Codex CLI。請點選下方按鈕查看啟用教學！',
   },
   'en': {
-    title: 'Token Usage Insights',
+    title: 'AI CLI Token Insights',
     select_assistant: 'Select Agent',
     assistant_all: '🌟 All Agents (Overview)',
-    assistant_antigravity: '🤖 Antigravity CLI',
-    assistant_copilot: '🐱 GitHub Copilot CLI',
-    assistant_codex: '⚡ Codex CLI',
+    assistant_antigravity: '<img class="assistant-logo" src="/static/antigravity.webp" alt="Antigravity" /> Antigravity CLI',
+    assistant_copilot: '<img class="assistant-logo" src="/static/githubcopilot.webp" alt="Copilot" /> GitHub Copilot CLI',
+    assistant_codex: '<img class="assistant-logo" src="/static/codex.webp" alt="Codex" /> Codex CLI',
     col_assistant: 'Agent',
     tab_daily: '📊 Daily Real-time',
     tab_monthly: '📅 Monthly Summary',
@@ -409,13 +410,13 @@ const i18n = {
     placeholder_no_daily_summary: 'No daily summary data this month',
     no_data_for_date: 'No Data for This Agent on This Date',
     no_data_for_date_desc: '{agent} has no usage records on {date}. Try selecting a different date or switching to another Agent.',
-    antigravity_title: 'Google Antigravity CLI Token Insights Dashboard',
+    antigravity_title: 'Antigravity CLI Token Insights',
     antigravity_header_description: 'Monitor daily tokens and session details of Google Antigravity CLI locally',
     antigravity_pricing_sheet_title: '💰 Google Antigravity Pricing Rates',
     antigravity_setup_modal_title: '⚙️ Google Antigravity CLI Configuration & Setup Guide',
     antigravity_empty_title: 'Welcome to Google Antigravity CLI Token Insights Dashboard',
     antigravity_empty_desc: 'We detected that there is currently no usage data in your local <code>~/.antigravity</code> directory. This is because you haven\'t enabled the Google Antigravity CLI Status Line or deployed the data collection script. Please click the button below to view the setup guide!',
-    copilot_title: 'GitHub Copilot CLI Token Insights Dashboard',
+    copilot_title: 'GitHub Copilot CLI Token Insights',
     copilot_header_description: 'Monitor daily tokens and session details of GitHub Copilot CLI locally',
     copilot_pricing_sheet_title: '💰 GitHub Copilot Pricing Rates',
     copilot_setup_modal_title: '⚙️ GitHub Copilot CLI Configuration & Setup Guide',
@@ -427,7 +428,7 @@ const i18n = {
     copilot_setup_step_4: '<span>4️⃣</span> 4. Restart Copilot CLI',
     copilot_setup_step_4_desc: 'After saving the file, please <strong>exit your current Copilot CLI session and re-enter</strong> to apply the new settings.',
     copilot_setup_step_5_desc: 'After entering the Copilot CLI session, you should see a beautifully rendered status line generated by this project script at the bottom:',
-    codex_title: 'Codex CLI Token Insights Dashboard',
+    codex_title: 'Codex CLI Token Insights',
     codex_header_description: 'Monitor daily tokens and session details of Codex CLI locally',
     codex_pricing_sheet_title: '💰 Codex Pricing Rates',
     codex_setup_modal_title: '⚙️ Codex CLI Guide & User Instructions',
@@ -445,8 +446,27 @@ function t(key) {
   return i18n[currentLang][key] || i18n['zh-TW'][key] || key;
 }
 
+function updateBrandLogo() {
+  const brandLogo = document.getElementById('brand-logo-img');
+  if (!brandLogo) return;
+  
+  if (currentAssistant === 'antigravity') {
+    brandLogo.src = '/static/antigravity.webp';
+    brandLogo.alt = 'Antigravity';
+  } else if (currentAssistant === 'copilot') {
+    brandLogo.src = '/static/githubcopilot.webp';
+    brandLogo.alt = 'Copilot';
+  } else if (currentAssistant === 'codex') {
+    brandLogo.src = '/static/codex.webp';
+    brandLogo.alt = 'Codex';
+  } else {
+    brandLogo.src = '/static/favicon.ico';
+    brandLogo.alt = 'Logo';
+  }
+}
+
 function updateLanguageUI() {
-  document.title = t('title');
+  document.title = 'Token Usage Insights';
 
   document.querySelectorAll('[data-i18n]').forEach(el => {
     const key = el.getAttribute('data-i18n');
@@ -478,6 +498,9 @@ function updateLanguageUI() {
   if (emptyContainer && !emptyContainer.classList.contains('hidden')) {
     toggleEmptyState(true);
   }
+
+  // Update dynamic brand logo in sidebar
+  updateBrandLogo();
 }
 
 document.addEventListener('DOMContentLoaded', () => {
@@ -1125,9 +1148,9 @@ async function loadUsageData(date) {
 // 顯示「此 Agent 於當日無資料」的提示畫面
 function showNoDataForDate(date) {
   const agentNames = {
-    antigravity: '🤖 Antigravity CLI',
-    copilot: '🐱 GitHub Copilot CLI',
-    codex: '⚡ Codex CLI',
+    antigravity: '<img class="badge-logo" src="/static/antigravity.webp" alt="Antigravity" /> Antigravity CLI',
+    copilot: '<img class="badge-logo" src="/static/githubcopilot.webp" alt="Copilot" /> GitHub Copilot CLI',
+    codex: '<img class="badge-logo" src="/static/codex.webp" alt="Codex" /> Codex CLI',
   };
   const agentLabel = agentNames[currentAssistant] || currentAssistant;
   const desc = t('no_data_for_date_desc')
@@ -1188,18 +1211,18 @@ function renderMetricValue(elementId, getValFn, formatFn, sessions, activeAgents
     
     let html = '<div class="stat-value-list">';
     activeAgents.forEach(a => {
-      let emoji = '🤖';
+      let logoUrl = '/static/antigravity.webp';
       let displayName = 'Antigravity CLI';
       if (a === 'copilot') {
-        emoji = '🐱';
+        logoUrl = '/static/githubcopilot.webp';
         displayName = 'Copilot CLI';
       } else if (a === 'codex') {
-        emoji = '⚡';
+        logoUrl = '/static/codex.webp';
         displayName = 'Codex CLI';
       }
       html += `
         <div class="stat-value-item">
-          <span class="agent-name" title="${displayName}">${emoji}</span>
+          <span class="agent-name" title="${displayName}"><img class="badge-logo" src="${logoUrl}" alt="${displayName}" /></span>
           <span class="val">${formatFn(agentData[a])}</span>
         </div>
       `;
@@ -1220,20 +1243,20 @@ function renderMonthlyMetricValue(elementId, getValFn, formatFn, agentBreakdown,
   } else {
     let html = '<div class="stat-value-list">';
     activeAgents.forEach(a => {
-      let emoji = '🤖';
+      let logoUrl = '/static/antigravity.webp';
       let displayName = 'Antigravity CLI';
       if (a === 'copilot') {
-        emoji = '🐱';
+        logoUrl = '/static/githubcopilot.webp';
         displayName = 'Copilot CLI';
       } else if (a === 'codex') {
-        emoji = '⚡';
+        logoUrl = '/static/codex.webp';
         displayName = 'Codex CLI';
       }
       
       const val = (agentBreakdown && agentBreakdown[a]) ? getValFn(agentBreakdown[a]) : 0;
       html += `
         <div class="stat-value-item">
-          <span class="agent-name" title="${displayName}">${emoji}</span>
+          <span class="agent-name" title="${displayName}"><img class="badge-logo" src="${logoUrl}" alt="${displayName}" /></span>
           <span class="val">${formatFn(val)}</span>
         </div>
       `;
@@ -1691,11 +1714,11 @@ function renderSessionTable(sessions) {
 
     let assistantBadge = "";
     if (s.assistant_type === "antigravity") {
-      assistantBadge = `<span class="badge" style="background: rgba(0, 242, 254, 0.15); color: #00f2fe; border: 1px solid rgba(0, 242, 254, 0.3);">🤖 Antigravity</span>`;
+      assistantBadge = `<span class="badge" style="background: rgba(0, 242, 254, 0.15); color: #00f2fe; border: 1px solid rgba(0, 242, 254, 0.3); display: inline-flex; align-items: center;"><img class="badge-logo" src="/static/antigravity.webp" alt="Antigravity" /> Antigravity</span>`;
     } else if (s.assistant_type === "copilot") {
-      assistantBadge = `<span class="badge" style="background: rgba(185, 43, 39, 0.15); color: #b92b27; border: 1px solid rgba(185, 43, 39, 0.3);">🐱 Copilot</span>`;
+      assistantBadge = `<span class="badge" style="background: rgba(185, 43, 39, 0.15); color: #b92b27; border: 1px solid rgba(185, 43, 39, 0.3); display: inline-flex; align-items: center;"><img class="badge-logo" src="/static/githubcopilot.webp" alt="Copilot" /> Copilot</span>`;
     } else if (s.assistant_type === "codex") {
-      assistantBadge = `<span class="badge" style="background: rgba(79, 172, 254, 0.15); color: #4facfe; border: 1px solid rgba(79, 172, 254, 0.3);">⚡ Codex</span>`;
+      assistantBadge = `<span class="badge" style="background: rgba(79, 172, 254, 0.15); color: #4facfe; border: 1px solid rgba(79, 172, 254, 0.3); display: inline-flex; align-items: center;"><img class="badge-logo" src="/static/codex.webp" alt="Codex" /> Codex</span>`;
     }
 
     const astColumn = (currentAssistant === 'all' || currentAssistant.includes(',')) ? `<td>${assistantBadge}</td>` : '';
@@ -1808,6 +1831,7 @@ async function openSessionTimeline(sessionId, sessionName, totalTokens, cacheRea
   currentSessionReasoningTokens = reasoningTokens || 0;
   currentSessionCwd = cwd || '';
   currentSessionModel = model || '';
+  currentSessionAssistantType = assistantType || '';
 
   // 設定基礎抬頭 (截斷至 100 字元，滑鼠移過去可以看到全部)
   let displayName = sessionName || '';
@@ -2064,6 +2088,20 @@ function renderTimeline(data) {
         const reasoningEffort = item.event_data.reasoning_effort;
         const modelDisplay = reasoningEffort ? `${model} (${t('drawer_effort')}: ${reasoningEffort})` : model;
 
+        const finalAssistantType = metadata.assistant_type || currentSessionAssistantType || currentAssistant;
+        let senderLogoHtml = '';
+        let senderNameText = 'AGENT';
+        if (finalAssistantType === 'antigravity') {
+          senderLogoHtml = `<img class="badge-logo" src="/static/antigravity.webp" alt="Antigravity" />`;
+          senderNameText = 'ANTIGRAVITY AGENT';
+        } else if (finalAssistantType === 'copilot') {
+          senderLogoHtml = `<img class="badge-logo" src="/static/githubcopilot.webp" alt="Copilot" />`;
+          senderNameText = 'COPILOT AGENT';
+        } else if (finalAssistantType === 'codex') {
+          senderLogoHtml = `<img class="badge-logo" src="/static/codex.webp" alt="Codex" />`;
+          senderNameText = 'CODEX AGENT';
+        }
+
         // 如果 content 為空但有 Tool 呼叫，代表助理正在使用工具
         let replyHtml = '';
         const toolRequests = item.event_data.tool_requests || [];
@@ -2104,7 +2142,7 @@ function renderTimeline(data) {
             <div class="bubble-header">
               <div class="header-left">
                 <span class="turn-no-badge">#${turnNo}</span>
-                <span class="sender">${t('sender_agent')} (${escapeHtml(modelDisplay)})</span>
+                <span class="sender">${senderLogoHtml} ${senderNameText} (${escapeHtml(modelDisplay)})</span>
               </div>
               <div style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap;">
                 ${copyButtonHtml}
@@ -2456,19 +2494,19 @@ function renderMonthlyDashboard(data) {
     // For sessions: show individual session count list
     let sessionsHtml = '<div class="stat-value-list">';
     activeAgents.forEach(a => {
-      let emoji = '🤖';
+      let logoUrl = '/static/antigravity.webp';
       let displayName = 'Antigravity CLI';
       if (a === 'copilot') {
-        emoji = '🐱';
+        logoUrl = '/static/githubcopilot.webp';
         displayName = 'Copilot CLI';
       } else if (a === 'codex') {
-        emoji = '⚡';
+        logoUrl = '/static/codex.webp';
         displayName = 'Codex CLI';
       }
       const val = (agent_breakdown && agent_breakdown[a]) ? agent_breakdown[a].total_sessions : 0;
       sessionsHtml += `
         <div class="stat-value-item">
-          <span class="agent-name" title="${displayName}">${emoji}</span>
+          <span class="agent-name" title="${displayName}"><img class="badge-logo" src="${logoUrl}" alt="${displayName}" /></span>
           <span class="val">${formatNumber(val)}</span>
         </div>
       `;
@@ -3174,9 +3212,17 @@ function toggleEmptyState(showEmpty) {
           </div>
         `;
       } else {
+        let emptyLogoUrl = '/static/antigravity.webp';
+        if (currentAssistant === 'copilot') {
+          emptyLogoUrl = '/static/githubcopilot.webp';
+        } else if (currentAssistant === 'codex') {
+          emptyLogoUrl = '/static/codex.webp';
+        }
         emptyContainer.innerHTML = `
           <div class="welcome-setup-card">
-            <div class="card-icon">🤖</div>
+            <div class="card-icon" style="display: flex; justify-content: center; align-items: center; filter: drop-shadow(0 0 10px rgba(255,255,255,0.1)); margin-bottom: 12px;">
+              <img src="${emptyLogoUrl}" alt="${currentAssistant}" style="width: 48px; height: 48px; border-radius: 8px; object-fit: cover;" />
+            </div>
             <h2>${t('empty_title')}</h2>
             <p>${t('empty_desc')}</p>
             <div class="action-buttons">

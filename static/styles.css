@@ -2622,3 +2622,38 @@ input:checked + .slider-round:before {
   color: #e11d48 !important;
 }
 
+/* Premium Assistant & Badge Logos */
+.assistant-logo {
+  width: 20px;
+  height: 20px;
+  border-radius: 4px;
+  object-fit: cover;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  display: inline-block;
+  vertical-align: middle;
+  transition: transform 0.2s ease;
+}
+
+.assistant-badge-btn:hover .assistant-logo {
+  transform: scale(1.1);
+}
+
+.badge-logo {
+  width: 14px;
+  height: 14px;
+  border-radius: 3px;
+  object-fit: cover;
+  margin-right: 6px;
+  vertical-align: middle;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  display: inline-block;
+}
+
+/* Brand Logo Image Size */
+.brand .logo img {
+  width: 64px;
+  height: 64px;
+  border-radius: 12px;
+  object-fit: cover;
+  display: block;
+}
