@@ -2533,6 +2533,15 @@ input:checked + .slider-round:before {
   flex-direction: column;
   align-items: flex-start;
   max-width: 250px;
+  width: 100%;
+}
+
+.session-name-text {
+  display: block;
+  width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .session-name-wrapper.is-subagent {

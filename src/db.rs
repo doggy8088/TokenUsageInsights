@@ -273,8 +273,64 @@ fn parse_usage_entries(content: &str) -> Vec<UsageEntry> {
     entries
 }
 
+fn get_antigravity_session_name(session_id: &str) -> Option<String> {
+    let path = get_antigravity_dir()
+        .join("brain")
+        .join(session_id)
+        .join(".system_generated/logs/transcript_full.jsonl");
+    if !path.exists() {
+        return None;
+    }
+    let file = File::open(path).ok()?;
+    let reader = BufReader::new(file);
+    for line_res in reader.lines() {
+        let line = line_res.ok()?;
+        let event: serde_json::Value = serde_json::from_str(&line).ok()?;
+        if event.get("type").and_then(|t| t.as_str()) == Some("USER_INPUT") {
+            if let Some(content) = event.get("content").and_then(|c| c.as_str()) {
+                let request_text = if let Some(start_idx) = content.find("<USER_REQUEST>") {
+                    let actual_start = start_idx + "<USER_REQUEST>".len();
+                    if let Some(end_idx) = content[actual_start..].find("</USER_REQUEST>") {
+                        &content[actual_start..(actual_start + end_idx)]
+                    } else {
+                        content
+                    }
+                } else {
+                    content
+                };
+                let trimmed = request_text.trim();
+                let cleaned = trimmed.replace('\r', "").replace('\n', " ");
+                let truncated = cleaned.chars().take(100).collect::<String>();
+                return Some(truncated);
+            }
+            break;
+        }
+    }
+    None
+}
+
 /// Sync usage logs for hooks-based assistant (Antigravity or Copilot)
 fn sync_hook_usage_logs(conn: &Connection, assistant_type: &str, base_dir: &Path) -> Result<(), String> {
+    if assistant_type == "antigravity" {
+        // Perform migration if we haven't tracked it yet to update antigravity session names
+        let migration_done: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = 'migration:antigravity_user_request_names')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+
+        if !migration_done {
+            let _ = conn.execute("DELETE FROM sync_state WHERE filename LIKE 'antigravity:%'", []);
+            let _ = conn.execute("DELETE FROM usage_entries WHERE assistant_type = 'antigravity'", []);
+            let _ = conn.execute(
+                "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time) VALUES ('migration:antigravity_user_request_names', 1, 0)",
+                [],
+            );
+        }
+    }
+
     let usage_dir = base_dir.join("usage");
     if !usage_dir.exists() {
         return Ok(());
@@ -347,6 +403,13 @@ fn sync_hook_usage_logs(conn: &Connection, assistant_type: &str, base_dir: &Path
                     let delta = entry.delta_tokens.as_ref();
                     let cost = entry.cost.as_ref();
 
+                    let mut resolved_name = entry.session_name.clone();
+                    if assistant_type == "antigravity" {
+                        if let Some(name) = get_antigravity_session_name(&entry.session_id) {
+                            resolved_name = Some(name);
+                        }
+                    }
+
                     let insert_res = conn.execute(
                         "INSERT OR IGNORE INTO usage_entries (
                             assistant_type, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
@@ -359,7 +422,7 @@ fn sync_hook_usage_logs(conn: &Connection, assistant_type: &str, base_dir: &Path
                             entry.timestamp,
                             date_str,
                             entry.session_id,
-                            entry.session_name.as_deref(),
+                            resolved_name.as_deref(),
                             entry.transcript_path.as_deref(),
                             entry.cwd.as_deref(),
                             entry.version.as_deref(),
@@ -473,6 +536,7 @@ fn parse_codex_session_file(
     let mut parent_session_id = None;
     let mut agent_nickname = None;
     let mut agent_role = None;
+    let mut first_user_message = None;
 
     let mut seen_turn_ids = Vec::new();
     let mut active_turn_id: Option<String> = None;
@@ -491,6 +555,29 @@ fn parse_codex_session_file(
         let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
         let timestamp = event.get("timestamp").and_then(|t| t.as_str()).unwrap_or("").to_string();
         let payload = event.get("payload");
+
+        if event_type == "event_msg" && first_user_message.is_none() {
+            if let Some(p) = payload {
+                let is_user_msg = if let Some(t) = p.get("type") {
+                    if let Some(s) = t.as_str() {
+                        s == "user_message"
+                    } else if let Some(arr) = t.as_array() {
+                        arr.first().and_then(|v| v.as_str()) == Some("user_message")
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if is_user_msg {
+                    if let Some(msg) = p.get("message").and_then(|m| m.as_str()) {
+                        let cleaned = msg.replace('\r', "").replace('\n', " ");
+                        let truncated = cleaned.chars().take(100).collect::<String>();
+                        first_user_message = Some(truncated);
+                    }
+                }
+            }
+        }
 
         if event_type == "session_meta" {
             if let Some(p) = payload {
@@ -687,10 +774,11 @@ fn parse_codex_session_file(
                 None
             };
 
+            let actual_session_name = first_user_message.clone().unwrap_or_else(|| session_name.to_string());
             results.push(UsageEntry {
                 timestamp: td.timestamp.clone(),
                 session_id: session_id.to_string(),
-                session_name: Some(session_name.to_string()),
+                session_name: Some(actual_session_name),
                 transcript_path: Some(filepath.to_string_lossy().into_owned()),
                 cwd: td.cwd.clone().or_else(|| session_meta_cwd.clone()),
                 version: cli_version.clone(),
@@ -714,6 +802,24 @@ fn parse_codex_session_file(
 
 /// Sync usage logs for directory-based assistant (Codex)
 fn sync_codex_usage_logs(conn: &Connection) -> Result<(), String> {
+    // Perform migration if we haven't tracked it yet to update session names with user messages
+    let migration_done: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = 'migration:codex_user_message_names')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    if !migration_done {
+        let _ = conn.execute("DELETE FROM sync_state WHERE filename LIKE 'codex:%'", []);
+        let _ = conn.execute("DELETE FROM usage_entries WHERE assistant_type = 'codex'", []);
+        let _ = conn.execute(
+            "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time) VALUES ('migration:codex_user_message_names', 1, 0)",
+            [],
+        );
+    }
+
     let codex_dir = get_codex_dir();
     let sessions_dir = codex_dir.join("sessions");
     if !sessions_dir.exists() {
