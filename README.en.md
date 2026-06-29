@@ -106,6 +106,42 @@ If you have previously installed and used any of the following standalone token 
 
 Upon launching this dashboard, the backend will **automatically detect and migrate/merge the historical data** into the unified database of this project, while safely backing up the legacy database files to ensure no data is lost.
 
+### 🗑️ Disabling & Deleting Legacy Services
+
+Since this project consolidates all features of the standalone projects, we recommend stopping, disabling, and removing the legacy background services to avoid conflicts and save system resources:
+
+1. **Stop and Disable Legacy Services**:
+   Run the following commands to stop and disable the systemd user services for the legacy projects you previously installed:
+   ```bash
+   # Stop and disable legacy Copilot insights service
+   systemctl --user stop copilot-cli-token-insights.service
+   systemctl --user disable copilot-cli-token-insights.service
+
+   # Stop and disable legacy Antigravity insights service
+   systemctl --user stop antigravity-cli-token-insights.service
+   systemctl --user disable antigravity-cli-token-insights.service
+
+   # Stop and disable legacy Codex insights service
+   systemctl --user stop codex-cli-token-insights.service
+   systemctl --user disable codex-cli-token-insights.service
+   ```
+
+2. **Remove Legacy Service Unit Files**:
+   ```bash
+   rm -f ~/.config/systemd/user/copilot-cli-token-insights.service
+   rm -f ~/.config/systemd/user/antigravity-cli-token-insights.service
+   rm -f ~/.config/systemd/user/codex-cli-token-insights.service
+   ```
+
+3. **Reload Systemd User Daemon**:
+   ```bash
+   systemctl --user daemon-reload
+   systemctl --user reset-failed
+   ```
+
+4. **Delete Legacy Project Folders (Optional)**:
+   You may safely delete the code repositories of the legacy projects to free up space.
+
 ---
 
 ## ⚙️ Data Collection Setup

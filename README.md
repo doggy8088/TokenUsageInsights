@@ -106,6 +106,42 @@
 
 當您啟動本專案時，後端服務會**自動偵測並將舊有的歷史數據遷移合併**至本專案的統一資料庫中，並安全備份原有的舊資料庫檔案，確保您的歷史統計數據無縫接軌不遺失。
 
+### 🗑️ 舊服務的停用與刪除方法
+
+由於本專案已經完整整合了上述所有舊專案的功能，為了避免多個背景服務重複運行造成衝突與不必要的資源消耗，建議您在確認資料遷移完成後，手動停用並刪除舊服務的常駐設定：
+
+1. **停止並取消自動啟用 (Disable) 舊服務**：
+   根據您先前安裝的專案，依序停用對應的 systemd 使用者服務。例如：
+   ```bash
+   # 停用舊版 Copilot 統計服務
+   systemctl --user stop copilot-cli-token-insights.service
+   systemctl --user disable copilot-cli-token-insights.service
+
+   # 停用舊版 Antigravity 統計服務
+   systemctl --user stop antigravity-cli-token-insights.service
+   systemctl --user disable antigravity-cli-token-insights.service
+
+   # 停用舊版 Codex 統計服務
+   systemctl --user stop codex-cli-token-insights.service
+   systemctl --user disable codex-cli-token-insights.service
+   ```
+
+2. **刪除舊服務的描述檔**：
+   ```bash
+   rm -f ~/.config/systemd/user/copilot-cli-token-insights.service
+   rm -f ~/.config/systemd/user/antigravity-cli-token-insights.service
+   rm -f ~/.config/systemd/user/codex-cli-token-insights.service
+   ```
+
+3. **重新載入 systemd 設定**：
+   ```bash
+   systemctl --user daemon-reload
+   systemctl --user reset-failed
+   ```
+
+4. **刪除舊專案的目錄 (選用)**：
+   若您不再需要舊專案的原始碼目錄，可以將其整個資料夾刪除以釋放空間。
+
 ---
 
 ## ⚙️ 前置作業啟用指南
