@@ -232,45 +232,8 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
 
 /// Helper to parse usage entries from jsonl files (Antigravity & Copilot)
 fn parse_usage_entries(content: &str) -> Vec<UsageEntry> {
-    let mut entries = Vec::new();
-    let mut current_obj = String::new();
-    let mut in_object = false;
-
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        if !in_object && trimmed.starts_with('{') && trimmed.ends_with('}') {
-            if let Ok(entry) = serde_json::from_str::<UsageEntry>(trimmed) {
-                entries.push(entry);
-                continue;
-            }
-        }
-
-        if !in_object {
-            if trimmed.starts_with('{') {
-                in_object = true;
-                current_obj.clear();
-                current_obj.push_str(line);
-                current_obj.push('\n');
-            }
-        } else {
-            current_obj.push_str(line);
-            current_obj.push('\n');
-
-            let is_root_close = line.trim_end() == "}" && !line.starts_with(' ') && !line.starts_with('\t');
-            if is_root_close {
-                if let Ok(entry) = serde_json::from_str::<UsageEntry>(&current_obj) {
-                    entries.push(entry);
-                }
-                in_object = false;
-                current_obj.clear();
-            }
-        }
-    }
-    entries
+    let stream = serde_json::Deserializer::from_str(content).into_iter::<UsageEntry>();
+    stream.filter_map(Result::ok).collect()
 }
 
 fn get_antigravity_session_name(session_id: &str) -> Option<String> {
@@ -310,7 +273,7 @@ fn get_antigravity_session_name(session_id: &str) -> Option<String> {
 }
 
 /// Sync usage logs for hooks-based assistant (Antigravity or Copilot)
-fn sync_hook_usage_logs(conn: &Connection, assistant_type: &str, base_dir: &Path) -> Result<(), String> {
+fn sync_hook_usage_logs(conn: &mut Connection, assistant_type: &str, base_dir: &Path) -> Result<(), String> {
     if assistant_type == "antigravity" {
         // Perform migration if we haven't tracked it yet to update antigravity session names
         let migration_done: bool = conn
@@ -395,7 +358,7 @@ fn sync_hook_usage_logs(conn: &Connection, assistant_type: &str, base_dir: &Path
                     continue;
                 }
 
-                conn.execute("BEGIN TRANSACTION", []).map_err(|e| format!("Transaction BEGIN 失敗: {}", e))?;
+                let tx = conn.transaction().map_err(|e| format!("Transaction BEGIN 失敗: {}", e))?;
 
                 let mut success = true;
                 for entry in &parsed_entries {
@@ -410,7 +373,7 @@ fn sync_hook_usage_logs(conn: &Connection, assistant_type: &str, base_dir: &Path
                         }
                     }
 
-                    let insert_res = conn.execute(
+                    let insert_res = tx.execute(
                         "INSERT OR IGNORE INTO usage_entries (
                             assistant_type, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
                             tokens_input, tokens_output, tokens_cache_read, tokens_reasoning, tokens_total,
@@ -457,21 +420,16 @@ fn sync_hook_usage_logs(conn: &Connection, assistant_type: &str, base_dir: &Path
                         .unwrap_or_default()
                         .as_secs() as i64;
 
-                    let update_state_res = conn.execute(
+                    let update_state_res = tx.execute(
                         "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time) VALUES (?, ?, ?)",
                         params![state_key, (start_pos + read_len as u64) as i64, now],
                     );
 
                     if update_state_res.is_ok() {
-                        if let Err(e) = conn.execute("COMMIT TRANSACTION", []) {
+                        if let Err(e) = tx.commit() {
                             eprintln!("Transaction COMMIT 失敗: {}", e);
-                            let _ = conn.execute("ROLLBACK TRANSACTION", []);
                         }
-                    } else {
-                        let _ = conn.execute("ROLLBACK TRANSACTION", []);
                     }
-                } else {
-                    let _ = conn.execute("ROLLBACK TRANSACTION", []);
                 }
             }
         }
@@ -801,7 +759,7 @@ fn parse_codex_session_file(
 }
 
 /// Sync usage logs for directory-based assistant (Codex)
-fn sync_codex_usage_logs(conn: &Connection) -> Result<(), String> {
+fn sync_codex_usage_logs(conn: &mut Connection) -> Result<(), String> {
     // Perform migration if we haven't tracked it yet to update session names with user messages
     let migration_done: bool = conn
         .query_row(
@@ -864,17 +822,16 @@ fn sync_codex_usage_logs(conn: &Connection) -> Result<(), String> {
                 }
             };
 
-            conn.execute("BEGIN TRANSACTION", []).map_err(|e| format!("Transaction BEGIN 失敗: {}", e))?;
+            let tx = conn.transaction().map_err(|e| format!("Transaction BEGIN 失敗: {}", e))?;
 
             // First delete old entries for this session
-            let delete_res = conn.execute(
+            let delete_res = tx.execute(
                 "DELETE FROM usage_entries WHERE assistant_type = 'codex' AND session_id = ?",
                 params![session_id],
             );
 
             if let Err(e) = delete_res {
                 eprintln!("清空舊 Codex Session 資料失敗: {}", e);
-                let _ = conn.execute("ROLLBACK TRANSACTION", []);
                 continue;
             }
 
@@ -884,7 +841,7 @@ fn sync_codex_usage_logs(conn: &Connection) -> Result<(), String> {
                 let delta = entry.delta_tokens.as_ref();
                 let cost = entry.cost.as_ref();
 
-                let insert_res = conn.execute(
+                let insert_res = tx.execute(
                     "INSERT INTO usage_entries (
                         assistant_type, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
                         tokens_input, tokens_output, tokens_cache_read, tokens_reasoning, tokens_total,
@@ -934,21 +891,16 @@ fn sync_codex_usage_logs(conn: &Connection) -> Result<(), String> {
                     .unwrap_or_default()
                     .as_secs() as i64;
 
-                let update_state_res = conn.execute(
+                let update_state_res = tx.execute(
                     "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time) VALUES (?, ?, ?)",
                     params![state_key, current_size as i64, now],
                 );
 
                 if update_state_res.is_ok() {
-                    if let Err(e) = conn.execute("COMMIT TRANSACTION", []) {
+                    if let Err(e) = tx.commit() {
                         eprintln!("Transaction COMMIT 失敗: {}", e);
-                        let _ = conn.execute("ROLLBACK TRANSACTION", []);
                     }
-                } else {
-                    let _ = conn.execute("ROLLBACK TRANSACTION", []);
                 }
-            } else {
-                let _ = conn.execute("ROLLBACK TRANSACTION", []);
             }
         }
     }
@@ -957,7 +909,7 @@ fn sync_codex_usage_logs(conn: &Connection) -> Result<(), String> {
 }
 
 /// Unified sync function triggering sync for all three assistants
-pub fn sync_usage_logs(conn: &Connection) -> Result<(), String> {
+pub fn sync_usage_logs(conn: &mut Connection) -> Result<(), String> {
     // 1. Sync Google Antigravity CLI
     let antigravity_dir = get_antigravity_dir();
     if let Err(e) = sync_hook_usage_logs(conn, "antigravity", &antigravity_dir) {
@@ -979,7 +931,7 @@ pub fn sync_usage_logs(conn: &Connection) -> Result<(), String> {
 }
 
 /// Migrate data from legacy standalone databases into the centralized DB
-pub fn migrate_old_databases(dest_conn: &Connection) -> Result<(), String> {
+pub fn migrate_old_databases(dest_conn: &mut Connection) -> Result<(), String> {
     let home = match dirs::home_dir() {
         Some(h) => h,
         None => return Err("無法讀取家目錄以進行資料庫遷移。".to_string()),
@@ -1033,7 +985,7 @@ pub fn migrate_old_databases(dest_conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
-fn migrate_records(src_conn: &Connection, dest_conn: &Connection, assistant: &str) -> Result<(), rusqlite::Error> {
+fn migrate_records(src_conn: &Connection, dest_conn: &mut Connection, assistant: &str) -> Result<(), rusqlite::Error> {
     let table_exists: bool = src_conn
         .query_row(
             "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='usage_entries'",
@@ -1057,7 +1009,7 @@ fn migrate_records(src_conn: &Connection, dest_conn: &Connection, assistant: &st
 
     let mut rows = stmt.query([])?;
 
-    dest_conn.execute("BEGIN TRANSACTION", [])?;
+    let tx = dest_conn.transaction()?;
 
     while let Ok(Some(row)) = rows.next() {
         let session_id = row.get::<_, String>(2)?;
@@ -1081,7 +1033,7 @@ fn migrate_records(src_conn: &Connection, dest_conn: &Connection, assistant: &st
             }
         }
 
-        let insert_res = dest_conn.execute(
+        let insert_res = tx.execute(
             "INSERT OR IGNORE INTO usage_entries (
                 assistant_type, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
                 tokens_input, tokens_output, tokens_cache_read, tokens_reasoning, tokens_total,
@@ -1140,7 +1092,7 @@ fn migrate_records(src_conn: &Connection, dest_conn: &Connection, assistant: &st
                     let size = row.get::<_, i64>(1)?;
                     let time = row.get::<_, i64>(2)?;
                     let state_key = format!("{}:{}", assistant, filename);
-                    let _ = dest_conn.execute(
+                    let _ = tx.execute(
                         "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time) VALUES (?, ?, ?)",
                         params![state_key, size, time],
                     );
@@ -1149,7 +1101,7 @@ fn migrate_records(src_conn: &Connection, dest_conn: &Connection, assistant: &st
         }
     }
 
-    let _ = dest_conn.execute("COMMIT TRANSACTION", []);
+    tx.commit()?;
     Ok(())
 }
 
