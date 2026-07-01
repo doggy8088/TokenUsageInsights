@@ -84,6 +84,7 @@ const i18n = {
     setup_guide_title: '前置作業啟用教學',
     theme_toggle_title_dark: '切換至淺色主題',
     theme_toggle_title_light: '切換至深色主題',
+    github_repo_title: 'GitHub Repo',
     total_tokens_label: '總消耗 Token',
     input_tokens_label: '輸入 Token',
     output_tokens_label: '輸出 Token',
@@ -293,6 +294,7 @@ const i18n = {
     setup_guide_title: 'Setup Guide & Activation Tutorial',
     theme_toggle_title_dark: 'Switch to Light Theme',
     theme_toggle_title_light: 'Switch to Dark Theme',
+    github_repo_title: 'GitHub Repo',
     total_tokens_label: 'Total Tokens',
     input_tokens_label: 'Input Tokens',
     output_tokens_label: 'Output Tokens',
@@ -868,10 +870,14 @@ function initApp() {
     }
   });
 
-  // 支援 ESC 鍵關閉抽屜
+  // 支援 ESC 鍵關閉抽屜與關閉行動端側欄
   window.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
       closeDrawer();
+      const container = document.querySelector('.app-container');
+      if (container && window.innerWidth <= 992) {
+        container.classList.add('sidebar-collapsed');
+      }
     }
   });
 
@@ -887,6 +893,29 @@ function initApp() {
     if (window.innerWidth <= 1024) {
       appContainer.classList.add('sidebar-collapsed');
     }
+  }
+
+  // 自動依視窗大小變化調整收合狀態
+  window.addEventListener('resize', () => {
+    if (appContainer && window.innerWidth <= 992) {
+      appContainer.classList.add('sidebar-collapsed');
+    }
+  });
+
+  // 行動端側選單遮罩與關閉按鈕事件監聽
+  const sidebarOverlay = document.getElementById('sidebar-overlay');
+  const sidebarCloseBtn = document.getElementById('sidebar-close-btn');
+
+  if (sidebarOverlay && appContainer) {
+    sidebarOverlay.addEventListener('click', () => {
+      appContainer.classList.add('sidebar-collapsed');
+    });
+  }
+
+  if (sidebarCloseBtn && appContainer) {
+    sidebarCloseBtn.addEventListener('click', () => {
+      appContainer.classList.add('sidebar-collapsed');
+    });
   }
 
   // 初始化深淺色主題切換
@@ -1307,19 +1336,22 @@ function renderDashboard(data) {
 
   // 1. 更新標題與版本
   document.getElementById('current-date-title').innerHTML = `<span class="title-icon">📅</span> <span class="title-text">${t('usage_report')}${date}</span>`;
-  const versionBadge = document.getElementById('antigravity-version-badge');
+  const versionBadge = document.getElementById('assistant-version-badge');
   if (versionBadge) {
     if (currentAssistant === 'all' || currentAssistant.includes(',')) {
       versionBadge.textContent = 'Multi-Agent';
-    } else if (currentAssistant === 'antigravity') {
-      const firstVer = (data.raw_entries && data.raw_entries.length > 0) ? data.raw_entries[0].version : null;
-      versionBadge.textContent = `Antigravity CLI v${firstVer || '1.0.x'}`;
-    } else if (currentAssistant === 'copilot') {
-      versionBadge.textContent = 'Copilot CLI';
-    } else if (currentAssistant === 'codex') {
-      versionBadge.textContent = 'Codex CLI';
     } else {
-      versionBadge.textContent = 'Agent --';
+      const entryWithVer = (data.raw_entries || []).find(e => e.version);
+      const ver = entryWithVer ? entryWithVer.version : null;
+      if (currentAssistant === 'antigravity') {
+        versionBadge.textContent = `Antigravity CLI v${ver || '1.0.x'}`;
+      } else if (currentAssistant === 'copilot') {
+        versionBadge.textContent = `Copilot CLI v${ver || '1.0.x'}`;
+      } else if (currentAssistant === 'codex') {
+        versionBadge.textContent = `Codex CLI v${ver || '1.0.x'}`;
+      } else {
+        versionBadge.textContent = 'Agent --';
+      }
     }
   }
 
@@ -2505,7 +2537,7 @@ function renderMonthlyDashboard(data) {
 
   // 1. 更新標題與版本
   document.getElementById('current-date-title').innerHTML = `<span class="title-icon">📅</span> <span class="title-text">${t('monthly_report')}${year_month}</span>`;
-  document.getElementById('antigravity-version-badge').textContent = `Monthly Summary`;
+  document.getElementById('assistant-version-badge').textContent = `Monthly Summary`;
 
   // 2. 更新指標卡片
   const activeAgents = getActiveAgents();

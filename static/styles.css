@@ -1785,9 +1785,20 @@ input:checked + .slider-round:before {
   transform: rotate(180deg);
 }
 
+/* Sidebar close button (hidden on desktop) */
+.sidebar-close-btn {
+  display: none;
+}
+
+/* Sidebar overlay for mobile (hidden on desktop) */
+.sidebar-overlay {
+  display: none;
+}
+
 /* RWD Layout Adjustments for smaller screens */
 @media (max-width: 992px) {
-  .app-container {
+  .app-container,
+  .app-container.sidebar-collapsed {
     grid-template-columns: 1fr;
   }
   
@@ -1808,6 +1819,47 @@ input:checked + .slider-round:before {
     opacity: 0;
     pointer-events: none;
   }
+
+  .sidebar-close-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid var(--glass-border);
+    border-radius: 50%;
+    color: var(--text-secondary);
+    font-size: 14px;
+    width: 32px;
+    height: 32px;
+    cursor: pointer;
+    margin-left: auto;
+    transition: all 0.2s ease;
+  }
+  
+  .sidebar-close-btn:hover {
+    color: var(--accent-cyan);
+    background: rgba(0, 242, 254, 0.1);
+    border-color: var(--accent-cyan);
+  }
+  
+  .sidebar-overlay {
+    display: none;
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background-color: rgba(0, 0, 0, 0.55);
+    z-index: 998;
+    opacity: 0;
+    pointer-events: none;
+  }
+  
+  .app-container:not(.sidebar-collapsed) ~ .sidebar-overlay {
+    display: block;
+    opacity: 1;
+    pointer-events: auto;
+  }
   
   .app-main {
     padding: 0 20px 20px 20px; /* Top padding is 0 for sticky header placement */
@@ -1824,10 +1876,11 @@ input:checked + .slider-round:before {
   }
 }
 
-@media (max-width: 600px) {
+@media (max-width: 820px) {
   .main-header {
     flex-direction: column;
     align-items: flex-start;
+    gap: 12px;
   }
   
   .header-badge {
@@ -1835,105 +1888,113 @@ input:checked + .slider-round:before {
   }
 }
 
-/* Theme Toggle Button Styles */
-.theme-toggle-btn {
+/* Header Icon Buttons & Tooltips */
+.icon-btn {
   background: var(--card-bg);
   border: 1px solid var(--glass-border);
   color: var(--text-primary);
-  width: 40px;
-  height: 40px;
+  width: 38px;
+  height: 38px;
   border-radius: 50%;
   display: flex;
   align-items: center;
   justify-content: center;
   font-size: 16px;
+  line-height: 1;
   cursor: pointer;
   transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
   box-shadow: var(--shadow-sm);
   outline: none;
   user-select: none;
   -webkit-user-select: none;
+  text-decoration: none;
+  position: relative;
 }
 
-.theme-toggle-btn:hover {
-  transform: scale(1.05) rotate(15deg);
+.icon-btn:hover {
+  transform: scale(1.05);
   background: var(--card-bg-hover);
   border-color: var(--accent-cyan);
   box-shadow: 0 0 12px rgba(0, 242, 254, 0.2);
+  color: var(--accent-cyan);
 }
 
-.theme-toggle-btn:active {
+.icon-btn:active {
   transform: scale(0.95);
+}
+
+.icon-btn .github-icon {
+  width: 18px;
+  height: 18px;
+}
+
+/* Tooltip shown on hover */
+.has-tooltip::before {
+  content: attr(title);
+  position: absolute;
+  top: calc(100% + 8px);
+  left: 50%;
+  transform: translateX(-50%) translateY(4px);
+  background: rgba(0, 0, 0, 0.85);
+  color: #ffffff;
+  font-size: 12px;
+  font-weight: 500;
+  padding: 6px 10px;
+  border-radius: 8px;
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 0;
+  visibility: hidden;
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  box-shadow: var(--shadow-md);
+  z-index: 1000;
+}
+
+.has-tooltip::after {
+  content: "";
+  position: absolute;
+  top: calc(100% + 2px);
+  left: 50%;
+  transform: translateX(-50%) translateY(4px);
+  border-width: 6px;
+  border-style: solid;
+  border-color: transparent transparent rgba(0, 0, 0, 0.85) transparent;
+  pointer-events: none;
+  opacity: 0;
+  visibility: hidden;
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  z-index: 1000;
+}
+
+.has-tooltip:hover::before,
+.has-tooltip:hover::after,
+.has-tooltip:focus-visible::before,
+.has-tooltip:focus-visible::after {
+  opacity: 1;
+  visibility: visible;
+  transform: translateX(-50%) translateY(0);
+}
+
+[data-theme="light"] .has-tooltip::before {
+  background: rgba(17, 24, 39, 0.9);
+}
+
+[data-theme="light"] .has-tooltip::after {
+  border-color: transparent transparent rgba(17, 24, 39, 0.9) transparent;
+}
+
+#theme-toggle-btn:hover {
+  transform: scale(1.05) rotate(15deg);
+}
+
+.icon-btn.loading {
+  pointer-events: none;
+  opacity: 0.6;
 }
 
 /* =========================================================================
    Setup Guide & Tutorial UI Components (Glassmorphism & Interactive)
    ========================================================================= */
-
-/* Setup Guide Button */
-.setup-guide-btn {
-  background: linear-gradient(135deg, rgba(0, 242, 254, 0.15) 0%, rgba(79, 172, 254, 0.15) 100%);
-  border: 1px solid rgba(0, 242, 254, 0.3);
-  color: var(--text-primary);
-  font-family: var(--font-display);
-  font-weight: 600;
-  padding: 8px 16px;
-  border-radius: 20px;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 13px;
-  cursor: pointer;
-  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-  box-shadow: var(--shadow-sm);
-  outline: none;
-}
-
-.setup-guide-btn:hover {
-  transform: translateY(-2px);
-  background: linear-gradient(135deg, rgba(0, 242, 254, 0.25) 0%, rgba(79, 172, 254, 0.25) 100%);
-  border-color: var(--accent-cyan);
-  box-shadow: 0 0 15px rgba(0, 242, 254, 0.35);
-}
-
-.setup-guide-btn:active {
-  transform: translateY(0);
-}
-
-/* Sync Database Button */
-.sync-db-btn {
-  background: linear-gradient(135deg, rgba(168, 85, 247, 0.15) 0%, rgba(236, 72, 153, 0.15) 100%);
-  border: 1px solid rgba(168, 85, 247, 0.3);
-  color: var(--text-primary);
-  font-family: var(--font-display);
-  font-weight: 600;
-  padding: 8px 16px;
-  border-radius: 20px;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 13px;
-  cursor: pointer;
-  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-  box-shadow: var(--shadow-sm);
-  outline: none;
-}
-
-.sync-db-btn:hover {
-  transform: translateY(-2px);
-  background: linear-gradient(135deg, rgba(168, 85, 247, 0.25) 0%, rgba(236, 72, 153, 0.25) 100%);
-  border-color: #a855f7;
-  box-shadow: 0 0 15px rgba(168, 85, 247, 0.35);
-}
-
-.sync-db-btn:active {
-  transform: translateY(0);
-}
-
-.sync-db-btn.loading {
-  pointer-events: none;
-  opacity: 0.6;
-}
 
 /* Center-aligned Modal */
 .modal-overlay {

@@ -4,6 +4,9 @@
 
 This is a local token consumption and session analysis dashboard designed specifically for local terminal AI assistants including **Google Antigravity CLI**, **GitHub Copilot CLI**, and **Codex CLI**. Powered by a high-performance **Rust (Axum)** backend and a beautiful **dark glassmorphic (Glassmorphism)** frontend, it helps you monitor token usage, cache hit rates, and API latency across all local AI assistants in one single place, and **reconstructs/restores the full conversation timeline of every session**!
 
+> [!IMPORTANT]
+> **System Requirement**: This project is only supported on **WSL (Windows Subsystem for Linux)** or **macOS** environments.
+
 ---
 
 ## 🤖 Agent Quick Start Prompt

@@ -4,6 +4,9 @@
 
 這是一個專為本地終端 AI 助理（**Google Antigravity CLI**、**GitHub Copilot CLI** 與 **Codex CLI**）設計的本地 Token 消耗與會話分析綜合看板。使用高效能的 **Rust (Axum)** 作為後端，搭配 **深色毛玻璃風格 (Glassmorphism)** 前端，協助您在一處集中查看所有本地 AI 助理的 Token 使用量、命中率、對話耗時以及**還原與重建每個會話的完整歷史對話時間軸**！
 
+> [!IMPORTANT]
+> **系統環境限制 (System Requirement)**: 本專案僅支援在 **WSL (Windows Subsystem for Linux)** 或 **macOS** 環境下使用。
+
 ---
 
 ## 🤖 給 Agent / 自動化流程的安裝提示
