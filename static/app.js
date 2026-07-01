@@ -1,9 +1,32 @@
 // Globals
 let tokenChartInstance = null;
 let monthlyChartInstance = null;
-let activeTab = 'daily'; // 'daily' or 'monthly'
+
+// Cookie helper functions
+function setCookie(name, value, days = 365) {
+  const date = new Date();
+  date.setTime(date.getTime() + (days * 24 * 60 * 60 * 1000));
+  const expires = "; expires=" + date.toUTCString();
+  document.cookie = name + "=" + encodeURIComponent(value) + expires + "; path=/; SameSite=Strict";
+}
+
+function getCookie(name) {
+  const nameEQ = name + "=";
+  const ca = document.cookie.split(';');
+  for(let i = 0; i < ca.length; i++) {
+    let c = ca[i];
+    while (c.charAt(0) == ' ') c = c.substring(1, c.length);
+    if (c.indexOf(nameEQ) == 0) return decodeURIComponent(c.substring(nameEQ.length, c.length));
+  }
+  return null;
+}
+
+const savedAgent = getCookie('selected_agent');
+let currentAssistant = ['antigravity', 'copilot', 'codex'].includes(savedAgent) ? savedAgent : 'antigravity';
+
+const savedTab = getCookie('active_tab');
+let activeTab = ['daily', 'monthly', 'yearly'].includes(savedTab) ? savedTab : 'daily'; // 'daily' or 'monthly' or 'yearly'
 let isEmptyState = false;
-let currentAssistant = 'antigravity';
 let currentChartSessions = [];
 let currentMonthlyBreakdown = [];
 let currentSessionTotalTokens = 0;
@@ -628,6 +651,63 @@ function initApp() {
   const liveToggle = document.getElementById('live-toggle');
   const liveInterval = document.getElementById('live-interval');
 
+  // Apply initial tab visibility based on restored activeTab
+  const dailySelector = document.getElementById('daily-selector-section');
+  const monthlySelector = document.getElementById('monthly-selector-section');
+  const yearlySelector = document.getElementById('yearly-selector-section');
+  const quickStats = document.getElementById('quick-stats-section');
+  const dailyView = document.getElementById('daily-view-container');
+  const monthlyView = document.getElementById('monthly-view-container');
+  const yearlyView = document.getElementById('yearly-view-container');
+
+  if (activeTab === 'daily') {
+    tabBtnDaily.classList.add('active');
+    tabBtnMonthly.classList.remove('active');
+    if (tabBtnYearly) tabBtnYearly.classList.remove('active');
+    dailySelector.classList.remove('hidden');
+    monthlySelector.classList.add('hidden');
+    if (yearlySelector) yearlySelector.classList.add('hidden');
+    if (quickStats) quickStats.classList.remove('hidden');
+    
+    if (dailyView) dailyView.classList.remove('hidden');
+    if (monthlyView) monthlyView.classList.add('hidden');
+    if (yearlyView) yearlyView.classList.add('hidden');
+  } else if (activeTab === 'monthly') {
+    tabBtnDaily.classList.remove('active');
+    tabBtnMonthly.classList.add('active');
+    if (tabBtnYearly) tabBtnYearly.classList.remove('active');
+    dailySelector.classList.add('hidden');
+    monthlySelector.classList.remove('hidden');
+    if (yearlySelector) yearlySelector.classList.add('hidden');
+    if (quickStats) quickStats.classList.add('hidden');
+    
+    if (dailyView) dailyView.classList.add('hidden');
+    if (monthlyView) monthlyView.classList.remove('hidden');
+    if (yearlyView) yearlyView.classList.add('hidden');
+  } else if (activeTab === 'yearly') {
+    tabBtnDaily.classList.remove('active');
+    tabBtnMonthly.classList.remove('active');
+    if (tabBtnYearly) tabBtnYearly.classList.add('active');
+    dailySelector.classList.add('hidden');
+    monthlySelector.classList.add('hidden');
+    if (yearlySelector) yearlySelector.classList.remove('hidden');
+    if (quickStats) quickStats.classList.add('hidden');
+    
+    if (dailyView) dailyView.classList.add('hidden');
+    if (monthlyView) monthlyView.classList.add('hidden');
+    if (yearlyView) yearlyView.classList.remove('hidden');
+  }
+
+  // Set initial live refresh toggle checkbox state based on cookie
+  const savedLiveRefresh = getCookie('live_refresh') === 'true';
+  if (liveToggle) {
+    if (savedLiveRefresh && activeTab === 'daily') {
+      liveToggle.checked = true;
+    } else {
+      liveToggle.checked = false;
+    }
+  }
+
   // 監聽助理切換 (單選 Badge)
   const badgeButtons = document.querySelectorAll('.assistant-badge-btn');
   if (badgeButtons.length > 0) {
@@ -644,6 +724,7 @@ function initApp() {
     if (!document.querySelector('.assistant-badge-btn.active')) {
       badgeButtons[0].classList.add('active');
       currentAssistant = badgeButtons[0].getAttribute('data-value');
+      setCookie('selected_agent', currentAssistant);
     }
 
     badgeButtons.forEach(btn => {
@@ -653,6 +734,7 @@ function initApp() {
         btn.classList.add('active');
 
         currentAssistant = btn.getAttribute('data-value');
+        setCookie('selected_agent', currentAssistant);
         updateLanguageUI();
         fetchPricingRules();
 
@@ -1093,6 +1175,7 @@ function initApp() {
   // 監聽 Live 重新整理切換
   liveToggle.addEventListener('change', (e) => {
     toggleLiveRefresh(e.target.checked);
+    setCookie('live_refresh', e.target.checked ? 'true' : 'false');
   });
 
   // 監聽 Live 頻率變更
@@ -1173,6 +1256,12 @@ function initApp() {
   fetchPricingRules();
   // 初始化費用標準 Modal 與事件
   initPricingModal();
+
+  // 恢復即時自動刷新狀態 (無提示)
+  const savedLiveRefreshOnLoad = getCookie('live_refresh') === 'true';
+  if (savedLiveRefreshOnLoad && activeTab === 'daily') {
+    toggleLiveRefresh(true, false);
+  }
 }
 
 // =========================================================================
@@ -1181,6 +1270,7 @@ function initApp() {
 function switchTab(tab) {
   if (activeTab === tab) return;
   activeTab = tab;
+  setCookie('active_tab', tab);
 
   const tabBtnDaily = document.getElementById('tab-btn-daily');
   const tabBtnMonthly = document.getElementById('tab-btn-monthly');
@@ -1224,6 +1314,7 @@ function switchTab(tab) {
     if (liveToggle && liveToggle.checked) {
       liveToggle.checked = false;
       toggleLiveRefresh(false);
+      setCookie('live_refresh', 'false');
     }
 
     tabBtnDaily.classList.remove('active');
@@ -1249,6 +1340,7 @@ function switchTab(tab) {
     if (liveToggle && liveToggle.checked) {
       liveToggle.checked = false;
       toggleLiveRefresh(false);
+      setCookie('live_refresh', 'false');
     }
 
     tabBtnDaily.classList.remove('active');
@@ -1275,7 +1367,7 @@ function switchTab(tab) {
 // =========================================================================
 // 即時監控自動重新整理 (Live Auto-Refresh)
 // =========================================================================
-function toggleLiveRefresh(enabled) {
+function toggleLiveRefresh(enabled, showToast = true) {
   const panel = document.getElementById('live-settings-panel');
   const dateSelect = document.getElementById('date-select');
   const btnToday = document.getElementById('btn-today');
@@ -1295,7 +1387,9 @@ function toggleLiveRefresh(enabled) {
     loadUsageData(todayStr);
 
     startLiveRefresh();
-    showNotification(t('live_refresh_enabled'), 'success');
+    if (showToast) {
+      showNotification(t('live_refresh_enabled'), 'success');
+    }
   } else {
     panel.style.display = 'none';
     dateSelect.disabled = false;
@@ -1304,7 +1398,9 @@ function toggleLiveRefresh(enabled) {
     if (btnNextDay) btnNextDay.disabled = false;
 
     stopLiveRefresh();
-    showNotification(t('live_refresh_disabled'), 'info');
+    if (showToast) {
+      showNotification(t('live_refresh_disabled'), 'info');
+    }
   }
 }
 
