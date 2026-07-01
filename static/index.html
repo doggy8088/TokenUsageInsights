@@ -422,6 +422,35 @@
           </div>
         </section>
 
+        <!-- Monthly Daily Summary -->
+        <section class="monthly-daily-summary-section" style="margin-top: 24px;">
+          <div class="glass-card">
+            <div class="section-header">
+              <h3 style="margin-bottom: 0px;" data-i18n="monthly_daily_summary_title">📅 當月每日彙總</h3>
+            </div>
+            <div class="table-wrapper" style="margin-top: 18px;">
+              <table class="premium-table">
+                <thead>
+                  <tr>
+                    <th class="sortable" data-sort="date" data-table="monthly"><span data-i18n="col_date">日期</span> <span class="sort-icon"></span></th>
+                    <th class="sortable" data-sort="input" data-table="monthly"><span data-i18n="col_input">輸入</span> <span class="sort-icon"></span></th>
+                    <th class="sortable" data-sort="output" data-table="monthly"><span data-i18n="col_output">輸出</span> <span class="sort-icon"></span></th>
+                    <th class="sortable" data-sort="reasoning" data-table="monthly"><span data-i18n="col_reasoning">推理</span> <span class="sort-icon"></span></th>
+                    <th class="sortable" data-sort="cache" data-table="monthly"><span data-i18n="col_cache">快取</span> <span class="sort-icon"></span></th>
+                    <th class="sortable" data-sort="total" data-table="monthly"><span data-i18n="col_total">總計</span> <span class="sort-icon"></span></th>
+                    <th class="sortable" data-sort="cost" data-table="monthly"><span data-i18n="col_cost">估算費用 (美金)</span> <span class="sort-icon"></span></th>
+                  </tr>
+                </thead>
+                <tbody id="monthly-daily-summary-body">
+                  <tr>
+                    <td colspan="7" class="placeholder-text" data-i18n="placeholder_no_daily_summary">無每日彙總數據</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+
         <!-- Monthly Breakdown Grid -->
         <section class="monthly-breakdown-grid">
           <!-- Top Projects -->
@@ -467,34 +496,6 @@
                 <tbody id="monthly-models-body">
                   <tr>
                     <td colspan="5" class="placeholder-text" data-i18n="placeholder_no_models">無模型數據</td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-        </section>
-
-        <!-- Monthly Daily Summary -->
-        <section class="monthly-daily-summary-section" style="margin-top: 24px;">
-          <div class="glass-card">
-            <div class="section-header">
-              <h3 style="margin-bottom: 0px;" data-i18n="monthly_daily_summary_title">📅 當月每日彙總</h3>
-            </div>
-            <div class="table-wrapper" style="margin-top: 18px;">
-              <table class="premium-table">
-                <thead>
-                  <tr>
-                    <th class="sortable" data-sort="date" data-table="monthly"><span data-i18n="col_date">日期</span> <span class="sort-icon"></span></th>
-                    <th class="sortable" data-sort="input" data-table="monthly"><span data-i18n="col_input">輸入</span> <span class="sort-icon"></span></th>
-                    <th class="sortable" data-sort="output" data-table="monthly"><span data-i18n="col_output">輸出</span> <span class="sort-icon"></span></th>
-                    <th class="sortable" data-sort="reasoning" data-table="monthly"><span data-i18n="col_reasoning">推理</span> <span class="sort-icon"></span></th>
-                    <th class="sortable" data-sort="cache" data-table="monthly"><span data-i18n="col_cache">快取</span> <span class="sort-icon"></span></th>
-                    <th class="sortable" data-sort="total" data-table="monthly"><span data-i18n="col_total">總計</span> <span class="sort-icon"></span></th>
-                    <th class="sortable" data-sort="cost" data-table="monthly"><span data-i18n="col_cost">估算費用 (美金)</span> <span class="sort-icon"></span></th>
-                  </tr>
-                </thead>
-                <tbody id="monthly-daily-summary-body">
-                  <tr>
-                    <td colspan="7" class="placeholder-text" data-i18n="placeholder_no_daily_summary">無每日彙總數據</td>
                   </tr>
                 </tbody>
               </table>
@@ -563,6 +564,35 @@
           </div>
         </section>
 
+        <!-- Yearly Monthly Summary -->
+        <section class="monthly-daily-summary-section" style="margin-top: 24px;">
+          <div class="glass-card">
+            <div class="section-header">
+              <h3 style="margin-bottom: 0px;" data-i18n="yearly_monthly_summary_title">📅 當年每月彙總</h3>
+            </div>
+            <div class="table-wrapper" style="margin-top: 18px;">
+              <table class="premium-table">
+                <thead>
+                  <tr>
+                    <th class="sortable" data-sort="month" data-table="yearly"><span data-i18n="col_month">月份</span> <span class="sort-icon"></span></th>
+                    <th class="sortable" data-sort="input" data-table="yearly"><span data-i18n="col_input">輸入</span> <span class="sort-icon"></span></th>
+                    <th class="sortable" data-sort="output" data-table="yearly"><span data-i18n="col_output">輸出</span> <span class="sort-icon"></span></th>
+                    <th class="sortable" data-sort="reasoning" data-table="yearly"><span data-i18n="col_reasoning">推理</span> <span class="sort-icon"></span></th>
+                    <th class="sortable" data-sort="cache" data-table="yearly"><span data-i18n="col_cache">快取</span> <span class="sort-icon"></span></th>
+                    <th class="sortable" data-sort="total" data-table="yearly"><span data-i18n="col_total">總計</span> <span class="sort-icon"></span></th>
+                    <th class="sortable" data-sort="cost" data-table="yearly"><span data-i18n="col_cost">估算費用 (美金)</span> <span class="sort-icon"></span></th>
+                  </tr>
+                </thead>
+                <tbody id="yearly-monthly-summary-body">
+                  <tr>
+                    <td colspan="7" class="placeholder-text" data-i18n="placeholder_no_monthly_summary">無每月彙總數據</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+
         <!-- Yearly Breakdown Grid -->
         <section class="monthly-breakdown-grid">
           <!-- Top Projects -->
@@ -608,35 +638,6 @@
                 <tbody id="yearly-models-body">
                   <tr>
                     <td colspan="5" class="placeholder-text" data-i18n="placeholder_no_models">無模型數據</td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </section>
-
-        <!-- Yearly Monthly Summary -->
-        <section class="monthly-daily-summary-section" style="margin-top: 24px;">
-          <div class="glass-card">
-            <div class="section-header">
-              <h3 style="margin-bottom: 0px;" data-i18n="yearly_monthly_summary_title">📅 當年每月彙總</h3>
-            </div>
-            <div class="table-wrapper" style="margin-top: 18px;">
-              <table class="premium-table">
-                <thead>
-                  <tr>
-                    <th class="sortable" data-sort="month" data-table="yearly"><span data-i18n="col_month">月份</span> <span class="sort-icon"></span></th>
-                    <th class="sortable" data-sort="input" data-table="yearly"><span data-i18n="col_input">輸入</span> <span class="sort-icon"></span></th>
-                    <th class="sortable" data-sort="output" data-table="yearly"><span data-i18n="col_output">輸出</span> <span class="sort-icon"></span></th>
-                    <th class="sortable" data-sort="reasoning" data-table="yearly"><span data-i18n="col_reasoning">推理</span> <span class="sort-icon"></span></th>
-                    <th class="sortable" data-sort="cache" data-table="yearly"><span data-i18n="col_cache">快取</span> <span class="sort-icon"></span></th>
-                    <th class="sortable" data-sort="total" data-table="yearly"><span data-i18n="col_total">總計</span> <span class="sort-icon"></span></th>
-                    <th class="sortable" data-sort="cost" data-table="yearly"><span data-i18n="col_cost">估算費用 (美金)</span> <span class="sort-icon"></span></th>
-                  </tr>
-                </thead>
-                <tbody id="yearly-monthly-summary-body">
-                  <tr>
-                    <td colspan="7" class="placeholder-text" data-i18n="placeholder_no_monthly_summary">無每月彙總數據</td>
                   </tr>
                 </tbody>
               </table>
