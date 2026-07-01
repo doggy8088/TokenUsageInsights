@@ -263,3 +263,14 @@ Example of running with a custom database directory:
 export INSIGHTS_DIR="/your/custom/path"
 cargo run
 ```
+
+## Interface Demonstration
+
+<img width="1920" height="869" alt="image" src="https://github.com/user-attachments/assets/0e334f40-7771-4366-82f5-6f2bcec24b81" />
+
+
+<img width="1920" height="869" alt="image" src="https://github.com/user-attachments/assets/5ebc79ea-f44b-4c59-9f12-f37b4f6bb6e0" />
+
+
+<img width="1920" height="869" alt="image" src="https://github.com/user-attachments/assets/92739400-be86-4306-b7d6-aadc236c1aef" />
+
