@@ -4,7 +4,7 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use serde::Serialize;
+use serde::{Serialize, Deserialize};
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
@@ -138,6 +138,33 @@ pub struct MonthlyDetailsResponse {
     pub projects: Vec<MonthlyProjectSummary>,
     pub models: Vec<MonthlyModelSummary>,
     pub agent_breakdown: HashMap<String, AgentBreakdown>,
+}
+
+#[derive(Serialize)]
+pub struct YearlyMonthlyBreakdown {
+    pub month: String,
+    pub total_tokens: u64,
+    pub total_input_tokens: u64,
+    pub total_output_tokens: u64,
+    pub total_cache_read_tokens: u64,
+    pub total_reasoning_tokens: u64,
+    pub sessions_count: usize,
+    pub cost_usd: f64,
+}
+
+#[derive(Serialize)]
+pub struct YearlyDetailsResponse {
+    pub year: String,
+    pub summary: DaySummary,
+    pub monthly_breakdown: Vec<YearlyMonthlyBreakdown>,
+    pub projects: Vec<MonthlyProjectSummary>,
+    pub models: Vec<MonthlyModelSummary>,
+    pub agent_breakdown: HashMap<String, AgentBreakdown>,
+}
+
+#[derive(Serialize)]
+pub struct YearListResponse {
+    pub years: Vec<String>,
 }
 
 /// API 1: 獲取可用的有使用記錄日期
@@ -745,13 +772,14 @@ pub async fn get_monthly_details(Path((assistant, year_month)): Path<(String, St
     let assistant_clone = assistant.clone();
     let query_month = format!("{}-%", year_month);
 
-    let entries_res: Result<Vec<(UsageEntry, String)>, String> = tokio::task::spawn_blocking(move || {
+    let entries_res: Result<Vec<(UsageEntry, String, String)>, String> = tokio::task::spawn_blocking(move || {
         let conn = db::get_db_conn()?;
         let mut query = "SELECT 
                 timestamp, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
                 tokens_input, tokens_output, tokens_cache_read, tokens_reasoning, tokens_total,
                 delta_input, delta_output, delta_cache_read, delta_reasoning, delta_total,
-                duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, assistant_type, reasoning_effort
+                duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, assistant_type, reasoning_effort,
+                date
              FROM usage_entries WHERE date LIKE ?".to_string();
         let mut params_vec = Vec::new();
         params_vec.push(rusqlite::types::Value::Text(query_month));
@@ -806,6 +834,8 @@ pub async fn get_monthly_details(Path((assistant, year_month)): Path<(String, St
                 None
             };
 
+            let entry_date = row.get::<_, String>(26).map_err(|e| e.to_string())?;
+
             entries.push((UsageEntry {
                 timestamp: row.get(0).map_err(|e| e.to_string())?,
                 session_id: row.get(1).map_err(|e| e.to_string())?,
@@ -824,7 +854,7 @@ pub async fn get_monthly_details(Path((assistant, year_month)): Path<(String, St
                 agent_nickname: row.get(22).ok(),
                 agent_role: row.get(23).ok(),
                 reasoning_effort: row.get(25).ok(),
-            }, ast_type));
+            }, ast_type, entry_date));
         }
         Ok(entries)
     }).await.unwrap_or_else(|_| Err("執行緒執行失敗".to_string()));
@@ -842,11 +872,8 @@ pub async fn get_monthly_details(Path((assistant, year_month)): Path<(String, St
     let mut daily_map: HashMap<String, Vec<(UsageEntry, String)>> = HashMap::new();
     let mut sessions_map: HashMap<String, (Vec<UsageEntry>, String)> = HashMap::new();
     
-    for (e, ast_type) in &entries_with_type {
-        if e.timestamp.len() >= 10 {
-            let d = e.timestamp[0..10].to_string();
-            daily_map.entry(d).or_default().push((e.clone(), ast_type.clone()));
-        }
+    for (e, ast_type, entry_date) in &entries_with_type {
+        daily_map.entry(entry_date.clone()).or_default().push((e.clone(), ast_type.clone()));
         let (list, _) = sessions_map.entry(e.session_id.clone()).or_insert_with(|| (Vec::new(), ast_type.clone()));
         list.push(e.clone());
     }
@@ -856,7 +883,7 @@ pub async fn get_monthly_details(Path((assistant, year_month)): Path<(String, St
     monthly_summary.total_sessions = sessions_map.len();
 
     let mut session_last_entries: HashMap<String, UsageEntry> = HashMap::new();
-    for (e, _) in &entries_with_type {
+    for (e, _, _) in &entries_with_type {
         let sid = e.session_id.clone();
         let last_e = session_last_entries.entry(sid).or_insert_with(|| e.clone());
         if e.turn_no > last_e.turn_no {
@@ -1010,6 +1037,315 @@ pub async fn get_monthly_details(Path((assistant, year_month)): Path<(String, St
     }).into_response()
 }
 
+/// API 12: 獲取可用的有使用記錄年份
+pub async fn get_available_years(Path(assistant): Path<String>) -> impl IntoResponse {
+    let res: Result<Vec<String>, String> = tokio::task::spawn_blocking(move || {
+        let conn = db::get_db_conn()?;
+        let mut years = Vec::new();
+        if assistant == "all" {
+            let mut stmt = conn.prepare("SELECT DISTINCT substr(date, 1, 4) FROM usage_entries ORDER BY date DESC").map_err(|e| e.to_string())?;
+            let year_iter = stmt.query_map([], |row| row.get::<_, String>(0)).map_err(|e| e.to_string())?;
+            for y in year_iter {
+                years.push(y.map_err(|e| e.to_string())?);
+            }
+        } else {
+            let assistants: Vec<&str> = assistant.split(',').collect();
+            let mut placeholders = Vec::new();
+            let mut params_vec = Vec::new();
+            for a in assistants {
+                placeholders.push("?");
+                params_vec.push(rusqlite::types::Value::Text(a.to_string()));
+            }
+            let query = format!(
+                "SELECT DISTINCT substr(date, 1, 4) FROM usage_entries WHERE assistant_type IN ({}) ORDER BY date DESC",
+                placeholders.join(",")
+            );
+            let mut stmt = conn.prepare(&query).map_err(|e| e.to_string())?;
+            let year_iter = stmt.query_map(rusqlite::params_from_iter(params_vec), |row| row.get::<_, String>(0)).map_err(|e| e.to_string())?;
+            for y in year_iter {
+                years.push(y.map_err(|e| e.to_string())?);
+            }
+        }
+        Ok(years)
+    }).await.unwrap_or_else(|_| Err("執行緒執行失敗".to_string()));
+
+    match res {
+        Ok(year_list) => Json(YearListResponse { years: year_list }).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))).into_response(),
+    }
+}
+
+/// API 13: 獲取指定年份的統計摘要數據
+pub async fn get_yearly_details(Path((assistant, year)): Path<(String, String)>) -> impl IntoResponse {
+    let assistant_clone = assistant.clone();
+    let query_year = format!("{}-%", year);
+
+    let entries_res: Result<Vec<(UsageEntry, String, String)>, String> = tokio::task::spawn_blocking(move || {
+        let conn = db::get_db_conn()?;
+        let mut query = "SELECT 
+                timestamp, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
+                tokens_input, tokens_output, tokens_cache_read, tokens_reasoning, tokens_total,
+                delta_input, delta_output, delta_cache_read, delta_reasoning, delta_total,
+                duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, assistant_type, reasoning_effort,
+                date
+             FROM usage_entries WHERE date LIKE ?".to_string();
+        let mut params_vec = Vec::new();
+        params_vec.push(rusqlite::types::Value::Text(query_year));
+
+        if assistant_clone != "all" {
+            let assistants: Vec<&str> = assistant_clone.split(',').collect();
+            let mut placeholders = Vec::new();
+            for a in assistants {
+                placeholders.push("?");
+                params_vec.push(rusqlite::types::Value::Text(a.to_string()));
+            }
+            query.push_str(&format!(" AND assistant_type IN ({})", placeholders.join(",")));
+        }
+        query.push_str(" ORDER BY timestamp ASC");
+
+        let mut stmt = conn.prepare(&query).map_err(|e| e.to_string())?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(params_vec)).map_err(|e| e.to_string())?;
+
+        let mut entries = Vec::new();
+        while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+            let ast_type = row.get::<_, String>(24).map_err(|e| e.to_string())?;
+            let tokens_input: Option<u64> = row.get::<_, Option<i64>>(9).map_err(|e| e.to_string())?.map(|v| v as u64);
+            let tokens_output: Option<u64> = row.get::<_, Option<i64>>(10).map_err(|e| e.to_string())?.map(|v| v as u64);
+            let tokens_cache_read: Option<u64> = row.get::<_, Option<i64>>(11).map_err(|e| e.to_string())?.map(|v| v as u64);
+            let tokens_reasoning: Option<u64> = row.get::<_, Option<i64>>(12).map_err(|e| e.to_string())?.map(|v| v as u64);
+            let tokens_total: Option<u64> = row.get::<_, Option<i64>>(13).map_err(|e| e.to_string())?.map(|v| v as u64);
+
+            let tokens = if let (Some(input), Some(output), Some(total)) = (tokens_input, tokens_output, tokens_total) {
+                Some(TokenStats { input, output, cache_read: tokens_cache_read, cache_write: None, reasoning: tokens_reasoning, total })
+            } else {
+                None
+            };
+
+            let delta_input: Option<u64> = row.get::<_, Option<i64>>(14).map_err(|e| e.to_string())?.map(|v| v as u64);
+            let delta_output: Option<u64> = row.get::<_, Option<i64>>(15).map_err(|e| e.to_string())?.map(|v| v as u64);
+            let delta_cache_read: Option<u64> = row.get::<_, Option<i64>>(16).map_err(|e| e.to_string())?.map(|v| v as u64);
+            let delta_reasoning: Option<u64> = row.get::<_, Option<i64>>(17).map_err(|e| e.to_string())?.map(|v| v as u64);
+            let delta_total: Option<u64> = row.get::<_, Option<i64>>(18).map_err(|e| e.to_string())?.map(|v| v as u64);
+
+            let delta_tokens = if let (Some(input), Some(output), Some(total)) = (delta_input, delta_output, delta_total) {
+                Some(TokenStats { input, output, cache_read: delta_cache_read, cache_write: None, reasoning: delta_reasoning, total })
+            } else {
+                None
+            };
+
+            let duration_ms: Option<f64> = row.get::<_, Option<i64>>(19).map_err(|e| e.to_string())?.map(|v| v as f64);
+            let premium_requests: Option<f64> = row.get::<_, Option<i64>>(20).map_err(|e| e.to_string())?.map(|v| v as f64);
+
+            let cost = if duration_ms.is_some() || premium_requests.is_some() {
+                Some(CostStats { total_api_duration_ms: duration_ms, total_duration_ms: None, total_premium_requests: premium_requests })
+            } else {
+                None
+            };
+
+            let entry_date = row.get::<_, String>(26).map_err(|e| e.to_string())?;
+
+            entries.push((UsageEntry {
+                timestamp: row.get(0).map_err(|e| e.to_string())?,
+                session_id: row.get(1).map_err(|e| e.to_string())?,
+                session_name: row.get(2).ok(),
+                transcript_path: row.get(3).ok(),
+                cwd: row.get(4).ok(),
+                version: row.get(5).ok(),
+                turn_no: row.get::<_, i64>(6).map_err(|e| e.to_string())? as u32,
+                model: row.get(7).ok(),
+                model_id: row.get(8).ok(),
+                tokens,
+                delta_tokens,
+                context: None,
+                cost,
+                parent_session_id: row.get(21).ok(),
+                agent_nickname: row.get(22).ok(),
+                agent_role: row.get(23).ok(),
+                reasoning_effort: row.get(25).ok(),
+            }, ast_type, entry_date));
+        }
+        Ok(entries)
+    }).await.unwrap_or_else(|_| Err("執行緒執行失敗".to_string()));
+
+    let entries_with_type = match entries_res {
+        Ok(e) => e,
+        Err(err) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": err }))).into_response(),
+    };
+
+    if entries_with_type.is_empty() {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "找不到該年份的使用量資料。" }))).into_response();
+    }
+
+    let pricing_rules = load_pricing_rules();
+    let mut monthly_map: HashMap<String, Vec<(UsageEntry, String)>> = HashMap::new();
+    let mut sessions_map: HashMap<String, (Vec<UsageEntry>, String)> = HashMap::new();
+    
+    for (e, ast_type, entry_date) in &entries_with_type {
+        let month_str = if entry_date.len() >= 7 { &entry_date[0..7] } else { "Unknown" };
+        monthly_map.entry(month_str.to_string()).or_default().push((e.clone(), ast_type.clone()));
+        let (list, _) = sessions_map.entry(e.session_id.clone()).or_insert_with(|| (Vec::new(), ast_type.clone()));
+        list.push(e.clone());
+    }
+
+    let mut monthly_breakdown = Vec::new();
+    let mut yearly_summary = DaySummary::default();
+    yearly_summary.total_sessions = sessions_map.len();
+
+    let mut session_last_entries: HashMap<String, UsageEntry> = HashMap::new();
+    for (e, _, _) in &entries_with_type {
+        let sid = e.session_id.clone();
+        let last_e = session_last_entries.entry(sid).or_insert_with(|| e.clone());
+        if e.turn_no > last_e.turn_no {
+            *last_e = e.clone();
+        }
+    }
+
+    // 計算每月彙整與年彙整
+    let mut sorted_months: Vec<String> = monthly_map.keys().cloned().collect();
+    sorted_months.sort();
+
+    for month_str in sorted_months {
+        let month_entries_with_type = monthly_map.get(&month_str).unwrap();
+        let mut m_tokens = 0;
+        let mut m_input = 0;
+        let mut m_output = 0;
+        let mut m_reasoning = 0;
+        let mut m_cache_read = 0;
+        let mut m_cost_usd = 0.0;
+        let mut m_sessions = HashSet::new();
+
+        let mut month_sessions_map: HashMap<String, Vec<UsageEntry>> = HashMap::new();
+        for (e, _) in month_entries_with_type {
+            m_sessions.insert(e.session_id.clone());
+            month_sessions_map.entry(e.session_id.clone()).or_default().push(e.clone());
+        }
+
+        for (sid, s_entries) in &month_sessions_map {
+            let s_tokens = s_entries.iter().map(|e| e.delta_tokens.as_ref().map(|t| t.total).unwrap_or(0)).sum::<u64>();
+            let s_input = s_entries.iter().map(|e| e.delta_tokens.as_ref().map(|t| t.input).unwrap_or(0)).sum::<u64>();
+            let s_output = s_entries.iter().map(|e| e.delta_tokens.as_ref().map(|t| t.output).unwrap_or(0)).sum::<u64>();
+            let s_cache = s_entries.iter().map(|e| e.delta_tokens.as_ref().and_then(|t| t.cache_read).unwrap_or(0)).sum::<u64>();
+            let s_reasoning = s_entries.iter().map(|e| e.delta_tokens.as_ref().and_then(|t| t.reasoning).unwrap_or(0)).sum::<u64>();
+
+            let last_entry = session_last_entries.get(sid).cloned().unwrap_or_else(|| s_entries[0].clone());
+            let final_input = if s_tokens > 0 { s_input } else { last_entry.tokens.as_ref().map(|t| t.input).unwrap_or(0) };
+            let final_output = if s_tokens > 0 { s_output } else { last_entry.tokens.as_ref().map(|t| t.output).unwrap_or(0) };
+            let final_cache = if s_tokens > 0 { s_cache } else { last_entry.tokens.as_ref().and_then(|t| t.cache_read).unwrap_or(0) };
+            let final_reasoning = if s_tokens > 0 { s_reasoning } else { last_entry.tokens.as_ref().and_then(|t| t.reasoning).unwrap_or(0) };
+            let final_total = if s_tokens > 0 { s_tokens } else { last_entry.tokens.as_ref().map(|t| t.total).unwrap_or(0) };
+
+            let cost_usd = calculate_cost(
+                &pricing_rules,
+                &last_entry.model.clone().unwrap_or_else(|| "Unknown Model".to_string()),
+                final_input,
+                final_output,
+                final_cache,
+            );
+
+            m_tokens += final_total;
+            m_input += final_input;
+            m_output += final_output;
+            m_cache_read += final_cache;
+            m_reasoning += final_reasoning;
+            m_cost_usd += cost_usd;
+        }
+
+        yearly_summary.total_tokens += m_tokens;
+        yearly_summary.total_input_tokens += m_input;
+        yearly_summary.total_output_tokens += m_output;
+        yearly_summary.total_cache_read_tokens += m_cache_read;
+        yearly_summary.total_reasoning_tokens += m_reasoning;
+        yearly_summary.total_cost_usd += m_cost_usd;
+
+        monthly_breakdown.push(YearlyMonthlyBreakdown {
+            month: month_str,
+            total_tokens: m_tokens,
+            total_input_tokens: m_input,
+            total_output_tokens: m_output,
+            total_cache_read_tokens: m_cache_read,
+            total_reasoning_tokens: m_reasoning,
+            sessions_count: m_sessions.len(),
+            cost_usd: m_cost_usd,
+        });
+    }
+
+    // 按專案統計 (CWD)
+    let mut project_map_stats: HashMap<String, (usize, u64, f64)> = HashMap::new();
+    // 按模型統計 (Model)
+    let mut model_map_stats: HashMap<String, (usize, u64, u64, u64, u64, f64)> = HashMap::new();
+    // 按 Agent 類型統計
+    let mut agent_map_stats: HashMap<String, AgentBreakdown> = HashMap::new();
+
+    for (session_id, (s_entries, ast_type)) in &sessions_map {
+        let last_entry = session_last_entries.get(session_id).cloned().unwrap_or_else(|| s_entries[0].clone());
+        
+        let s_tokens = s_entries.iter().map(|e| e.delta_tokens.as_ref().map(|t| t.total).unwrap_or(0)).sum::<u64>();
+        let s_input = s_entries.iter().map(|e| e.delta_tokens.as_ref().map(|t| t.input).unwrap_or(0)).sum::<u64>();
+        let s_output = s_entries.iter().map(|e| e.delta_tokens.as_ref().map(|t| t.output).unwrap_or(0)).sum::<u64>();
+        let s_cache = s_entries.iter().map(|e| e.delta_tokens.as_ref().and_then(|t| t.cache_read).unwrap_or(0)).sum::<u64>();
+        let s_reasoning = s_entries.iter().map(|e| e.delta_tokens.as_ref().and_then(|t| t.reasoning).unwrap_or(0)).sum::<u64>();
+
+        let final_input = if s_tokens > 0 { s_input } else { last_entry.tokens.as_ref().map(|t| t.input).unwrap_or(0) };
+        let final_output = if s_tokens > 0 { s_output } else { last_entry.tokens.as_ref().map(|t| t.output).unwrap_or(0) };
+        let final_cache = if s_tokens > 0 { s_cache } else { last_entry.tokens.as_ref().and_then(|t| t.cache_read).unwrap_or(0) };
+        let final_reasoning = if s_tokens > 0 { s_reasoning } else { last_entry.tokens.as_ref().and_then(|t| t.reasoning).unwrap_or(0) };
+        let final_total = if s_tokens > 0 { s_tokens } else { last_entry.tokens.as_ref().map(|t| t.total).unwrap_or(0) };
+
+        let cost_usd = calculate_cost(
+            &pricing_rules,
+            &last_entry.model.clone().unwrap_or_else(|| "Unknown Model".to_string()),
+            final_input,
+            final_output,
+            final_cache,
+        );
+
+        let cwd = last_entry.cwd.unwrap_or_else(|| "Unknown CWD".to_string());
+        let project_stat = project_map_stats.entry(cwd).or_insert((0, 0, 0.0));
+        project_stat.0 += 1;
+        project_stat.1 += final_total;
+        project_stat.2 += cost_usd;
+
+        let model = last_entry.model.unwrap_or_else(|| "Unknown Model".to_string());
+        let model_stat = model_map_stats.entry(model).or_insert((0, 0, 0, 0, 0, 0.0));
+        model_stat.0 += 1;
+        model_stat.1 += final_total;
+        model_stat.2 += final_input;
+        model_stat.3 += final_output;
+        model_stat.4 += final_cache;
+        model_stat.5 += cost_usd;
+
+        let agent_stat = agent_map_stats.entry(ast_type.clone()).or_default();
+        agent_stat.total_tokens += final_total;
+        agent_stat.total_input_tokens += final_input;
+        agent_stat.total_output_tokens += final_output;
+        agent_stat.total_cache_read_tokens += final_cache;
+        agent_stat.total_reasoning_tokens += final_reasoning;
+        agent_stat.total_cost_usd += cost_usd;
+        agent_stat.total_sessions += 1;
+    }
+
+    let mut project_summaries = Vec::new();
+    for (cwd, (sessions_count, total_tokens, cost_usd)) in project_map_stats {
+        project_summaries.push(MonthlyProjectSummary { cwd, sessions_count, total_tokens, cost_usd });
+    }
+    project_summaries.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens));
+
+    let mut model_summaries = Vec::new();
+    for (model, (sessions_count, total_tokens, total_input_tokens, total_output_tokens, total_cache_read_tokens, cost_usd)) in model_map_stats {
+        model_summaries.push(MonthlyModelSummary { model, sessions_count, total_tokens, total_input_tokens, total_output_tokens, total_cache_read_tokens, cost_usd });
+    }
+    model_summaries.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens));
+
+    Json(YearlyDetailsResponse {
+        year,
+        summary: yearly_summary,
+        monthly_breakdown,
+        projects: project_summaries,
+        models: model_summaries,
+        agent_breakdown: agent_map_stats,
+    }).into_response()
+}
+
 /// API 7: 獲取模型價格清單 ( pricing.csv 資訊)
 pub async fn get_pricing(Path(_assistant): Path<String>) -> impl IntoResponse {
     let mut entries = Vec::new();
@@ -1081,4 +1417,195 @@ pub async fn get_rate_limit(Path(assistant): Path<String>) -> impl IntoResponse 
         None => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "No rate limit data found" }))).into_response(),
     }
 }
+
+#[derive(Serialize)]
+pub struct CodexAuthInfo {
+    pub name: String,
+    pub active: bool,
+}
+
+#[derive(Serialize)]
+pub struct CodexAuthListResponse {
+    pub configs: Vec<CodexAuthInfo>,
+    pub current_active: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct SwitchAuthRequest {
+    pub name: String,
+}
+
+/// API: 獲取 Codex 的 auth 憑證列表
+pub async fn get_codex_auth_configs(Path(assistant): Path<String>) -> impl IntoResponse {
+    if assistant != "codex" {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Only codex is supported" }))).into_response();
+    }
+
+    let res = tokio::task::spawn_blocking(move || {
+        let codex_dir = db::get_codex_dir();
+        let auth_dir = codex_dir.join("auth");
+        let active_auth_file = codex_dir.join("auth.json");
+
+        if !auth_dir.exists() {
+            let _ = std::fs::create_dir_all(&auth_dir);
+        }
+
+        // Read active auth.json contents to compare
+        let active_bytes = std::fs::read(&active_auth_file).ok();
+
+        let mut configs = Vec::new();
+        let mut current_active = None;
+
+        if let Ok(entries) = std::fs::read_dir(&auth_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    if let Some(filename) = path.file_name().and_then(|f| f.to_str()) {
+                        if filename.ends_with(".json") {
+                            let mut active = false;
+                            if let Some(ref active_content) = active_bytes {
+                                if let Ok(content) = std::fs::read(&path) {
+                                    if content == *active_content {
+                                        active = true;
+                                        current_active = Some(filename.to_string());
+                                    }
+                                }
+                            }
+                            configs.push(CodexAuthInfo {
+                                name: filename.to_string(),
+                                active,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Sort configs alphabetically by name
+        configs.sort_by(|a, b| a.name.cmp(&b.name));
+
+        Ok(CodexAuthListResponse {
+            configs,
+            current_active,
+        })
+    }).await.unwrap_or_else(|_| Err("Thread execution failed".to_string()));
+
+    match res {
+        Ok(data) => (StatusCode::OK, Json(data)).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))).into_response(),
+    }
+}
+
+/// API: 切換 Codex 的 auth 憑證
+pub async fn switch_codex_auth(
+    Path(assistant): Path<String>,
+    Json(payload): Json<SwitchAuthRequest>,
+) -> impl IntoResponse {
+    if assistant != "codex" {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Only codex is supported" }))).into_response();
+    }
+
+    // Safety check: make sure filename doesn't contain path traversal
+    let filename = payload.name.clone();
+    if filename.contains('/') || filename.contains('\\') || filename.contains("..") {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid filename" }))).into_response();
+    }
+
+    let res = tokio::task::spawn_blocking(move || {
+        let codex_dir = db::get_codex_dir();
+        let auth_dir = codex_dir.join("auth");
+        let source_file = auth_dir.join(&filename);
+        let dest_file = codex_dir.join("auth.json");
+
+        if !source_file.exists() {
+            return Err(format!("Auth file {} does not exist", filename));
+        }
+
+        std::fs::copy(&source_file, &dest_file)
+            .map_err(|e| format!("Failed to copy file: {}", e))?;
+
+        Ok(())
+    }).await.unwrap_or_else(|_| Err("Thread execution failed".to_string()));
+
+    match res {
+        Ok(_) => (StatusCode::OK, Json(serde_json::json!({ "status": "success", "message": format!("Successfully switched to {}", payload.name) }))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "status": "error", "message": e }))).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::env;
+    use crate::db;
+
+    #[tokio::test]
+    async fn test_yearly_handlers() {
+        let temp_dir = std::path::PathBuf::from("temp_test_insights");
+        if temp_dir.exists() {
+            let _ = fs::remove_dir_all(&temp_dir);
+        }
+        fs::create_dir_all(&temp_dir).unwrap();
+        env::set_var("INSIGHTS_DIR", temp_dir.to_str().unwrap());
+
+        // Initialize SQLite DB
+        let conn = db::get_db_conn().unwrap();
+        db::init_db(&conn).unwrap();
+
+        // Insert some fake entries
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, session_name, cwd, turn_no, model,
+                tokens_input, tokens_output, tokens_cache_read, tokens_total,
+                delta_input, delta_output, delta_cache_read, delta_total
+            ) VALUES (
+                'antigravity', '2026-07-01 12:00:00', '2026-07-01', 'session_1', 'Session 1', '/cwd/1', 1, 'Gemini 3.5 Flash',
+                100, 50, 20, 150,
+                100, 50, 20, 150
+            )",
+            [],
+        ).unwrap();
+
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, session_name, cwd, turn_no, model,
+                tokens_input, tokens_output, tokens_cache_read, tokens_total,
+                delta_input, delta_output, delta_cache_read, delta_total
+            ) VALUES (
+                'antigravity', '2026-07-01 12:05:00', '2026-07-01', 'session_1', 'Session 1', '/cwd/1', 2, 'Gemini 3.5 Flash',
+                120, 60, 20, 180,
+                20, 10, 0, 30
+            )",
+            [],
+        ).unwrap();
+
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, session_name, cwd, turn_no, model,
+                tokens_input, tokens_output, tokens_cache_read, tokens_total,
+                delta_input, delta_output, delta_cache_read, delta_total
+            ) VALUES (
+                'antigravity', '2025-06-01 12:00:00', '2025-06-01', 'session_2', 'Session 2', '/cwd/2', 1, 'Gemini 3.5 Flash',
+                200, 100, 40, 300,
+                200, 100, 40, 300
+            )",
+            [],
+        ).unwrap();
+
+        // 1. Test get_available_years
+        let conn = db::get_db_conn().unwrap();
+        let mut stmt = conn.prepare("SELECT DISTINCT substr(date, 1, 4) FROM usage_entries ORDER BY date DESC").unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        let mut years = Vec::new();
+        while let Some(row) = rows.next().unwrap() {
+            years.push(row.get::<_, String>(0).unwrap());
+        }
+        assert_eq!(years, vec!["2026", "2025"]);
+
+        // Cleanup
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+}
+
 

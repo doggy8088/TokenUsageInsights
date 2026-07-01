@@ -33,6 +33,13 @@ let currentSortDirection = 'desc';  // Default chronological order
 let monthlyDailySortColumn = 'date';
 let monthlyDailySortDirection = 'desc';
 
+// Yearly monthly summary sorting state
+let yearlyMonthlySortColumn = 'month';
+let yearlyMonthlySortDirection = 'desc';
+let currentYearlyBreakdown = [];
+let currentYearlyData = null;
+let yearlyChartInstance = null;
+
 // Live Auto-Refresh State
 let liveRefreshTimer = null;
 let liveProgressTimer = null;
@@ -108,14 +115,14 @@ const i18n = {
     col_reasoning: '推理',
     col_cache: '快取',
     col_total: '總計',
-    col_cost: '估算費用',
+    col_cost: '估算費用 (美金)',
     col_duration: '耗時',
     col_time: '時間',
-    estimated_cost_label: '估算費用',
-    stat_cost_desc: '基於 pricing.csv 的估計金額',
+    estimated_cost_label: '估算費用 (美金)',
+    stat_cost_desc: '⚠️ 此為預估試算僅供參考 (基於 pricing.csv)',
     btn_pricing_sheet: '費用標準',
     pricing_sheet_title: '💰 AI 模型費用標準表',
-    pricing_intro: '此費用為本地估算，單價依據 <code>pricing.csv</code> 載入。單位為 1M Tokens (每百萬個 Token) 的美金價格：',
+    pricing_intro: '此費用為本地估算，單價依據 <code>pricing.csv</code> 載入。單位為 1M Tokens (每百萬個 Token) 的美金價格。<br><strong style="color: var(--neon-gold, #fbbf24);">⚠️ 註：此為預估試算僅供參考。</strong>',
     placeholder_select_date: '請先在左側選擇一個日期',
     placeholder_no_sessions: '今日無任何會話記錄',
     monthly_tokens_label: '月總消耗 Token',
@@ -125,6 +132,30 @@ const i18n = {
     monthly_requests_count: '總請求: {count} 次',
     monthly_projects_title: '🏢 最常活動的專案目錄',
     monthly_models_title: '🤖 使用的模型佔比',
+    tab_yearly: '📅 年度彙整',
+    select_year: '選擇年份',
+    this_year_btn: '今年',
+    prev_year_btn: '上一年',
+    next_year_btn: '下一年',
+    no_year_logs: '無年度日誌記錄',
+    yearly_tokens_label: '年總消耗 Token',
+    yearly_input_label: '年輸入 Token',
+    yearly_output_label: '年輸出 Token',
+    yearly_sessions_label: '年總會話數',
+    yearly_requests_count: '總請求: {count} 次',
+    yearly_projects_title: '🏢 年度最常活動的專案目錄',
+    yearly_models_title: '🤖 年度使用的模型佔比',
+    yearly_monthly_summary_title: '📅 當年每月彙總',
+    col_month: '月份',
+    placeholder_no_monthly_summary: '當年無每月彙總數據',
+    chart_yearly_title: '單年每月 Token 消耗與會話數趨勢',
+    chart_yearly_token_label: '年總 Token 消耗',
+    chart_yearly_session_label: '每月會話數',
+    yearly_reload_success: '年度數據已成功重新整理',
+    yearly_load_failed: '載入年份彙整數據失敗',
+    loading_year_prefix: '載入年份數據中: ',
+    yearly_report: '年度統計報告：',
+    year_not_found: '找不到該年份的數據',
     col_rank: '排名',
     col_project_cwd: '工作路徑 (CWD)',
     col_sessions_count: '會話數',
@@ -201,13 +232,23 @@ const i18n = {
     no_agent_selected_desc: '您目前尚未選取任何 Agent 類型。請在左側側邊欄勾選/點擊選取至少一個 Agent (例如 Antigravity CLI, GitHub Copilot CLI, Codex CLI) 以呈現數據。',
     btn_empty_setup: '⚙️ 啟用前置設定教學',
     btn_empty_refresh: '🔄 重新整理檢查',
-    codex_rate_limit_title: 'Codex CLI 額度限制狀態',
-    codex_rate_limit_updated: '最後更新:',
-    codex_primary_label: '五小時內剩餘 (Primary)',
-    codex_secondary_label: '一週內剩餘 (Secondary)',
-    codex_reset_time: '下次重置時間:',
+    codex_rate_limit_title: 'API 額度',
+    codex_rate_limit_tip_title: '提示：此處顯示的 API 額度剩餘數據來源是最後一次本地會話的日誌紀錄，而非向伺服器發起即時線上查詢。',
+    codex_rate_limit_updated: '更新:',
+    codex_primary_label: '5h 額度 (Primary)',
+    codex_secondary_label: '7d 額度 (Secondary)',
+    codex_reset_time: '重置:',
     codex_rate_limit_unlimited: '無限制',
     codex_rate_limit_remaining: '剩餘 {percent}%',
+    codex_control_title: 'Codex 控制與狀態',
+    codex_auth_tip_title: '提示：您可以在 ~/.codex/auth/ 目錄下放入多個不同的 JSON 憑證檔（例如 (a)auth.json、(b)auth.json），並透過下拉選單在看板上即時切換套用，系統將自動覆蓋並套用至 ~/.codex/auth.json。',
+    codex_auth_switch_title: 'Codex CLI 身分憑證切換',
+    codex_select_auth_label: '憑證帳號：',
+    codex_btn_switch: '切換',
+    codex_auth_loading: '正在讀取...',
+    codex_auth_status: '{name}',
+    codex_auth_status_custom: '自訂',
+    codex_auth_status_none: '未載入',
     usage_report: '使用量報告：',
     loading_prefix: '載入中: ',
     loading_month_prefix: '載入月份數據中: ',
@@ -315,14 +356,14 @@ const i18n = {
     col_reasoning: 'Reasoning',
     col_cache: 'Cache',
     col_total: 'Total',
-    col_cost: 'Est. Cost',
+    col_cost: 'Est. Cost (USD)',
     col_duration: 'Duration',
     col_time: 'Time',
-    estimated_cost_label: 'Est. Cost',
-    stat_cost_desc: 'Estimated based on pricing.csv',
+    estimated_cost_label: 'Est. Cost (USD)',
+    stat_cost_desc: '⚠️ For reference only (Based on pricing.csv)',
     btn_pricing_sheet: 'Pricing Rates',
     pricing_sheet_title: '💰 AI Model Pricing Rates',
-    pricing_intro: 'This cost is locally estimated based on rates loaded from <code>pricing.csv</code>. Rates are in USD per 1M Tokens (per million tokens):',
+    pricing_intro: 'This cost is locally estimated based on rates loaded from <code>pricing.csv</code>. Rates are in USD per 1M Tokens (per million tokens).<br><strong style="color: var(--neon-gold, #fbbf24);">⚠️ Note: This is an estimated trial calculation for reference only.</strong>',
     placeholder_select_date: 'Please select a date on the left',
     placeholder_no_sessions: 'No session records found today',
     monthly_tokens_label: 'Monthly Total Tokens',
@@ -332,6 +373,30 @@ const i18n = {
     monthly_requests_count: 'Total Requests: {count}',
     monthly_projects_title: '🏢 Most Active Project Directories',
     monthly_models_title: '🤖 Model Usage Breakdown',
+    tab_yearly: '📅 Yearly Summary',
+    select_year: 'Select Year',
+    this_year_btn: 'This Year',
+    prev_year_btn: 'Last Year',
+    next_year_btn: 'Next Year',
+    no_year_logs: 'No yearly logs found',
+    yearly_tokens_label: 'Yearly Total Tokens',
+    yearly_input_label: 'Yearly Input Tokens',
+    yearly_output_label: 'Yearly Output Tokens',
+    yearly_sessions_label: 'Yearly Total Sessions',
+    yearly_requests_count: 'Total Requests: {count}',
+    yearly_projects_title: '🏢 Most Active Project Directories of the Year',
+    yearly_models_title: '🤖 Model Usage Breakdown of the Year',
+    yearly_monthly_summary_title: '📅 Monthly Summary of the Year',
+    col_month: 'Month',
+    placeholder_no_monthly_summary: 'No monthly summary data this year',
+    chart_yearly_title: 'Monthly Token & Session Trend of the Year',
+    chart_yearly_token_label: 'Yearly Total Tokens',
+    chart_yearly_session_label: 'Monthly Sessions',
+    yearly_reload_success: 'Yearly data refreshed successfully',
+    yearly_load_failed: 'Failed to load yearly aggregated data',
+    loading_year_prefix: 'Loading Yearly Data: ',
+    yearly_report: 'Yearly Report: ',
+    year_not_found: 'Data for the specified year not found',
     col_rank: 'Rank',
     col_project_cwd: 'Working Directory (CWD)',
     col_sessions_count: 'Sessions',
@@ -408,13 +473,23 @@ const i18n = {
     no_agent_selected_desc: 'You have not selected any Agent type. Please select at least one Agent (e.g., Antigravity CLI, GitHub Copilot CLI, Codex CLI) on the left sidebar to display data.',
     btn_empty_setup: '⚙️ View Setup Guide',
     btn_empty_refresh: '🔄 Reload and Check',
-    codex_rate_limit_title: 'Codex CLI Rate Limit Status',
-    codex_rate_limit_updated: 'Last Updated:',
-    codex_primary_label: 'Remaining in 5 Hours (Primary)',
-    codex_secondary_label: 'Remaining in 1 Week (Secondary)',
-    codex_reset_time: 'Next Reset:',
+    codex_rate_limit_title: 'API Limits',
+    codex_rate_limit_tip_title: 'Tip: The API rate limit data shown here is from the log of your last local session, not retrieved via real-time online queries.',
+    codex_rate_limit_updated: 'Updated:',
+    codex_primary_label: '5h Limit (Primary)',
+    codex_secondary_label: '7d Limit (Secondary)',
+    codex_reset_time: 'Reset:',
     codex_rate_limit_unlimited: 'Unlimited',
     codex_rate_limit_remaining: '{percent}% remaining',
+    codex_control_title: 'Codex Control & Status',
+    codex_auth_tip_title: 'Tip: You can put multiple JSON credential files (e.g. (a)auth.json, (b)auth.json) under ~/.codex/auth/ directory. Selecting one from this dropdown will automatically switch and overwrite ~/.codex/auth.json.',
+    codex_auth_switch_title: 'Codex CLI Authentication Switcher',
+    codex_select_auth_label: 'Auth Profile:',
+    codex_btn_switch: 'Switch',
+    codex_auth_loading: 'Loading...',
+    codex_auth_status: '{name}',
+    codex_auth_status_custom: 'Custom',
+    codex_auth_status_none: 'None',
     usage_report: 'Usage Report: ',
     loading_prefix: 'Loading: ',
     loading_month_prefix: 'Loading Monthly Data: ',
@@ -538,12 +613,14 @@ document.addEventListener('DOMContentLoaded', () => {
 function initApp() {
   const dateSelect = document.getElementById('date-select');
   const monthSelect = document.getElementById('month-select');
+  const yearSelect = document.getElementById('year-select');
   const closeDrawerBtn = document.getElementById('close-drawer-btn');
   const drawerOverlay = document.getElementById('timeline-drawer');
 
   // Tab Buttons
   const tabBtnDaily = document.getElementById('tab-btn-daily');
   const tabBtnMonthly = document.getElementById('tab-btn-monthly');
+  const tabBtnYearly = document.getElementById('tab-btn-yearly');
 
   // Live Controls
   const liveToggle = document.getElementById('live-toggle');
@@ -585,6 +662,7 @@ function initApp() {
         // 切換 agent 時保留目前日期，當日無資料則顯示提示
         await fetchDates(null, true);
         await fetchMonths();
+        await fetchYears();
       });
     });
   }
@@ -603,6 +681,8 @@ function initApp() {
         renderDashboard(currentUsageData);
       } else if (activeTab === 'monthly' && currentMonthlyData) {
         renderMonthlyDashboard(currentMonthlyData);
+      } else if (activeTab === 'yearly' && currentYearlyData) {
+        renderYearlyDashboard(currentYearlyData);
       }
     });
   }
@@ -611,6 +691,8 @@ function initApp() {
   fetchDates();
   // 載入月份清單
   fetchMonths();
+  // 載入年份清單
+  fetchYears();
 
   // Initialize language UI translation
   updateLanguageUI();
@@ -618,6 +700,7 @@ function initApp() {
   // Tab切換監聽
   tabBtnDaily.addEventListener('click', () => switchTab('daily'));
   tabBtnMonthly.addEventListener('click', () => switchTab('monthly'));
+  tabBtnYearly.addEventListener('click', () => switchTab('yearly'));
 
   // 監聽日期切換
   dateSelect.addEventListener('change', (e) => {
@@ -804,6 +887,115 @@ function initApp() {
     });
   }
 
+  // 監聽年份切換
+  if (yearSelect) {
+    yearSelect.addEventListener('change', (e) => {
+      if (e.target.value) {
+        loadYearlyData(e.target.value);
+      }
+    });
+  }
+
+  // 快速切換上一年與下一年邏輯
+  const adjustYear = async (offset) => {
+    if (!yearSelect) return;
+    const currentYearVal = yearSelect.value;
+    if (!currentYearVal) return;
+    
+    const year = parseInt(currentYearVal, 10);
+    const targetYear = year + offset;
+    const newYearStr = String(targetYear);
+    
+    let exists = false;
+    for (let i = 0; i < yearSelect.options.length; i++) {
+      if (yearSelect.options[i].value === newYearStr) {
+        exists = true;
+        break;
+      }
+    }
+    if (!exists) {
+      const opt = document.createElement('option');
+      opt.value = newYearStr;
+      opt.textContent = newYearStr;
+      let inserted = false;
+      for (let i = 0; i < yearSelect.options.length; i++) {
+        if (yearSelect.options[i].value < newYearStr) {
+          yearSelect.insertBefore(opt, yearSelect.options[i]);
+          inserted = true;
+          break;
+        }
+      }
+      if (!inserted) {
+        yearSelect.appendChild(opt);
+      }
+    }
+    
+    yearSelect.value = newYearStr;
+    await loadYearlyData(newYearStr);
+  };
+
+  const btnPrevYear = document.getElementById('btn-prev-year');
+  if (btnPrevYear) {
+    btnPrevYear.addEventListener('click', () => adjustYear(-1));
+  }
+
+  const btnNextYear = document.getElementById('btn-next-year');
+  if (btnNextYear) {
+    btnNextYear.addEventListener('click', () => adjustYear(1));
+  }
+
+  const btnThisYear = document.getElementById('btn-this-year');
+  if (btnThisYear) {
+    btnThisYear.addEventListener('click', async () => {
+      if (!yearSelect) return;
+      const now = new Date();
+      const thisYearStr = String(now.getFullYear());
+      
+      let exists = false;
+      for (let i = 0; i < yearSelect.options.length; i++) {
+        if (yearSelect.options[i].value === thisYearStr) {
+          exists = true;
+          break;
+        }
+      }
+      if (!exists) {
+        const opt = document.createElement('option');
+        opt.value = thisYearStr;
+        opt.textContent = thisYearStr;
+        let inserted = false;
+        for (let i = 0; i < yearSelect.options.length; i++) {
+          if (yearSelect.options[i].value < thisYearStr) {
+            yearSelect.insertBefore(opt, yearSelect.options[i]);
+            inserted = true;
+            break;
+          }
+        }
+        if (!inserted) {
+          yearSelect.appendChild(opt);
+        }
+      }
+      yearSelect.value = thisYearStr;
+      await loadYearlyData(thisYearStr);
+      showNotification(`${t('this_year_btn') || '今年'} ${thisYearStr}`, 'success');
+    });
+  }
+
+  const btnReloadYearly = document.getElementById('btn-reload-yearly');
+  if (btnReloadYearly) {
+    btnReloadYearly.addEventListener('click', async () => {
+      btnReloadYearly.classList.add('loading');
+      try {
+        await reloadYearlyData();
+        showNotification(t('yearly_reload_success'), 'success');
+      } catch (err) {
+        console.error('Reload failed:', err);
+        showNotification(t('reload_failed'), 'error');
+      } finally {
+        btnReloadYearly.classList.remove('loading');
+      }
+    });
+  }
+
   // 監聽手動同步資料庫按鈕
   const btnSyncDb = document.getElementById('btn-sync-db');
   if (btnSyncDb) {
@@ -818,12 +1010,15 @@ function initApp() {
           // 重新載入目前頁面的數據
           if (activeTab === 'daily') {
             await reloadDailyData();
-          } else {
+          } else if (activeTab === 'monthly') {
             await reloadMonthlyData();
+          } else if (activeTab === 'yearly') {
+            await reloadYearlyData();
           }
-          // 同時重新整理可用的日期與月份清單
+          // 同時重新整理可用的日期、月份與年份清單
           await fetchDates();
           await fetchMonths();
+          await fetchYears();
         } else {
           let errMsg = res.statusText;
           try {
@@ -838,6 +1033,57 @@ function initApp() {
       } finally {
         btnSyncDb.classList.remove('loading');
         btnSyncDb.disabled = false;
+      }
+    });
+  }
+
+  // 監聽 Codex 憑證切換按鈕
+  const btnCodexAuthSwitch = document.getElementById('btn-codex-auth-switch');
+  if (btnCodexAuthSwitch) {
+    btnCodexAuthSwitch.addEventListener('click', async () => {
+      const selectEl = document.getElementById('codex-auth-select');
+      if (!selectEl || !selectEl.value) {
+        showNotification(t('codex_select_auth_label') || '請選擇憑證帳號', 'warning');
+        return;
+      }
+      
+      const targetName = selectEl.value;
+      btnCodexAuthSwitch.disabled = true;
+      const originalText = btnCodexAuthSwitch.textContent;
+      btnCodexAuthSwitch.textContent = '🔄...';
+      
+      try {
+        const res = await fetch(`/api/codex/auth-switch`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({ name: targetName })
+        });
+        
+        if (res.ok) {
+          showNotification(`成功切換至 "${targetName}"！`, 'success');
+          await updateCodexAuthSwitcher();
+          await updateCodexRateLimit();
+          // 手動觸發一次同步以取得最新數據
+          if (btnSyncDb) {
+            btnSyncDb.click();
+          }
+        } else {
+          let errMsg = '切換失敗';
+          try {
+            const data = await res.json();
+            if (data && data.message) errMsg = data.message;
+            else if (data && data.error) errMsg = data.error;
+          } catch (_) {}
+          showNotification(errMsg, 'error');
+        }
+      } catch (err) {
+        console.error('Switch auth failed:', err);
+        showNotification('切換時發生錯誤: ' + err.message, 'error');
+      } finally {
+        btnCodexAuthSwitch.disabled = false;
+        btnCodexAuthSwitch.textContent = originalText;
       }
     });
   }
@@ -936,53 +1182,57 @@ function switchTab(tab) {
 
   const tabBtnDaily = document.getElementById('tab-btn-daily');
   const tabBtnMonthly = document.getElementById('tab-btn-monthly');
+  const tabBtnYearly = document.getElementById('tab-btn-yearly');
   const dailySelector = document.getElementById('daily-selector-section');
   const monthlySelector = document.getElementById('monthly-selector-section');
+  const yearlySelector = document.getElementById('yearly-selector-section');
   const quickStats = document.getElementById('quick-stats-section');
   const dailyView = document.getElementById('daily-view-container');
   const monthlyView = document.getElementById('monthly-view-container');
+  const yearlyView = document.getElementById('yearly-view-container');
+
+  const updateVisibility = (activeView) => {
+    dailyView.classList.add('hidden');
+    monthlyView.classList.add('hidden');
+    yearlyView.classList.add('hidden');
+    if (!isEmptyState && activeView) {
+      activeView.classList.remove('hidden');
+    }
+  };
 
   if (tab === 'daily') {
     tabBtnDaily.classList.add('active');
     tabBtnMonthly.classList.remove('active');
+    if (tabBtnYearly) tabBtnYearly.classList.remove('active');
     dailySelector.classList.remove('hidden');
     monthlySelector.classList.add('hidden');
+    if (yearlySelector) yearlySelector.classList.add('hidden');
     quickStats.classList.remove('hidden');
     
-    if (isEmptyState) {
-      dailyView.classList.add('hidden');
-      monthlyView.classList.add('hidden');
-    } else {
-      dailyView.classList.remove('hidden');
-      monthlyView.classList.add('hidden');
-    }
+    updateVisibility(dailyView);
 
     // 載入當前日期的數據
     const dateSelect = document.getElementById('date-select');
     if (dateSelect.value) {
       loadUsageData(dateSelect.value);
     }
-  } else {
+  } else if (tab === 'monthly') {
     // 關閉即時自動刷新以節省資源
     const liveToggle = document.getElementById('live-toggle');
-    if (liveToggle.checked) {
+    if (liveToggle && liveToggle.checked) {
       liveToggle.checked = false;
       toggleLiveRefresh(false);
     }
 
     tabBtnDaily.classList.remove('active');
     tabBtnMonthly.classList.add('active');
+    if (tabBtnYearly) tabBtnYearly.classList.remove('active');
     dailySelector.classList.add('hidden');
     monthlySelector.classList.remove('hidden');
+    if (yearlySelector) yearlySelector.classList.add('hidden');
     quickStats.classList.add('hidden');
     
-    if (isEmptyState) {
-      dailyView.classList.add('hidden');
-      monthlyView.classList.add('hidden');
-    } else {
-      dailyView.classList.add('hidden');
-      monthlyView.classList.remove('hidden');
-    }
+    updateVisibility(monthlyView);
 
     // 載入當前月份的數據
     const monthSelect = document.getElementById('month-select');
@@ -990,6 +1240,31 @@ function switchTab(tab) {
       loadMonthlyData(monthSelect.value);
     } else {
       fetchMonths();
+    }
+  } else if (tab === 'yearly') {
+    // 關閉即時自動刷新以節省資源
+    const liveToggle = document.getElementById('live-toggle');
+    if (liveToggle && liveToggle.checked) {
+      liveToggle.checked = false;
+      toggleLiveRefresh(false);
+    }
+
+    tabBtnDaily.classList.remove('active');
+    tabBtnMonthly.classList.remove('active');
+    if (tabBtnYearly) tabBtnYearly.classList.add('active');
+    dailySelector.classList.add('hidden');
+    monthlySelector.classList.add('hidden');
+    if (yearlySelector) yearlySelector.classList.remove('hidden');
+    quickStats.classList.add('hidden');
+    
+    updateVisibility(yearlyView);
+
+    // 載入當前年份的數據
+    const yearSelect = document.getElementById('year-select');
+    if (yearSelect && yearSelect.value) {
+      loadYearlyData(yearSelect.value);
+    } else {
+      fetchYears();
     }
   }
   updateCodexRateLimit();
@@ -1601,7 +1876,16 @@ function initTableSorting() {
       const column = th.getAttribute('data-sort');
       const tableType = th.getAttribute('data-table');
       
-      if (tableType === 'monthly') {
+      if (tableType === 'yearly') {
+        // 年度每月彙總表格排序
+        if (yearlyMonthlySortColumn === column) {
+          yearlyMonthlySortDirection = yearlyMonthlySortDirection === 'asc' ? 'desc' : 'asc';
+        } else {
+          yearlyMonthlySortColumn = column;
+          yearlyMonthlySortDirection = 'desc'; // 預設降冪排序
+        }
+        sortAndRenderYearlyMonthlyTable();
+      } else if (tableType === 'monthly') {
         // 月度每日彙總表格排序
         if (monthlyDailySortColumn === column) {
           monthlyDailySortDirection = monthlyDailySortDirection === 'asc' ? 'desc' : 'asc';
@@ -2497,6 +2781,576 @@ async function reloadMonthlyData() {
 }
 
 // =========================================================================
+// API 呼叫: 載入年份清單
+// =========================================================================
+async function fetchYears(selectedYear = null) {
+  try {
+    const res = await fetch(`/api/${currentAssistant}/years`);
+    const data = await res.json();
+    
+    const yearSelect = document.getElementById('year-select');
+    if (!yearSelect) return;
+    const targetYear = selectedYear || yearSelect.value;
+    
+    yearSelect.innerHTML = '';
+
+    if (!data.years || data.years.length === 0) {
+      yearSelect.innerHTML = `<option value="" disabled selected>${t('no_year_logs')}</option>`;
+      return;
+    }
+
+    let yearToLoad = data.years[0];
+    let hasSelected = false;
+
+    data.years.forEach((year) => {
+      const opt = document.createElement('option');
+      opt.value = year;
+      opt.textContent = year;
+      if (targetYear && year === targetYear) {
+        opt.selected = true;
+        yearToLoad = year;
+        hasSelected = true;
+      }
+      yearSelect.appendChild(opt);
+    });
+
+    if (!hasSelected) {
+      if (yearSelect.options.length > 0) {
+        yearSelect.options[0].selected = true;
+      }
+    }
+
+    if (activeTab === 'yearly') {
+      await loadYearlyData(yearToLoad);
+    }
+
+  } catch (err) {
+    console.error('獲取年份清單失敗:', err);
+    showNotification(t('load_failed'), 'error');
+  }
+}
+
+async function reloadYearlyData() {
+  const yearSelect = document.getElementById('year-select');
+  if (yearSelect) {
+    const selectedYear = yearSelect.value;
+    await fetchYears(selectedYear);
+  }
+}
+
+// =========================================================================
+// API 呼叫: 載入單年彙整數據
+// =========================================================================
+async function loadYearlyData(year) {
+  if (!year || year === 'undefined' || year === 'null') {
+    return;
+  }
+  try {
+    document.getElementById('current-date-title').innerHTML = `<span class="title-icon">⌛</span> <span class="title-text">${t('loading_year_prefix')}${year}...</span>`;
+
+    const res = await fetch(`/api/${currentAssistant}/yearly/${year}`);
+    if (res.status === 404) {
+      showNotification(t('year_not_found'), 'error');
+      return;
+    }
+    
+    const data = await res.json();
+    toggleEmptyState(false);
+    renderYearlyDashboard(data);
+
+  } catch (err) {
+    console.error('載入年份彙整失敗:', err);
+    showNotification(t('yearly_load_failed'), 'error');
+  }
+}
+
+// =========================================================================
+// 渲染年報看板數據
+// =========================================================================
+function renderYearlyDashboard(data) {
+  currentYearlyData = data;
+  const { year, summary, monthly_breakdown, models, projects, agent_breakdown } = data;
+
+  // 1. 更新標題與版本
+  document.getElementById('current-date-title').innerHTML = `<span class="title-icon">📅</span> <span class="title-text">${t('yearly_report')}${year}</span>`;
+  const badge = document.getElementById('assistant-version-badge');
+  if (badge) badge.textContent = `Yearly Summary`;
+
+  // 2. 更新指標卡片
+  const activeAgents = getActiveAgents();
+  const isMulti = activeAgents.length > 1;
+
+  if (!isMulti) {
+    const totalTokensEl = document.getElementById('yearly-stat-total-tokens');
+    const inputTokensEl = document.getElementById('yearly-stat-input-tokens');
+    const outputTokensEl = document.getElementById('yearly-stat-output-tokens');
+    const sessionsEl = document.getElementById('yearly-stat-sessions');
+    const totalCostEl = document.getElementById('yearly-stat-total-cost');
+
+    if (totalTokensEl) totalTokensEl.textContent = formatToken(summary.total_tokens);
+    if (inputTokensEl) inputTokensEl.textContent = formatToken(summary.total_input_tokens);
+    if (outputTokensEl) outputTokensEl.textContent = formatToken(summary.total_output_tokens);
+    if (sessionsEl) sessionsEl.textContent = summary.total_sessions;
+    if (totalCostEl) totalCostEl.textContent = formatCost(summary.total_cost_usd || 0);
+  } else {
+    renderYearlyMetricValue('yearly-stat-total-tokens', a => a.total_tokens, formatToken, agent_breakdown, activeAgents);
+    renderYearlyMetricValue('yearly-stat-input-tokens', a => a.total_input_tokens, formatToken, agent_breakdown, activeAgents);
+    renderYearlyMetricValue('yearly-stat-output-tokens', a => a.total_output_tokens, formatToken, agent_breakdown, activeAgents);
+    renderYearlyMetricValue('yearly-stat-total-cost', a => a.total_cost_usd, formatCost, agent_breakdown, activeAgents);
+    
+    // For sessions: show individual session count list
+    let sessionsHtml = '<div class="stat-value-list">';
+    activeAgents.forEach(a => {
+      let logoUrl = '/static/antigravity.webp';
+      let displayName = 'Antigravity CLI';
+      if (a === 'copilot') {
+        logoUrl = '/static/githubcopilot.webp';
+        displayName = 'Copilot CLI';
+      } else if (a === 'codex') {
+        logoUrl = '/static/codex.webp';
+        displayName = 'Codex CLI';
+      }
+      const val = (agent_breakdown && agent_breakdown[a]) ? agent_breakdown[a].total_sessions : 0;
+      sessionsHtml += `
+        <div class="stat-value-item">
+          <span class="agent-name" title="${displayName}"><img class="badge-logo" src="${logoUrl}" alt="${displayName}" /></span>
+          <span class="val">${formatNumber(val)}</span>
+        </div>
+      `;
+    });
+    sessionsHtml += '</div>';
+    const sessionsEl = document.getElementById('yearly-stat-sessions');
+    if (sessionsEl) sessionsEl.innerHTML = sessionsHtml;
+  }
+
+  const statCacheRead = document.getElementById('yearly-stat-cache-read');
+  const statInputPct = document.getElementById('yearly-stat-input-pct');
+  const statOutputPct = document.getElementById('yearly-stat-output-pct');
+  const statRequests = document.getElementById('yearly-stat-requests');
+
+  if (isMulti) {
+    if (statCacheRead) statCacheRead.classList.add('hidden');
+    if (statInputPct) statInputPct.classList.add('hidden');
+    if (statOutputPct) statOutputPct.classList.add('hidden');
+    if (statRequests) statRequests.classList.add('hidden');
+  } else {
+    if (statCacheRead) {
+      statCacheRead.classList.remove('hidden');
+      statCacheRead.textContent = `${t('cache_read_label')}: ${formatToken(summary.total_cache_read_tokens)} (${calculatePercentage(summary.total_cache_read_tokens, summary.total_tokens)})`;
+    }
+    if (statInputPct) {
+      statInputPct.classList.remove('hidden');
+      statInputPct.textContent = `${t('ratio_label')}: ${calculatePercentage(summary.total_input_tokens, summary.total_tokens)}`;
+    }
+    if (statOutputPct) {
+      statOutputPct.classList.remove('hidden');
+      statOutputPct.textContent = `${t('ratio_label')}: ${calculatePercentage(summary.total_output_tokens, summary.total_tokens)}`;
+    }
+    if (statRequests) {
+      statRequests.classList.remove('hidden');
+      statRequests.textContent = t('yearly_requests_count').replace('{count}', formatNumber(summary.total_requests));
+    }
+  }
+
+  // 3. 繪製單年每月趨勢圖
+  renderYearlyChart(monthly_breakdown);
+
+  // 4. 渲染最常活動專案列表
+  renderYearlyProjectsTable(projects);
+
+  // 5. 渲染模型佔比列表
+  renderYearlyModelsTable(models);
+
+  // 6. 渲染當年每月彙總列表
+  yearlyMonthlySortColumn = 'month';
+  yearlyMonthlySortDirection = 'desc';
+  sortAndRenderYearlyMonthlyTable();
+}
+
+function renderYearlyMetricValue(elementId, getter, formatter, agentBreakdown, activeAgents) {
+  let html = '<div class="stat-value-list">';
+  activeAgents.forEach(a => {
+    let logoUrl = '/static/antigravity.webp';
+    let displayName = 'Antigravity CLI';
+    if (a === 'copilot') {
+      logoUrl = '/static/githubcopilot.webp';
+      displayName = 'Copilot CLI';
+    } else if (a === 'codex') {
+      logoUrl = '/static/codex.webp';
+      displayName = 'Codex CLI';
+    }
+    const val = (agentBreakdown && agentBreakdown[a]) ? getter(agentBreakdown[a]) : 0;
+    html += `
+      <div class="stat-value-item">
+        <span class="agent-name" title="${displayName}"><img class="badge-logo" src="${logoUrl}" alt="${displayName}" /></span>
+        <span class="val">${formatter(val)}</span>
+      </div>
+    `;
+  });
+  html += '</div>';
+  const el = document.getElementById(elementId);
+  if (el) el.innerHTML = html;
+}
+
+// =========================================================================
+// 渲染單年每月 Token 與 Session 趨勢圖
+// =========================================================================
+function renderYearlyChart(monthlyBreakdown) {
+  currentYearlyBreakdown = monthlyBreakdown;
+  const canvas = document.getElementById('yearlyTokenChart');
+  if (!canvas) return;
+
+  const labels = monthlyBreakdown.map(entry => entry.month);
+  const tokenData = monthlyBreakdown.map(entry => entry.total_tokens);
+  const cacheData = monthlyBreakdown.map(entry => entry.total_cache_read_tokens || 0);
+  const sessionData = monthlyBreakdown.map(entry => entry.sessions_count);
+
+  if (yearlyChartInstance) {
+    yearlyChartInstance.data.labels = labels;
+    yearlyChartInstance.data.datasets[0].label = t('chart_yearly_token_label');
+    yearlyChartInstance.data.datasets[1].label = t('chart_cache_label');
+    yearlyChartInstance.data.datasets[2].label = t('chart_yearly_session_label');
+    yearlyChartInstance.data.datasets[0].data = tokenData;
+    yearlyChartInstance.data.datasets[1].data = cacheData;
+    yearlyChartInstance.data.datasets[2].data = sessionData;
+    if (yearlyChartInstance.options.scales && yearlyChartInstance.options.scales.y && yearlyChartInstance.options.scales.y.title) {
+      yearlyChartInstance.options.scales.y.title.text = t('col_total');
+    }
+    if (yearlyChartInstance.options.scales && yearlyChartInstance.options.scales.y1 && yearlyChartInstance.options.scales.y1.title) {
+      yearlyChartInstance.options.scales.y1.title.text = t('col_sessions_count');
+    }
+    yearlyChartInstance.update();
+    return;
+  }
+
+  yearlyChartInstance = new Chart(canvas, {
+    type: 'bar',
+    data: {
+      labels: labels,
+      datasets: [
+        {
+          label: t('chart_yearly_token_label'),
+          data: tokenData,
+          backgroundColor: 'rgba(0, 242, 254, 0.22)',
+          borderColor: '#00f2fe',
+          borderWidth: 1.5,
+          borderRadius: 6,
+          yAxisID: 'y',
+          grouped: false,
+          barPercentage: 0.8,
+        },
+        {
+          label: t('chart_cache_label'),
+          data: cacheData,
+          backgroundColor: 'rgba(129, 140, 248, 0.75)',
+          borderColor: '#818cf8',
+          borderWidth: 1.5,
+          borderRadius: 6,
+          yAxisID: 'y',
+          grouped: false,
+          barPercentage: 0.8,
+        },
+        {
+          label: t('chart_yearly_session_label'),
+          data: sessionData,
+          type: 'line',
+          borderColor: '#fbbf24',
+          backgroundColor: 'rgba(251, 191, 36, 0.1)',
+          borderWidth: 3,
+          pointBackgroundColor: '#fbbf24',
+          pointBorderColor: '#fff',
+          pointBorderWidth: 1.5,
+          pointRadius: 4,
+          pointHoverRadius: 6,
+          yAxisID: 'y1',
+          tension: 0.35,
+        }
+      ]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: {
+        mode: 'index',
+        intersect: false,
+      },
+      plugins: {
+        legend: {
+          position: 'top',
+          labels: {
+            color: '#94a3b8',
+            font: { family: 'Outfit, system-ui, sans-serif', size: 12 }
+          }
+        },
+        tooltip: {
+          backgroundColor: 'rgba(15, 23, 42, 0.92)',
+          borderColor: 'rgba(255, 255, 255, 0.08)',
+          borderWidth: 1,
+          titleColor: '#fff',
+          titleFont: { size: 14, weight: 'bold' },
+          bodyFont: { size: 13 },
+          padding: 12,
+          cornerRadius: 8,
+          callbacks: {
+            label: function(context) {
+              let label = context.dataset.label || '';
+              if (label) {
+                label += ': ';
+              }
+              if (context.dataset.type === 'line') {
+                label += formatNumber(context.parsed.y) + ' Sessions';
+              } else {
+                label += formatToken(context.parsed.y);
+              }
+              return label;
+            }
+          }
+        }
+      },
+      scales: {
+        x: {
+          grid: { display: false },
+          ticks: { color: '#94a3b8', font: { size: 11 } }
+        },
+        y: {
+          type: 'linear',
+          display: true,
+          position: 'left',
+          grid: { color: 'rgba(255, 255, 255, 0.04)' },
+          ticks: {
+            color: '#94a3b8',
+            font: { size: 11 },
+            callback: value => formatToken(value)
+          },
+          title: {
+            display: true,
+            text: t('col_total'),
+            color: '#94a3b8',
+            font: { size: 11 }
+          }
+        },
+        y1: {
+          type: 'linear',
+          display: true,
+          position: 'right',
+          grid: { drawOnChartArea: false },
+          ticks: {
+            color: '#94a3b8',
+            font: { size: 11 },
+            callback: value => formatNumber(value)
+          },
+          title: {
+            display: true,
+            text: t('col_sessions_count'),
+            color: '#94a3b8',
+            font: { size: 11 }
+          }
+        }
+      }
+    }
+  });
+
+  const currentTheme = document.documentElement.getAttribute('data-theme') || 'dark';
+  updateChartsTheme(currentTheme);
+}
+
+// =========================================================================
+// 渲染年度專案列表 Table
+// =========================================================================
+function renderYearlyProjectsTable(projects) {
+  const tbody = document.getElementById('yearly-projects-body');
+  if (!tbody) return;
+  tbody.innerHTML = '';
+
+  if (projects.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="4" class="placeholder-text">${t('placeholder_no_projects')}</td></tr>`;
+    return;
+  }
+
+  // 僅取前 15 名
+  const displayProjects = projects.slice(0, 15);
+
+  displayProjects.forEach((p, idx) => {
+    const tr = document.createElement('tr');
+    tr.style.cursor = 'default';
+
+    tr.innerHTML = `
+      <td style="text-align: center;"><span class="badge ${idx < 3 ? 'highlight' : ''}">${idx + 1}</span></td>
+      <td class="cwd-cell" title="${escapeHtml(p.cwd)}" style="max-width: 250px;">${escapeHtml(p.cwd)}</td>
+      <td><span class="badge">${p.sessions_count} Sessions</span></td>
+      <td style="font-weight: 700; color: var(--accent-cyan);">
+        ${formatToken(p.total_tokens)}
+        ${p.total_cache_read_tokens ? `<div style="font-size: 0.72rem; font-weight: normal; color: #a5b4fc; margin-top: 3px;" title="${t('chart_cache_label')}">${t('cache_prefix')}${formatToken(p.total_cache_read_tokens)}</div>` : ''}
+      </td>
+    `;
+    tbody.appendChild(tr);
+  });
+}
+
+// =========================================================================
+// 渲染年度模型佔比列表 Table
+// =========================================================================
+function renderYearlyModelsTable(models) {
+  const tbody = document.getElementById('yearly-models-body');
+  if (!tbody) return;
+  tbody.innerHTML = '';
+
+  if (models.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="5" class="placeholder-text">${t('placeholder_no_models')}</td></tr>`;
+    return;
+  }
+
+  models.forEach((m, idx) => {
+    const tr = document.createElement('tr');
+    tr.style.cursor = 'default';
+
+    tr.innerHTML = `
+      <td style="text-align: center;"><span class="badge ${idx < 3 ? 'highlight' : ''}">${idx + 1}</span></td>
+      <td><span class="badge highlight">${escapeHtml(m.model)}</span></td>
+      <td><span class="badge">${m.sessions_count} Sessions</span></td>
+      <td style="font-weight: 700; color: var(--accent-purple);">
+        ${formatToken(m.total_tokens)}
+        ${m.total_cache_read_tokens ? `<div style="font-size: 0.72rem; font-weight: normal; color: #a5b4fc; margin-top: 3px;" title="${t('chart_cache_label')}">${t('cache_prefix')}${formatToken(m.total_cache_read_tokens)}</div>` : ''}
+      </td>
+      <td style="font-weight: 700; color: var(--neon-gold);">${formatCost(m.cost_usd || 0)}</td>
+    `;
+    tbody.appendChild(tr);
+  });
+}
+
+// =========================================================================
+// 渲染當年每月彙總 Table
+// =========================================================================
+function renderYearlyMonthlySummaryTable(monthlyBreakdown) {
+  const tbody = document.getElementById('yearly-monthly-summary-body');
+  if (!tbody) return;
+  tbody.innerHTML = '';
+
+  if (!monthlyBreakdown || monthlyBreakdown.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="7" class="placeholder-text">${t('placeholder_no_monthly_summary')}</td></tr>`;
+    return;
+  }
+
+  monthlyBreakdown.forEach(entry => {
+    const tr = document.createElement('tr');
+    tr.style.cursor = 'pointer';
+    
+    // 點選整列可跳轉並帶入該月份查詢
+    tr.addEventListener('click', () => {
+      switchToMonthlyMonth(entry.month);
+    });
+
+    tr.innerHTML = `
+      <td style="font-weight: 600; color: var(--accent-cyan);">${escapeHtml(entry.month)}</td>
+      <td style="color: var(--text-secondary);">${formatToken(entry.total_input_tokens || 0)}</td>
+      <td style="color: var(--text-secondary);">${formatToken(entry.total_output_tokens || 0)}</td>
+      <td style="color: #a78bfa;">${formatToken(entry.total_reasoning_tokens || 0)}</td>
+      <td style="color: #34d399;">${formatToken(entry.total_cache_read_tokens || 0)}</td>
+      <td style="font-weight: 700; color: #fbbf24;">${formatToken(entry.total_tokens)}</td>
+      <td style="font-weight: 700; color: var(--neon-gold);">${formatCost(entry.cost_usd || 0)}</td>
+    `;
+    tbody.appendChild(tr);
+  });
+}
+
+function switchToMonthlyMonth(monthStr) {
+  const monthSelect = document.getElementById('month-select');
+  if (!monthSelect) return;
+  
+  // 檢查 option 是否存在，若不存在則動態加入
+  let exists = false;
+  for (let i = 0; i < monthSelect.options.length; i++) {
+    if (monthSelect.options[i].value === monthStr) {
+      exists = true;
+      break;
+    }
+  }
+  if (!exists) {
+    const opt = document.createElement('option');
+    opt.value = monthStr;
+    opt.textContent = monthStr;
+    let inserted = false;
+    for (let i = 0; i < monthSelect.options.length; i++) {
+      if (monthSelect.options[i].value < monthStr) {
+        monthSelect.insertBefore(opt, monthSelect.options[i]);
+        inserted = true;
+        break;
+      }
+    }
+    if (!inserted) {
+      monthSelect.appendChild(opt);
+    }
+  }
+  
+  monthSelect.value = monthStr;
+  switchTab('monthly');
+}
+
+function sortAndRenderYearlyMonthlyTable() {
+  if (!currentYearlyBreakdown || currentYearlyBreakdown.length === 0) {
+    renderYearlyMonthlySummaryTable([]);
+    return;
+  }
+
+  currentYearlyBreakdown.sort((a, b) => {
+    let valA, valB;
+    if (yearlyMonthlySortColumn === 'month') {
+      valA = a.month;
+      valB = b.month;
+    } else {
+      const keyMap = {
+        'input': 'total_input_tokens',
+        'output': 'total_output_tokens',
+        'reasoning': 'total_reasoning_tokens',
+        'cache': 'total_cache_read_tokens',
+        'total': 'total_tokens',
+        'cost': 'cost_usd'
+      };
+      const field = keyMap[yearlyMonthlySortColumn] || yearlyMonthlySortColumn;
+      valA = a[field];
+      valB = b[field];
+    }
+
+    if (valA === undefined || valA === null) valA = 0;
+    if (valB === undefined || valB === null) valB = 0;
+
+    if (typeof valA === 'string' && typeof valB === 'string') {
+      return yearlyMonthlySortDirection === 'asc' 
+        ? valA.localeCompare(valB) 
+        : valB.localeCompare(valA);
+    }
+
+    return yearlyMonthlySortDirection === 'asc' ? valA - valB : valB - valA;
+  });
+
+  renderYearlyMonthlySummaryTable(currentYearlyBreakdown);
+  updateYearlySortHeadersUI();
+}
+
+function updateYearlySortHeadersUI() {
+  const headers = document.querySelectorAll('.premium-table th.sortable[data-table="yearly"]');
+  headers.forEach(th => {
+    const column = th.getAttribute('data-sort');
+    const icon = th.querySelector('.sort-icon');
+    if (!icon) return;
+
+    th.classList.remove('sorted-asc', 'sorted-desc');
+    
+    if (column === yearlyMonthlySortColumn) {
+      if (yearlyMonthlySortDirection === 'asc') {
+        th.classList.add('sorted-asc');
+        icon.innerHTML = '▴';
+      } else {
+        th.classList.add('sorted-desc');
+        icon.innerHTML = '▾';
+      }
+    } else {
+      icon.innerHTML = '<span class="sort-icon-placeholder">▴▾</span>';
+    }
+  });
+}
+
+// =========================================================================
 // API 呼叫: 載入單月彙整數據
 // =========================================================================
 async function loadMonthlyData(month) {
@@ -2809,8 +3663,8 @@ function renderMonthlyProjectsTable(projects) {
 
     tr.innerHTML = `
       <td style="text-align: center;"><span class="badge ${idx < 3 ? 'highlight' : ''}">${idx + 1}</span></td>
-      <td class="cwd-cell" title="${escapeHtml(p.project)}" style="max-width: 250px;">${escapeHtml(p.project)}</td>
-      <td><span class="badge">${p.session_count} Sessions</span></td>
+      <td class="cwd-cell" title="${escapeHtml(p.cwd)}" style="max-width: 250px;">${escapeHtml(p.cwd)}</td>
+      <td><span class="badge">${p.sessions_count} Sessions</span></td>
       <td style="font-weight: 700; color: var(--accent-cyan);">
         ${formatToken(p.total_tokens)}
         ${p.total_cache_read_tokens ? `<div style="font-size: 0.72rem; font-weight: normal; color: #a5b4fc; margin-top: 3px;" title="${t('chart_cache_label')}">${t('cache_prefix')}${formatToken(p.total_cache_read_tokens)}</div>` : ''}
@@ -2839,7 +3693,7 @@ function renderMonthlyModelsTable(models) {
     tr.innerHTML = `
       <td style="text-align: center;"><span class="badge ${idx < 3 ? 'highlight' : ''}">${idx + 1}</span></td>
       <td><span class="badge highlight">${escapeHtml(m.model)}</span></td>
-      <td><span class="badge">${m.session_count} Sessions</span></td>
+      <td><span class="badge">${m.sessions_count} Sessions</span></td>
       <td style="font-weight: 700; color: var(--accent-purple);">
         ${formatToken(m.total_tokens)}
         ${m.total_cache_read_tokens ? `<div style="font-size: 0.72rem; font-weight: normal; color: #a5b4fc; margin-top: 3px;" title="${t('chart_cache_label')}">${t('cache_prefix')}${formatToken(m.total_cache_read_tokens)}</div>` : ''}
@@ -3058,7 +3912,7 @@ function updateChartsTheme(theme) {
   const tooltipBg = isLight ? 'rgba(255, 255, 255, 0.95)' : 'rgba(15, 18, 29, 0.95)';
   const tooltipBorder = isLight ? 'rgba(0, 0, 0, 0.1)' : 'rgba(255, 255, 255, 0.1)';
 
-  [tokenChartInstance, monthlyChartInstance].forEach(chart => {
+  [tokenChartInstance, monthlyChartInstance, yearlyChartInstance].forEach(chart => {
     if (chart) {
       // 更新標籤文字顏色
       if (chart.options.plugins.legend && chart.options.plugins.legend.labels) {
@@ -3434,13 +4288,16 @@ function formatCost(cost) {
 }
 
 async function updateCodexRateLimit() {
-  const panel = document.getElementById('codex-rate-limit-panel');
-  if (!panel) return;
+  const container = document.getElementById('codex-control-panel');
+  if (!container) return;
 
   if (currentAssistant !== 'codex' || activeTab !== 'daily' || isEmptyState) {
-    panel.classList.add('hidden');
+    container.classList.add('hidden');
     return;
   }
+
+  // 更新 Codex 憑證切換器
+  updateCodexAuthSwitcher();
 
   try {
     const res = await fetch(`/api/codex/rate-limit`);
@@ -3453,7 +4310,7 @@ async function updateCodexRateLimit() {
         document.getElementById('codex-rate-limit-secondary-bar').style.width = '0%';
         document.getElementById('codex-rate-limit-secondary-reset').textContent = t('codex_reset_time') + ' --';
         document.getElementById('codex-rate-limit-updated').textContent = t('codex_rate_limit_updated') + ' --';
-        panel.classList.remove('hidden');
+        container.classList.remove('hidden');
       }
       return;
     }
@@ -3492,7 +4349,7 @@ async function updateCodexRateLimit() {
       document.getElementById('codex-rate-limit-updated').textContent = t('codex_rate_limit_updated') + ' --';
     }
 
-    panel.classList.remove('hidden');
+    container.classList.remove('hidden');
   } catch (err) {
     console.error('更新 Codex Rate Limit 失敗:', err);
   }
@@ -3508,4 +4365,68 @@ function formatDateTime(dateObj) {
   const minutes = pad(dateObj.getMinutes());
   const seconds = pad(dateObj.getSeconds());
   return `${year}-${month}-${date} ${hours}:${minutes}:${seconds}`;
+}
+
+async function updateCodexAuthSwitcher() {
+  if (currentAssistant !== 'codex' || activeTab !== 'daily' || isEmptyState) {
+    return;
+  }
+
+  try {
+    const res = await fetch(`/api/codex/auth-configs`);
+    if (!res.ok) {
+      return;
+    }
+    const data = await res.json();
+    const selectEl = document.getElementById('codex-auth-select');
+    if (!selectEl) return;
+
+    // Preserve the currently selected value if any
+    const prevSelected = selectEl.value;
+
+    selectEl.innerHTML = '';
+
+    if (!data.configs || data.configs.length === 0) {
+      const opt = document.createElement('option');
+      opt.value = '';
+      opt.disabled = true;
+      opt.selected = true;
+      opt.textContent = t('auth_status_none') || 'No auth files found';
+      selectEl.appendChild(opt);
+      document.getElementById('codex-auth-switcher-status').textContent = t('auth_status_none');
+      return;
+    }
+
+    let activeFound = false;
+    let activeName = '';
+    data.configs.forEach(cfg => {
+      const opt = document.createElement('option');
+      opt.value = cfg.name;
+      opt.textContent = cfg.name;
+      if (cfg.active) {
+        opt.selected = true;
+        activeFound = true;
+        activeName = cfg.name;
+      }
+      selectEl.appendChild(opt);
+    });
+
+    // If active is not found but we had a selection previously, keep it
+    if (!activeFound && prevSelected && data.configs.some(c => c.name === prevSelected)) {
+      selectEl.value = prevSelected;
+    }
+
+    const statusEl = document.getElementById('codex-auth-switcher-status');
+    if (statusEl) {
+      if (activeFound) {
+        statusEl.textContent = t('auth_status').replace('{name}', activeName);
+        statusEl.title = activeName;
+      } else {
+        statusEl.textContent = t('auth_status_custom');
+        statusEl.removeAttribute('title');
+      }
+    }
+  } catch (err) {
+    console.error('更新 Codex Auth Switcher 失敗:', err);
+  }
 }

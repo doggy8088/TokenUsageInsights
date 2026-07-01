@@ -9,28 +9,33 @@ Gemini 3.1 Pro (Low),Google AI,1M Tokens,2.00,0.50,12.00,1.00/0.25/6.00
 Gemini 3.1 Pro (High) (<272k),Google AI,1M Tokens,2.00,0.50,12.00,1.00/0.25/6.00
 Gemini 3.1 Pro (High) (>272k),Google AI,1M Tokens,4.00,1.00,18.00,2.00/0.50/9.00
 Gemini 3.1 Pro (High),Google AI,1M Tokens,2.00,0.50,12.00,1.00/0.25/6.00
+Gemini 3.1 Pro Preview (<272k),Google AI,1M Tokens,2.00,0.50,12.00,1.00/0.25/6.00
+Gemini 3.1 Pro Preview (>272k),Google AI,1M Tokens,4.00,1.00,18.00,2.00/0.50/9.00
+Gemini 3.1 Pro Preview,Google AI,1M Tokens,2.00,0.50,12.00,1.00/0.25/6.00
 Claude Sonnet 4.6 (Thinking),Global,1M Tokens,3.00,0.30,15.00,N/A
 Claude Opus 4.6 (Thinking) (<272k),Global,1M Tokens,5.00,0.50,25.00,N/A
 Claude Opus 4.6 (Thinking) (>272k),Global,1M Tokens,10.00,1.00,37.50,N/A
 Claude Opus 4.6 (Thinking),Global,1M Tokens,5.00,0.50,25.00,N/A
 GPT-OSS 120B (Medium),Local/OSS,1M Tokens,0.00,0.00,0.00,N/A
-Gemini 1.5 Flash,Google AI,1M Tokens,0.075,0.01875,0.30,0.0375/0.009375/0.15
-Gemini 1.5 Pro,Google AI,1M Tokens,1.25,0.3125,5.00,0.625/0.15625/2.50
-Gemini 2.0 Flash,Google AI,1M Tokens,0.10,0.025,0.40,0.05/0.0125/0.20
 GPT-5.5 (<272k),Global,1M Tokens,5.00,0.50,30.00,N/A
 GPT-5.5 (>272k),Global,1M Tokens,10.00,1.00,45.00,N/A
-GPT-5.5-pro (<272k),Global,1M Tokens,30.00,0.00,180.00,N/A
-GPT-5.5-pro (>272k),Global,1M Tokens,60.00,0.00,270.00,N/A
 GPT-5.5,Global,1M Tokens,5.00,0.50,30.00,N/A
 GPT-5.4 (<272k),Global,1M Tokens,2.50,0.25,15.00,N/A
 GPT-5.4 (>272k),Global,1M Tokens,5.00,0.50,22.50,1.25/0.13/7.50
 GPT-5.4-mini,Global,1M Tokens,0.75,0.08,4.50,N/A
-GPT-5.4-nano,Global,1M Tokens,0.20,0.02,1.25,N/A
-GPT-5.4-pro (<272k),Global,1M Tokens,30.00,0.00,180.00,N/A
-GPT-5.4-pro (>272k),Global,1M Tokens,60.00,0.00,270.00,N/A
 GPT-5.4,Global,1M Tokens,2.50,0.25,15.00,N/A
 GPT-5.3-Codex,Global,1M Tokens,1.75,0.18,14.00,N/A
-GPT-5.2-Codex,Global,1M Tokens,1.75,0.18,14.00,N/A
-GPT-5.1-Codex,Global,1M Tokens,1.75,0.18,14.00,N/A
+GPT-5-mini,Global,1M Tokens,0.25,0.025,2.00,N/A
+Claude Sonnet 5,Global,1M Tokens,3.00,0.30,15.00,N/A
 Claude Sonnet 4.6,Global,1M Tokens,3.00,0.30,15.00,N/A
-Claude Sonnet,Global,1M Tokens,3.00,0.30,15.00,N/A
+Claude Sonnet 4.5,Global,1M Tokens,3.00,0.30,15.00,N/A
+Claude Haiku 4.5,Global,1M Tokens,1.00,0.10,5.00,N/A
+Claude Fable 5,Global,1M Tokens,10.00,1.00,50.00,N/A
+Claude Opus 4.8-fast,Global,1M Tokens,10.00,1.00,50.00,N/A
+Claude Opus 4.8,Global,1M Tokens,5.00,0.50,25.00,N/A
+Claude Opus 4.7,Global,1M Tokens,5.00,0.50,25.00,N/A
+Claude Opus 4.6 (<272k),Global,1M Tokens,5.00,0.50,25.00,N/A
+Claude Opus 4.6 (>272k),Global,1M Tokens,10.00,1.00,37.50,N/A
+Claude Opus 4.6,Global,1M Tokens,5.00,0.50,25.00,N/A
+Claude Opus 4.5,Global,1M Tokens,5.00,0.50,25.00,N/A
+Codex Auto Review,Global,1M Tokens,0.10,0.00,0.10,N/A

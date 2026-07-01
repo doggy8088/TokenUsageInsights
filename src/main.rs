@@ -1,5 +1,5 @@
 use axum::{
-    routing::get,
+    routing::{get, post},
     Router,
 };
 use std::path::PathBuf;
@@ -65,9 +65,13 @@ async fn main() {
         .route("/api/:assistant/session/:session_id", get(get_session_details))
         .route("/api/:assistant/months", get(get_available_months))
         .route("/api/:assistant/monthly/:year_month", get(get_monthly_details))
+        .route("/api/:assistant/years", get(get_available_years))
+        .route("/api/:assistant/yearly/:year", get(get_yearly_details))
         .route("/api/:assistant/pricing", get(get_pricing))
         .route("/api/:assistant/sync", get(trigger_manual_sync))
         .route("/api/:assistant/rate-limit", get(get_rate_limit))
+        .route("/api/:assistant/auth-configs", get(get_codex_auth_configs))
+        .route("/api/:assistant/auth-switch", post(switch_codex_auth))
         
         // 靜態檔案路由
         .nest_service("/static", ServeDir::new(&static_dir))

@@ -49,6 +49,7 @@
         <div class="tabs-nav">
           <button class="nav-tab active" id="tab-btn-daily" data-i18n="tab_daily">📊 每日即時</button>
           <button class="nav-tab" id="tab-btn-monthly" data-i18n="tab_monthly">📅 月度彙整</button>
+          <button class="nav-tab" id="tab-btn-yearly" data-i18n="tab_yearly">📅 年度彙整</button>
         </div>
       </div>
 
@@ -122,6 +123,86 @@
         </div>
       </div>
 
+      <!-- Section 2.5: Yearly Selector (hidden by default) -->
+      <div class="sidebar-section hidden" id="yearly-selector-section">
+        <h3 data-i18n="select_year">選擇年份</h3>
+        <div class="date-selector-wrapper" style="display: flex; flex-direction: column; gap: 10px; width: 100%;">
+          <div style="display: flex; gap: 8px; width: 100%;">
+            <select id="year-select" class="premium-select" style="flex: 1;">
+              <option value="" disabled selected data-i18n="loading">載入中...</option>
+            </select>
+            <button id="btn-reload-yearly" class="reload-btn" data-i18n-title="reload_data" title="重新載入數據">🔄</button>
+          </div>
+          <div style="display: flex; gap: 8px; width: 100%;">
+            <button id="btn-prev-year" class="today-btn" style="flex: 1; padding: 12px 8px;" data-i18n-title="prev_year_btn" title="上一年">◀</button>
+            <button id="btn-this-year" class="today-btn" style="flex: 2; padding: 12px 8px;">
+              <span>📅</span>
+              <span data-i18n="this_year_btn">今年</span>
+            </button>
+            <button id="btn-next-year" class="today-btn" style="flex: 1; padding: 12px 8px;" data-i18n-title="next_year_btn" title="下一年">▶</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Section 1.5: Codex CLI Settings (visible only when Codex is selected and daily tab is active) -->
+      <div class="sidebar-section hidden" id="codex-control-panel">
+        <h3 style="display: flex; align-items: center; justify-content: space-between; width: 100%;">
+          <span data-i18n="codex_control_title">Codex 控制與狀態</span>
+          <button id="btn-codex-auth-tip" class="reload-btn" style="width: 20px; height: 20px; min-width: 20px; padding: 0; display: flex; align-items: center; justify-content: center; font-size: 11px; margin: 0; border-radius: 50%; opacity: 0.85;" data-i18n-title="codex_auth_tip_title" title="💡 提示：您可以在 ~/.codex/auth/ 目錄下放入多個不同的 JSON 憑證檔（例如 (a)auth.json、(b)auth.json），並透過下拉選單在看板上即時切換套用，系統將自動覆蓋並套用至 ~/.codex/auth.json。">💡</button>
+        </h3>
+        
+        <!-- Auth Switcher -->
+        <div style="margin-bottom: 12px; display: flex; flex-direction: column; gap: 6px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; font-size: 12px; width: 100%; overflow: hidden;">
+            <span style="color: var(--text-muted); white-space: nowrap;" data-i18n="codex_select_auth_label">憑證帳號：</span>
+            <span id="codex-auth-switcher-status" style="font-size: 11px; color: var(--accent-cyan); font-weight: 600; max-width: 130px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: right;" title="">--</span>
+          </div>
+          <div style="display: flex; gap: 8px; width: 100%; align-items: center;">
+            <select id="codex-auth-select" class="premium-select-mini" style="flex: 1; height: 36px; padding: 6px 28px 6px 12px; font-size: 13px; margin: 0;">
+              <option value="" disabled selected data-i18n="codex_auth_loading">正在讀取 ~/.codex/auth ...</option>
+            </select>
+            <button id="btn-codex-auth-switch" class="today-btn" style="padding: 0 12px; font-size: 13px; height: 36px; margin: 0; border-radius: 8px; font-family: var(--font-body);" data-i18n="codex_btn_switch">
+              切換
+            </button>
+          </div>
+        </div>
+
+        <!-- Rate Limits -->
+        <div style="display: flex; flex-direction: column; gap: 8px; border-top: 1px solid var(--glass-border); padding-top: 12px;">
+          <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 2px;">
+            <span style="font-size: 12px; font-weight: 600; color: var(--text-secondary); display: flex; align-items: center; gap: 4px;">
+              <span data-i18n="codex_rate_limit_title">API 額度限制</span>
+              <span id="codex-rate-limit-tip" style="cursor: help; opacity: 0.8; font-size: 11px;" data-i18n-title="codex_rate_limit_tip_title" title="💡 提示：此處顯示的 API 額度剩餘數據來源是最後一次本地會話的日誌紀錄，而非向伺服器發起即時線上查詢。">💡</span>
+            </span>
+            <span class="text-muted" style="font-size: 10px;" id="codex-rate-limit-updated">更新: --</span>
+          </div>
+          
+          <!-- Primary Limit -->
+          <div>
+            <div style="display: flex; justify-content: space-between; font-size: 11px; margin-bottom: 2px;">
+              <span style="color: var(--text-muted);" data-i18n="codex_primary_label">五小時內剩餘 (Primary)</span>
+              <span id="codex-rate-limit-primary-val" style="font-weight: 500;">--</span>
+            </div>
+            <div style="height: 4px; background: rgba(255,255,255,0.1); border-radius: 2px; overflow: hidden; width: 100%;">
+              <div id="codex-rate-limit-primary-bar" style="width: 0%; height: 100%; background: var(--accent-cyan); transition: width 0.5s ease-out;"></div>
+            </div>
+            <span class="sub-label" id="codex-rate-limit-primary-reset" style="font-size: 9px; display: block; text-align: right; margin-top: 2px; color: var(--text-muted);">下次重置: --</span>
+          </div>
+          
+          <!-- Secondary Limit -->
+          <div>
+            <div style="display: flex; justify-content: space-between; font-size: 11px; margin-bottom: 2px;">
+              <span style="color: var(--text-muted);" data-i18n="codex_secondary_label">一週內剩餘 (Secondary)</span>
+              <span id="codex-rate-limit-secondary-val" style="font-weight: 500;">--</span>
+            </div>
+            <div style="height: 4px; background: rgba(255,255,255,0.1); border-radius: 2px; overflow: hidden; width: 100%;">
+              <div id="codex-rate-limit-secondary-bar" style="width: 0%; height: 100%; background: var(--neon-gold); transition: width 0.5s ease-out;"></div>
+            </div>
+            <span class="sub-label" id="codex-rate-limit-secondary-reset" style="font-size: 9px; display: block; text-align: right; margin-top: 2px; color: var(--text-muted);">下次重置: --</span>
+          </div>
+        </div>
+      </div>
+
       <!-- Quick Stats (daily only) -->
       <div class="sidebar-section quick-stats" id="quick-stats-section">
         <h3 data-i18n="quick_stats_title">當日彙整指標</h3>
@@ -135,7 +216,7 @@
           <span class="sub-label" id="mini-cache">快取讀取: -</span>
         </div>
         <div class="stat-card mini">
-          <span class="label" data-i18n="col_cost">估算費用</span>
+          <span class="label" data-i18n="col_cost">估算費用 (美金)</span>
           <span class="value" id="mini-cost">-</span>
         </div>
         <div class="stat-card mini">
@@ -183,44 +264,7 @@
       <!-- Empty State Placeholder -->
       <div id="empty-state-container" class="hidden"></div>
 
-      <!-- Codex Rate Limit Panel -->
-      <div id="codex-rate-limit-panel" class="hidden" style="display: flex; flex-direction: column; gap: 12px;">
-        <div class="section-title-wrapper" style="display: flex; align-items: center; justify-content: space-between;">
-          <h3 style="margin: 0; font-size: 16px; font-weight: 600; display: flex; align-items: center; gap: 8px;">
-            <span>⏱️</span> <span data-i18n="codex_rate_limit_title">Codex CLI 額度限制狀態</span>
-          </h3>
-          <span class="text-muted" style="font-size: 12px;" id="codex-rate-limit-updated">最後更新: --</span>
-        </div>
-        <div class="dashboard-grid" style="grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));">
-          
-          <!-- Primary Limit Card (5 Hours) -->
-          <div class="stat-card highlight">
-            <div class="card-icon">⏳</div>
-            <div class="stat-info" style="flex: 1; min-width: 0;">
-              <span class="label" id="lbl-codex-primary" data-i18n="codex_primary_label">五小時內剩餘 (Primary)</span>
-              <span class="value" id="codex-rate-limit-primary-val">--</span>
-              <div style="height: 6px; background: rgba(255,255,255,0.1); border-radius: 3px; margin: 8px 0 4px 0; overflow: hidden; width: 100%;">
-                <div id="codex-rate-limit-primary-bar" style="width: 0%; height: 100%; border-radius: 3px; background: var(--accent-cyan); transition: width 0.5s ease-out;"></div>
-              </div>
-              <span class="sub-label" id="codex-rate-limit-primary-reset">下次重置: --</span>
-            </div>
-          </div>
 
-          <!-- Secondary Limit Card (1 Week) -->
-          <div class="stat-card highlight-gold">
-            <div class="card-icon">📅</div>
-            <div class="stat-info" style="flex: 1; min-width: 0;">
-              <span class="label" id="lbl-codex-secondary" data-i18n="codex_secondary_label">一週內剩餘 (Secondary)</span>
-              <span class="value" id="codex-rate-limit-secondary-val">--</span>
-              <div style="height: 6px; background: rgba(255,255,255,0.1); border-radius: 3px; margin: 8px 0 4px 0; overflow: hidden; width: 100%;">
-                <div id="codex-rate-limit-secondary-bar" style="width: 0%; height: 100%; border-radius: 3px; background: #fbbf24; transition: width 0.5s ease-out;"></div>
-              </div>
-              <span class="sub-label" id="codex-rate-limit-secondary-reset">下次重置: --</span>
-            </div>
-          </div>
-
-        </div>
-      </div>
 
       <!-- Daily View Container -->
       <div id="daily-view-container">
@@ -267,9 +311,9 @@
           <div class="stat-card highlight-gold">
             <div class="card-icon">💰</div>
             <div class="stat-info">
-              <span class="label" data-i18n="estimated_cost_label">估算費用</span>
+              <span class="label" data-i18n="estimated_cost_label">估算費用 (美金)</span>
               <span class="value" id="stat-total-cost">$0.00</span>
-              <span class="sub-label" id="stat-cost-desc" data-i18n="stat_cost_desc">基於 pricing.csv</span>
+              <span class="sub-label" id="stat-cost-desc" data-i18n="stat_cost_desc">⚠️ 此為預估試算僅供參考 (基於 pricing.csv)</span>
             </div>
           </div>
         </section>
@@ -303,7 +347,7 @@
                   <th class="sortable" data-sort="total_reasoning_tokens"><span data-i18n="col_reasoning">推理</span> <span class="sort-icon"></span></th>
                   <th class="sortable" data-sort="total_cache_read_tokens"><span data-i18n="col_cache">快取</span> <span class="sort-icon"></span></th>
                   <th class="sortable" data-sort="total_tokens"><span data-i18n="col_total">總計</span> <span class="sort-icon"></span></th>
-                  <th class="sortable" data-sort="cost_usd"><span data-i18n="col_cost">估算費用</span> <span class="sort-icon"></span></th>
+                  <th class="sortable" data-sort="cost_usd"><span data-i18n="col_cost">估算費用 (美金)</span> <span class="sort-icon"></span></th>
                   <th class="sortable" data-sort="duration_ms"><span data-i18n="col_duration">耗時</span> <span class="sort-icon"></span></th>
                   <th class="sortable" data-sort="timestamp"><span data-i18n="col_time">時間</span> <span class="sort-icon"></span></th>
                 </tr>
@@ -361,9 +405,9 @@
           <div class="stat-card highlight-gold">
             <div class="card-icon">💰</div>
             <div class="stat-info">
-              <span class="label" data-i18n="estimated_cost_label">估算費用</span>
+              <span class="label" data-i18n="estimated_cost_label">估算費用 (美金)</span>
               <span class="value" id="monthly-stat-total-cost">$0.00</span>
-              <span class="sub-label" id="monthly-stat-cost-desc" data-i18n="stat_cost_desc">基於 pricing.csv</span>
+              <span class="sub-label" id="monthly-stat-cost-desc" data-i18n="stat_cost_desc">⚠️ 此為預估試算僅供參考 (基於 pricing.csv)</span>
             </div>
           </div>
         </section>
@@ -417,7 +461,7 @@
                     <th data-i18n="col_model">使用的模型</th>
                     <th data-i18n="col_sessions_count">會話數</th>
                     <th data-i18n="col_total">總 Token</th>
-                    <th data-i18n="col_cost">估算費用</th>
+                    <th data-i18n="col_cost">估算費用 (美金)</th>
                   </tr>
                 </thead>
                 <tbody id="monthly-models-body">
@@ -445,12 +489,154 @@
                     <th class="sortable" data-sort="reasoning" data-table="monthly"><span data-i18n="col_reasoning">推理</span> <span class="sort-icon"></span></th>
                     <th class="sortable" data-sort="cache" data-table="monthly"><span data-i18n="col_cache">快取</span> <span class="sort-icon"></span></th>
                     <th class="sortable" data-sort="total" data-table="monthly"><span data-i18n="col_total">總計</span> <span class="sort-icon"></span></th>
-                    <th class="sortable" data-sort="cost" data-table="monthly"><span data-i18n="col_cost">估算費用</span> <span class="sort-icon"></span></th>
+                    <th class="sortable" data-sort="cost" data-table="monthly"><span data-i18n="col_cost">估算費用 (美金)</span> <span class="sort-icon"></span></th>
                   </tr>
                 </thead>
                 <tbody id="monthly-daily-summary-body">
                   <tr>
                     <td colspan="7" class="placeholder-text" data-i18n="placeholder_no_daily_summary">無每日彙總數據</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <!-- Yearly View Container (hidden by default) -->
+      <div id="yearly-view-container" class="hidden">
+        <!-- Yearly Metrics Grid -->
+        <section class="dashboard-grid">
+          <div class="stat-card highlight">
+            <div class="card-icon">📆</div>
+            <div class="stat-info">
+              <span class="label" data-i18n="yearly_tokens_label">年總消耗 Token</span>
+              <span class="value" id="yearly-stat-total-tokens">0</span>
+              <span class="sub-label" id="yearly-stat-cache-read">快取讀取: -</span>
+            </div>
+          </div>
+
+          <div class="stat-card">
+            <div class="card-icon">📥</div>
+            <div class="stat-info">
+              <span class="label" data-i18n="yearly_input_label">年輸入 Token</span>
+              <span class="value" id="yearly-stat-input-tokens">0</span>
+              <span class="sub-label" id="yearly-stat-input-pct">佔比: 0%</span>
+            </div>
+          </div>
+
+          <div class="stat-card">
+            <div class="card-icon">📤</div>
+            <div class="stat-info">
+              <span class="label" data-i18n="yearly_output_label">年輸出 Token</span>
+              <span class="value" id="yearly-stat-output-tokens">0</span>
+              <span class="sub-label" id="yearly-stat-output-pct">佔比: 0%</span>
+            </div>
+          </div>
+
+          <div class="stat-card">
+            <div class="card-icon">👥</div>
+            <div class="stat-info">
+              <span class="label" data-i18n="yearly_sessions_label">年總會話數</span>
+              <span class="value" id="yearly-stat-sessions">0</span>
+              <span class="sub-label" id="yearly-stat-requests">總請求: 0 次</span>
+            </div>
+          </div>
+
+          <div class="stat-card highlight-gold">
+            <div class="card-icon">💰</div>
+            <div class="stat-info">
+              <span class="label" data-i18n="estimated_cost_label">估算費用 (美金)</span>
+              <span class="value" id="yearly-stat-total-cost">$0.00</span>
+              <span class="sub-label" id="yearly-stat-cost-desc" data-i18n="stat_cost_desc">⚠️ 此為預估試算僅供參考 (基於 pricing.csv)</span>
+            </div>
+          </div>
+        </section>
+
+        <!-- Yearly Charts Section -->
+        <section class="charts-section">
+          <div class="chart-container glass-card">
+            <h3 data-i18n="chart_yearly_title">單年每月 Token 消耗與會話數趨勢</h3>
+            <div class="canvas-wrapper">
+              <canvas id="yearlyTokenChart"></canvas>
+            </div>
+          </div>
+        </section>
+
+        <!-- Yearly Breakdown Grid -->
+        <section class="monthly-breakdown-grid">
+          <!-- Top Projects -->
+          <div class="glass-card">
+            <div class="section-header">
+              <h3 style="margin-bottom: 0px;" data-i18n="yearly_projects_title">🏢 年度最常活動的專案目錄</h3>
+            </div>
+            <div class="table-wrapper" style="margin-top: 18px;">
+              <table class="premium-table">
+                <thead>
+                  <tr>
+                    <th data-i18n="col_rank">排名</th>
+                    <th data-i18n="col_project_cwd">工作路徑 (CWD)</th>
+                    <th data-i18n="col_sessions_count">會話數</th>
+                    <th data-i18n="col_total">總 Token</th>
+                  </tr>
+                </thead>
+                <tbody id="yearly-projects-body">
+                  <tr>
+                    <td colspan="4" class="placeholder-text" data-i18n="placeholder_no_projects">無專案數據</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- Top Models -->
+          <div class="glass-card">
+            <div class="section-header">
+              <h3 style="margin-bottom: 0px;" data-i18n="yearly_models_title">🤖 使用的模型佔比</h3>
+            </div>
+            <div class="table-wrapper" style="margin-top: 18px;">
+              <table class="premium-table">
+                <thead>
+                  <tr>
+                    <th data-i18n="col_rank">排名</th>
+                    <th data-i18n="col_model">使用的模型</th>
+                    <th data-i18n="col_sessions_count">會話數</th>
+                    <th data-i18n="col_total">總 Token</th>
+                    <th data-i18n="col_cost">估算費用 (美金)</th>
+                  </tr>
+                </thead>
+                <tbody id="yearly-models-body">
+                  <tr>
+                    <td colspan="5" class="placeholder-text" data-i18n="placeholder_no_models">無模型數據</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+
+        <!-- Yearly Monthly Summary -->
+        <section class="monthly-daily-summary-section" style="margin-top: 24px;">
+          <div class="glass-card">
+            <div class="section-header">
+              <h3 style="margin-bottom: 0px;" data-i18n="yearly_monthly_summary_title">📅 當年每月彙總</h3>
+            </div>
+            <div class="table-wrapper" style="margin-top: 18px;">
+              <table class="premium-table">
+                <thead>
+                  <tr>
+                    <th class="sortable" data-sort="month" data-table="yearly"><span data-i18n="col_month">月份</span> <span class="sort-icon"></span></th>
+                    <th class="sortable" data-sort="input" data-table="yearly"><span data-i18n="col_input">輸入</span> <span class="sort-icon"></span></th>
+                    <th class="sortable" data-sort="output" data-table="yearly"><span data-i18n="col_output">輸出</span> <span class="sort-icon"></span></th>
+                    <th class="sortable" data-sort="reasoning" data-table="yearly"><span data-i18n="col_reasoning">推理</span> <span class="sort-icon"></span></th>
+                    <th class="sortable" data-sort="cache" data-table="yearly"><span data-i18n="col_cache">快取</span> <span class="sort-icon"></span></th>
+                    <th class="sortable" data-sort="total" data-table="yearly"><span data-i18n="col_total">總計</span> <span class="sort-icon"></span></th>
+                    <th class="sortable" data-sort="cost" data-table="yearly"><span data-i18n="col_cost">估算費用 (美金)</span> <span class="sort-icon"></span></th>
+                  </tr>
+                </thead>
+                <tbody id="yearly-monthly-summary-body">
+                  <tr>
+                    <td colspan="7" class="placeholder-text" data-i18n="placeholder_no_monthly_summary">無每月彙總數據</td>
                   </tr>
                 </tbody>
               </table>
@@ -673,7 +859,7 @@
       </div>
       <div class="modal-body">
         <p class="modal-text" style="margin-bottom: 16px;" data-i18n="pricing_intro">
-          此費用為本地估算，單價依據 <code>pricing.csv</code> 載入。單位為 1M Tokens (每百萬個 Token) 的美金價格：
+          此費用為本地估算，單價依據 <code>pricing.csv</code> 載入。單位為 1M Tokens (每百萬個 Token) 的美金價格。<br><strong style="color: var(--neon-gold, #fbbf24);">⚠️ 註：此為預估試算僅供參考。</strong>
         </p>
         <div class="table-wrapper">
           <table class="premium-table">
