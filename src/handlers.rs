@@ -1040,8 +1040,10 @@ pub async fn get_pricing(Path(_assistant): Path<String>) -> impl IntoResponse {
     }
     if entries.is_empty() {
         entries = vec![
-            PricingEntry { model_name: "Gemini 3.5 Flash".to_string(), deployment_type: "Google AI".to_string(), unit: "1M Tokens".to_string(), input_price: 0.075, cache_input_price: 0.01875, output_price: 0.30, batch_api_price: "N/A".to_string() },
-            PricingEntry { model_name: "Gemini 3.5 Pro".to_string(), deployment_type: "Google AI".to_string(), unit: "1M Tokens".to_string(), input_price: 1.25, cache_input_price: 0.3125, output_price: 5.00, batch_api_price: "N/A".to_string() },
+            PricingEntry { model_name: "Gemini 3.5 Flash".to_string(), deployment_type: "Google AI".to_string(), unit: "1M Tokens".to_string(), input_price: 1.50, cache_input_price: 0.375, output_price: 9.00, batch_api_price: "0.75/0.1875/4.50".to_string() },
+            PricingEntry { model_name: "Gemini 1.5 Flash".to_string(), deployment_type: "Google AI".to_string(), unit: "1M Tokens".to_string(), input_price: 0.075, cache_input_price: 0.01875, output_price: 0.30, batch_api_price: "0.0375/0.009375/0.15".to_string() },
+            PricingEntry { model_name: "Gemini 1.5 Pro".to_string(), deployment_type: "Google AI".to_string(), unit: "1M Tokens".to_string(), input_price: 1.25, cache_input_price: 0.3125, output_price: 5.00, batch_api_price: "0.625/0.15625/2.50".to_string() },
+            PricingEntry { model_name: "Gemini 2.0 Flash".to_string(), deployment_type: "Google AI".to_string(), unit: "1M Tokens".to_string(), input_price: 0.10, cache_input_price: 0.025, output_price: 0.40, batch_api_price: "0.05/0.0125/0.20".to_string() },
         ];
     }
     Json(entries)

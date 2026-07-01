@@ -47,8 +47,10 @@ pub fn load_pricing_rules() -> Vec<PricingRule> {
     }
     if rules.is_empty() {
         rules = vec![
-            PricingRule { model_name: "Gemini 3.5 Flash".to_string(), input_price: 0.075, cache_input_price: 0.01875, output_price: 0.30 },
-            PricingRule { model_name: "Gemini 3.5 Pro".to_string(), input_price: 1.25, cache_input_price: 0.3125, output_price: 5.00 },
+            PricingRule { model_name: "Gemini 3.5 Flash".to_string(), input_price: 1.50, cache_input_price: 0.375, output_price: 9.00 },
+            PricingRule { model_name: "Gemini 1.5 Flash".to_string(), input_price: 0.075, cache_input_price: 0.01875, output_price: 0.30 },
+            PricingRule { model_name: "Gemini 1.5 Pro".to_string(), input_price: 1.25, cache_input_price: 0.3125, output_price: 5.00 },
+            PricingRule { model_name: "Gemini 2.0 Flash".to_string(), input_price: 0.10, cache_input_price: 0.025, output_price: 0.40 },
         ];
     }
     rules

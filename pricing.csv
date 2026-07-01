@@ -1,8 +1,22 @@
 模型名稱,部署類型,單位,輸入價格(美金),快取輸入價格(美金),輸出價格(美金),批次 API 價格(美金)
-Gemini 3.5 Flash,Google AI,1M Tokens,0.075,0.01875,0.30,N/A
-Gemini 3.5 Pro,Google AI,1M Tokens,1.25,0.3125,5.00,N/A
-Gemini 3.5 Flash (Medium),Google AI,1M Tokens,0.075,0.01875,0.30,N/A
-Gemini 3.5 Pro (Scale),Google AI,1M Tokens,1.25,0.3125,5.00,N/A
+Gemini 3.5 Flash,Google AI,1M Tokens,1.50,0.375,9.00,0.75/0.1875/4.50
+Gemini 3.5 Flash (Medium),Google AI,1M Tokens,1.50,0.375,9.00,0.75/0.1875/4.50
+Gemini 3.5 Flash (High),Google AI,1M Tokens,1.50,0.375,9.00,0.75/0.1875/4.50
+Gemini 3.5 Flash (Low),Google AI,1M Tokens,1.50,0.375,9.00,0.75/0.1875/4.50
+Gemini 3.1 Pro (Low) (<272k),Google AI,1M Tokens,2.00,0.50,12.00,1.00/0.25/6.00
+Gemini 3.1 Pro (Low) (>272k),Google AI,1M Tokens,4.00,1.00,18.00,2.00/0.50/9.00
+Gemini 3.1 Pro (Low),Google AI,1M Tokens,2.00,0.50,12.00,1.00/0.25/6.00
+Gemini 3.1 Pro (High) (<272k),Google AI,1M Tokens,2.00,0.50,12.00,1.00/0.25/6.00
+Gemini 3.1 Pro (High) (>272k),Google AI,1M Tokens,4.00,1.00,18.00,2.00/0.50/9.00
+Gemini 3.1 Pro (High),Google AI,1M Tokens,2.00,0.50,12.00,1.00/0.25/6.00
+Claude Sonnet 4.6 (Thinking),Global,1M Tokens,3.00,0.30,15.00,N/A
+Claude Opus 4.6 (Thinking) (<272k),Global,1M Tokens,5.00,0.50,25.00,N/A
+Claude Opus 4.6 (Thinking) (>272k),Global,1M Tokens,10.00,1.00,37.50,N/A
+Claude Opus 4.6 (Thinking),Global,1M Tokens,5.00,0.50,25.00,N/A
+GPT-OSS 120B (Medium),Local/OSS,1M Tokens,0.00,0.00,0.00,N/A
+Gemini 1.5 Flash,Google AI,1M Tokens,0.075,0.01875,0.30,0.0375/0.009375/0.15
+Gemini 1.5 Pro,Google AI,1M Tokens,1.25,0.3125,5.00,0.625/0.15625/2.50
+Gemini 2.0 Flash,Google AI,1M Tokens,0.10,0.025,0.40,0.05/0.0125/0.20
 GPT-5.5 (<272k),Global,1M Tokens,5.00,0.50,30.00,N/A
 GPT-5.5 (>272k),Global,1M Tokens,10.00,1.00,45.00,N/A
 GPT-5.5-pro (<272k),Global,1M Tokens,30.00,0.00,180.00,N/A
