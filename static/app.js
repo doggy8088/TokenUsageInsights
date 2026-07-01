@@ -1490,6 +1490,7 @@ function showNoDataForDate(date) {
   const emptyContainer = document.getElementById('empty-state-container');
   const dailyView = document.getElementById('daily-view-container');
   const monthlyView = document.getElementById('monthly-view-container');
+  const yearlyView = document.getElementById('yearly-view-container');
 
   if (emptyContainer) {
     emptyContainer.classList.remove('hidden');
@@ -1503,6 +1504,7 @@ function showNoDataForDate(date) {
   }
   if (dailyView) dailyView.classList.add('hidden');
   if (monthlyView) monthlyView.classList.add('hidden');
+  if (yearlyView) yearlyView.classList.add('hidden');
 
   // 更新標題
   const titleEl = document.getElementById('current-date-title');
@@ -4111,6 +4113,7 @@ function toggleEmptyState(showEmpty) {
   const emptyContainer = document.getElementById('empty-state-container');
   const dailyView = document.getElementById('daily-view-container');
   const monthlyView = document.getElementById('monthly-view-container');
+  const yearlyView = document.getElementById('yearly-view-container');
   
   if (showEmpty) {
     if (emptyContainer) {
@@ -4162,16 +4165,22 @@ function toggleEmptyState(showEmpty) {
     
     if (dailyView) dailyView.classList.add('hidden');
     if (monthlyView) monthlyView.classList.add('hidden');
+    if (yearlyView) yearlyView.classList.add('hidden');
   } else {
     if (emptyContainer) {
       emptyContainer.classList.add('hidden');
     }
+    
+    if (dailyView) dailyView.classList.add('hidden');
+    if (monthlyView) monthlyView.classList.add('hidden');
+    if (yearlyView) yearlyView.classList.add('hidden');
+
     if (activeTab === 'daily') {
       if (dailyView) dailyView.classList.remove('hidden');
-      if (monthlyView) monthlyView.classList.add('hidden');
-    } else {
-      if (dailyView) dailyView.classList.add('hidden');
+    } else if (activeTab === 'monthly') {
       if (monthlyView) monthlyView.classList.remove('hidden');
+    } else if (activeTab === 'yearly') {
+      if (yearlyView) yearlyView.classList.remove('hidden');
     }
   }
   updateCodexRateLimit();
