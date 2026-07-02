@@ -2061,8 +2061,20 @@ pub async fn get_codex_auth_configs(Path(assistant): Path<String>) -> impl IntoR
         let auth_dir = codex_dir.join("auth");
         let active_auth_file = codex_dir.join("auth.json");
 
-        if !auth_dir.exists() {
+        let mut is_empty = true;
+        if auth_dir.exists() {
+            if let Ok(mut entries) = std::fs::read_dir(&auth_dir) {
+                if entries.next().is_some() {
+                    is_empty = false;
+                }
+            }
+        } else {
             let _ = std::fs::create_dir_all(&auth_dir);
+        }
+
+        if is_empty && active_auth_file.exists() {
+            let dest_auth_file = auth_dir.join("auth.json");
+            let _ = std::fs::copy(&active_auth_file, &dest_auth_file);
         }
 
         // Read active auth.json contents to compare
@@ -2345,6 +2357,47 @@ mod tests {
             years.push(row.get::<_, String>(0).unwrap());
         }
         assert_eq!(years, vec!["2026", "2025"]);
+
+        // Cleanup
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_codex_auth_configs_copy() {
+        let temp_dir = std::path::PathBuf::from("temp_test_codex_auth");
+        if temp_dir.exists() {
+            let _ = fs::remove_dir_all(&temp_dir);
+        }
+        fs::create_dir_all(&temp_dir).unwrap();
+        env::set_var("CODEX_DIR", temp_dir.to_str().unwrap());
+
+        // 1. Initially, auth.json does not exist. We call get_codex_auth_configs.
+        // It shouldn't copy anything, auth/ should be created but empty.
+        let _res = get_codex_auth_configs(Path("codex".to_string())).await;
+        let auth_dir = temp_dir.join("auth");
+        assert!(auth_dir.exists());
+        let count = fs::read_dir(&auth_dir).unwrap().count();
+        assert_eq!(count, 0);
+
+        // 2. Now write a fake auth.json (representing active_auth_file)
+        let active_auth_file = temp_dir.join("auth.json");
+        fs::write(&active_auth_file, b"test-credentials").unwrap();
+
+        // 3. Since auth/ is empty and auth.json exists, calling get_codex_auth_configs
+        // should copy auth.json into auth/auth.json
+        let _res2 = get_codex_auth_configs(Path("codex".to_string())).await;
+        let dest_auth_file = auth_dir.join("auth.json");
+        assert!(dest_auth_file.exists());
+        let copied_content = fs::read_to_string(&dest_auth_file).unwrap();
+        assert_eq!(copied_content, "test-credentials");
+
+        // 4. Overwrite copied file with different content to simulate an existing non-empty directory.
+        fs::write(&dest_auth_file, b"different-credentials").unwrap();
+
+        // 5. Calling get_codex_auth_configs again should NOT overwrite it because the directory is not empty.
+        let _res3 = get_codex_auth_configs(Path("codex".to_string())).await;
+        let copied_content_after = fs::read_to_string(&dest_auth_file).unwrap();
+        assert_eq!(copied_content_after, "different-credentials");
 
         // Cleanup
         let _ = fs::remove_dir_all(&temp_dir);
