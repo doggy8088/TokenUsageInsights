@@ -1,10 +1,10 @@
-use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom, BufRead, BufReader};
-use std::path::{Path, PathBuf};
-use std::collections::HashMap;
-use std::time::SystemTime;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TokenStats {
@@ -45,7 +45,7 @@ pub struct UsageEntry {
     pub delta_tokens: Option<TokenStats>,
     pub context: Option<ContextStats>,
     pub cost: Option<CostStats>,
-    
+
     // Codex-specific / Extended fields
     pub parent_session_id: Option<String>,
     pub agent_nickname: Option<String>,
@@ -131,13 +131,16 @@ pub fn get_codex_dir() -> PathBuf {
 pub fn get_db_conn() -> Result<Connection, String> {
     let dir = get_insights_dir();
     let db_path = dir.join("token_usage_insights.db");
-    
+
     // Automatically move old centralized database if it exists in the legacy folder
     if !db_path.exists() {
         if let Some(home) = dirs::home_dir() {
             let old_unified_db = home.join(".gemini/antigravity-cli/token_usage_insights.db");
             if old_unified_db.exists() {
-                println!("🔄 偵測到存在於舊位置的統一資料庫，正在移動至新位置：{:?} -> {:?}", old_unified_db, db_path);
+                println!(
+                    "🔄 偵測到存在於舊位置的統一資料庫，正在移動至新位置：{:?} -> {:?}",
+                    old_unified_db, db_path
+                );
                 if let Err(e) = fs::rename(&old_unified_db, &db_path) {
                     eprintln!("⚠️ 移動舊統一資料庫失敗: {}", e);
                 } else {
@@ -194,28 +197,35 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
             reasoning_effort TEXT
         )",
         [],
-    ).map_err(|e| format!("建立 usage_entries 表失敗: {}", e))?;
+    )
+    .map_err(|e| format!("建立 usage_entries 表失敗: {}", e))?;
 
     // Ensure reasoning_effort column is present in case database already exists
-    let _ = conn.execute("ALTER TABLE usage_entries ADD COLUMN reasoning_effort TEXT", []);
+    let _ = conn.execute(
+        "ALTER TABLE usage_entries ADD COLUMN reasoning_effort TEXT",
+        [],
+    );
 
     // Unique index on assistant, session, and turn
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS uidx_assistant_session_turn 
          ON usage_entries(assistant_type, session_id, turn_no)",
         [],
-    ).map_err(|e| format!("建立唯一索引 uidx_assistant_session_turn 失敗: {}", e))?;
+    )
+    .map_err(|e| format!("建立唯一索引 uidx_assistant_session_turn 失敗: {}", e))?;
 
     // Indexes for performance
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_usage_date ON usage_entries(date)",
         [],
-    ).map_err(|e| format!("建立日期索引 idx_usage_date 失敗: {}", e))?;
+    )
+    .map_err(|e| format!("建立日期索引 idx_usage_date 失敗: {}", e))?;
 
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_assistant_type ON usage_entries(assistant_type)",
         [],
-    ).map_err(|e| format!("建立助理類型索引 idx_assistant_type 失敗: {}", e))?;
+    )
+    .map_err(|e| format!("建立助理類型索引 idx_assistant_type 失敗: {}", e))?;
 
     // Sync state tracking table
     conn.execute(
@@ -225,7 +235,8 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
             last_synced_time INTEGER NOT NULL
         )",
         [],
-    ).map_err(|e| format!("建立 sync_state 表失敗: {}", e))?;
+    )
+    .map_err(|e| format!("建立 sync_state 表失敗: {}", e))?;
 
     Ok(())
 }
@@ -273,7 +284,11 @@ fn get_antigravity_session_name(session_id: &str) -> Option<String> {
 }
 
 /// Sync usage logs for hooks-based assistant (Antigravity or Copilot)
-fn sync_hook_usage_logs(conn: &mut Connection, assistant_type: &str, base_dir: &Path) -> Result<(), String> {
+fn sync_hook_usage_logs(
+    conn: &mut Connection,
+    assistant_type: &str,
+    base_dir: &Path,
+) -> Result<(), String> {
     if assistant_type == "antigravity" {
         // Perform migration if we haven't tracked it yet to update antigravity session names
         let migration_done: bool = conn
@@ -285,8 +300,14 @@ fn sync_hook_usage_logs(conn: &mut Connection, assistant_type: &str, base_dir: &
             .unwrap_or(false);
 
         if !migration_done {
-            let _ = conn.execute("DELETE FROM sync_state WHERE filename LIKE 'antigravity:%'", []);
-            let _ = conn.execute("DELETE FROM usage_entries WHERE assistant_type = 'antigravity'", []);
+            let _ = conn.execute(
+                "DELETE FROM sync_state WHERE filename LIKE 'antigravity:%'",
+                [],
+            );
+            let _ = conn.execute(
+                "DELETE FROM usage_entries WHERE assistant_type = 'antigravity'",
+                [],
+            );
             let _ = conn.execute(
                 "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time) VALUES ('migration:antigravity_user_request_names', 1, 0)",
                 [],
@@ -322,7 +343,7 @@ fn sync_hook_usage_logs(conn: &mut Connection, assistant_type: &str, base_dir: &
             .to_string();
 
         let filepath = entry.path();
-        
+
         // Scope the sync_state key with the assistant prefix to prevent key collision
         let state_key = format!("{}:{}", assistant_type, filename);
 
@@ -334,16 +355,25 @@ fn sync_hook_usage_logs(conn: &mut Connection, assistant_type: &str, base_dir: &
             )
             .unwrap_or(0u64);
 
-        let mut file = File::open(&filepath).map_err(|e| format!("無法開啟日誌檔 {}: {}", filename, e))?;
-        let metadata = file.metadata().map_err(|e| format!("無法取得檔案資訊 {}: {}", filename, e))?;
+        let mut file =
+            File::open(&filepath).map_err(|e| format!("無法開啟日誌檔 {}: {}", filename, e))?;
+        let metadata = file
+            .metadata()
+            .map_err(|e| format!("無法取得檔案資訊 {}: {}", filename, e))?;
         let current_size = metadata.len();
 
-        let start_pos = if current_size < last_synced_size { 0 } else { last_synced_size };
+        let start_pos = if current_size < last_synced_size {
+            0
+        } else {
+            last_synced_size
+        };
 
         if current_size > start_pos {
-            file.seek(SeekFrom::Start(start_pos)).map_err(|e| format!("Seek 失敗 {}: {}", filename, e))?;
+            file.seek(SeekFrom::Start(start_pos))
+                .map_err(|e| format!("Seek 失敗 {}: {}", filename, e))?;
             let mut buffer = Vec::new();
-            file.read_to_end(&mut buffer).map_err(|e| format!("讀取檔案失敗 {}: {}", filename, e))?;
+            file.read_to_end(&mut buffer)
+                .map_err(|e| format!("讀取檔案失敗 {}: {}", filename, e))?;
 
             let mut read_len = buffer.len();
             while read_len > 0 && buffer[read_len - 1] != b'\n' {
@@ -358,7 +388,9 @@ fn sync_hook_usage_logs(conn: &mut Connection, assistant_type: &str, base_dir: &
                     continue;
                 }
 
-                let tx = conn.transaction().map_err(|e| format!("Transaction BEGIN 失敗: {}", e))?;
+                let tx = conn
+                    .transaction()
+                    .map_err(|e| format!("Transaction BEGIN 失敗: {}", e))?;
 
                 let mut success = true;
                 for entry in &parsed_entries {
@@ -450,12 +482,12 @@ fn parse_codex_filename(filename: &str) -> Option<(String, String, String)> {
     let date_part = &core[0..10]; // YYYY-MM-DD
     let time_part = &core[11..19]; // HH-mm-ss
     let uuid_part = &core[20..]; // UUID
-    
+
     let date = date_part.to_string();
     let time_formatted = time_part.replace('-', ":");
     let session_name = format!("Rollout {} {}", date, time_formatted);
     let session_id = uuid_part.to_string();
-    
+
     Some((session_id, date, session_name))
 }
 
@@ -511,7 +543,11 @@ fn parse_codex_session_file(
         };
 
         let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
-        let timestamp = event.get("timestamp").and_then(|t| t.as_str()).unwrap_or("").to_string();
+        let timestamp = event
+            .get("timestamp")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string();
         let payload = event.get("payload");
 
         if event_type == "event_msg" && first_user_message.is_none() {
@@ -540,7 +576,10 @@ fn parse_codex_session_file(
         if event_type == "session_meta" {
             if let Some(p) = payload {
                 if cli_version.is_none() {
-                    cli_version = p.get("cli_version").and_then(|v| v.as_str()).map(|s| s.to_string());
+                    cli_version = p
+                        .get("cli_version")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
                 }
                 if session_meta_cwd.is_none() {
                     session_meta_cwd = p.get("cwd").and_then(|c| c.as_str()).map(|s| s.to_string());
@@ -553,7 +592,8 @@ fn parse_codex_session_file(
                     }
                 }
                 if agent_nickname.is_none() {
-                    agent_nickname = p.get("agent_nickname")
+                    agent_nickname = p
+                        .get("agent_nickname")
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string())
                         .or_else(|| {
@@ -566,7 +606,8 @@ fn parse_codex_session_file(
                         });
                 }
                 if agent_role.is_none() {
-                    agent_role = p.get("agent_role")
+                    agent_role = p
+                        .get("agent_role")
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string())
                         .or_else(|| {
@@ -585,18 +626,28 @@ fn parse_codex_session_file(
         let mut turn_id = None;
         if event_type == "turn_context" {
             if let Some(p) = payload {
-                turn_id = p.get("turn_id").and_then(|id| id.as_str()).map(|s| s.to_string());
+                turn_id = p
+                    .get("turn_id")
+                    .and_then(|id| id.as_str())
+                    .map(|s| s.to_string());
             }
         } else if event_type == "event_msg" {
             if let Some(p) = payload {
-                turn_id = p.get("turn_id").and_then(|id| id.as_str()).map(|s| s.to_string());
+                turn_id = p
+                    .get("turn_id")
+                    .and_then(|id| id.as_str())
+                    .map(|s| s.to_string());
             }
         } else if event_type == "response_item" {
             if let Some(meta) = event.get("metadata") {
-                turn_id = meta.get("turn_id").and_then(|id| id.as_str()).map(|s| s.to_string());
+                turn_id = meta
+                    .get("turn_id")
+                    .and_then(|id| id.as_str())
+                    .map(|s| s.to_string());
             }
             if turn_id.is_none() {
-                turn_id = event.get("internal_chat_message_metadata_passthrough")
+                turn_id = event
+                    .get("internal_chat_message_metadata_passthrough")
                     .and_then(|m| m.get("turn_id"))
                     .and_then(|id| id.as_str())
                     .map(|s| s.to_string());
@@ -608,15 +659,18 @@ fn parse_codex_session_file(
             if !seen_turn_ids.contains(&tid) {
                 seen_turn_ids.push(tid.clone());
                 let turn_no = seen_turn_ids.len() as u32;
-                turn_data_map.insert(tid.clone(), ParsedTurnData {
-                    turn_no,
-                    timestamp: timestamp.clone(),
-                    model: None,
-                    cwd: None,
-                    duration_ms: None,
-                    total_token_usage: None,
-                    reasoning_effort: None,
-                });
+                turn_data_map.insert(
+                    tid.clone(),
+                    ParsedTurnData {
+                        turn_no,
+                        timestamp: timestamp.clone(),
+                        model: None,
+                        cwd: None,
+                        duration_ms: None,
+                        total_token_usage: None,
+                        reasoning_effort: None,
+                    },
+                );
             }
         }
 
@@ -625,22 +679,35 @@ fn parse_codex_session_file(
                 if event_type == "turn_context" {
                     if let Some(p) = payload {
                         if td.model.is_none() {
-                            td.model = p.get("model").and_then(|m| m.as_str()).map(|s| s.to_string());
+                            td.model = p
+                                .get("model")
+                                .and_then(|m| m.as_str())
+                                .map(|s| s.to_string());
                         }
                         if td.cwd.is_none() {
                             td.cwd = p.get("cwd").and_then(|c| c.as_str()).map(|s| s.to_string());
                         }
                         if td.reasoning_effort.is_none() {
-                            td.reasoning_effort = p.get("effort")
-                                .or_else(|| p.get("collaboration_mode").and_then(|cm| cm.get("settings")).and_then(|s| s.get("reasoning_effort")))
+                            td.reasoning_effort = p
+                                .get("effort")
+                                .or_else(|| {
+                                    p.get("collaboration_mode")
+                                        .and_then(|cm| cm.get("settings"))
+                                        .and_then(|s| s.get("reasoning_effort"))
+                                })
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.to_string());
                         }
                     }
                 } else if event_type == "response_item" {
                     if let Some(p) = payload {
-                        if p.get("role").and_then(|r| r.as_str()) == Some("assistant") && td.model.is_none() {
-                            td.model = p.get("model").and_then(|m| m.as_str()).map(|s| s.to_string());
+                        if p.get("role").and_then(|r| r.as_str()) == Some("assistant")
+                            && td.model.is_none()
+                        {
+                            td.model = p
+                                .get("model")
+                                .and_then(|m| m.as_str())
+                                .map(|s| s.to_string());
                         }
                     }
                 } else if event_type == "event_msg" {
@@ -649,7 +716,9 @@ fn parse_codex_session_file(
                         if sub_type == "token_count" {
                             if let Some(info) = p.get("info") {
                                 if let Some(usage_val) = info.get("total_token_usage") {
-                                    if let Ok(usage) = serde_json::from_value::<TokenCountUsage>(usage_val.clone()) {
+                                    if let Ok(usage) =
+                                        serde_json::from_value::<TokenCountUsage>(usage_val.clone())
+                                    {
                                         td.total_token_usage = Some(usage);
                                     }
                                 }
@@ -686,7 +755,9 @@ fn parse_codex_session_file(
                 cumulative_usage = usage.clone();
             }
 
-            let cli_input = cumulative_usage.input_tokens.saturating_sub(cumulative_usage.cached_input_tokens);
+            let cli_input = cumulative_usage
+                .input_tokens
+                .saturating_sub(cumulative_usage.cached_input_tokens);
             let cli_cached = cumulative_usage.cached_input_tokens;
             let cli_output = cumulative_usage.output_tokens;
             let cli_reasoning = cumulative_usage.reasoning_output_tokens;
@@ -732,7 +803,9 @@ fn parse_codex_session_file(
                 None
             };
 
-            let actual_session_name = first_user_message.clone().unwrap_or_else(|| session_name.to_string());
+            let actual_session_name = first_user_message
+                .clone()
+                .unwrap_or_else(|| session_name.to_string());
             results.push(UsageEntry {
                 timestamp: td.timestamp.clone(),
                 session_id: session_id.to_string(),
@@ -771,7 +844,10 @@ fn sync_codex_usage_logs(conn: &mut Connection) -> Result<(), String> {
 
     if !migration_done {
         let _ = conn.execute("DELETE FROM sync_state WHERE filename LIKE 'codex:%'", []);
-        let _ = conn.execute("DELETE FROM usage_entries WHERE assistant_type = 'codex'", []);
+        let _ = conn.execute(
+            "DELETE FROM usage_entries WHERE assistant_type = 'codex'",
+            [],
+        );
         let _ = conn.execute(
             "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time) VALUES ('migration:codex_user_message_names', 1, 0)",
             [],
@@ -814,7 +890,12 @@ fn sync_codex_usage_logs(conn: &mut Connection) -> Result<(), String> {
         let current_size = metadata.len();
 
         if current_size != last_synced_size {
-            let parsed_entries = match parse_codex_session_file(&filepath, &session_id, &session_name, &session_date) {
+            let parsed_entries = match parse_codex_session_file(
+                &filepath,
+                &session_id,
+                &session_name,
+                &session_date,
+            ) {
                 Ok(entries) => entries,
                 Err(e) => {
                     eprintln!("解析 Codex 會話檔案 {} 失敗: {}", filename, e);
@@ -822,7 +903,9 @@ fn sync_codex_usage_logs(conn: &mut Connection) -> Result<(), String> {
                 }
             };
 
-            let tx = conn.transaction().map_err(|e| format!("Transaction BEGIN 失敗: {}", e))?;
+            let tx = conn
+                .transaction()
+                .map_err(|e| format!("Transaction BEGIN 失敗: {}", e))?;
 
             // First delete old entries for this session
             let delete_res = tx.execute(
@@ -946,7 +1029,8 @@ pub fn migrate_old_databases(dest_conn: &mut Connection) -> Result<(), String> {
                 eprintln!("❌ 遷移 Antigravity 數據失敗: {}", e);
             } else {
                 println!("✅ Antigravity 數據遷移完成！");
-                let backup_path = home.join(".gemini/antigravity-cli/antigravity_cli_token_insights.db.bak");
+                let backup_path =
+                    home.join(".gemini/antigravity-cli/antigravity_cli_token_insights.db.bak");
                 let _ = fs::rename(&old_antigravity_db, &backup_path);
             }
         }
@@ -985,14 +1069,19 @@ pub fn migrate_old_databases(dest_conn: &mut Connection) -> Result<(), String> {
     Ok(())
 }
 
-fn migrate_records(src_conn: &Connection, dest_conn: &mut Connection, assistant: &str) -> Result<(), rusqlite::Error> {
+fn migrate_records(
+    src_conn: &Connection,
+    dest_conn: &mut Connection,
+    assistant: &str,
+) -> Result<(), rusqlite::Error> {
     let table_exists: bool = src_conn
         .query_row(
             "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='usage_entries'",
             [],
             |row| row.get(0),
         )
-        .unwrap_or(0) > 0;
+        .unwrap_or(0)
+        > 0;
 
     if !table_exists {
         return Ok(());
@@ -1071,7 +1160,10 @@ fn migrate_records(src_conn: &Connection, dest_conn: &mut Connection, assistant:
         );
 
         if let Err(e) = insert_res {
-            eprintln!("遷移單筆紀錄失敗 ({} - session_id: {}, turn_no: {}): {}", assistant, session_id, turn_no, e);
+            eprintln!(
+                "遷移單筆紀錄失敗 ({} - session_id: {}, turn_no: {}): {}",
+                assistant, session_id, turn_no, e
+            );
         }
     }
 
@@ -1082,10 +1174,13 @@ fn migrate_records(src_conn: &Connection, dest_conn: &mut Connection, assistant:
             [],
             |row| row.get(0),
         )
-        .unwrap_or(0) > 0;
+        .unwrap_or(0)
+        > 0;
 
     if sync_table_exists {
-        if let Ok(mut sync_stmt) = src_conn.prepare("SELECT filename, last_synced_size, last_synced_time FROM sync_state") {
+        if let Ok(mut sync_stmt) =
+            src_conn.prepare("SELECT filename, last_synced_size, last_synced_time FROM sync_state")
+        {
             if let Ok(mut sync_rows) = sync_stmt.query([]) {
                 while let Ok(Some(row)) = sync_rows.next() {
                     let filename = row.get::<_, String>(0)?;
@@ -1109,10 +1204,10 @@ pub fn get_latest_codex_rate_limit() -> Option<serde_json::Value> {
     let codex_dir = get_codex_dir();
     let sessions_dir = codex_dir.join("sessions");
     let mut files = find_codex_session_files(&sessions_dir);
-    
+
     // Sort descending so that the newest session files are processed first
     files.sort_by(|a, b| b.cmp(a));
-    
+
     for filepath in files {
         if let Ok(file) = File::open(&filepath) {
             let reader = BufReader::new(file);
@@ -1126,7 +1221,7 @@ pub fn get_latest_codex_rate_limit() -> Option<serde_json::Value> {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                
+
                 let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
                 if event_type == "event_msg" {
                     if let Some(payload) = event.get("payload") {
@@ -1139,7 +1234,10 @@ pub fn get_latest_codex_rate_limit() -> Option<serde_json::Value> {
                                         // Include the timestamp of the event for display
                                         if let Some(obj) = res.as_object_mut() {
                                             if let Some(timestamp) = event.get("timestamp") {
-                                                obj.insert("timestamp".to_string(), timestamp.clone());
+                                                obj.insert(
+                                                    "timestamp".to_string(),
+                                                    timestamp.clone(),
+                                                );
                                             }
                                         }
                                         last_valid_rate_limit = Some(res);
@@ -1157,5 +1255,3 @@ pub fn get_latest_codex_rate_limit() -> Option<serde_json::Value> {
     }
     None
 }
-
-

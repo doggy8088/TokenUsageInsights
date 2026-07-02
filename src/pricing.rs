@@ -1,7 +1,7 @@
+use serde::Serialize;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
-use serde::Serialize;
 
 #[derive(Debug, Clone)]
 pub struct PricingRule {
@@ -47,10 +47,30 @@ pub fn load_pricing_rules() -> Vec<PricingRule> {
     }
     if rules.is_empty() {
         rules = vec![
-            PricingRule { model_name: "Gemini 3.5 Flash".to_string(), input_price: 1.50, cache_input_price: 0.375, output_price: 9.00 },
-            PricingRule { model_name: "Gemini 1.5 Flash".to_string(), input_price: 0.075, cache_input_price: 0.01875, output_price: 0.30 },
-            PricingRule { model_name: "Gemini 1.5 Pro".to_string(), input_price: 1.25, cache_input_price: 0.3125, output_price: 5.00 },
-            PricingRule { model_name: "Gemini 2.0 Flash".to_string(), input_price: 0.10, cache_input_price: 0.025, output_price: 0.40 },
+            PricingRule {
+                model_name: "Gemini 3.5 Flash".to_string(),
+                input_price: 1.50,
+                cache_input_price: 0.375,
+                output_price: 9.00,
+            },
+            PricingRule {
+                model_name: "Gemini 1.5 Flash".to_string(),
+                input_price: 0.075,
+                cache_input_price: 0.01875,
+                output_price: 0.30,
+            },
+            PricingRule {
+                model_name: "Gemini 1.5 Pro".to_string(),
+                input_price: 1.25,
+                cache_input_price: 0.3125,
+                output_price: 5.00,
+            },
+            PricingRule {
+                model_name: "Gemini 2.0 Flash".to_string(),
+                input_price: 0.10,
+                cache_input_price: 0.025,
+                output_price: 0.40,
+            },
         ];
     }
     rules
@@ -65,7 +85,7 @@ fn parse_threshold_rule(name: &str) -> (String, Option<bool>) {
     } else {
         None
     };
-    
+
     let base = lower
         .replace("<272k", "")
         .replace(">272k", "")
@@ -73,12 +93,9 @@ fn parse_threshold_rule(name: &str) -> (String, Option<bool>) {
         .replace("(>272k)", "")
         .replace("(<272k context length)", "")
         .replace("(>272k context length)", "");
-        
-    let normalized = base
-        .chars()
-        .filter(|c| c.is_alphanumeric())
-        .collect();
-        
+
+    let normalized = base.chars().filter(|c| c.is_alphanumeric()).collect();
+
     (normalized, is_greater)
 }
 
@@ -90,12 +107,18 @@ pub fn normalize_model_name(name: &str) -> String {
         .collect()
 }
 
-pub fn calculate_cost(rules: &[PricingRule], model_name: &str, input: u64, output: u64, cache_read: u64) -> f64 {
+pub fn calculate_cost(
+    rules: &[PricingRule],
+    model_name: &str,
+    input: u64,
+    output: u64,
+    cache_read: u64,
+) -> f64 {
     let (m_base, _) = parse_threshold_rule(model_name);
     if m_base.is_empty() {
         return 0.0;
     }
-    
+
     let total_context = input + cache_read + output;
     let is_long_context = total_context > 272_000;
 

@@ -2101,6 +2101,44 @@ pub async fn switch_codex_auth(
     }
 }
 
+fn find_npx_path() -> PathBuf {
+    // 1. Check in PATH env var
+    if let Ok(path_env) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path_env) {
+            let npx_in_path = dir.join("npx");
+            if npx_in_path.exists() && npx_in_path.is_file() {
+                return npx_in_path;
+            }
+        }
+    }
+
+    // 2. Try looking in NVM directory under home_dir
+    if let Some(home) = dirs::home_dir() {
+        let nvm_dir = home.join(".nvm/versions/node");
+        if nvm_dir.exists() {
+            if let Ok(entries) = std::fs::read_dir(nvm_dir) {
+                let mut versions = Vec::new();
+                for entry in entries.flatten() {
+                    if entry.path().is_dir() {
+                        versions.push(entry.path());
+                    }
+                }
+                // Sort versions to pick the latest Node version
+                versions.sort();
+                if let Some(newest_node) = versions.last() {
+                    let npx_fallback = newest_node.join("bin/npx");
+                    if npx_fallback.exists() {
+                        return npx_fallback;
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Fallback to just "npx"
+    PathBuf::from("npx")
+}
+
 /// API: 獲取 Codex 的重置額度資訊
 pub async fn get_codex_reset_info(Path(assistant): Path<String>) -> impl IntoResponse {
     if assistant != "codex" {
@@ -2115,7 +2153,8 @@ pub async fn get_codex_reset_info(Path(assistant): Path<String>) -> impl IntoRes
         let codex_dir = db::get_codex_dir();
         let active_auth_file = codex_dir.join("auth.json");
 
-        let mut cmd = std::process::Command::new("npx");
+        let npx_path = find_npx_path();
+        let mut cmd = std::process::Command::new(npx_path);
         cmd.args(["-y", "@willh/codex-reset-checker", "--json"]);
         if active_auth_file.exists() {
             cmd.arg("--auth").arg(&active_auth_file);
