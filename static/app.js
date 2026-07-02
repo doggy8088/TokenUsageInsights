@@ -75,6 +75,8 @@ let refreshInterval = 10000; // default 10s
 let currentLang = localStorage.getItem('lang') || 'zh-TW';
 let currentUsageData = null;
 let currentMonthlyData = null;
+let cachedCodexResets = null;
+let isQueryingCodexResets = false;
 
 const i18n = {
   'zh-TW': {
@@ -265,7 +267,7 @@ const i18n = {
     codex_reset_time: '重置:',
     codex_rate_limit_unlimited: '無限制',
     codex_rate_limit_remaining: '剩餘 {percent}%',
-    codex_control_title: 'Codex 控制與狀態',
+    codex_control_title: 'Codex 憑證',
     codex_auth_tip_title: '提示：您可以在 ~/.codex/auth/ 目錄下放入多個不同的 JSON 憑證檔（例如 (a)auth.json、(b)auth.json），並透過下拉選單在看板上即時切換套用，系統將自動覆蓋並套用至 ~/.codex/auth.json。',
     codex_auth_switch_title: 'Codex CLI 身分憑證切換',
     codex_select_auth_label: '憑證帳號：',
@@ -274,6 +276,18 @@ const i18n = {
     codex_auth_status: '{name}',
     codex_auth_status_custom: '自訂',
     codex_auth_status_none: '未載入',
+    codex_resets_title: '手動重置額度',
+    codex_resets_refresh_title: '即時查詢 Codex 重置額度',
+    codex_resets_available_label: '可用重置次數',
+    codex_resets_updated: '更新:',
+    codex_resets_status_available: '可用',
+    codex_resets_status_used: '已使用',
+    codex_resets_remaining: '剩餘 {time}',
+    codex_resets_granted: '獲得:',
+    codex_resets_expires: '到期:',
+    codex_resets_querying: '正在查詢...',
+    codex_resets_query_failed: '查詢失敗: {msg}',
+    codex_resets_empty: '無可用重置額度紀錄',
     usage_report: '使用量報告：',
     loading_prefix: '載入中: ',
     loading_month_prefix: '載入月份數據中: ',
@@ -506,7 +520,7 @@ const i18n = {
     codex_reset_time: 'Reset:',
     codex_rate_limit_unlimited: 'Unlimited',
     codex_rate_limit_remaining: '{percent}% remaining',
-    codex_control_title: 'Codex Control & Status',
+    codex_control_title: 'Codex Credentials',
     codex_auth_tip_title: 'Tip: You can put multiple JSON credential files (e.g. (a)auth.json, (b)auth.json) under ~/.codex/auth/ directory. Selecting one from this dropdown will automatically switch and overwrite ~/.codex/auth.json.',
     codex_auth_switch_title: 'Codex CLI Authentication Switcher',
     codex_select_auth_label: 'Auth Profile:',
@@ -515,6 +529,18 @@ const i18n = {
     codex_auth_status: '{name}',
     codex_auth_status_custom: 'Custom',
     codex_auth_status_none: 'None',
+    codex_resets_title: 'Reset Quotas',
+    codex_resets_refresh_title: 'Query Codex Reset Quotas',
+    codex_resets_available_label: 'Available Resets',
+    codex_resets_updated: 'Updated:',
+    codex_resets_status_available: 'Available',
+    codex_resets_status_used: 'Used',
+    codex_resets_remaining: 'Remaining {time}',
+    codex_resets_granted: 'Granted:',
+    codex_resets_expires: 'Expires:',
+    codex_resets_querying: 'Querying...',
+    codex_resets_query_failed: 'Query failed: {msg}',
+    codex_resets_empty: 'No reset quotas found',
     usage_report: 'Usage Report: ',
     loading_prefix: 'Loading: ',
     loading_month_prefix: 'Loading Monthly Data: ',
@@ -1147,8 +1173,10 @@ function initApp() {
         
         if (res.ok) {
           showNotification(`成功切換至 "${targetName}"！`, 'success');
+          cachedCodexResets = null;
           await updateCodexAuthSwitcher();
           await updateCodexRateLimit();
+          updateCodexResets(true);
           // 手動觸發一次同步以取得最新數據
           if (btnSyncDb) {
             btnSyncDb.click();
@@ -1169,6 +1197,14 @@ function initApp() {
         btnCodexAuthSwitch.disabled = false;
         btnCodexAuthSwitch.textContent = originalText;
       }
+    });
+  }
+
+  // 監聽 Codex 重置額度重新整理按鈕
+  const btnCodexResetsRefresh = document.getElementById('btn-codex-resets-refresh');
+  if (btnCodexResetsRefresh) {
+    btnCodexResetsRefresh.addEventListener('click', () => {
+      updateCodexResets(true);
     });
   }
 
@@ -4471,9 +4507,130 @@ async function updateCodexRateLimit() {
     }
 
     container.classList.remove('hidden');
+    updateCodexResets(false);
   } catch (err) {
     console.error('更新 Codex Rate Limit 失敗:', err);
   }
+}
+
+async function updateCodexResets(forceRefresh = false) {
+  if (currentAssistant !== 'codex' || activeTab !== 'daily' || isEmptyState) {
+    return;
+  }
+
+  const listContainer = document.getElementById('codex-resets-list');
+  const availableVal = document.getElementById('codex-resets-available-val');
+  const updatedVal = document.getElementById('codex-resets-updated');
+  const refreshBtn = document.getElementById('btn-codex-resets-refresh');
+
+  if (!listContainer || !availableVal || !updatedVal) return;
+
+  if (isQueryingCodexResets) return;
+
+  if (cachedCodexResets && !forceRefresh) {
+    renderCodexResets(cachedCodexResets);
+    return;
+  }
+
+  isQueryingCodexResets = true;
+  if (refreshBtn) refreshBtn.classList.add('loading');
+  listContainer.innerHTML = `<div style="text-align: center; color: var(--text-muted); font-size: 11px; padding: 10px 0;">${t('codex_resets_querying')}</div>`;
+
+  try {
+    const res = await fetch(`/api/codex/reset-info`);
+    if (!res.ok) {
+      let errMsg = res.statusText;
+      try {
+        const errData = await res.json();
+        if (errData && errData.error) errMsg = errData.error;
+      } catch (_) {}
+      throw new Error(errMsg);
+    }
+    const data = await res.json();
+    cachedCodexResets = {
+      data,
+      timestamp: new Date()
+    };
+    renderCodexResets(cachedCodexResets);
+  } catch (err) {
+    console.error('Fetch Codex Reset Info failed:', err);
+    availableVal.textContent = '--';
+    listContainer.innerHTML = `<div style="text-align: center; color: #ef4444; font-size: 11px; padding: 10px 0;">${t('codex_resets_query_failed').replace('{msg}', err.message)}</div>`;
+    updatedVal.textContent = t('codex_resets_updated') + ' --';
+  } finally {
+    isQueryingCodexResets = false;
+    if (refreshBtn) refreshBtn.classList.remove('loading');
+  }
+}
+
+function renderCodexResets(cachedData) {
+  const listContainer = document.getElementById('codex-resets-list');
+  const availableVal = document.getElementById('codex-resets-available-val');
+  const updatedVal = document.getElementById('codex-resets-updated');
+
+  if (!listContainer || !availableVal || !updatedVal) return;
+
+  const { data, timestamp } = cachedData;
+  availableVal.textContent = data.available_count !== undefined ? data.available_count + ' ' + (currentLang === 'zh-TW' ? '次' : 'times') : '--';
+  updatedVal.textContent = t('codex_resets_updated') + ' ' + formatDateTime(timestamp);
+
+  const credits = data.credits || [];
+  if (credits.length === 0) {
+    listContainer.innerHTML = `<div style="text-align: center; color: var(--text-muted); font-size: 11px; padding: 10px 0;">${t('codex_resets_empty')}</div>`;
+    return;
+  }
+
+  let html = '';
+  credits.forEach((credit, idx) => {
+    const isAvailable = credit.status === 'available';
+    const statusText = isAvailable ? t('codex_resets_status_available') : t('codex_resets_status_used');
+    const statusColor = isAvailable ? 'var(--accent-cyan)' : 'var(--text-muted)';
+    const bgOpacity = isAvailable ? 'rgba(0, 242, 254, 0.05)' : 'rgba(255, 255, 255, 0.02)';
+    const borderColor = isAvailable ? 'rgba(0, 242, 254, 0.2)' : 'rgba(255, 255, 255, 0.08)';
+
+    let remainingText = '';
+    if (credit.expires_at) {
+      const expiry = new Date(credit.expires_at);
+      const now = new Date();
+      const diffMs = expiry.getTime() - now.getTime();
+      if (diffMs > 0) {
+        const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+        const diffHrs = Math.floor((diffMs % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
+        const diffMins = Math.round((diffMs % (1000 * 60 * 60)) / (1000 * 60));
+        let timeStr = '';
+        if (diffDays > 0) {
+          timeStr += diffDays + 'd ';
+        }
+        if (diffHrs > 0 || diffDays > 0) {
+          timeStr += diffHrs + 'h ';
+        }
+        timeStr += diffMins + 'm';
+        remainingText = t('codex_resets_remaining').replace('{time}', timeStr);
+      } else {
+        remainingText = currentLang === 'zh-TW' ? '已過期' : 'Expired';
+      }
+    }
+
+    const titleStr = credit.title || 'Full Reset';
+    const grantedStr = credit.granted_at ? formatDateTime(new Date(credit.granted_at)) : '--';
+    const expiresStr = credit.expires_at ? formatDateTime(new Date(credit.expires_at)) : '--';
+
+    html += `
+      <div style="background: ${bgOpacity}; border: 1px solid ${borderColor}; border-radius: 6px; padding: 6px 8px; font-size: 10.5px; display: flex; flex-direction: column; gap: 4px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; font-weight: 500;">
+          <span style="color: var(--text-secondary); max-width: 120px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${titleStr}">#${idx + 1} ${titleStr}</span>
+          <span style="color: ${statusColor}; font-size: 10px; font-weight: 600; background: ${isAvailable ? 'rgba(0, 242, 254, 0.1)' : 'rgba(255,255,255,0.05)'}; padding: 1px 4px; border-radius: 4px;">${statusText}</span>
+        </div>
+        ${remainingText ? `<div style="color: var(--neon-gold); font-size: 10px;">⏳ ${remainingText}</div>` : ''}
+        <div style="display: flex; flex-direction: column; font-size: 9px; color: var(--text-muted); gap: 1px;">
+          <span>${t('codex_resets_granted')} ${grantedStr}</span>
+          <span>${t('codex_resets_expires')} ${expiresStr}</span>
+        </div>
+      </div>
+    `;
+  });
+
+  listContainer.innerHTML = html;
 }
 
 function formatDateTime(dateObj) {

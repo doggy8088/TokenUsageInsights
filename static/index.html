@@ -147,7 +147,7 @@
       <!-- Section 1.5: Codex CLI Settings (visible only when Codex is selected and daily tab is active) -->
       <div class="sidebar-section hidden" id="codex-control-panel">
         <h3 style="display: flex; align-items: center; justify-content: space-between; width: 100%;">
-          <span data-i18n="codex_control_title">Codex 控制與狀態</span>
+          <span data-i18n="codex_control_title">Codex 憑證</span>
           <button id="btn-codex-auth-tip" class="reload-btn" style="width: 20px; height: 20px; min-width: 20px; padding: 0; display: flex; align-items: center; justify-content: center; font-size: 11px; margin: 0; border-radius: 50%; opacity: 0.85;" data-i18n-title="codex_auth_tip_title" title="💡 提示：您可以在 ~/.codex/auth/ 目錄下放入多個不同的 JSON 憑證檔（例如 (a)auth.json、(b)auth.json），並透過下拉選單在看板上即時切換套用，系統將自動覆蓋並套用至 ~/.codex/auth.json。">💡</button>
         </h3>
         
@@ -200,6 +200,27 @@
             </div>
             <span class="sub-label" id="codex-rate-limit-secondary-reset" style="font-size: 9px; display: block; text-align: right; margin-top: 2px; color: var(--text-muted);">下次重置: --</span>
           </div>
+        </div>
+
+        <!-- Codex Resets -->
+        <div id="codex-resets-section" style="display: flex; flex-direction: column; gap: 8px; border-top: 1px solid var(--glass-border); padding-top: 12px; margin-top: 12px;">
+          <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 2px;">
+            <span style="font-size: 12px; font-weight: 600; color: var(--text-secondary); display: flex; align-items: center; gap: 4px;">
+              <span data-i18n="codex_resets_title">手動重置額度</span>
+            </span>
+            <button id="btn-codex-resets-refresh" class="reload-btn" style="width: 20px; height: 20px; min-width: 20px; padding: 0; display: flex; align-items: center; justify-content: center; font-size: 11px; margin: 0; border-radius: 50%;" data-i18n-title="codex_resets_refresh_title" title="即時查詢 Codex 重置額度">🔄</button>
+          </div>
+          
+          <div style="display: flex; justify-content: space-between; font-size: 11px; margin-bottom: 2px;">
+            <span style="color: var(--text-muted);" data-i18n="codex_resets_available_label">可用重置次數</span>
+            <span id="codex-resets-available-val" style="font-weight: 600; color: var(--accent-cyan);">--</span>
+          </div>
+
+          <div id="codex-resets-list" style="display: flex; flex-direction: column; gap: 6px; max-height: 150px; overflow-y: auto; padding-right: 4px;">
+            <!-- Reset credits will be dynamically rendered here -->
+          </div>
+          
+          <span class="sub-label" id="codex-resets-updated" style="font-size: 9px; display: block; text-align: right; color: var(--text-muted);">更新: --</span>
         </div>
       </div>
 

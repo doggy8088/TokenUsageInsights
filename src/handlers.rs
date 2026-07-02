@@ -1,22 +1,17 @@
-use axum::{
-    extract::Path,
-    http::StatusCode,
-    response::IntoResponse,
-    Json,
-};
-use serde::{Serialize, Deserialize};
+use axum::{extract::Path, http::StatusCode, response::IntoResponse, Json};
+use rusqlite::params;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
     io::{BufRead, BufReader},
     path::PathBuf,
 };
-use rusqlite::params;
 
-use crate::db::{self, TokenStats, CostStats, UsageEntry};
-use crate::pricing::{load_pricing_rules, calculate_cost, PricingEntry};
+use crate::db::{self, CostStats, TokenStats, UsageEntry};
+use crate::pricing::{calculate_cost, load_pricing_rules, PricingEntry};
 use crate::timeline::{
-    TimelineItem, parse_antigravity_timeline, parse_copilot_timeline, parse_codex_timeline
+    parse_antigravity_timeline, parse_codex_timeline, parse_copilot_timeline, TimelineItem,
 };
 
 #[derive(Serialize)]
@@ -201,7 +196,11 @@ pub async fn get_available_dates(Path(assistant): Path<String>) -> impl IntoResp
 
     match res {
         Ok(date_list) => Json(DateListResponse { dates: date_list }).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e })),
+        )
+            .into_response(),
     }
 }
 
@@ -215,11 +214,17 @@ pub async fn get_setup_info(Path(_assistant): Path<String>) -> impl IntoResponse
     let home_dir = home_dir_path.to_string_lossy().into_owned();
 
     let anti_dir = db::get_antigravity_dir();
-    let anti_script = anti_dir.join("statusline-token.sh").to_string_lossy().into_owned();
+    let anti_script = anti_dir
+        .join("statusline-token.sh")
+        .to_string_lossy()
+        .into_owned();
     let anti_exists = anti_dir.exists();
 
     let copilot_dir = db::get_copilot_dir();
-    let copilot_script = copilot_dir.join("statusline-token.sh").to_string_lossy().into_owned();
+    let copilot_script = copilot_dir
+        .join("statusline-token.sh")
+        .to_string_lossy()
+        .into_owned();
     let copilot_exists = copilot_dir.exists();
 
     let codex_dir = db::get_codex_dir();
@@ -228,14 +233,28 @@ pub async fn get_setup_info(Path(_assistant): Path<String>) -> impl IntoResponse
     Json(SetupInfoResponse {
         workspace_dir,
         home_dir,
-        antigravity: AssistantSetupStatus { dir_path: anti_dir.to_string_lossy().into_owned(), exists: anti_exists, script_path: anti_script },
-        copilot: AssistantSetupStatus { dir_path: copilot_dir.to_string_lossy().into_owned(), exists: copilot_exists, script_path: copilot_script },
-        codex: AssistantSetupStatus { dir_path: codex_dir.to_string_lossy().into_owned(), exists: codex_exists, script_path: "".to_string() },
+        antigravity: AssistantSetupStatus {
+            dir_path: anti_dir.to_string_lossy().into_owned(),
+            exists: anti_exists,
+            script_path: anti_script,
+        },
+        copilot: AssistantSetupStatus {
+            dir_path: copilot_dir.to_string_lossy().into_owned(),
+            exists: copilot_exists,
+            script_path: copilot_script,
+        },
+        codex: AssistantSetupStatus {
+            dir_path: codex_dir.to_string_lossy().into_owned(),
+            exists: codex_exists,
+            script_path: "".to_string(),
+        },
     })
 }
 
 /// API 3: 獲取指定日期的 Token 使用詳情與會話列表
-pub async fn get_usage_details(Path((assistant, date)): Path<(String, String)>) -> impl IntoResponse {
+pub async fn get_usage_details(
+    Path((assistant, date)): Path<(String, String)>,
+) -> impl IntoResponse {
     let assistant_clone = assistant.clone();
     let date_clone = date.clone();
 
@@ -325,11 +344,21 @@ pub async fn get_usage_details(Path((assistant, date)): Path<(String, String)>) 
 
     let entries_with_type = match entries_res {
         Ok(e) => e,
-        Err(err) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": err }))).into_response(),
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": err })),
+            )
+                .into_response()
+        }
     };
 
     if entries_with_type.is_empty() {
-        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "找不到該日期的使用量資料。" }))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "找不到該日期的使用量資料。" })),
+        )
+            .into_response();
     }
 
     let mut summary = DaySummary::default();
@@ -338,7 +367,9 @@ pub async fn get_usage_details(Path((assistant, date)): Path<(String, String)>) 
 
     for (e, ast_type) in &entries_with_type {
         entries.push(e.clone());
-        let (list, _) = sessions_map.entry(e.session_id.clone()).or_insert_with(|| (Vec::new(), ast_type.clone()));
+        let (list, _) = sessions_map
+            .entry(e.session_id.clone())
+            .or_insert_with(|| (Vec::new(), ast_type.clone()));
         list.push(e.clone());
     }
 
@@ -373,28 +404,91 @@ pub async fn get_usage_details(Path((assistant, date)): Path<(String, String)>) 
     let mut sessions_summary = Vec::new();
 
     for (session_id, (s_entries, ast_type)) in &sessions_map {
-        let last_entry = session_last_entries.get(session_id).cloned().unwrap_or_else(|| s_entries[0].clone());
-        
-        let session_tokens = s_entries.iter().map(|e| e.delta_tokens.as_ref().map(|t| t.total).unwrap_or(0)).sum::<u64>();
-        let session_input_tokens = s_entries.iter().map(|e| e.delta_tokens.as_ref().map(|t| t.input).unwrap_or(0)).sum::<u64>();
-        let session_output_tokens = s_entries.iter().map(|e| e.delta_tokens.as_ref().map(|t| t.output).unwrap_or(0)).sum::<u64>();
-        let session_cache_read = s_entries.iter().map(|e| e.delta_tokens.as_ref().and_then(|t| t.cache_read).unwrap_or(0)).sum::<u64>();
-        let session_reasoning = s_entries.iter().map(|e| e.delta_tokens.as_ref().and_then(|t| t.reasoning).unwrap_or(0)).sum::<u64>();
+        let last_entry = session_last_entries
+            .get(session_id)
+            .cloned()
+            .unwrap_or_else(|| s_entries[0].clone());
 
-        let session_duration = last_entry.cost.as_ref().and_then(|c| c.total_api_duration_ms).unwrap_or(0.0) as u64;
-        let session_requests = last_entry.cost.as_ref().and_then(|c| c.total_premium_requests).unwrap_or(0.0) as u64;
+        let session_tokens = s_entries
+            .iter()
+            .map(|e| e.delta_tokens.as_ref().map(|t| t.total).unwrap_or(0))
+            .sum::<u64>();
+        let session_input_tokens = s_entries
+            .iter()
+            .map(|e| e.delta_tokens.as_ref().map(|t| t.input).unwrap_or(0))
+            .sum::<u64>();
+        let session_output_tokens = s_entries
+            .iter()
+            .map(|e| e.delta_tokens.as_ref().map(|t| t.output).unwrap_or(0))
+            .sum::<u64>();
+        let session_cache_read = s_entries
+            .iter()
+            .map(|e| {
+                e.delta_tokens
+                    .as_ref()
+                    .and_then(|t| t.cache_read)
+                    .unwrap_or(0)
+            })
+            .sum::<u64>();
+        let session_reasoning = s_entries
+            .iter()
+            .map(|e| {
+                e.delta_tokens
+                    .as_ref()
+                    .and_then(|t| t.reasoning)
+                    .unwrap_or(0)
+            })
+            .sum::<u64>();
+
+        let session_duration = last_entry
+            .cost
+            .as_ref()
+            .and_then(|c| c.total_api_duration_ms)
+            .unwrap_or(0.0) as u64;
+        let session_requests = last_entry
+            .cost
+            .as_ref()
+            .and_then(|c| c.total_premium_requests)
+            .unwrap_or(0.0) as u64;
 
         summary.total_duration_ms += session_duration;
         summary.total_requests += session_requests;
 
-        let total_cache_read_tokens = if session_tokens > 0 { session_cache_read } else { last_entry.tokens.as_ref().and_then(|t| t.cache_read).unwrap_or(0) };
-        let total_reasoning_tokens = if session_tokens > 0 { session_reasoning } else { last_entry.tokens.as_ref().and_then(|t| t.reasoning).unwrap_or(0) };
-        let total_input_tokens = if session_tokens > 0 { session_input_tokens } else { last_entry.tokens.as_ref().map(|t| t.input).unwrap_or(0) };
-        let total_output_tokens = if session_tokens > 0 { session_output_tokens } else { last_entry.tokens.as_ref().map(|t| t.output).unwrap_or(0) };
+        let total_cache_read_tokens = if session_tokens > 0 {
+            session_cache_read
+        } else {
+            last_entry
+                .tokens
+                .as_ref()
+                .and_then(|t| t.cache_read)
+                .unwrap_or(0)
+        };
+        let total_reasoning_tokens = if session_tokens > 0 {
+            session_reasoning
+        } else {
+            last_entry
+                .tokens
+                .as_ref()
+                .and_then(|t| t.reasoning)
+                .unwrap_or(0)
+        };
+        let total_input_tokens = if session_tokens > 0 {
+            session_input_tokens
+        } else {
+            last_entry.tokens.as_ref().map(|t| t.input).unwrap_or(0)
+        };
+        let total_output_tokens = if session_tokens > 0 {
+            session_output_tokens
+        } else {
+            last_entry.tokens.as_ref().map(|t| t.output).unwrap_or(0)
+        };
 
         let cost_usd = calculate_cost(
             &pricing_rules,
-            &last_entry.model.clone().unwrap_or_else(|| "Unknown Model".to_string()),
+            &last_entry
+                .model
+                .clone()
+                .unwrap_or_else(|| "Unknown Model".to_string()),
             total_input_tokens,
             total_output_tokens,
             total_cache_read_tokens,
@@ -403,11 +497,19 @@ pub async fn get_usage_details(Path((assistant, date)): Path<(String, String)>) 
 
         sessions_summary.push(SessionSummary {
             session_id: session_id.clone(),
-            session_name: last_entry.session_name.unwrap_or_else(|| "Start Coding Session".to_string()),
+            session_name: last_entry
+                .session_name
+                .unwrap_or_else(|| "Start Coding Session".to_string()),
             assistant_type: ast_type.clone(),
             cwd: last_entry.cwd.unwrap_or_default(),
-            model: last_entry.model.unwrap_or_else(|| "Unknown Model".to_string()),
-            total_tokens: if session_tokens > 0 { session_tokens } else { last_entry.tokens.as_ref().map(|t| t.total).unwrap_or(0) },
+            model: last_entry
+                .model
+                .unwrap_or_else(|| "Unknown Model".to_string()),
+            total_tokens: if session_tokens > 0 {
+                session_tokens
+            } else {
+                last_entry.tokens.as_ref().map(|t| t.total).unwrap_or(0)
+            },
             total_input_tokens,
             total_output_tokens,
             total_cache_read_tokens,
@@ -430,7 +532,8 @@ pub async fn get_usage_details(Path((assistant, date)): Path<(String, String)>) 
         summary,
         sessions: sessions_summary,
         raw_entries: entries,
-    }).into_response()
+    })
+    .into_response()
 }
 
 /// API 4: 獲取特定會話的詳細對話歷史還原時間軸
@@ -469,7 +572,9 @@ fn get_git_info(cwd_str: &str) -> (Option<String>, Option<String>) {
     (branch, repo)
 }
 
-pub async fn get_session_details(Path((assistant, session_id)): Path<(String, String)>) -> impl IntoResponse {
+pub async fn get_session_details(
+    Path((assistant, session_id)): Path<(String, String)>,
+) -> impl IntoResponse {
     // 1. 若 assistant == "all"，需要先在資料庫尋找此 session 屬於哪一個 assistant，並獲取 transcript 路徑
     let session_info: Result<(String, Option<String>), String> = tokio::task::spawn_blocking({
         let sid = session_id.clone();
@@ -496,13 +601,21 @@ pub async fn get_session_details(Path((assistant, session_id)): Path<(String, St
     let filepath = match resolved_assistant.as_str() {
         "antigravity" => {
             let anti_dir = db::get_antigravity_dir();
-            anti_dir.join("brain").join(&session_id).join(".system_generated/logs/transcript_full.jsonl")
+            anti_dir
+                .join("brain")
+                .join(&session_id)
+                .join(".system_generated/logs/transcript_full.jsonl")
         }
         "copilot" => {
             let cop_dir = db::get_copilot_dir();
-            let mut path = cop_dir.join("session-state").join(&session_id).join("events.jsonl");
+            let mut path = cop_dir
+                .join("session-state")
+                .join(&session_id)
+                .join("events.jsonl");
             if !path.exists() {
-                path = cop_dir.join("session-state").join(format!("{}.jsonl", session_id));
+                path = cop_dir
+                    .join("session-state")
+                    .join(format!("{}.jsonl", session_id));
             }
             path
         }
@@ -510,10 +623,20 @@ pub async fn get_session_details(Path((assistant, session_id)): Path<(String, St
             if let Some(ref p_str) = transcript_path_db {
                 PathBuf::from(p_str)
             } else {
-                return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "找不到 Codex 會話日誌檔案路徑。" }))).into_response();
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({ "error": "找不到 Codex 會話日誌檔案路徑。" })),
+                )
+                    .into_response();
             }
         }
-        _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "不支援的助理類型" }))).into_response(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "不支援的助理類型" })),
+            )
+                .into_response()
+        }
     };
 
     if !filepath.exists() {
@@ -525,13 +648,23 @@ pub async fn get_session_details(Path((assistant, session_id)): Path<(String, St
             }
             _ => false,
         };
-        let reason = if is_session_dir_present { "no_events_yet" } else { "file_missing" };
+        let reason = if is_session_dir_present {
+            "no_events_yet"
+        } else {
+            "file_missing"
+        };
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": format!("找不到該會話的本地日誌檔: {:?}", filepath), "reason": reason }))).into_response();
     }
 
     let file = match File::open(&filepath) {
         Ok(f) => f,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": format!("開啟日誌檔案失敗: {}", e) }))).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("開啟日誌檔案失敗: {}", e) })),
+            )
+                .into_response()
+        }
     };
 
     // 3. 預先載入 SQLite 中的回合 (turn_no) 增量 token 數據
@@ -600,7 +733,7 @@ pub async fn get_session_details(Path((assistant, session_id)): Path<(String, St
         if !metadata.contains_key("cwd") {
             metadata.insert("cwd".to_string(), serde_json::Value::String(cwd.clone()));
         }
-        
+
         let (branch, repo) = get_git_info(cwd);
         if !metadata.contains_key("git_branch") {
             if let Some(b) = branch {
@@ -629,11 +762,26 @@ pub async fn get_session_details(Path((assistant, session_id)): Path<(String, St
         total_reasoning_tokens += stats.reasoning.unwrap_or(0);
     }
 
-    metadata.insert("total_tokens".to_string(), serde_json::Value::Number(serde_json::Number::from(total_tokens)));
-    metadata.insert("total_cache_read_tokens".to_string(), serde_json::Value::Number(serde_json::Number::from(total_cache_read_tokens)));
-    metadata.insert("total_input_tokens".to_string(), serde_json::Value::Number(serde_json::Number::from(total_input_tokens)));
-    metadata.insert("total_output_tokens".to_string(), serde_json::Value::Number(serde_json::Number::from(total_output_tokens)));
-    metadata.insert("total_reasoning_tokens".to_string(), serde_json::Value::Number(serde_json::Number::from(total_reasoning_tokens)));
+    metadata.insert(
+        "total_tokens".to_string(),
+        serde_json::Value::Number(serde_json::Number::from(total_tokens)),
+    );
+    metadata.insert(
+        "total_cache_read_tokens".to_string(),
+        serde_json::Value::Number(serde_json::Number::from(total_cache_read_tokens)),
+    );
+    metadata.insert(
+        "total_input_tokens".to_string(),
+        serde_json::Value::Number(serde_json::Number::from(total_input_tokens)),
+    );
+    metadata.insert(
+        "total_output_tokens".to_string(),
+        serde_json::Value::Number(serde_json::Number::from(total_output_tokens)),
+    );
+    metadata.insert(
+        "total_reasoning_tokens".to_string(),
+        serde_json::Value::Number(serde_json::Number::from(total_reasoning_tokens)),
+    );
 
     #[derive(Serialize)]
     struct LegacyEventWrapper {
@@ -726,7 +874,8 @@ pub async fn get_session_details(Path((assistant, session_id)): Path<(String, St
         "session_id": session_id,
         "metadata": metadata,
         "timeline": legacy_timeline,
-    })).into_response()
+    }))
+    .into_response()
 }
 
 /// API 5: 獲取可用的有使用記錄月份
@@ -763,12 +912,18 @@ pub async fn get_available_months(Path(assistant): Path<String>) -> impl IntoRes
 
     match res {
         Ok(month_list) => Json(MonthListResponse { months: month_list }).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e })),
+        )
+            .into_response(),
     }
 }
 
 /// API 6: 獲取指定月份的統計摘要數據
-pub async fn get_monthly_details(Path((assistant, year_month)): Path<(String, String)>) -> impl IntoResponse {
+pub async fn get_monthly_details(
+    Path((assistant, year_month)): Path<(String, String)>,
+) -> impl IntoResponse {
     let assistant_clone = assistant.clone();
     let query_month = format!("{}-%", year_month);
 
@@ -861,20 +1016,35 @@ pub async fn get_monthly_details(Path((assistant, year_month)): Path<(String, St
 
     let entries_with_type = match entries_res {
         Ok(e) => e,
-        Err(err) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": err }))).into_response(),
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": err })),
+            )
+                .into_response()
+        }
     };
 
     if entries_with_type.is_empty() {
-        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "找不到該月份的使用量資料。" }))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "找不到該月份的使用量資料。" })),
+        )
+            .into_response();
     }
 
     let pricing_rules = load_pricing_rules();
     let mut daily_map: HashMap<String, Vec<(UsageEntry, String)>> = HashMap::new();
     let mut sessions_map: HashMap<String, (Vec<UsageEntry>, String)> = HashMap::new();
-    
+
     for (e, ast_type, entry_date) in &entries_with_type {
-        daily_map.entry(entry_date.clone()).or_default().push((e.clone(), ast_type.clone()));
-        let (list, _) = sessions_map.entry(e.session_id.clone()).or_insert_with(|| (Vec::new(), ast_type.clone()));
+        daily_map
+            .entry(entry_date.clone())
+            .or_default()
+            .push((e.clone(), ast_type.clone()));
+        let (list, _) = sessions_map
+            .entry(e.session_id.clone())
+            .or_insert_with(|| (Vec::new(), ast_type.clone()));
         list.push(e.clone());
     }
 
@@ -908,26 +1078,88 @@ pub async fn get_monthly_details(Path((assistant, year_month)): Path<(String, St
         let mut day_sessions_map: HashMap<String, Vec<UsageEntry>> = HashMap::new();
         for (e, _) in day_entries_with_type {
             day_sessions.insert(e.session_id.clone());
-            day_sessions_map.entry(e.session_id.clone()).or_default().push(e.clone());
+            day_sessions_map
+                .entry(e.session_id.clone())
+                .or_default()
+                .push(e.clone());
         }
 
         for (sid, s_entries) in &day_sessions_map {
-            let s_tokens = s_entries.iter().map(|e| e.delta_tokens.as_ref().map(|t| t.total).unwrap_or(0)).sum::<u64>();
-            let s_input = s_entries.iter().map(|e| e.delta_tokens.as_ref().map(|t| t.input).unwrap_or(0)).sum::<u64>();
-            let s_output = s_entries.iter().map(|e| e.delta_tokens.as_ref().map(|t| t.output).unwrap_or(0)).sum::<u64>();
-            let s_cache = s_entries.iter().map(|e| e.delta_tokens.as_ref().and_then(|t| t.cache_read).unwrap_or(0)).sum::<u64>();
-            let s_reasoning = s_entries.iter().map(|e| e.delta_tokens.as_ref().and_then(|t| t.reasoning).unwrap_or(0)).sum::<u64>();
+            let s_tokens = s_entries
+                .iter()
+                .map(|e| e.delta_tokens.as_ref().map(|t| t.total).unwrap_or(0))
+                .sum::<u64>();
+            let s_input = s_entries
+                .iter()
+                .map(|e| e.delta_tokens.as_ref().map(|t| t.input).unwrap_or(0))
+                .sum::<u64>();
+            let s_output = s_entries
+                .iter()
+                .map(|e| e.delta_tokens.as_ref().map(|t| t.output).unwrap_or(0))
+                .sum::<u64>();
+            let s_cache = s_entries
+                .iter()
+                .map(|e| {
+                    e.delta_tokens
+                        .as_ref()
+                        .and_then(|t| t.cache_read)
+                        .unwrap_or(0)
+                })
+                .sum::<u64>();
+            let s_reasoning = s_entries
+                .iter()
+                .map(|e| {
+                    e.delta_tokens
+                        .as_ref()
+                        .and_then(|t| t.reasoning)
+                        .unwrap_or(0)
+                })
+                .sum::<u64>();
 
-            let last_entry = session_last_entries.get(sid).cloned().unwrap_or_else(|| s_entries[0].clone());
-            let final_input = if s_tokens > 0 { s_input } else { last_entry.tokens.as_ref().map(|t| t.input).unwrap_or(0) };
-            let final_output = if s_tokens > 0 { s_output } else { last_entry.tokens.as_ref().map(|t| t.output).unwrap_or(0) };
-            let final_cache = if s_tokens > 0 { s_cache } else { last_entry.tokens.as_ref().and_then(|t| t.cache_read).unwrap_or(0) };
-            let final_reasoning = if s_tokens > 0 { s_reasoning } else { last_entry.tokens.as_ref().and_then(|t| t.reasoning).unwrap_or(0) };
-            let final_total = if s_tokens > 0 { s_tokens } else { last_entry.tokens.as_ref().map(|t| t.total).unwrap_or(0) };
+            let last_entry = session_last_entries
+                .get(sid)
+                .cloned()
+                .unwrap_or_else(|| s_entries[0].clone());
+            let final_input = if s_tokens > 0 {
+                s_input
+            } else {
+                last_entry.tokens.as_ref().map(|t| t.input).unwrap_or(0)
+            };
+            let final_output = if s_tokens > 0 {
+                s_output
+            } else {
+                last_entry.tokens.as_ref().map(|t| t.output).unwrap_or(0)
+            };
+            let final_cache = if s_tokens > 0 {
+                s_cache
+            } else {
+                last_entry
+                    .tokens
+                    .as_ref()
+                    .and_then(|t| t.cache_read)
+                    .unwrap_or(0)
+            };
+            let final_reasoning = if s_tokens > 0 {
+                s_reasoning
+            } else {
+                last_entry
+                    .tokens
+                    .as_ref()
+                    .and_then(|t| t.reasoning)
+                    .unwrap_or(0)
+            };
+            let final_total = if s_tokens > 0 {
+                s_tokens
+            } else {
+                last_entry.tokens.as_ref().map(|t| t.total).unwrap_or(0)
+            };
 
             let cost_usd = calculate_cost(
                 &pricing_rules,
-                &last_entry.model.clone().unwrap_or_else(|| "Unknown Model".to_string()),
+                &last_entry
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| "Unknown Model".to_string()),
                 final_input,
                 final_output,
                 final_cache,
@@ -968,23 +1200,82 @@ pub async fn get_monthly_details(Path((assistant, year_month)): Path<(String, St
     let mut agent_map_stats: HashMap<String, AgentBreakdown> = HashMap::new();
 
     for (session_id, (s_entries, ast_type)) in &sessions_map {
-        let last_entry = session_last_entries.get(session_id).cloned().unwrap_or_else(|| s_entries[0].clone());
-        
-        let s_tokens = s_entries.iter().map(|e| e.delta_tokens.as_ref().map(|t| t.total).unwrap_or(0)).sum::<u64>();
-        let s_input = s_entries.iter().map(|e| e.delta_tokens.as_ref().map(|t| t.input).unwrap_or(0)).sum::<u64>();
-        let s_output = s_entries.iter().map(|e| e.delta_tokens.as_ref().map(|t| t.output).unwrap_or(0)).sum::<u64>();
-        let s_cache = s_entries.iter().map(|e| e.delta_tokens.as_ref().and_then(|t| t.cache_read).unwrap_or(0)).sum::<u64>();
-        let s_reasoning = s_entries.iter().map(|e| e.delta_tokens.as_ref().and_then(|t| t.reasoning).unwrap_or(0)).sum::<u64>();
+        let last_entry = session_last_entries
+            .get(session_id)
+            .cloned()
+            .unwrap_or_else(|| s_entries[0].clone());
 
-        let final_input = if s_tokens > 0 { s_input } else { last_entry.tokens.as_ref().map(|t| t.input).unwrap_or(0) };
-        let final_output = if s_tokens > 0 { s_output } else { last_entry.tokens.as_ref().map(|t| t.output).unwrap_or(0) };
-        let final_cache = if s_tokens > 0 { s_cache } else { last_entry.tokens.as_ref().and_then(|t| t.cache_read).unwrap_or(0) };
-        let final_reasoning = if s_tokens > 0 { s_reasoning } else { last_entry.tokens.as_ref().and_then(|t| t.reasoning).unwrap_or(0) };
-        let final_total = if s_tokens > 0 { s_tokens } else { last_entry.tokens.as_ref().map(|t| t.total).unwrap_or(0) };
+        let s_tokens = s_entries
+            .iter()
+            .map(|e| e.delta_tokens.as_ref().map(|t| t.total).unwrap_or(0))
+            .sum::<u64>();
+        let s_input = s_entries
+            .iter()
+            .map(|e| e.delta_tokens.as_ref().map(|t| t.input).unwrap_or(0))
+            .sum::<u64>();
+        let s_output = s_entries
+            .iter()
+            .map(|e| e.delta_tokens.as_ref().map(|t| t.output).unwrap_or(0))
+            .sum::<u64>();
+        let s_cache = s_entries
+            .iter()
+            .map(|e| {
+                e.delta_tokens
+                    .as_ref()
+                    .and_then(|t| t.cache_read)
+                    .unwrap_or(0)
+            })
+            .sum::<u64>();
+        let s_reasoning = s_entries
+            .iter()
+            .map(|e| {
+                e.delta_tokens
+                    .as_ref()
+                    .and_then(|t| t.reasoning)
+                    .unwrap_or(0)
+            })
+            .sum::<u64>();
+
+        let final_input = if s_tokens > 0 {
+            s_input
+        } else {
+            last_entry.tokens.as_ref().map(|t| t.input).unwrap_or(0)
+        };
+        let final_output = if s_tokens > 0 {
+            s_output
+        } else {
+            last_entry.tokens.as_ref().map(|t| t.output).unwrap_or(0)
+        };
+        let final_cache = if s_tokens > 0 {
+            s_cache
+        } else {
+            last_entry
+                .tokens
+                .as_ref()
+                .and_then(|t| t.cache_read)
+                .unwrap_or(0)
+        };
+        let final_reasoning = if s_tokens > 0 {
+            s_reasoning
+        } else {
+            last_entry
+                .tokens
+                .as_ref()
+                .and_then(|t| t.reasoning)
+                .unwrap_or(0)
+        };
+        let final_total = if s_tokens > 0 {
+            s_tokens
+        } else {
+            last_entry.tokens.as_ref().map(|t| t.total).unwrap_or(0)
+        };
 
         let cost_usd = calculate_cost(
             &pricing_rules,
-            &last_entry.model.clone().unwrap_or_else(|| "Unknown Model".to_string()),
+            &last_entry
+                .model
+                .clone()
+                .unwrap_or_else(|| "Unknown Model".to_string()),
             final_input,
             final_output,
             final_cache,
@@ -996,7 +1287,9 @@ pub async fn get_monthly_details(Path((assistant, year_month)): Path<(String, St
         project_stat.1 += final_total;
         project_stat.2 += cost_usd;
 
-        let model = last_entry.model.unwrap_or_else(|| "Unknown Model".to_string());
+        let model = last_entry
+            .model
+            .unwrap_or_else(|| "Unknown Model".to_string());
         let model_stat = model_map_stats.entry(model).or_insert((0, 0, 0, 0, 0, 0.0));
         model_stat.0 += 1;
         model_stat.1 += final_total;
@@ -1017,13 +1310,37 @@ pub async fn get_monthly_details(Path((assistant, year_month)): Path<(String, St
 
     let mut project_summaries = Vec::new();
     for (cwd, (sessions_count, total_tokens, cost_usd)) in project_map_stats {
-        project_summaries.push(MonthlyProjectSummary { cwd, sessions_count, total_tokens, cost_usd });
+        project_summaries.push(MonthlyProjectSummary {
+            cwd,
+            sessions_count,
+            total_tokens,
+            cost_usd,
+        });
     }
     project_summaries.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens));
 
     let mut model_summaries = Vec::new();
-    for (model, (sessions_count, total_tokens, total_input_tokens, total_output_tokens, total_cache_read_tokens, cost_usd)) in model_map_stats {
-        model_summaries.push(MonthlyModelSummary { model, sessions_count, total_tokens, total_input_tokens, total_output_tokens, total_cache_read_tokens, cost_usd });
+    for (
+        model,
+        (
+            sessions_count,
+            total_tokens,
+            total_input_tokens,
+            total_output_tokens,
+            total_cache_read_tokens,
+            cost_usd,
+        ),
+    ) in model_map_stats
+    {
+        model_summaries.push(MonthlyModelSummary {
+            model,
+            sessions_count,
+            total_tokens,
+            total_input_tokens,
+            total_output_tokens,
+            total_cache_read_tokens,
+            cost_usd,
+        });
     }
     model_summaries.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens));
 
@@ -1034,7 +1351,8 @@ pub async fn get_monthly_details(Path((assistant, year_month)): Path<(String, St
         projects: project_summaries,
         models: model_summaries,
         agent_breakdown: agent_map_stats,
-    }).into_response()
+    })
+    .into_response()
 }
 
 /// API 12: 獲取可用的有使用記錄年份
@@ -1071,12 +1389,18 @@ pub async fn get_available_years(Path(assistant): Path<String>) -> impl IntoResp
 
     match res {
         Ok(year_list) => Json(YearListResponse { years: year_list }).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e })),
+        )
+            .into_response(),
     }
 }
 
 /// API 13: 獲取指定年份的統計摘要數據
-pub async fn get_yearly_details(Path((assistant, year)): Path<(String, String)>) -> impl IntoResponse {
+pub async fn get_yearly_details(
+    Path((assistant, year)): Path<(String, String)>,
+) -> impl IntoResponse {
     let assistant_clone = assistant.clone();
     let query_year = format!("{}-%", year);
 
@@ -1169,21 +1493,40 @@ pub async fn get_yearly_details(Path((assistant, year)): Path<(String, String)>)
 
     let entries_with_type = match entries_res {
         Ok(e) => e,
-        Err(err) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": err }))).into_response(),
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": err })),
+            )
+                .into_response()
+        }
     };
 
     if entries_with_type.is_empty() {
-        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "找不到該年份的使用量資料。" }))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "找不到該年份的使用量資料。" })),
+        )
+            .into_response();
     }
 
     let pricing_rules = load_pricing_rules();
     let mut monthly_map: HashMap<String, Vec<(UsageEntry, String)>> = HashMap::new();
     let mut sessions_map: HashMap<String, (Vec<UsageEntry>, String)> = HashMap::new();
-    
+
     for (e, ast_type, entry_date) in &entries_with_type {
-        let month_str = if entry_date.len() >= 7 { &entry_date[0..7] } else { "Unknown" };
-        monthly_map.entry(month_str.to_string()).or_default().push((e.clone(), ast_type.clone()));
-        let (list, _) = sessions_map.entry(e.session_id.clone()).or_insert_with(|| (Vec::new(), ast_type.clone()));
+        let month_str = if entry_date.len() >= 7 {
+            &entry_date[0..7]
+        } else {
+            "Unknown"
+        };
+        monthly_map
+            .entry(month_str.to_string())
+            .or_default()
+            .push((e.clone(), ast_type.clone()));
+        let (list, _) = sessions_map
+            .entry(e.session_id.clone())
+            .or_insert_with(|| (Vec::new(), ast_type.clone()));
         list.push(e.clone());
     }
 
@@ -1217,26 +1560,88 @@ pub async fn get_yearly_details(Path((assistant, year)): Path<(String, String)>)
         let mut month_sessions_map: HashMap<String, Vec<UsageEntry>> = HashMap::new();
         for (e, _) in month_entries_with_type {
             m_sessions.insert(e.session_id.clone());
-            month_sessions_map.entry(e.session_id.clone()).or_default().push(e.clone());
+            month_sessions_map
+                .entry(e.session_id.clone())
+                .or_default()
+                .push(e.clone());
         }
 
         for (sid, s_entries) in &month_sessions_map {
-            let s_tokens = s_entries.iter().map(|e| e.delta_tokens.as_ref().map(|t| t.total).unwrap_or(0)).sum::<u64>();
-            let s_input = s_entries.iter().map(|e| e.delta_tokens.as_ref().map(|t| t.input).unwrap_or(0)).sum::<u64>();
-            let s_output = s_entries.iter().map(|e| e.delta_tokens.as_ref().map(|t| t.output).unwrap_or(0)).sum::<u64>();
-            let s_cache = s_entries.iter().map(|e| e.delta_tokens.as_ref().and_then(|t| t.cache_read).unwrap_or(0)).sum::<u64>();
-            let s_reasoning = s_entries.iter().map(|e| e.delta_tokens.as_ref().and_then(|t| t.reasoning).unwrap_or(0)).sum::<u64>();
+            let s_tokens = s_entries
+                .iter()
+                .map(|e| e.delta_tokens.as_ref().map(|t| t.total).unwrap_or(0))
+                .sum::<u64>();
+            let s_input = s_entries
+                .iter()
+                .map(|e| e.delta_tokens.as_ref().map(|t| t.input).unwrap_or(0))
+                .sum::<u64>();
+            let s_output = s_entries
+                .iter()
+                .map(|e| e.delta_tokens.as_ref().map(|t| t.output).unwrap_or(0))
+                .sum::<u64>();
+            let s_cache = s_entries
+                .iter()
+                .map(|e| {
+                    e.delta_tokens
+                        .as_ref()
+                        .and_then(|t| t.cache_read)
+                        .unwrap_or(0)
+                })
+                .sum::<u64>();
+            let s_reasoning = s_entries
+                .iter()
+                .map(|e| {
+                    e.delta_tokens
+                        .as_ref()
+                        .and_then(|t| t.reasoning)
+                        .unwrap_or(0)
+                })
+                .sum::<u64>();
 
-            let last_entry = session_last_entries.get(sid).cloned().unwrap_or_else(|| s_entries[0].clone());
-            let final_input = if s_tokens > 0 { s_input } else { last_entry.tokens.as_ref().map(|t| t.input).unwrap_or(0) };
-            let final_output = if s_tokens > 0 { s_output } else { last_entry.tokens.as_ref().map(|t| t.output).unwrap_or(0) };
-            let final_cache = if s_tokens > 0 { s_cache } else { last_entry.tokens.as_ref().and_then(|t| t.cache_read).unwrap_or(0) };
-            let final_reasoning = if s_tokens > 0 { s_reasoning } else { last_entry.tokens.as_ref().and_then(|t| t.reasoning).unwrap_or(0) };
-            let final_total = if s_tokens > 0 { s_tokens } else { last_entry.tokens.as_ref().map(|t| t.total).unwrap_or(0) };
+            let last_entry = session_last_entries
+                .get(sid)
+                .cloned()
+                .unwrap_or_else(|| s_entries[0].clone());
+            let final_input = if s_tokens > 0 {
+                s_input
+            } else {
+                last_entry.tokens.as_ref().map(|t| t.input).unwrap_or(0)
+            };
+            let final_output = if s_tokens > 0 {
+                s_output
+            } else {
+                last_entry.tokens.as_ref().map(|t| t.output).unwrap_or(0)
+            };
+            let final_cache = if s_tokens > 0 {
+                s_cache
+            } else {
+                last_entry
+                    .tokens
+                    .as_ref()
+                    .and_then(|t| t.cache_read)
+                    .unwrap_or(0)
+            };
+            let final_reasoning = if s_tokens > 0 {
+                s_reasoning
+            } else {
+                last_entry
+                    .tokens
+                    .as_ref()
+                    .and_then(|t| t.reasoning)
+                    .unwrap_or(0)
+            };
+            let final_total = if s_tokens > 0 {
+                s_tokens
+            } else {
+                last_entry.tokens.as_ref().map(|t| t.total).unwrap_or(0)
+            };
 
             let cost_usd = calculate_cost(
                 &pricing_rules,
-                &last_entry.model.clone().unwrap_or_else(|| "Unknown Model".to_string()),
+                &last_entry
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| "Unknown Model".to_string()),
                 final_input,
                 final_output,
                 final_cache,
@@ -1277,23 +1682,82 @@ pub async fn get_yearly_details(Path((assistant, year)): Path<(String, String)>)
     let mut agent_map_stats: HashMap<String, AgentBreakdown> = HashMap::new();
 
     for (session_id, (s_entries, ast_type)) in &sessions_map {
-        let last_entry = session_last_entries.get(session_id).cloned().unwrap_or_else(|| s_entries[0].clone());
-        
-        let s_tokens = s_entries.iter().map(|e| e.delta_tokens.as_ref().map(|t| t.total).unwrap_or(0)).sum::<u64>();
-        let s_input = s_entries.iter().map(|e| e.delta_tokens.as_ref().map(|t| t.input).unwrap_or(0)).sum::<u64>();
-        let s_output = s_entries.iter().map(|e| e.delta_tokens.as_ref().map(|t| t.output).unwrap_or(0)).sum::<u64>();
-        let s_cache = s_entries.iter().map(|e| e.delta_tokens.as_ref().and_then(|t| t.cache_read).unwrap_or(0)).sum::<u64>();
-        let s_reasoning = s_entries.iter().map(|e| e.delta_tokens.as_ref().and_then(|t| t.reasoning).unwrap_or(0)).sum::<u64>();
+        let last_entry = session_last_entries
+            .get(session_id)
+            .cloned()
+            .unwrap_or_else(|| s_entries[0].clone());
 
-        let final_input = if s_tokens > 0 { s_input } else { last_entry.tokens.as_ref().map(|t| t.input).unwrap_or(0) };
-        let final_output = if s_tokens > 0 { s_output } else { last_entry.tokens.as_ref().map(|t| t.output).unwrap_or(0) };
-        let final_cache = if s_tokens > 0 { s_cache } else { last_entry.tokens.as_ref().and_then(|t| t.cache_read).unwrap_or(0) };
-        let final_reasoning = if s_tokens > 0 { s_reasoning } else { last_entry.tokens.as_ref().and_then(|t| t.reasoning).unwrap_or(0) };
-        let final_total = if s_tokens > 0 { s_tokens } else { last_entry.tokens.as_ref().map(|t| t.total).unwrap_or(0) };
+        let s_tokens = s_entries
+            .iter()
+            .map(|e| e.delta_tokens.as_ref().map(|t| t.total).unwrap_or(0))
+            .sum::<u64>();
+        let s_input = s_entries
+            .iter()
+            .map(|e| e.delta_tokens.as_ref().map(|t| t.input).unwrap_or(0))
+            .sum::<u64>();
+        let s_output = s_entries
+            .iter()
+            .map(|e| e.delta_tokens.as_ref().map(|t| t.output).unwrap_or(0))
+            .sum::<u64>();
+        let s_cache = s_entries
+            .iter()
+            .map(|e| {
+                e.delta_tokens
+                    .as_ref()
+                    .and_then(|t| t.cache_read)
+                    .unwrap_or(0)
+            })
+            .sum::<u64>();
+        let s_reasoning = s_entries
+            .iter()
+            .map(|e| {
+                e.delta_tokens
+                    .as_ref()
+                    .and_then(|t| t.reasoning)
+                    .unwrap_or(0)
+            })
+            .sum::<u64>();
+
+        let final_input = if s_tokens > 0 {
+            s_input
+        } else {
+            last_entry.tokens.as_ref().map(|t| t.input).unwrap_or(0)
+        };
+        let final_output = if s_tokens > 0 {
+            s_output
+        } else {
+            last_entry.tokens.as_ref().map(|t| t.output).unwrap_or(0)
+        };
+        let final_cache = if s_tokens > 0 {
+            s_cache
+        } else {
+            last_entry
+                .tokens
+                .as_ref()
+                .and_then(|t| t.cache_read)
+                .unwrap_or(0)
+        };
+        let final_reasoning = if s_tokens > 0 {
+            s_reasoning
+        } else {
+            last_entry
+                .tokens
+                .as_ref()
+                .and_then(|t| t.reasoning)
+                .unwrap_or(0)
+        };
+        let final_total = if s_tokens > 0 {
+            s_tokens
+        } else {
+            last_entry.tokens.as_ref().map(|t| t.total).unwrap_or(0)
+        };
 
         let cost_usd = calculate_cost(
             &pricing_rules,
-            &last_entry.model.clone().unwrap_or_else(|| "Unknown Model".to_string()),
+            &last_entry
+                .model
+                .clone()
+                .unwrap_or_else(|| "Unknown Model".to_string()),
             final_input,
             final_output,
             final_cache,
@@ -1305,7 +1769,9 @@ pub async fn get_yearly_details(Path((assistant, year)): Path<(String, String)>)
         project_stat.1 += final_total;
         project_stat.2 += cost_usd;
 
-        let model = last_entry.model.unwrap_or_else(|| "Unknown Model".to_string());
+        let model = last_entry
+            .model
+            .unwrap_or_else(|| "Unknown Model".to_string());
         let model_stat = model_map_stats.entry(model).or_insert((0, 0, 0, 0, 0, 0.0));
         model_stat.0 += 1;
         model_stat.1 += final_total;
@@ -1326,13 +1792,37 @@ pub async fn get_yearly_details(Path((assistant, year)): Path<(String, String)>)
 
     let mut project_summaries = Vec::new();
     for (cwd, (sessions_count, total_tokens, cost_usd)) in project_map_stats {
-        project_summaries.push(MonthlyProjectSummary { cwd, sessions_count, total_tokens, cost_usd });
+        project_summaries.push(MonthlyProjectSummary {
+            cwd,
+            sessions_count,
+            total_tokens,
+            cost_usd,
+        });
     }
     project_summaries.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens));
 
     let mut model_summaries = Vec::new();
-    for (model, (sessions_count, total_tokens, total_input_tokens, total_output_tokens, total_cache_read_tokens, cost_usd)) in model_map_stats {
-        model_summaries.push(MonthlyModelSummary { model, sessions_count, total_tokens, total_input_tokens, total_output_tokens, total_cache_read_tokens, cost_usd });
+    for (
+        model,
+        (
+            sessions_count,
+            total_tokens,
+            total_input_tokens,
+            total_output_tokens,
+            total_cache_read_tokens,
+            cost_usd,
+        ),
+    ) in model_map_stats
+    {
+        model_summaries.push(MonthlyModelSummary {
+            model,
+            sessions_count,
+            total_tokens,
+            total_input_tokens,
+            total_output_tokens,
+            total_cache_read_tokens,
+            cost_usd,
+        });
     }
     model_summaries.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens));
 
@@ -1343,7 +1833,8 @@ pub async fn get_yearly_details(Path((assistant, year)): Path<(String, String)>)
         projects: project_summaries,
         models: model_summaries,
         agent_breakdown: agent_map_stats,
-    }).into_response()
+    })
+    .into_response()
 }
 
 /// API 7: 獲取模型價格清單 ( pricing.csv 資訊)
@@ -1360,7 +1851,11 @@ pub async fn get_pricing(Path(_assistant): Path<String>) -> impl IntoResponse {
                     let input_price = parts[3].trim().parse::<f64>().unwrap_or(0.0);
                     let cache_input_price = parts[4].trim().parse::<f64>().unwrap_or(0.0);
                     let output_price = parts[5].trim().parse::<f64>().unwrap_or(0.0);
-                    let batch_api_price = if parts.len() >= 7 { parts[6].trim().to_string() } else { "N/A".to_string() };
+                    let batch_api_price = if parts.len() >= 7 {
+                        parts[6].trim().to_string()
+                    } else {
+                        "N/A".to_string()
+                    };
                     entries.push(PricingEntry {
                         model_name: parts[0].trim().to_string(),
                         deployment_type: parts[1].trim().to_string(),
@@ -1376,10 +1871,42 @@ pub async fn get_pricing(Path(_assistant): Path<String>) -> impl IntoResponse {
     }
     if entries.is_empty() {
         entries = vec![
-            PricingEntry { model_name: "Gemini 3.5 Flash".to_string(), deployment_type: "Google AI".to_string(), unit: "1M Tokens".to_string(), input_price: 1.50, cache_input_price: 0.375, output_price: 9.00, batch_api_price: "0.75/0.1875/4.50".to_string() },
-            PricingEntry { model_name: "Gemini 1.5 Flash".to_string(), deployment_type: "Google AI".to_string(), unit: "1M Tokens".to_string(), input_price: 0.075, cache_input_price: 0.01875, output_price: 0.30, batch_api_price: "0.0375/0.009375/0.15".to_string() },
-            PricingEntry { model_name: "Gemini 1.5 Pro".to_string(), deployment_type: "Google AI".to_string(), unit: "1M Tokens".to_string(), input_price: 1.25, cache_input_price: 0.3125, output_price: 5.00, batch_api_price: "0.625/0.15625/2.50".to_string() },
-            PricingEntry { model_name: "Gemini 2.0 Flash".to_string(), deployment_type: "Google AI".to_string(), unit: "1M Tokens".to_string(), input_price: 0.10, cache_input_price: 0.025, output_price: 0.40, batch_api_price: "0.05/0.0125/0.20".to_string() },
+            PricingEntry {
+                model_name: "Gemini 3.5 Flash".to_string(),
+                deployment_type: "Google AI".to_string(),
+                unit: "1M Tokens".to_string(),
+                input_price: 1.50,
+                cache_input_price: 0.375,
+                output_price: 9.00,
+                batch_api_price: "0.75/0.1875/4.50".to_string(),
+            },
+            PricingEntry {
+                model_name: "Gemini 1.5 Flash".to_string(),
+                deployment_type: "Google AI".to_string(),
+                unit: "1M Tokens".to_string(),
+                input_price: 0.075,
+                cache_input_price: 0.01875,
+                output_price: 0.30,
+                batch_api_price: "0.0375/0.009375/0.15".to_string(),
+            },
+            PricingEntry {
+                model_name: "Gemini 1.5 Pro".to_string(),
+                deployment_type: "Google AI".to_string(),
+                unit: "1M Tokens".to_string(),
+                input_price: 1.25,
+                cache_input_price: 0.3125,
+                output_price: 5.00,
+                batch_api_price: "0.625/0.15625/2.50".to_string(),
+            },
+            PricingEntry {
+                model_name: "Gemini 2.0 Flash".to_string(),
+                deployment_type: "Google AI".to_string(),
+                unit: "1M Tokens".to_string(),
+                input_price: 0.10,
+                cache_input_price: 0.025,
+                output_price: 0.40,
+                batch_api_price: "0.05/0.0125/0.20".to_string(),
+            },
         ];
     }
     Json(entries)
@@ -1393,28 +1920,49 @@ pub async fn trigger_manual_sync(Path(_assistant): Path<String>) -> impl IntoRes
         } else {
             Err("無法連接至 SQLite 資料庫".to_string())
         }
-    }).await;
+    })
+    .await;
 
     match sync_res {
-        Ok(Ok(_)) => (StatusCode::OK, Json(serde_json::json!({ "status": "success", "message": "手動增量同步已成功完成！" }))).into_response(),
-        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "status": "error", "message": format!("同步失敗: {}", e) }))).into_response(),
-        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "status": "error", "message": "執行緒執行失敗" }))).into_response(),
+        Ok(Ok(_)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "status": "success", "message": "手動增量同步已成功完成！" })),
+        )
+            .into_response(),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "status": "error", "message": format!("同步失敗: {}", e) })),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "status": "error", "message": "執行緒執行失敗" })),
+        )
+            .into_response(),
     }
 }
 
 /// API: 獲取 Codex 的 rate limit 資料
 pub async fn get_rate_limit(Path(assistant): Path<String>) -> impl IntoResponse {
     if assistant != "codex" {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Only codex is supported" }))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "Only codex is supported" })),
+        )
+            .into_response();
     }
-    
-    let res = tokio::task::spawn_blocking(move || {
-        db::get_latest_codex_rate_limit()
-    }).await.unwrap();
-    
+
+    let res = tokio::task::spawn_blocking(move || db::get_latest_codex_rate_limit())
+        .await
+        .unwrap();
+
     match res {
         Some(val) => (StatusCode::OK, Json(val)).into_response(),
-        None => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "No rate limit data found" }))).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "No rate limit data found" })),
+        )
+            .into_response(),
     }
 }
 
@@ -1438,7 +1986,11 @@ pub struct SwitchAuthRequest {
 /// API: 獲取 Codex 的 auth 憑證列表
 pub async fn get_codex_auth_configs(Path(assistant): Path<String>) -> impl IntoResponse {
     if assistant != "codex" {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Only codex is supported" }))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "Only codex is supported" })),
+        )
+            .into_response();
     }
 
     let res = tokio::task::spawn_blocking(move || {
@@ -1488,11 +2040,17 @@ pub async fn get_codex_auth_configs(Path(assistant): Path<String>) -> impl IntoR
             configs,
             current_active,
         })
-    }).await.unwrap_or_else(|_| Err("Thread execution failed".to_string()));
+    })
+    .await
+    .unwrap_or_else(|_| Err("Thread execution failed".to_string()));
 
     match res {
         Ok(data) => (StatusCode::OK, Json(data)).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e })),
+        )
+            .into_response(),
     }
 }
 
@@ -1502,13 +2060,21 @@ pub async fn switch_codex_auth(
     Json(payload): Json<SwitchAuthRequest>,
 ) -> impl IntoResponse {
     if assistant != "codex" {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Only codex is supported" }))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "Only codex is supported" })),
+        )
+            .into_response();
     }
 
     // Safety check: make sure filename doesn't contain path traversal
     let filename = payload.name.clone();
     if filename.contains('/') || filename.contains('\\') || filename.contains("..") {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid filename" }))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "Invalid filename" })),
+        )
+            .into_response();
     }
 
     let res = tokio::task::spawn_blocking(move || {
@@ -1525,7 +2091,9 @@ pub async fn switch_codex_auth(
             .map_err(|e| format!("Failed to copy file: {}", e))?;
 
         Ok(())
-    }).await.unwrap_or_else(|_| Err("Thread execution failed".to_string()));
+    })
+    .await
+    .unwrap_or_else(|_| Err("Thread execution failed".to_string()));
 
     match res {
         Ok(_) => (StatusCode::OK, Json(serde_json::json!({ "status": "success", "message": format!("Successfully switched to {}", payload.name) }))).into_response(),
@@ -1533,12 +2101,66 @@ pub async fn switch_codex_auth(
     }
 }
 
+/// API: 獲取 Codex 的重置額度資訊
+pub async fn get_codex_reset_info(Path(assistant): Path<String>) -> impl IntoResponse {
+    if assistant != "codex" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "Only codex is supported" })),
+        )
+            .into_response();
+    }
+
+    let res = tokio::task::spawn_blocking(move || {
+        let codex_dir = db::get_codex_dir();
+        let active_auth_file = codex_dir.join("auth.json");
+
+        let mut cmd = std::process::Command::new("npx");
+        cmd.args(["-y", "@willh/codex-reset-checker", "--json"]);
+        if active_auth_file.exists() {
+            cmd.arg("--auth").arg(&active_auth_file);
+        }
+
+        let output = cmd.output();
+        match output {
+            Ok(out) => {
+                if out.status.success() {
+                    let stdout_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&stdout_str) {
+                        Ok(json_val)
+                    } else {
+                        Err(format!("Failed to parse output as JSON: {}", stdout_str))
+                    }
+                } else {
+                    let stderr_str = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                    Err(format!(
+                        "Command exited with status code {}: {}",
+                        out.status, stderr_str
+                    ))
+                }
+            }
+            Err(e) => Err(format!("Failed to execute command: {}", e)),
+        }
+    })
+    .await
+    .unwrap_or_else(|_| Err("Thread execution failed".to_string()));
+
+    match res {
+        Ok(data) => (StatusCode::OK, Json(data)).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e })),
+        )
+            .into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use std::env;
     use crate::db;
+    use std::env;
+    use std::fs;
 
     #[tokio::test]
     async fn test_yearly_handlers() {
@@ -1595,7 +2217,9 @@ mod tests {
 
         // 1. Test get_available_years
         let conn = db::get_db_conn().unwrap();
-        let mut stmt = conn.prepare("SELECT DISTINCT substr(date, 1, 4) FROM usage_entries ORDER BY date DESC").unwrap();
+        let mut stmt = conn
+            .prepare("SELECT DISTINCT substr(date, 1, 4) FROM usage_entries ORDER BY date DESC")
+            .unwrap();
         let mut rows = stmt.query([]).unwrap();
         let mut years = Vec::new();
         while let Some(row) = rows.next().unwrap() {
@@ -1607,5 +2231,3 @@ mod tests {
         let _ = fs::remove_dir_all(&temp_dir);
     }
 }
-
-

@@ -7,9 +7,9 @@ use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 
 mod db;
+mod handlers;
 mod pricing;
 mod timeline;
-mod handlers;
 
 use handlers::*;
 
@@ -44,7 +44,8 @@ async fn main() {
                 } else {
                     Err("無法建立背景資料庫連接".to_string())
                 }
-            }).await;
+            })
+            .await;
             if let Err(e) = sync_res {
                 eprintln!("⚠️ 背景日誌同步任務異常: {:?}", e);
             } else if let Ok(Err(e)) = sync_res {
@@ -62,9 +63,15 @@ async fn main() {
         .route("/api/:assistant/dates", get(get_available_dates))
         .route("/api/:assistant/setup-info", get(get_setup_info))
         .route("/api/:assistant/usage/:date", get(get_usage_details))
-        .route("/api/:assistant/session/:session_id", get(get_session_details))
+        .route(
+            "/api/:assistant/session/:session_id",
+            get(get_session_details),
+        )
         .route("/api/:assistant/months", get(get_available_months))
-        .route("/api/:assistant/monthly/:year_month", get(get_monthly_details))
+        .route(
+            "/api/:assistant/monthly/:year_month",
+            get(get_monthly_details),
+        )
         .route("/api/:assistant/years", get(get_available_years))
         .route("/api/:assistant/yearly/:year", get(get_yearly_details))
         .route("/api/:assistant/pricing", get(get_pricing))
@@ -72,7 +79,7 @@ async fn main() {
         .route("/api/:assistant/rate-limit", get(get_rate_limit))
         .route("/api/:assistant/auth-configs", get(get_codex_auth_configs))
         .route("/api/:assistant/auth-switch", post(switch_codex_auth))
-        
+        .route("/api/:assistant/reset-info", get(get_codex_reset_info))
         // 靜態檔案路由
         .nest_service("/static", ServeDir::new(&static_dir))
         .fallback_service(ServeDir::new(&static_dir))
@@ -83,9 +90,14 @@ async fn main() {
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(3003); // 預設使用 3003 Port
 
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await.unwrap();
-    println!("🚀 CLI Token Usage Insights Dashboard is running on: http://localhost:{}", port);
-    
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port))
+        .await
+        .unwrap();
+    println!(
+        "🚀 CLI Token Usage Insights Dashboard is running on: http://localhost:{}",
+        port
+    );
+
     axum::serve(listener, app).await.unwrap();
 }
 
@@ -93,24 +105,34 @@ async fn main() {
 fn get_static_dir() -> PathBuf {
     if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
         let p = PathBuf::from(manifest_dir).join("static");
-        if p.exists() { return p; }
+        if p.exists() {
+            return p;
+        }
     }
     if let Ok(exe_path) = std::env::current_exe() {
         if let Some(exe_dir) = exe_path.parent() {
             let p = exe_dir.join("static");
-            if p.exists() { return p; }
+            if p.exists() {
+                return p;
+            }
             if let Some(grandparent) = exe_dir.parent().and_then(|p| p.parent()) {
                 let p = grandparent.join("static");
-                if p.exists() { return p; }
+                if p.exists() {
+                    return p;
+                }
             }
         }
     }
     let pwd = PathBuf::from("static");
-    if pwd.exists() { return pwd; }
-    
+    if pwd.exists() {
+        return pwd;
+    }
+
     if let Ok(cwd) = std::env::current_dir() {
         let p = cwd.join("static");
-        if p.exists() { return p; }
+        if p.exists() {
+            return p;
+        }
     }
     eprintln!("❌ 無法定位 static 目錄。請在專案根目錄下執行此程式。");
     std::process::exit(1);
