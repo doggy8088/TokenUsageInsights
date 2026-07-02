@@ -1255,3 +1255,400 @@ pub fn get_latest_codex_rate_limit() -> Option<serde_json::Value> {
     }
     None
 }
+
+// =========================================================================
+// Encapsulated SQL Queries (Phase 2 Refactoring)
+// =========================================================================
+
+pub fn get_available_dates(conn: &rusqlite::Connection, assistant: &str) -> Result<Vec<String>, String> {
+    let mut dates = Vec::new();
+    if assistant == "all" {
+        let mut stmt = conn.prepare("SELECT DISTINCT date FROM usage_entries ORDER BY date DESC").map_err(|e| e.to_string())?;
+        let date_iter = stmt.query_map([], |row| row.get::<_, String>(0)).map_err(|e| e.to_string())?;
+        for d in date_iter {
+            dates.push(d.map_err(|e| e.to_string())?);
+        }
+    } else {
+        let assistants: Vec<&str> = assistant.split(',').collect();
+        let mut placeholders = Vec::new();
+        let mut params_vec = Vec::new();
+        for a in assistants {
+            placeholders.push("?");
+            params_vec.push(rusqlite::types::Value::Text(a.to_string()));
+        }
+        let query = format!(
+            "SELECT DISTINCT date FROM usage_entries WHERE assistant_type IN ({}) ORDER BY date DESC",
+            placeholders.join(",")
+        );
+        let mut stmt = conn.prepare(&query).map_err(|e| e.to_string())?;
+        let date_iter = stmt.query_map(rusqlite::params_from_iter(params_vec), |row| row.get::<_, String>(0)).map_err(|e| e.to_string())?;
+        for d in date_iter {
+            dates.push(d.map_err(|e| e.to_string())?);
+        }
+    }
+    Ok(dates)
+}
+
+pub fn get_usage_entries_by_date(conn: &rusqlite::Connection, date: &str, assistant: &str) -> Result<Vec<(UsageEntry, String)>, String> {
+    let mut query = "SELECT 
+            timestamp, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
+            tokens_input, tokens_output, tokens_cache_read, tokens_reasoning, tokens_total,
+            delta_input, delta_output, delta_cache_read, delta_reasoning, delta_total,
+            duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, assistant_type, reasoning_effort
+         FROM usage_entries WHERE date = ?".to_string();
+    let mut params_vec = Vec::new();
+    params_vec.push(rusqlite::types::Value::Text(date.to_string()));
+
+    if assistant != "all" {
+        let assistants: Vec<&str> = assistant.split(',').collect();
+        let mut placeholders = Vec::new();
+        for a in assistants {
+            placeholders.push("?");
+            params_vec.push(rusqlite::types::Value::Text(a.to_string()));
+        }
+        query.push_str(&format!(" AND assistant_type IN ({})", placeholders.join(",")));
+    }
+    query.push_str(" ORDER BY timestamp ASC");
+
+    let mut stmt = conn.prepare(&query).map_err(|e| e.to_string())?;
+    let mut rows = stmt.query(rusqlite::params_from_iter(params_vec)).map_err(|e| e.to_string())?;
+
+    let mut entries = Vec::new();
+    while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+        let ast_type = row.get::<_, String>(24).map_err(|e| e.to_string())?;
+        let tokens_input: Option<u64> = row.get::<_, Option<i64>>(9).map_err(|e| e.to_string())?.map(|v| v as u64);
+        let tokens_output: Option<u64> = row.get::<_, Option<i64>>(10).map_err(|e| e.to_string())?.map(|v| v as u64);
+        let tokens_cache_read: Option<u64> = row.get::<_, Option<i64>>(11).map_err(|e| e.to_string())?.map(|v| v as u64);
+        let tokens_reasoning: Option<u64> = row.get::<_, Option<i64>>(12).map_err(|e| e.to_string())?.map(|v| v as u64);
+        let tokens_total: Option<u64> = row.get::<_, Option<i64>>(13).map_err(|e| e.to_string())?.map(|v| v as u64);
+
+        let tokens = if let (Some(input), Some(output), Some(total)) = (tokens_input, tokens_output, tokens_total) {
+            Some(TokenStats { input, output, cache_read: tokens_cache_read, cache_write: None, reasoning: tokens_reasoning, total })
+        } else {
+            None
+        };
+
+        let delta_input: Option<u64> = row.get::<_, Option<i64>>(14).map_err(|e| e.to_string())?.map(|v| v as u64);
+        let delta_output: Option<u64> = row.get::<_, Option<i64>>(15).map_err(|e| e.to_string())?.map(|v| v as u64);
+        let delta_cache_read: Option<u64> = row.get::<_, Option<i64>>(16).map_err(|e| e.to_string())?.map(|v| v as u64);
+        let delta_reasoning: Option<u64> = row.get::<_, Option<i64>>(17).map_err(|e| e.to_string())?.map(|v| v as u64);
+        let delta_total: Option<u64> = row.get::<_, Option<i64>>(18).map_err(|e| e.to_string())?.map(|v| v as u64);
+
+        let delta_tokens = if let (Some(input), Some(output), Some(total)) = (delta_input, delta_output, delta_total) {
+            Some(TokenStats { input, output, cache_read: delta_cache_read, cache_write: None, reasoning: delta_reasoning, total })
+        } else {
+            None
+        };
+
+        let duration_ms: Option<f64> = row.get::<_, Option<i64>>(19).map_err(|e| e.to_string())?.map(|v| v as f64);
+        let premium_requests: Option<f64> = row.get::<_, Option<i64>>(20).map_err(|e| e.to_string())?.map(|v| v as f64);
+
+        let cost = if duration_ms.is_some() || premium_requests.is_some() {
+            Some(CostStats { total_api_duration_ms: duration_ms, total_duration_ms: None, total_premium_requests: premium_requests })
+        } else {
+            None
+        };
+
+        entries.push((UsageEntry {
+            timestamp: row.get(0).map_err(|e| e.to_string())?,
+            session_id: row.get(1).map_err(|e| e.to_string())?,
+            session_name: row.get(2).ok(),
+            transcript_path: row.get(3).ok(),
+            cwd: row.get(4).ok(),
+            version: row.get(5).ok(),
+            turn_no: row.get::<_, i64>(6).map_err(|e| e.to_string())? as u32,
+            model: row.get(7).ok(),
+            model_id: row.get(8).ok(),
+            tokens,
+            delta_tokens,
+            context: None,
+            cost,
+            parent_session_id: row.get(21).ok(),
+            agent_nickname: row.get(22).ok(),
+            agent_role: row.get(23).ok(),
+            reasoning_effort: row.get(25).ok(),
+        }, ast_type));
+    }
+    Ok(entries)
+}
+
+pub fn get_session_assistant_and_transcript(conn: &rusqlite::Connection, session_id: &str) -> Result<(String, Option<String>), String> {
+    let mut stmt = conn.prepare("SELECT assistant_type, transcript_path FROM usage_entries WHERE session_id = ? LIMIT 1").map_err(|e| e.to_string())?;
+    let mut rows = stmt.query(params![session_id]).map_err(|e| e.to_string())?;
+    if let Some(row) = rows.next().map_err(|e| e.to_string())? {
+        let ast: String = row.get(0).map_err(|e| e.to_string())?;
+        let path: Option<String> = row.get(1).ok();
+        Ok((ast, path))
+    } else {
+        Err("Session not found".to_string())
+    }
+}
+
+pub fn get_session_cwd(conn: &rusqlite::Connection, session_id: &str) -> Result<Option<String>, String> {
+    let mut stmt = conn.prepare(
+        "SELECT cwd FROM usage_entries WHERE session_id = ? AND cwd IS NOT NULL LIMIT 1"
+    ).map_err(|e| e.to_string())?;
+    let mut rows = stmt.query(params![session_id]).map_err(|e| e.to_string())?;
+    if let Some(row) = rows.next().map_err(|e| e.to_string())? {
+        Ok(row.get::<_, String>(0).ok())
+    } else {
+        Ok(None)
+    }
+}
+
+pub fn get_session_turns_token_stats(conn: &rusqlite::Connection, session_id: &str) -> Result<HashMap<u32, (TokenStats, String)>, String> {
+    let mut map = HashMap::new();
+    let mut stmt = conn.prepare(
+        "SELECT turn_no, delta_input, delta_output, delta_cache_read, delta_reasoning, delta_total, model 
+         FROM usage_entries WHERE session_id = ? ORDER BY turn_no ASC"
+    ).map_err(|e| e.to_string())?;
+    let mut rows = stmt.query(params![session_id]).map_err(|e| e.to_string())?;
+    while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+        if let (Ok(turn_no), Ok(delta_input), Ok(delta_output), Ok(delta_total)) = (
+            row.get::<_, i64>(0),
+            row.get::<_, Option<i64>>(1),
+            row.get::<_, Option<i64>>(2),
+            row.get::<_, Option<i64>>(5)
+        ) {
+            if let (Some(input), Some(output), Some(total)) = (delta_input, delta_output, delta_total) {
+                let cache_read = row.get::<_, Option<i64>>(3).ok().flatten().map(|v| v as u64);
+                let reasoning = row.get::<_, Option<i64>>(4).ok().flatten().map(|v| v as u64);
+                let model = row.get::<_, Option<String>>(6).unwrap_or(None).unwrap_or_else(|| "Gemini".to_string());
+                map.insert(turn_no as u32, (TokenStats { input: input as u64, output: output as u64, cache_read, cache_write: None, reasoning, total: total as u64 }, model));
+            }
+        }
+    }
+    Ok(map)
+}
+
+pub fn get_available_months(conn: &rusqlite::Connection, assistant: &str) -> Result<Vec<String>, String> {
+    let mut months = Vec::new();
+    if assistant == "all" {
+        let mut stmt = conn.prepare("SELECT DISTINCT substr(date, 1, 7) FROM usage_entries ORDER BY date DESC").map_err(|e| e.to_string())?;
+        let month_iter = stmt.query_map([], |row| row.get::<_, String>(0)).map_err(|e| e.to_string())?;
+        for m in month_iter {
+            months.push(m.map_err(|e| e.to_string())?);
+        }
+    } else {
+        let assistants: Vec<&str> = assistant.split(',').collect();
+        let mut placeholders = Vec::new();
+        let mut params_vec = Vec::new();
+        for a in assistants {
+            placeholders.push("?");
+            params_vec.push(rusqlite::types::Value::Text(a.to_string()));
+        }
+        let query = format!(
+            "SELECT DISTINCT substr(date, 1, 7) FROM usage_entries WHERE assistant_type IN ({}) ORDER BY date DESC",
+            placeholders.join(",")
+        );
+        let mut stmt = conn.prepare(&query).map_err(|e| e.to_string())?;
+        let month_iter = stmt.query_map(rusqlite::params_from_iter(params_vec), |row| row.get::<_, String>(0)).map_err(|e| e.to_string())?;
+        for m in month_iter {
+            months.push(m.map_err(|e| e.to_string())?);
+        }
+    }
+    Ok(months)
+}
+
+pub fn get_usage_entries_by_month(conn: &rusqlite::Connection, year_month: &str, assistant: &str) -> Result<Vec<(UsageEntry, String, String)>, String> {
+    let query_month = format!("{}-%", year_month);
+    let mut query = "SELECT 
+            timestamp, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
+            tokens_input, tokens_output, tokens_cache_read, tokens_reasoning, tokens_total,
+            delta_input, delta_output, delta_cache_read, delta_reasoning, delta_total,
+            duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, assistant_type, reasoning_effort,
+            date
+         FROM usage_entries WHERE date LIKE ?".to_string();
+    let mut params_vec = Vec::new();
+    params_vec.push(rusqlite::types::Value::Text(query_month));
+
+    if assistant != "all" {
+        let assistants: Vec<&str> = assistant.split(',').collect();
+        let mut placeholders = Vec::new();
+        for a in assistants {
+            placeholders.push("?");
+            params_vec.push(rusqlite::types::Value::Text(a.to_string()));
+        }
+        query.push_str(&format!(" AND assistant_type IN ({})", placeholders.join(",")));
+    }
+    query.push_str(" ORDER BY timestamp ASC");
+
+    let mut stmt = conn.prepare(&query).map_err(|e| e.to_string())?;
+    let mut rows = stmt.query(rusqlite::params_from_iter(params_vec)).map_err(|e| e.to_string())?;
+
+    let mut entries = Vec::new();
+    while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+        let ast_type = row.get::<_, String>(24).map_err(|e| e.to_string())?;
+        let tokens_input: Option<u64> = row.get::<_, Option<i64>>(9).map_err(|e| e.to_string())?.map(|v| v as u64);
+        let tokens_output: Option<u64> = row.get::<_, Option<i64>>(10).map_err(|e| e.to_string())?.map(|v| v as u64);
+        let tokens_cache_read: Option<u64> = row.get::<_, Option<i64>>(11).map_err(|e| e.to_string())?.map(|v| v as u64);
+        let tokens_reasoning: Option<u64> = row.get::<_, Option<i64>>(12).map_err(|e| e.to_string())?.map(|v| v as u64);
+        let tokens_total: Option<u64> = row.get::<_, Option<i64>>(13).map_err(|e| e.to_string())?.map(|v| v as u64);
+
+        let tokens = if let (Some(input), Some(output), Some(total)) = (tokens_input, tokens_output, tokens_total) {
+            Some(TokenStats { input, output, cache_read: tokens_cache_read, cache_write: None, reasoning: tokens_reasoning, total })
+        } else {
+            None
+        };
+
+        let delta_input: Option<u64> = row.get::<_, Option<i64>>(14).map_err(|e| e.to_string())?.map(|v| v as u64);
+        let delta_output: Option<u64> = row.get::<_, Option<i64>>(15).map_err(|e| e.to_string())?.map(|v| v as u64);
+        let delta_cache_read: Option<u64> = row.get::<_, Option<i64>>(16).map_err(|e| e.to_string())?.map(|v| v as u64);
+        let delta_reasoning: Option<u64> = row.get::<_, Option<i64>>(17).map_err(|e| e.to_string())?.map(|v| v as u64);
+        let delta_total: Option<u64> = row.get::<_, Option<i64>>(18).map_err(|e| e.to_string())?.map(|v| v as u64);
+
+        let delta_tokens = if let (Some(input), Some(output), Some(total)) = (delta_input, delta_output, delta_total) {
+            Some(TokenStats { input, output, cache_read: delta_cache_read, cache_write: None, reasoning: delta_reasoning, total })
+        } else {
+            None
+        };
+
+        let duration_ms: Option<f64> = row.get::<_, Option<i64>>(19).map_err(|e| e.to_string())?.map(|v| v as f64);
+        let premium_requests: Option<f64> = row.get::<_, Option<i64>>(20).map_err(|e| e.to_string())?.map(|v| v as f64);
+
+        let cost = if duration_ms.is_some() || premium_requests.is_some() {
+            Some(CostStats { total_api_duration_ms: duration_ms, total_duration_ms: None, total_premium_requests: premium_requests })
+        } else {
+            None
+        };
+
+        let entry_date = row.get::<_, String>(26).map_err(|e| e.to_string())?;
+
+        entries.push((UsageEntry {
+            timestamp: row.get(0).map_err(|e| e.to_string())?,
+            session_id: row.get(1).map_err(|e| e.to_string())?,
+            session_name: row.get(2).ok(),
+            transcript_path: row.get(3).ok(),
+            cwd: row.get(4).ok(),
+            version: row.get(5).ok(),
+            turn_no: row.get::<_, i64>(6).map_err(|e| e.to_string())? as u32,
+            model: row.get(7).ok(),
+            model_id: row.get(8).ok(),
+            tokens,
+            delta_tokens,
+            context: None,
+            cost,
+            parent_session_id: row.get(21).ok(),
+            agent_nickname: row.get(22).ok(),
+            agent_role: row.get(23).ok(),
+            reasoning_effort: row.get(25).ok(),
+        }, ast_type, entry_date));
+    }
+    Ok(entries)
+}
+
+pub fn get_available_years(conn: &rusqlite::Connection, assistant: &str) -> Result<Vec<String>, String> {
+    let mut years = Vec::new();
+    if assistant == "all" {
+        let mut stmt = conn.prepare("SELECT DISTINCT substr(date, 1, 4) FROM usage_entries ORDER BY date DESC").map_err(|e| e.to_string())?;
+        let year_iter = stmt.query_map([], |row| row.get::<_, String>(0)).map_err(|e| e.to_string())?;
+        for y in year_iter {
+            years.push(y.map_err(|e| e.to_string())?);
+        }
+    } else {
+        let assistants: Vec<&str> = assistant.split(',').collect();
+        let mut placeholders = Vec::new();
+        let mut params_vec = Vec::new();
+        for a in assistants {
+            placeholders.push("?");
+            params_vec.push(rusqlite::types::Value::Text(a.to_string()));
+        }
+        let query = format!(
+            "SELECT DISTINCT substr(date, 1, 4) FROM usage_entries WHERE assistant_type IN ({}) ORDER BY date DESC",
+            placeholders.join(",")
+        );
+        let mut stmt = conn.prepare(&query).map_err(|e| e.to_string())?;
+        let year_iter = stmt.query_map(rusqlite::params_from_iter(params_vec), |row| row.get::<_, String>(0)).map_err(|e| e.to_string())?;
+        for y in year_iter {
+            years.push(y.map_err(|e| e.to_string())?);
+        }
+    }
+    Ok(years)
+}
+
+pub fn get_usage_entries_by_year(conn: &rusqlite::Connection, year: &str, assistant: &str) -> Result<Vec<(UsageEntry, String, String)>, String> {
+    let query_year = format!("{}-%", year);
+    let mut query = "SELECT 
+            timestamp, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
+            tokens_input, tokens_output, tokens_cache_read, tokens_reasoning, tokens_total,
+            delta_input, delta_output, delta_cache_read, delta_reasoning, delta_total,
+            duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, assistant_type, reasoning_effort,
+            date
+         FROM usage_entries WHERE date LIKE ?".to_string();
+    let mut params_vec = Vec::new();
+    params_vec.push(rusqlite::types::Value::Text(query_year));
+
+    if assistant != "all" {
+        let assistants: Vec<&str> = assistant.split(',').collect();
+        let mut placeholders = Vec::new();
+        for a in assistants {
+            placeholders.push("?");
+            params_vec.push(rusqlite::types::Value::Text(a.to_string()));
+        }
+        query.push_str(&format!(" AND assistant_type IN ({})", placeholders.join(",")));
+    }
+    query.push_str(" ORDER BY timestamp ASC");
+
+    let mut stmt = conn.prepare(&query).map_err(|e| e.to_string())?;
+    let mut rows = stmt.query(rusqlite::params_from_iter(params_vec)).map_err(|e| e.to_string())?;
+
+    let mut entries = Vec::new();
+    while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+        let ast_type = row.get::<_, String>(24).map_err(|e| e.to_string())?;
+        let tokens_input: Option<u64> = row.get::<_, Option<i64>>(9).map_err(|e| e.to_string())?.map(|v| v as u64);
+        let tokens_output: Option<u64> = row.get::<_, Option<i64>>(10).map_err(|e| e.to_string())?.map(|v| v as u64);
+        let tokens_cache_read: Option<u64> = row.get::<_, Option<i64>>(11).map_err(|e| e.to_string())?.map(|v| v as u64);
+        let tokens_reasoning: Option<u64> = row.get::<_, Option<i64>>(12).map_err(|e| e.to_string())?.map(|v| v as u64);
+        let tokens_total: Option<u64> = row.get::<_, Option<i64>>(13).map_err(|e| e.to_string())?.map(|v| v as u64);
+
+        let tokens = if let (Some(input), Some(output), Some(total)) = (tokens_input, tokens_output, tokens_total) {
+            Some(TokenStats { input, output, cache_read: tokens_cache_read, cache_write: None, reasoning: tokens_reasoning, total })
+        } else {
+            None
+        };
+
+        let delta_input: Option<u64> = row.get::<_, Option<i64>>(14).map_err(|e| e.to_string())?.map(|v| v as u64);
+        let delta_output: Option<u64> = row.get::<_, Option<i64>>(15).map_err(|e| e.to_string())?.map(|v| v as u64);
+        let delta_cache_read: Option<u64> = row.get::<_, Option<i64>>(16).map_err(|e| e.to_string())?.map(|v| v as u64);
+        let delta_reasoning: Option<u64> = row.get::<_, Option<i64>>(17).map_err(|e| e.to_string())?.map(|v| v as u64);
+        let delta_total: Option<u64> = row.get::<_, Option<i64>>(18).map_err(|e| e.to_string())?.map(|v| v as u64);
+
+        let delta_tokens = if let (Some(input), Some(output), Some(total)) = (delta_input, delta_output, delta_total) {
+            Some(TokenStats { input, output, cache_read: delta_cache_read, cache_write: None, reasoning: delta_reasoning, total })
+        } else {
+            None
+        };
+
+        let duration_ms: Option<f64> = row.get::<_, Option<i64>>(19).map_err(|e| e.to_string())?.map(|v| v as f64);
+        let premium_requests: Option<f64> = row.get::<_, Option<i64>>(20).map_err(|e| e.to_string())?.map(|v| v as f64);
+
+        let cost = if duration_ms.is_some() || premium_requests.is_some() {
+            Some(CostStats { total_api_duration_ms: duration_ms, total_duration_ms: None, total_premium_requests: premium_requests })
+        } else {
+            None
+        };
+
+        let entry_date = row.get::<_, String>(26).map_err(|e| e.to_string())?;
+
+        entries.push((UsageEntry {
+            timestamp: row.get(0).map_err(|e| e.to_string())?,
+            session_id: row.get(1).map_err(|e| e.to_string())?,
+            session_name: row.get(2).ok(),
+            transcript_path: row.get(3).ok(),
+            cwd: row.get(4).ok(),
+            version: row.get(5).ok(),
+            turn_no: row.get::<_, i64>(6).map_err(|e| e.to_string())? as u32,
+            model: row.get(7).ok(),
+            model_id: row.get(8).ok(),
+            tokens,
+            delta_tokens,
+            context: None,
+            cost,
+            parent_session_id: row.get(21).ok(),
+            agent_nickname: row.get(22).ok(),
+            agent_role: row.get(23).ok(),
+            reasoning_effort: row.get(25).ok(),
+        }, ast_type, entry_date));
+    }
+    Ok(entries)
+}
