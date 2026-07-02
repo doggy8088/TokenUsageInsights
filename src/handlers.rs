@@ -2027,6 +2027,28 @@ fn get_codex_auth_identity(path: &std::path::Path) -> (Option<String>, Option<St
     (None, None)
 }
 
+fn get_codex_auth_access_token_exp(path: &std::path::Path) -> Option<u64> {
+    if let Ok(content) = std::fs::read_to_string(path) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(tokens) = v.get("tokens") {
+                if let Some(access_token) = tokens.get("access_token").and_then(|t| t.as_str()) {
+                    let parts: Vec<&str> = access_token.split('.').collect();
+                    if parts.len() >= 2 {
+                        if let Some(payload_bytes) = decode_base64(parts[1]) {
+                            if let Ok(payload_json) =
+                                serde_json::from_slice::<serde_json::Value>(&payload_bytes)
+                            {
+                                return payload_json.get("exp").and_then(|e| e.as_u64());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 #[derive(Serialize)]
 pub struct CodexAuthInfo {
     pub name: String,
@@ -2164,6 +2186,27 @@ pub async fn switch_codex_auth(
 
         if !source_file.exists() {
             return Err(format!("Auth file {} does not exist", filename));
+        }
+
+        // Check if access_token in source_file is expired
+        if let Some(exp_secs) = get_codex_auth_access_token_exp(&source_file) {
+            let current_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            if exp_secs <= current_secs {
+                use chrono::TimeZone;
+                let exp_time = chrono::Utc
+                    .timestamp_opt(exp_secs as i64, 0)
+                    .single()
+                    .map(|dt| {
+                        dt.with_timezone(&chrono::Local)
+                            .format("%Y-%m-%d %H:%M:%S")
+                            .to_string()
+                    })
+                    .unwrap_or_else(|| exp_secs.to_string());
+                return Err(format!("憑證已過期，失效時間：{}", exp_time));
+            }
         }
 
         std::fs::copy(&source_file, &dest_file)
@@ -2398,6 +2441,64 @@ mod tests {
         let _res3 = get_codex_auth_configs(Path("codex".to_string())).await;
         let copied_content_after = fs::read_to_string(&dest_auth_file).unwrap();
         assert_eq!(copied_content_after, "different-credentials");
+
+        // Cleanup
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_switch_codex_auth_expiration() {
+        let temp_dir = std::path::PathBuf::from("temp_test_codex_auth_exp");
+        if temp_dir.exists() {
+            let _ = fs::remove_dir_all(&temp_dir);
+        }
+        let auth_dir = temp_dir.join("auth");
+        fs::create_dir_all(&auth_dir).unwrap();
+        env::set_var("CODEX_DIR", temp_dir.to_str().unwrap());
+
+        // Write expired token JSON (exp: 1000, which is in 1970)
+        let expired_json = r#"{
+            "tokens": {
+                "access_token": "header.eyJleHAiOjEwMDB9.signature"
+            }
+        }"#;
+        fs::write(auth_dir.join("expired.json"), expired_json).unwrap();
+
+        // Write valid token JSON (exp: 2783039221, which is in 2058)
+        let valid_json = r#"{
+            "tokens": {
+                "access_token": "header.eyJleHAiOjI3ODMwMzkyMjF9.signature"
+            }
+        }"#;
+        fs::write(auth_dir.join("valid.json"), valid_json).unwrap();
+
+        // 1. Try to switch to expired credential
+        let req_expired = axum::Json(SwitchAuthRequest {
+            name: "expired.json".to_string(),
+        });
+        let res_expired = switch_codex_auth(Path("codex".to_string()), req_expired)
+            .await
+            .into_response();
+        assert_eq!(
+            res_expired.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+
+        // Assert that the destination auth.json was NOT created (switch blocked)
+        let active_auth_file = temp_dir.join("auth.json");
+        assert!(!active_auth_file.exists());
+
+        // 2. Try to switch to valid credential
+        let req_valid = axum::Json(SwitchAuthRequest {
+            name: "valid.json".to_string(),
+        });
+        let res_valid = switch_codex_auth(Path("codex".to_string()), req_valid)
+            .await
+            .into_response();
+        assert_eq!(res_valid.status(), axum::http::StatusCode::OK);
+
+        // Assert that the destination auth.json WAS created (switch successful)
+        assert!(active_auth_file.exists());
 
         // Cleanup
         let _ = fs::remove_dir_all(&temp_dir);
