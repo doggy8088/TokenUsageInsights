@@ -284,6 +284,7 @@ display_reasoning="$(fmt_tokens "$reasoning_tokens")"
 display_total="$(fmt_tokens "$total_tokens")"
 display_delta_total="$(fmt_tokens "$delta_total")"
 display_last_input="$(fmt_tokens "$last_call_input_tokens")"
+display_last_cache_read="$(fmt_tokens "$delta_cache_read")"
 display_last_output="$(fmt_tokens "$last_call_output_tokens")"
 
 # 顯示規則：
@@ -291,8 +292,8 @@ display_last_output="$(fmt_tokens "$last_call_output_tokens")"
 # c = cache read/write
 # ↓ = total output
 # r = reasoning
-# last = last API call input/output
-line="🤖 $model • #$turn_no • ↑ $display_input_total • c $display_cache_read/$display_cache_write • ↓ $display_output • r $display_reasoning • total $display_total • +$display_delta_total • last $display_last_input/$display_last_output"
+# last = last API call input/cache read/output
+line="🤖 $model • #$turn_no • ↑ $display_input_total • c $display_cache_read/$display_cache_write • ↓ $display_output • r $display_reasoning • total $display_total • +$display_delta_total • last $display_last_input/$display_last_cache_read/$display_last_output"
 
 if [ "$model_changed" = true ]; then
   line="$line • from $previous_model"
