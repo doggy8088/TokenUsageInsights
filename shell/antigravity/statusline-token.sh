@@ -312,7 +312,20 @@ line="🤖 $model • #$turn_no • ↑ $display_input_total • c $display_cach
 if [ "$model_changed" = true ]; then
   line="$line • from $previous_model"
 elif [ -n "$current_context_used_percentage" ]; then
-  line="$line • ctx ${current_context_used_percentage}%"
+  display_ctx=$(awk -v p="$current_context_used_percentage" 'BEGIN {
+    if (p ~ /^[0-9]+(\.[0-9]+)?$/) {
+      v = sprintf("%.2f", p)
+      if (v ~ /\.00$/) {
+        sub(/\.00$/, "", v)
+      } else if (v ~ /0$/) {
+        sub(/0$/, "", v)
+      }
+      print v
+    } else {
+      print p
+    }
+  }')
+  line="$line • ctx ${display_ctx}%"
 fi
 
 printf "%s\n" "$line"
