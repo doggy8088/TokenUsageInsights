@@ -1,0 +1,189 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-07-05T04:53:30+08:00",
+  "title": "Design System: Token Usage Insights",
+  "extensions": {
+    "colorMeta": {
+      "app-bg": {
+        "role": "neutral",
+        "displayName": "Deep Console Black",
+        "canonical": "#07090D",
+        "tonalRamp": ["#030406", "#07090D", "#0B0E14", "#0D1118", "#111722", "#151D2A", "#475569", "#E9EDF4"]
+      },
+      "accent-cyan": {
+        "role": "primary",
+        "displayName": "Operations Cyan",
+        "canonical": "#00D2E0",
+        "tonalRamp": ["#002326", "#00464B", "#006B73", "#00949E", "#00B8C5", "#00D2E0", "#70EFF5", "#D8FEFF"]
+      },
+      "accent-purple": {
+        "role": "secondary",
+        "displayName": "Operational Purple",
+        "canonical": "#A78BFA",
+        "tonalRamp": ["#1D1231", "#302052", "#473078", "#6045A1", "#7F63CD", "#A78BFA", "#CCBCFF", "#F0E9FF"]
+      },
+      "state-warning": {
+        "role": "tertiary",
+        "displayName": "Warning Gold",
+        "canonical": "#F6BE4F",
+        "tonalRamp": ["#241600", "#4B3105", "#73500B", "#9A7117", "#C19329", "#F6BE4F", "#FAD887", "#FFF3CF"]
+      },
+      "text-primary": {
+        "role": "neutral",
+        "displayName": "Primary Text",
+        "canonical": "#F4F7FB",
+        "tonalRamp": ["#111827", "#1F2937", "#374151", "#64748B", "#94A3B8", "#C8D2DF", "#E5EAF1", "#F4F7FB"]
+      }
+    },
+    "typographyMeta": {
+      "display": {
+        "displayName": "Display",
+        "purpose": "Current view title and major panel title."
+      },
+      "body": {
+        "displayName": "Body",
+        "purpose": "Operational UI copy, setup guidance and timeline text."
+      },
+      "data": {
+        "displayName": "Data",
+        "purpose": "Session ids, paths, costs, token values and code-like metadata."
+      }
+    },
+    "shadows": [
+      {
+        "name": "shadow-sm",
+        "value": "0 1px 2px rgba(0, 0, 0, 0.24)",
+        "purpose": "Small controls that need minimal separation."
+      },
+      {
+        "name": "panel-edge",
+        "value": "-6px 0 12px rgba(0, 0, 0, 0.22)",
+        "purpose": "Directional separation for the session drawer."
+      }
+    ],
+    "motion": [
+      {
+        "name": "ease-standard",
+        "value": "cubic-bezier(0.4, 0, 0.2, 1)",
+        "purpose": "Default state transition easing."
+      },
+      {
+        "name": "duration-fast",
+        "value": "0.2s",
+        "purpose": "Hover, focus and compact UI feedback."
+      },
+      {
+        "name": "duration-standard",
+        "value": "0.3s",
+        "purpose": "Drawer, sidebar, modal and state panel transitions."
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "sidebar-collapse",
+        "value": "992px"
+      },
+      {
+        "name": "header-stack",
+        "value": "820px"
+      },
+      {
+        "name": "drawer-mobile",
+        "value": "768px"
+      },
+      {
+        "name": "narrow",
+        "value": "480px"
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "Primary action for setup, refresh or focused workflow actions.",
+      "html": "<button class=\"ds-btn-primary\">重新整理檢查</button>",
+      "css": ".ds-btn-primary { background: #00D2E0; color: #07090D; border: 1px solid #00D2E0; border-radius: 10px; padding: 12px 28px; font-family: Inter, system-ui, sans-serif; font-size: 14px; font-weight: 700; cursor: pointer; transition: transform 0.18s cubic-bezier(0.25, 1, 0.5, 1), background 0.18s, border-color 0.18s; } .ds-btn-primary:hover { transform: translateY(-1px); background: #2D8CFF; border-color: #2D8CFF; } .ds-btn-primary:focus-visible { outline: 2px solid rgba(0, 210, 224, 0.6); outline-offset: 2px; } .ds-btn-primary:active { transform: translateY(0); }"
+    },
+    {
+      "name": "Icon Button",
+      "kind": "button",
+      "refersTo": "button-icon",
+      "description": "Compact header action for pricing, setup, sync, theme and repository access.",
+      "html": "<button class=\"ds-icon-btn\" aria-label=\"同步\">⚡</button>",
+      "css": ".ds-icon-btn { width: 42px; height: 42px; display: inline-flex; align-items: center; justify-content: center; border-radius: 10px; background: #0D1118; border: 1px solid rgba(219,228,238,0.11); color: #F4F7FB; font-size: 16px; cursor: pointer; transition: transform 0.18s cubic-bezier(0.25, 1, 0.5, 1), border-color 0.18s, color 0.18s, background 0.18s; } .ds-icon-btn:hover { transform: translateY(-1px); background: #1A2331; border-color: #00D2E0; color: #00D2E0; } .ds-icon-btn:focus-visible { outline: 2px solid rgba(0, 210, 224, 0.6); outline-offset: 2px; } .ds-icon-btn:active { transform: translateY(0); }"
+    },
+    {
+      "name": "Stat Card",
+      "kind": "card",
+      "refersTo": "card-stat",
+      "description": "Dashboard metric container for token, cache, cost and duration summaries.",
+      "html": "<article class=\"ds-stat-card\"><div class=\"ds-stat-icon\">↑</div><div><div class=\"ds-stat-label\">輸入 Token</div><div class=\"ds-stat-value\">128.4k</div><div class=\"ds-stat-sub\">今日累計</div></div></article>",
+      "css": ".ds-stat-card { display: flex; align-items: center; gap: 16px; padding: 20px; border-radius: 14px; background: #0D1118; border: 1px solid rgba(219,228,238,0.11); color: #F4F7FB; font-family: Inter, system-ui, sans-serif; transition: transform 0.18s cubic-bezier(0.25, 1, 0.5, 1), background 0.18s, border-color 0.18s; } .ds-stat-card:hover { transform: translateY(-1px); background: #111722; border-color: rgba(219,228,238,0.18); } .ds-stat-icon { width: 44px; height: 44px; display: grid; place-items: center; border-radius: 10px; background: rgba(0,210,224,0.1); border: 1px solid rgba(0,210,224,0.25); color: #00D2E0; font-weight: 700; } .ds-stat-label { color: #C8D2DF; font-size: 12px; font-weight: 500; } .ds-stat-value { color: #F4F7FB; font: 750 22px/1.2 Inter, system-ui, sans-serif; margin-top: 2px; } .ds-stat-sub { color: #94A3B8; font-size: 11px; margin-top: 4px; }"
+    },
+    {
+      "name": "Select Field",
+      "kind": "input",
+      "refersTo": "input-select",
+      "description": "Agent, date dimension, month and year controls.",
+      "html": "<label class=\"ds-field\"><span>Agent 類型</span><select><option>Codex CLI</option><option>Claude Code</option></select></label>",
+      "css": ".ds-field { display: grid; gap: 6px; color: #94A3B8; font: 700 11px/1.2 Inter, system-ui, sans-serif; text-transform: uppercase; letter-spacing: 0.06em; } .ds-field select { width: 100%; min-height: 40px; border-radius: 10px; border: 1px solid rgba(219,228,238,0.11); background: #111620; color: #F4F7FB; padding: 10px 14px; font: 500 14px/1.2 Inter, system-ui, sans-serif; transition: border-color 0.18s, background 0.18s, box-shadow 0.18s; } .ds-field select:hover { background: #151B27; border-color: rgba(219,228,238,0.18); } .ds-field select:focus-visible { outline: none; border-color: #00D2E0; box-shadow: 0 0 0 3px rgba(0, 210, 224, 0.38); }"
+    },
+    {
+      "name": "Session Table Row",
+      "kind": "custom",
+      "refersTo": "table-row-session",
+      "description": "Dense clickable session rows used for drill-down into the timeline drawer.",
+      "html": "<table class=\"ds-session-table\"><thead><tr><th>會話</th><th>Model</th><th>總計</th><th>時間</th></tr></thead><tbody><tr><td>feature-token-sync</td><td>gpt-5</td><td>82.1k</td><td>14:32</td></tr></tbody></table>",
+      "css": ".ds-session-table { width: 100%; border-collapse: collapse; color: #F4F7FB; font-family: Inter, system-ui, sans-serif; background: #0D1118; border-radius: 14px; overflow: hidden; } .ds-session-table th { padding: 12px 10px; color: #C8D2DF; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; border-bottom: 1px solid rgba(219,228,238,0.11); text-align: left; white-space: nowrap; background: #111722; } .ds-session-table td { padding: 12px 10px; border-bottom: 1px solid rgba(219,228,238,0.11); font-size: 13px; font-weight: 500; white-space: nowrap; } .ds-session-table tbody tr { cursor: pointer; transition: background 0.18s; } .ds-session-table tbody tr:hover { background: rgba(0,210,224,0.1); }"
+    },
+    {
+      "name": "Timeline Bubble",
+      "kind": "custom",
+      "refersTo": "timeline-bubble",
+      "description": "Session reconstruction message bubble for user and assistant turns.",
+      "html": "<article class=\"ds-timeline-bubble\"><header><span>USER</span><time>14:32</time></header><p>請分析今日 token 使用量。</p></article>",
+      "css": ".ds-timeline-bubble { position: relative; padding: 14px 18px; border-radius: 14px; background: rgba(0,210,224,0.07); border: 1px solid rgba(0,210,224,0.18); color: #F4F7FB; font-family: Inter, system-ui, sans-serif; } .ds-timeline-bubble::before { content: \"\"; position: absolute; left: -27px; top: 8px; width: 12px; height: 12px; border-radius: 9999px; background: #00D2E0; box-shadow: 0 0 0 3px rgba(0,210,224,0.14); } .ds-timeline-bubble header { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 8px; } .ds-timeline-bubble span { color: #00D2E0; font: 700 12px/1.2 Inter, system-ui, sans-serif; letter-spacing: 0.04em; } .ds-timeline-bubble time { color: #94A3B8; font-size: 11px; } .ds-timeline-bubble p { margin: 0; color: #F4F7FB; font-size: 15px; line-height: 1.65; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "Local Operations Console",
+    "overview": "A dense local operations dashboard for AI CLI token usage. The redesign preserves the dark console structure, cyan interaction language and traceable workflow while reducing decorative glass, glow, gradient text and heavy shadows.",
+    "keyCharacteristics": [
+      "Dense but scannable dashboard structure",
+      "Local-first trust and source transparency",
+      "Consistent controls across time dimensions and agents",
+      "Session-level traceability from summary to timeline"
+    ],
+    "rules": [
+      {
+        "name": "The Accent Rarity Rule",
+        "body": "Cyan is for active selection, primary action, focus and key data roles, not general decoration.",
+        "section": "colors"
+      },
+      {
+        "name": "The Product Scale Rule",
+        "body": "Use stable product UI type sizes rather than fluid hero typography.",
+        "section": "typography"
+      },
+      {
+        "name": "The Structural Blur Rule",
+        "body": "Backdrop blur is reserved for structural layers such as sticky headers, drawers and modals.",
+        "section": "elevation"
+      }
+    ],
+    "dos": [
+      "Do keep dense dashboards readable with clear spacing, dividers and stable columns.",
+      "Do use #00D2E0 for active, primary and focus-visible states.",
+      "Do provide reduced-motion alternatives for auto-refresh, drawer, modal and timeline transitions.",
+      "Do make long paths, session ids and model names truncate or wrap predictably."
+    ],
+    "donts": [
+      "Don't turn the dashboard into a marketing landing page or hero metric template.",
+      "Don't use decorative glassmorphism, over-neon glow or purple-blue gradients when they do not clarify state.",
+      "Don't rely on color alone to communicate status.",
+      "Don't use low-contrast gray text on dark or tinted backgrounds."
+    ]
+  }
+}
