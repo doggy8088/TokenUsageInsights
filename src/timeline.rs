@@ -1,6 +1,6 @@
 use crate::db::TokenStats;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 
@@ -605,26 +605,62 @@ pub fn parse_copilot_timeline(
     );
 }
 
+fn codex_text_from_content(content: &serde_json::Value) -> String {
+    if let Some(text) = content.as_str() {
+        return text.to_string();
+    }
+
+    let mut parts = Vec::new();
+    if let Some(items) = content.as_array() {
+        for item in items {
+            match item.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+                "input_text" | "output_text" | "text" => {
+                    if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                        parts.push(text.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    parts.join("\n")
+}
+
+fn codex_tool_arguments(payload: &serde_json::Value) -> serde_json::Value {
+    let args = payload
+        .get("arguments")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    if let Some(raw_args) = args.as_str() {
+        serde_json::from_str(raw_args)
+            .unwrap_or_else(|_| serde_json::Value::String(raw_args.to_string()))
+    } else {
+        args
+    }
+}
+
 pub fn parse_codex_timeline(
     reader: BufReader<File>,
     db_entries: &HashMap<u32, (TokenStats, String)>,
     timeline: &mut Vec<TimelineItem>,
     metadata: &mut HashMap<String, serde_json::Value>,
 ) {
-    let mut seen_turn_ids = Vec::new();
-    let mut active_turn_id: Option<String> = None;
-    let mut current_model = "gpt-5.3-Codex".to_string();
-    let mut current_effort: Option<String> = None;
-    let mut current_context: Option<serde_json::Value> = None;
-    let mut tool_calls_map = HashMap::new();
+    let mut current_model = "Codex CLI".to_string();
+    let mut current_turn_no = 0u32;
+    let mut next_agent_turn_no = 1u32;
+    let mut tool_calls_map: HashMap<String, usize> = HashMap::new();
+    let mut seen_user_messages: HashSet<String> = HashSet::new();
+    let mut seen_agent_messages: HashSet<String> = HashSet::new();
+    let mut emitted_turn_tokens: HashSet<u32> = HashSet::new();
+    let mut reasoning_effort: Option<String> = None;
 
     for line_res in reader.lines() {
         let line = match line_res {
-            Ok(l) => l,
+            Ok(line) => line,
             Err(_) => continue,
         };
         let event: serde_json::Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
+            Ok(value) => value,
             Err(_) => continue,
         };
 
@@ -634,85 +670,40 @@ pub fn parse_codex_timeline(
             .and_then(|t| t.as_str())
             .unwrap_or("")
             .to_string();
-        let payload = event.get("payload");
-
-        let mut turn_id = None;
-        if event_type == "turn_context" {
-            if let Some(p) = payload {
-                turn_id = p
-                    .get("turn_id")
-                    .and_then(|id| id.as_str())
-                    .map(|s| s.to_string());
-            }
-        } else if event_type == "event_msg" {
-            if let Some(p) = payload {
-                turn_id = p
-                    .get("turn_id")
-                    .and_then(|id| id.as_str())
-                    .map(|s| s.to_string());
-            }
-        } else if event_type == "response_item" {
-            if let Some(meta) = event.get("metadata") {
-                turn_id = meta
-                    .get("turn_id")
-                    .and_then(|id| id.as_str())
-                    .map(|s| s.to_string());
-            }
-            if turn_id.is_none() {
-                turn_id = event
-                    .get("internal_chat_message_metadata_passthrough")
-                    .and_then(|m| m.get("turn_id"))
-                    .and_then(|id| id.as_str())
-                    .map(|s| s.to_string());
-            }
-        }
-
-        if let Some(tid) = turn_id {
-            active_turn_id = Some(tid.clone());
-            if !seen_turn_ids.contains(&tid) {
-                seen_turn_ids.push(tid);
-            }
-        }
-
-        let turn_no = active_turn_id
-            .as_ref()
-            .and_then(|tid| seen_turn_ids.iter().position(|id| id == tid))
-            .map(|pos| (pos + 1) as u32)
-            .unwrap_or(1);
+        let payload = match event.get("payload") {
+            Some(payload) => payload,
+            None => continue,
+        };
+        let payload_type = payload.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
         match event_type {
             "session_meta" => {
-                if let Some(p) = payload {
-                    if let Some(v) = p.get("cli_version") {
-                        metadata.insert("copilot_version".to_string(), v.clone());
+                if let Some(version) = payload.get("cli_version") {
+                    metadata.insert("codex_version".to_string(), version.clone());
+                }
+                if let Some(cwd) = payload.get("cwd") {
+                    metadata.insert("cwd".to_string(), cwd.clone());
+                }
+                if let Some(nickname) = payload.get("agent_nickname") {
+                    metadata.insert("agent_nickname".to_string(), nickname.clone());
+                }
+                if let Some(role) = payload.get("agent_role") {
+                    metadata.insert("agent_role".to_string(), role.clone());
+                }
+                if let Some(parent) = payload.get("parent_thread_id") {
+                    metadata.insert("parent_session_id".to_string(), parent.clone());
+                }
+                if let Some(git) = payload.get("git") {
+                    if let Some(branch) = git.get("branch") {
+                        metadata.insert("git_branch".to_string(), branch.clone());
                     }
-                    if let Some(cwd) = p.get("cwd") {
-                        metadata.insert("cwd".to_string(), cwd.clone());
+                    if let Some(repo) = git.get("repository_url").or_else(|| git.get("repository"))
+                    {
+                        metadata.insert("repository".to_string(), repo.clone());
                     }
-                    if let Some(git) = p.get("git") {
-                        if let Some(branch) = git.get("branch") {
-                            metadata.insert("git_branch".to_string(), branch.clone());
-                        }
-                        if let Some(repo) = git.get("repository_url") {
-                            metadata.insert("repository".to_string(), repo.clone());
-                        }
-                    }
-                    if let Some(nickname) = p.get("agent_nickname").or_else(|| {
-                        p.get("source")
-                            .and_then(|s| s.get("subagent"))
-                            .and_then(|s| s.get("thread_spawn"))
-                            .and_then(|t| t.get("agent_nickname"))
-                    }) {
-                        metadata.insert("agent_nickname".to_string(), nickname.clone());
-                    }
-                    if let Some(role) = p.get("agent_role").or_else(|| {
-                        p.get("source")
-                            .and_then(|s| s.get("subagent"))
-                            .and_then(|s| s.get("thread_spawn"))
-                            .and_then(|t| t.get("agent_role"))
-                    }) {
-                        metadata.insert("agent_role".to_string(), role.clone());
-                    }
+                }
+                if let Some(model) = payload.get("model").and_then(|m| m.as_str()) {
+                    current_model = model.to_string();
                 }
                 timeline.push(TimelineItem::SystemStatus {
                     timestamp,
@@ -721,86 +712,155 @@ pub fn parse_codex_timeline(
                 });
             }
             "turn_context" => {
-                if let Some(p) = payload {
-                    if let Some(m) = p.get("model").and_then(|v| v.as_str()) {
-                        current_model = m.to_string();
-                    }
-                    if let Some(eff) = p
-                        .get("effort")
-                        .or_else(|| {
-                            p.get("collaboration_mode")
-                                .and_then(|cm| cm.get("settings"))
-                                .and_then(|s| s.get("reasoning_effort"))
-                        })
-                        .and_then(|v| v.as_str())
+                if let Some(cwd) = payload.get("cwd") {
+                    metadata
+                        .entry("cwd".to_string())
+                        .or_insert_with(|| cwd.clone());
+                }
+                if let Some(model) = payload.get("model").and_then(|m| m.as_str()) {
+                    current_model = model.to_string();
+                }
+                reasoning_effort = payload
+                    .get("effort")
+                    .or_else(|| payload.get("reasoning_effort"))
+                    .and_then(|effort| effort.as_str())
+                    .map(|effort| effort.to_string())
+                    .or(reasoning_effort);
+            }
+            "event_msg" => match payload_type {
+                "user_message" => {
+                    let prompt = payload
+                        .get("message")
+                        .and_then(|message| message.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if !prompt.trim().is_empty()
+                        && seen_user_messages.insert(format!("{}:{}", timestamp, prompt))
                     {
-                        current_effort = Some(eff.to_string());
-                    }
-                    if let Some(ctx) = p.get("context") {
-                        current_context = Some(ctx.clone());
-                    }
-                }
-            }
-            "compacted" => {
-                timeline.push(TimelineItem::SystemStatus {
-                    timestamp,
-                    status_type: "session_compaction".to_string(),
-                    message: "會話狀態壓縮完成 (Session Compaction Completed)".to_string(),
-                });
-            }
-            "event_msg" => {
-                if let Some(p) = payload {
-                    let sub_type = p.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                    match sub_type {
-                        "task_started" => {
-                            timeline.push(TimelineItem::SystemStatus {
-                                timestamp,
-                                status_type: "task_started".to_string(),
-                                message: "任務開始 (Task Started)".to_string(),
-                            });
-                        }
-                        "task_complete" => {
-                            timeline.push(TimelineItem::SystemStatus {
-                                timestamp,
-                                status_type: "task_complete".to_string(),
-                                message: "任務完成 (Task Completed)".to_string(),
-                            });
-                        }
-                        "turn_aborted" => {
-                            timeline.push(TimelineItem::SystemStatus {
-                                timestamp,
-                                status_type: "turn_aborted".to_string(),
-                                message: "會話中斷 (Turn Aborted)".to_string(),
-                            });
-                        }
-                        _ => {}
+                        current_turn_no += 1;
+                        next_agent_turn_no = current_turn_no;
+                        timeline.push(TimelineItem::UserPrompt {
+                            timestamp,
+                            prompt,
+                            context: None,
+                            turn_no: current_turn_no,
+                        });
                     }
                 }
-            }
-            "tool_call" => {
-                if let Some(p) = payload {
-                    let call_id = p
-                        .get("id")
-                        .and_then(|i| i.as_str())
+                "agent_message" => {
+                    let reply = payload
+                        .get("message")
+                        .and_then(|message| message.as_str())
                         .unwrap_or("")
                         .to_string();
-                    let name = p
+                    if !reply.trim().is_empty()
+                        && seen_agent_messages.insert(format!("{}:{}", timestamp, reply))
+                    {
+                        let turn_no = next_agent_turn_no.max(1);
+                        let tokens = if emitted_turn_tokens.insert(turn_no) {
+                            db_entries.get(&turn_no).map(|(stats, model)| {
+                                current_model = model.clone();
+                                stats.clone()
+                            })
+                        } else {
+                            None
+                        };
+                        timeline.push(TimelineItem::AgentReply {
+                            timestamp,
+                            reply,
+                            reasoning: None,
+                            turn_no,
+                            model: current_model.clone(),
+                            tokens,
+                            duration_ms: None,
+                            reasoning_effort: reasoning_effort.clone(),
+                        });
+                    }
+                }
+                "task_started" => {
+                    timeline.push(TimelineItem::SystemStatus {
+                        timestamp,
+                        status_type: "task_started".to_string(),
+                        message: "任務開始 (Task Started)".to_string(),
+                    });
+                }
+                "task_complete" => {
+                    timeline.push(TimelineItem::SystemStatus {
+                        timestamp,
+                        status_type: "task_complete".to_string(),
+                        message: "任務完成 (Task Complete)".to_string(),
+                    });
+                }
+                _ => {}
+            },
+            "response_item" => match payload_type {
+                "message" => {
+                    let role = payload
+                        .get("role")
+                        .and_then(|role| role.as_str())
+                        .unwrap_or("");
+                    if role == "user" {
+                        if let Some(content) = payload.get("content") {
+                            let prompt = codex_text_from_content(content);
+                            if !prompt.trim().is_empty()
+                                && seen_user_messages.insert(format!("{}:{}", timestamp, prompt))
+                            {
+                                current_turn_no += 1;
+                                next_agent_turn_no = current_turn_no;
+                                timeline.push(TimelineItem::UserPrompt {
+                                    timestamp,
+                                    prompt,
+                                    context: None,
+                                    turn_no: current_turn_no,
+                                });
+                            }
+                        }
+                    } else if role == "assistant" {
+                        if let Some(content) = payload.get("content") {
+                            let reply = codex_text_from_content(content);
+                            if !reply.trim().is_empty()
+                                && seen_agent_messages.insert(format!("{}:{}", timestamp, reply))
+                            {
+                                let turn_no = next_agent_turn_no.max(1);
+                                let tokens = if emitted_turn_tokens.insert(turn_no) {
+                                    db_entries.get(&turn_no).map(|(stats, model)| {
+                                        current_model = model.clone();
+                                        stats.clone()
+                                    })
+                                } else {
+                                    None
+                                };
+                                timeline.push(TimelineItem::AgentReply {
+                                    timestamp,
+                                    reply,
+                                    reasoning: None,
+                                    turn_no,
+                                    model: current_model.clone(),
+                                    tokens,
+                                    duration_ms: None,
+                                    reasoning_effort: reasoning_effort.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
+                "function_call" => {
+                    let call_id = payload
+                        .get("call_id")
+                        .and_then(|id| id.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let name = payload
                         .get("name")
-                        .and_then(|n| n.as_str())
-                        .unwrap_or("")
+                        .and_then(|name| name.as_str())
+                        .unwrap_or("function_call")
                         .to_string();
-                    let args = p
-                        .get("arguments")
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Null);
-
                     let idx = timeline.len();
                     tool_calls_map.insert(call_id.clone(), idx);
-
                     timeline.push(TimelineItem::ToolStep {
                         timestamp,
                         tool_name: name,
-                        arguments: args,
+                        arguments: codex_tool_arguments(payload),
                         env: None,
                         exit_code: None,
                         stdout: "".to_string(),
@@ -809,80 +869,274 @@ pub fn parse_codex_timeline(
                         status: "running".to_string(),
                     });
                 }
-            }
-            "tool_response" => {
-                if let Some(p) = payload {
-                    let call_id = p
-                        .get("id")
-                        .and_then(|i| i.as_str())
+                "function_call_output" => {
+                    let call_id = payload
+                        .get("call_id")
+                        .and_then(|id| id.as_str())
                         .unwrap_or("")
                         .to_string();
-                    let stdout = p
-                        .get("stdout")
-                        .and_then(|o| o.as_str())
+                    let output = payload
+                        .get("output")
+                        .and_then(|output| output.as_str())
                         .unwrap_or("")
                         .to_string();
-                    let stderr = p
-                        .get("stderr")
-                        .and_then(|e| e.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let exit_code = p
-                        .get("exitCode")
-                        .and_then(|ec| ec.as_i64())
-                        .map(|v| v as i32);
-
                     if let Some(&idx) = tool_calls_map.get(&call_id) {
                         if let Some(TimelineItem::ToolStep {
-                            stdout: target_stdout,
-                            stderr: target_stderr,
-                            exit_code: target_exit_code,
+                            stdout,
+                            exit_code,
                             status,
                             ..
                         }) = timeline.get_mut(idx)
                         {
-                            *target_stdout = stdout;
-                            *target_stderr = stderr;
-                            *target_exit_code = exit_code;
-                            *status = if exit_code.unwrap_or(0) == 0 {
-                                "success".to_string()
-                            } else {
-                                "failed".to_string()
-                            };
+                            *stdout = output;
+                            *exit_code = Some(0);
+                            *status = "success".to_string();
                         }
                     }
                 }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
+    metadata.insert(
+        "selected_model".to_string(),
+        serde_json::Value::String(current_model),
+    );
+}
+
+fn claude_text_from_content(content: &serde_json::Value) -> String {
+    if let Some(text) = content.as_str() {
+        return text.to_string();
+    }
+
+    let mut parts = Vec::new();
+    if let Some(items) = content.as_array() {
+        for item in items {
+            match item.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+                "text" => {
+                    if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                        parts.push(text.to_string());
+                    }
+                }
+                "tool_result" => {
+                    if let Some(text) = item.get("content").and_then(|c| c.as_str()) {
+                        parts.push(text.to_string());
+                    }
+                }
+                _ => {}
             }
-            "response_item" => {
-                if let Some(p) = payload {
-                    let payload_type = p.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                    match payload_type {
-                        "function_call" | "custom_tool_call" | "tool_search_call" => {
-                            let call_id = p
-                                .get("call_id")
-                                .and_then(|i| i.as_str())
+        }
+    }
+    parts.join("\n")
+}
+
+pub fn parse_claude_timeline(
+    reader: BufReader<File>,
+    db_entries: &HashMap<u32, (TokenStats, String)>,
+    timeline: &mut Vec<TimelineItem>,
+    metadata: &mut HashMap<String, serde_json::Value>,
+) {
+    let mut current_model = "Claude Code".to_string();
+    let mut request_turns: HashMap<String, u32> = HashMap::new();
+    let mut emitted_reply_tokens: HashSet<String> = HashSet::new();
+    let mut tool_calls_map: HashMap<String, usize> = HashMap::new();
+    let mut user_turn_no = 0u32;
+
+    for line_res in reader.lines() {
+        let line = match line_res {
+            Ok(line) => line,
+            Err(_) => continue,
+        };
+        let event: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+
+        let timestamp = event
+            .get("timestamp")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        if let Some(cwd) = event.get("cwd") {
+            metadata
+                .entry("cwd".to_string())
+                .or_insert_with(|| cwd.clone());
+        }
+        if let Some(version) = event.get("version") {
+            metadata
+                .entry("copilot_version".to_string())
+                .or_insert_with(|| version.clone());
+        }
+        if let Some(branch) = event.get("gitBranch") {
+            metadata
+                .entry("git_branch".to_string())
+                .or_insert_with(|| branch.clone());
+        }
+
+        let message = match event.get("message") {
+            Some(message) => message,
+            None => continue,
+        };
+        let role = message.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        let content = message.get("content");
+
+        if role == "user" {
+            if let Some(content) = content {
+                let has_tool_result = content
+                    .as_array()
+                    .map(|items| {
+                        items.iter().any(|item| {
+                            item.get("type").and_then(|t| t.as_str()) == Some("tool_result")
+                        })
+                    })
+                    .unwrap_or(false);
+
+                if has_tool_result {
+                    if let Some(items) = content.as_array() {
+                        for item in items {
+                            if item.get("type").and_then(|t| t.as_str()) != Some("tool_result") {
+                                continue;
+                            }
+                            let call_id = item
+                                .get("tool_use_id")
+                                .and_then(|id| id.as_str())
                                 .unwrap_or("")
                                 .to_string();
-                            let name = p
-                                .get("name")
-                                .and_then(|n| n.as_str())
-                                .unwrap_or(payload_type)
-                                .to_string();
-                            let mut args = p
-                                .get("arguments")
-                                .cloned()
-                                .or_else(|| p.get("input").cloned())
-                                .unwrap_or(serde_json::Value::Null);
-                            if let Some(s) = args.as_str() {
-                                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
-                                    args = parsed;
+                            let output =
+                                claude_text_from_content(item.get("content").unwrap_or(item));
+                            let is_error = item
+                                .get("is_error")
+                                .and_then(|value| value.as_bool())
+                                .unwrap_or(false);
+
+                            if let Some(&idx) = tool_calls_map.get(&call_id) {
+                                if let Some(TimelineItem::ToolStep {
+                                    stdout,
+                                    exit_code,
+                                    status,
+                                    ..
+                                }) = timeline.get_mut(idx)
+                                {
+                                    *stdout = output;
+                                    *exit_code = Some(if is_error { 1 } else { 0 });
+                                    *status = if is_error {
+                                        "failed".to_string()
+                                    } else {
+                                        "success".to_string()
+                                    };
                                 }
                             }
+                        }
+                    }
+                } else {
+                    let prompt = claude_text_from_content(content);
+                    if !prompt.trim().is_empty() {
+                        user_turn_no += 1;
+                        timeline.push(TimelineItem::UserPrompt {
+                            timestamp,
+                            prompt,
+                            context: None,
+                            turn_no: user_turn_no,
+                        });
+                    }
+                }
+            }
+            continue;
+        }
+
+        if role != "assistant" {
+            continue;
+        }
+
+        if let Some(model) = message.get("model").and_then(|m| m.as_str()) {
+            current_model = model.to_string();
+        }
+
+        let request_key = event
+            .get("requestId")
+            .and_then(|id| id.as_str())
+            .or_else(|| message.get("id").and_then(|id| id.as_str()))
+            .or_else(|| event.get("uuid").and_then(|id| id.as_str()))
+            .unwrap_or("")
+            .to_string();
+        let turn_no = if request_key.is_empty() {
+            (request_turns.len() + 1) as u32
+        } else if let Some(turn_no) = request_turns.get(&request_key) {
+            *turn_no
+        } else {
+            let next_turn_no = (request_turns.len() + 1) as u32;
+            request_turns.insert(request_key.clone(), next_turn_no);
+            next_turn_no
+        };
+
+        let mut tokens_for_reply = |request_key: &str, turn_no: u32, current_model: &mut String| {
+            if request_key.is_empty() || !emitted_reply_tokens.insert(request_key.to_string()) {
+                return None;
+            }
+            db_entries.get(&turn_no).map(|(stats, model)| {
+                *current_model = model.clone();
+                stats.clone()
+            })
+        };
+
+        if let Some(content) = content {
+            if let Some(items) = content.as_array() {
+                let mut reasoning_parts = Vec::new();
+                for item in items {
+                    match item.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+                        "thinking" => {
+                            if let Some(thinking) = item.get("thinking").and_then(|t| t.as_str()) {
+                                reasoning_parts.push(thinking.to_string());
+                            }
+                        }
+                        "text" => {
+                            let reply = item
+                                .get("text")
+                                .and_then(|text| text.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            if !reply.trim().is_empty() {
+                                let tokens =
+                                    tokens_for_reply(&request_key, turn_no, &mut current_model);
+                                timeline.push(TimelineItem::AgentReply {
+                                    timestamp: timestamp.clone(),
+                                    reply,
+                                    reasoning: if reasoning_parts.is_empty() {
+                                        None
+                                    } else {
+                                        Some(reasoning_parts.join("\n"))
+                                    },
+                                    turn_no,
+                                    model: current_model.clone(),
+                                    tokens,
+                                    duration_ms: None,
+                                    reasoning_effort: None,
+                                });
+                                reasoning_parts.clear();
+                            }
+                        }
+                        "tool_use" => {
+                            let call_id = item
+                                .get("id")
+                                .and_then(|id| id.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let name = item
+                                .get("name")
+                                .and_then(|name| name.as_str())
+                                .unwrap_or("tool_use")
+                                .to_string();
+                            let args = item
+                                .get("input")
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null);
                             let idx = timeline.len();
                             tool_calls_map.insert(call_id.clone(), idx);
-
                             timeline.push(TimelineItem::ToolStep {
-                                timestamp,
+                                timestamp: timestamp.clone(),
                                 tool_name: name,
                                 arguments: args,
                                 env: None,
@@ -893,147 +1147,30 @@ pub fn parse_codex_timeline(
                                 status: "running".to_string(),
                             });
                         }
-                        "function_call_output"
-                        | "custom_tool_call_output"
-                        | "tool_search_output" => {
-                            let call_id = p
-                                .get("call_id")
-                                .and_then(|i| i.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                            let output = p
-                                .get("output")
-                                .and_then(|o| o.as_str())
-                                .unwrap_or("")
-                                .to_string();
-
-                            let mut exit_code = Some(0);
-                            if output.contains("Exit code:") {
-                                if !output.contains("Exit code: 0") {
-                                    exit_code = Some(1);
-                                }
-                            }
-
-                            if let Some(&idx) = tool_calls_map.get(&call_id) {
-                                if let Some(TimelineItem::ToolStep {
-                                    stdout: target_stdout,
-                                    exit_code: target_exit_code,
-                                    status,
-                                    ..
-                                }) = timeline.get_mut(idx)
-                                {
-                                    *target_stdout = output;
-                                    *target_exit_code = exit_code;
-                                    *status = if exit_code.unwrap_or(0) == 0 {
-                                        "success".to_string()
-                                    } else {
-                                        "failed".to_string()
-                                    };
-                                }
-                            }
-                        }
-                        _ => {
-                            let role = p.get("role").and_then(|r| r.as_str());
-                            if role == Some("assistant") {
-                                let mut reply = p
-                                    .get("reply")
-                                    .and_then(|r| r.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                if reply.is_empty() {
-                                    if let Some(content_arr) =
-                                        p.get("content").and_then(|c| c.as_array())
-                                    {
-                                        for item in content_arr {
-                                            if let Some(txt) =
-                                                item.get("text").and_then(|t| t.as_str())
-                                            {
-                                                reply.push_str(txt);
-                                            }
-                                        }
-                                    }
-                                }
-                                let reasoning = p
-                                    .get("reasoning")
-                                    .and_then(|r| r.as_str())
-                                    .map(|s| s.to_string());
-
-                                let (tokens, model_name) =
-                                    if let Some((stats, model)) = db_entries.get(&turn_no) {
-                                        current_model = model.clone();
-                                        (Some(stats.clone()), current_model.clone())
-                                    } else {
-                                        (None, current_model.clone())
-                                    };
-
-                                // Remove existing AgentReply for this turn_no to avoid duplicates
-                                timeline.retain(|item| {
-                                    if let TimelineItem::AgentReply {
-                                        turn_no: existing_turn_no,
-                                        ..
-                                    } = item
-                                    {
-                                        *existing_turn_no != turn_no
-                                    } else {
-                                        true
-                                    }
-                                });
-
-                                timeline.push(TimelineItem::AgentReply {
-                                    timestamp,
-                                    reply,
-                                    reasoning,
-                                    turn_no,
-                                    model: model_name,
-                                    tokens,
-                                    duration_ms: None,
-                                    reasoning_effort: current_effort.clone(),
-                                });
-                            } else if role == Some("user") {
-                                let mut prompt = p
-                                    .get("prompt")
-                                    .and_then(|r| r.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                if prompt.is_empty() {
-                                    if let Some(content_arr) =
-                                        p.get("content").and_then(|c| c.as_array())
-                                    {
-                                        for item in content_arr {
-                                            if let Some(txt) =
-                                                item.get("text").and_then(|t| t.as_str())
-                                            {
-                                                prompt.push_str(txt);
-                                            }
-                                        }
-                                    }
-                                }
-                                let context = p
-                                    .get("context")
-                                    .cloned()
-                                    .or_else(|| current_context.clone());
-                                timeline.push(TimelineItem::UserPrompt {
-                                    timestamp,
-                                    prompt,
-                                    context,
-                                    turn_no,
-                                });
-                            }
-                        }
+                        _ => {}
                     }
                 }
+            } else {
+                let reply = claude_text_from_content(content);
+                if !reply.trim().is_empty() {
+                    let tokens = tokens_for_reply(&request_key, turn_no, &mut current_model);
+                    timeline.push(TimelineItem::AgentReply {
+                        timestamp,
+                        reply,
+                        reasoning: None,
+                        turn_no,
+                        model: current_model.clone(),
+                        tokens,
+                        duration_ms: None,
+                        reasoning_effort: None,
+                    });
+                }
             }
-            _ => {}
         }
     }
+
     metadata.insert(
         "selected_model".to_string(),
         serde_json::Value::String(current_model),
     );
-    if let Some(eff) = current_effort {
-        metadata.insert(
-            "reasoning_effort".to_string(),
-            serde_json::Value::String(eff),
-        );
-    }
 }

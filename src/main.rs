@@ -1,5 +1,6 @@
 use axum::{
-    routing::{get, post},
+    http::{header::CONTENT_TYPE, Method},
+    routing::get,
     Router,
 };
 use std::path::PathBuf;
@@ -12,6 +13,49 @@ mod pricing;
 mod timeline;
 
 use handlers::*;
+
+fn build_cors_layer() -> CorsLayer {
+    let default_port = std::env::var("PORT")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(3003);
+
+    let allowed_origins: Vec<axum::http::HeaderValue> = std::env::var("CORS_ALLOWED_ORIGINS")
+        .ok()
+        .and_then(|origins| {
+            let parsed = origins
+                .split(',')
+                .filter_map(|origin| {
+                    let trimmed = origin.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        trimmed.parse::<axum::http::HeaderValue>().ok()
+                    }
+                })
+                .collect::<Vec<_>>();
+            if parsed.is_empty() {
+                None
+            } else {
+                Some(parsed)
+            }
+        })
+        .unwrap_or_else(|| {
+            vec![
+                format!("http://localhost:{default_port}")
+                    .parse::<axum::http::HeaderValue>()
+                    .unwrap(),
+                format!("http://127.0.0.1:{default_port}")
+                    .parse::<axum::http::HeaderValue>()
+                    .unwrap(),
+            ]
+        });
+
+    CorsLayer::new()
+        .allow_origin(allowed_origins)
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers([CONTENT_TYPE])
+}
 
 #[tokio::main]
 async fn main() {
@@ -77,13 +121,10 @@ async fn main() {
         .route("/api/:assistant/pricing", get(get_pricing))
         .route("/api/:assistant/sync", get(trigger_manual_sync))
         .route("/api/:assistant/rate-limit", get(get_rate_limit))
-        .route("/api/:assistant/auth-configs", get(get_codex_auth_configs))
-        .route("/api/:assistant/auth-switch", post(switch_codex_auth))
-        .route("/api/:assistant/reset-info", get(get_codex_reset_info))
         // 靜態檔案路由
         .nest_service("/static", ServeDir::new(&static_dir))
         .fallback_service(ServeDir::new(&static_dir))
-        .layer(CorsLayer::permissive());
+        .layer(build_cors_layer());
 
     let port = std::env::var("PORT")
         .ok()

@@ -5,18 +5,28 @@ use std::{
     path::PathBuf,
 };
 
+use super::*;
 use crate::db;
 use crate::pricing::PricingEntry;
 
 /// API 7: 獲取模型價格清單 ( pricing.csv 資訊)
-pub async fn get_pricing(Path(_assistant): Path<String>) -> impl IntoResponse {
+pub async fn get_pricing(Path(assistant): Path<String>) -> impl IntoResponse {
+    let assistant = normalize_assistant_name(&assistant);
+    if !is_supported_assistant(&assistant) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "不支援的助理類型" })),
+        )
+            .into_response();
+    }
+
     let mut entries = Vec::new();
     let file_path = PathBuf::from("pricing.csv");
     if let Ok(file) = File::open(&file_path) {
         let reader = BufReader::new(file);
         let mut lines = reader.lines();
         if let Some(Ok(_header)) = lines.next() {
-            for line in lines.flatten() {
+            for line in lines.map_while(Result::ok) {
                 let parts: Vec<&str> = line.split(',').collect();
                 if parts.len() >= 6 {
                     let input_price = parts[3].trim().parse::<f64>().unwrap_or(0.0);
@@ -80,11 +90,20 @@ pub async fn get_pricing(Path(_assistant): Path<String>) -> impl IntoResponse {
             },
         ];
     }
-    Json(entries)
+    Json(entries).into_response()
 }
 
 /// API 8: 手動觸發日誌增量同步
-pub async fn trigger_manual_sync(Path(_assistant): Path<String>) -> impl IntoResponse {
+pub async fn trigger_manual_sync(Path(assistant): Path<String>) -> impl IntoResponse {
+    let assistant = normalize_assistant_name(&assistant);
+    if !is_supported_assistant(&assistant) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "不支援的助理類型" })),
+        )
+            .into_response();
+    }
+
     let sync_res = tokio::task::spawn_blocking(|| {
         if let Ok(mut conn) = db::get_db_conn() {
             db::sync_usage_logs(&mut conn)
@@ -115,6 +134,15 @@ pub async fn trigger_manual_sync(Path(_assistant): Path<String>) -> impl IntoRes
 
 /// API: 獲取 Codex 的 rate limit 資料
 pub async fn get_rate_limit(Path(assistant): Path<String>) -> impl IntoResponse {
+    let assistant = normalize_assistant_name(&assistant);
+    if !is_supported_assistant(&assistant) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "不支援的助理類型" })),
+        )
+            .into_response();
+    }
+
     if assistant != "codex" {
         return (
             StatusCode::BAD_REQUEST,
@@ -123,7 +151,7 @@ pub async fn get_rate_limit(Path(assistant): Path<String>) -> impl IntoResponse 
             .into_response();
     }
 
-    let res = tokio::task::spawn_blocking(move || db::get_latest_codex_rate_limit())
+    let res = tokio::task::spawn_blocking(db::get_latest_codex_rate_limit)
         .await
         .unwrap();
 

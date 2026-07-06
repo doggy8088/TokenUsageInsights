@@ -39,3 +39,7 @@ Claude Opus 4.6 (>272k),Global,1M Tokens,10.00,1.00,37.50,N/A
 Claude Opus 4.6,Global,1M Tokens,5.00,0.50,25.00,N/A
 Claude Opus 4.5,Global,1M Tokens,5.00,0.50,25.00,N/A
 Codex Auto Review,Global,1M Tokens,0.10,0.00,0.10,N/A
+Kimi K2.7 Code,Global,1M Tokens,0.95,0.19,4.00,N/A
+MAI-Code-1-Flash,Global,1M Tokens,0.75,0.075,4.50,N/A
+Gemini 1.5 Pro,Google AI,1M Tokens,1.25,0.3125,5.00,0.625/0.15625/2.50
+GLM 5.2 (Cloud),Cloud,1M Tokens,0.9086,0.16874,2.8556,N/A

@@ -3,21 +3,110 @@ use std::{
     collections::HashMap,
     fs::File,
     io::BufReader,
-    path::PathBuf,
+    path::{Path as StdPath, PathBuf},
 };
 
 use super::*;
 use crate::db::{self, TokenStats};
 use crate::pricing::{calculate_cost, load_pricing_rules};
 use crate::timeline::{
-    parse_antigravity_timeline, parse_codex_timeline, parse_copilot_timeline, TimelineItem,
+    parse_antigravity_timeline, parse_claude_timeline, parse_codex_timeline,
+    parse_copilot_timeline, TimelineItem,
 };
 
+fn is_safe_session_id(session_id: &str) -> bool {
+    if session_id.is_empty() || session_id.len() > 128 {
+        return false;
+    }
+
+    if session_id == "." || session_id == ".." {
+        return false;
+    }
+
+    session_id
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.')
+}
+
+fn resolve_claude_transcript_path(
+    claude_dir: &StdPath,
+    session_id: &str,
+    transcript_path_db: &str,
+) -> Result<PathBuf, String> {
+    let mut path = PathBuf::from(transcript_path_db);
+    if path.is_relative() {
+        path = claude_dir.join(path);
+    }
+
+    if !path.exists() {
+        return Err("找不到該會話的本地日誌檔案。".to_string());
+    }
+
+    let claude_root = claude_dir
+        .canonicalize()
+        .map_err(|_| "無法存取 Claude Code 根目錄。".to_string())?;
+    let canonical_path = path
+        .canonicalize()
+        .map_err(|_| "無法解析會話日誌路徑。".to_string())?;
+
+    if !canonical_path.starts_with(claude_root) {
+        return Err("會話日誌路徑不在預期目錄內。".to_string());
+    }
+
+    let file_name = canonical_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    if !file_name.contains(session_id) {
+        return Err("會話日誌路徑與 session id 不一致。".to_string());
+    }
+
+    Ok(canonical_path)
+}
+
+fn resolve_codex_transcript_path(
+    codex_dir: &StdPath,
+    transcript_path_db: &str,
+) -> Result<PathBuf, String> {
+    let mut path = PathBuf::from(transcript_path_db);
+    if path.is_relative() {
+        path = codex_dir.join(path);
+    }
+
+    if !path.exists() {
+        return Err("找不到該 Codex CLI 會話的本地日誌檔案。".to_string());
+    }
+
+    let codex_root = codex_dir
+        .canonicalize()
+        .map_err(|_| "無法存取 Codex CLI 根目錄。".to_string())?;
+    let canonical_path = path
+        .canonicalize()
+        .map_err(|_| "無法解析 Codex CLI 會話日誌路徑。".to_string())?;
+
+    if !canonical_path.starts_with(codex_root) {
+        return Err("Codex CLI 會話日誌路徑不在預期目錄內。".to_string());
+    }
+
+    Ok(canonical_path)
+}
+
 pub async fn get_available_dates(Path(assistant): Path<String>) -> impl IntoResponse {
+    let assistant = normalize_assistant_name(&assistant);
+    if !is_supported_assistant(&assistant) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "不支援的助理類型" })),
+        )
+            .into_response();
+    }
+
     let res: Result<Vec<String>, String> = tokio::task::spawn_blocking(move || {
         let conn = db::get_db_conn()?;
         db::get_available_dates(&conn, &assistant)
-    }).await.unwrap_or_else(|_| Err("執行緒執行失敗".to_string()));
+    })
+    .await
+    .unwrap_or_else(|_| Err("執行緒執行失敗".to_string()));
 
     match res {
         Ok(date_list) => Json(DateListResponse { dates: date_list }).into_response(),
@@ -30,7 +119,16 @@ pub async fn get_available_dates(Path(assistant): Path<String>) -> impl IntoResp
 }
 
 /// API 2: 獲取當前環境配置與安裝狀況資訊
-pub async fn get_setup_info(Path(_assistant): Path<String>) -> impl IntoResponse {
+pub async fn get_setup_info(Path(assistant): Path<String>) -> impl IntoResponse {
+    let assistant = normalize_assistant_name(&assistant);
+    if !is_supported_assistant(&assistant) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "不支援的助理類型" })),
+        )
+            .into_response();
+    }
+
     let workspace_dir = match std::env::current_dir() {
         Ok(dir) => dir.to_string_lossy().into_owned(),
         Err(_) => "".to_string(),
@@ -53,7 +151,10 @@ pub async fn get_setup_info(Path(_assistant): Path<String>) -> impl IntoResponse
     let copilot_exists = copilot_dir.exists();
 
     let codex_dir = db::get_codex_dir();
-    let codex_exists = codex_dir.exists();
+    let codex_exists = codex_dir.join("sessions").exists();
+
+    let claude_dir = db::get_claude_dir();
+    let claude_exists = claude_dir.join("projects").exists();
 
     Json(SetupInfoResponse {
         workspace_dir,
@@ -73,20 +174,38 @@ pub async fn get_setup_info(Path(_assistant): Path<String>) -> impl IntoResponse
             exists: codex_exists,
             script_path: "".to_string(),
         },
+        claude: AssistantSetupStatus {
+            dir_path: claude_dir.to_string_lossy().into_owned(),
+            exists: claude_exists,
+            script_path: "".to_string(),
+        },
     })
+    .into_response()
 }
 
 /// API 3: 獲取指定日期的 Token 使用詳情與會話列表
 pub async fn get_usage_details(
     Path((assistant, date)): Path<(String, String)>,
 ) -> impl IntoResponse {
+    let assistant = normalize_assistant_name(&assistant);
+    if !is_supported_assistant(&assistant) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "不支援的助理類型" })),
+        )
+            .into_response();
+    }
+
     let assistant_clone = assistant.clone();
     let date_clone = date.clone();
 
-    let entries_res: Result<Vec<(UsageEntry, String)>, String> = tokio::task::spawn_blocking(move || {
-        let conn = db::get_db_conn()?;
-        db::get_usage_entries_by_date(&conn, &date_clone, &assistant_clone)
-    }).await.unwrap_or_else(|_| Err("執行緒執行失敗".to_string()));
+    let entries_res: Result<Vec<(UsageEntry, String)>, String> =
+        tokio::task::spawn_blocking(move || {
+            let conn = db::get_db_conn()?;
+            db::get_usage_entries_by_date(&conn, &date_clone, &assistant_clone)
+        })
+        .await
+        .unwrap_or_else(|_| Err("執行緒執行失敗".to_string()));
 
     let entries_with_type = match entries_res {
         Ok(e) => e,
@@ -229,7 +348,7 @@ pub async fn get_usage_details(
             last_entry.tokens.as_ref().map(|t| t.output).unwrap_or(0)
         };
 
-        let cost_usd = calculate_cost(
+        let cost_usd = match calculate_cost(
             &pricing_rules,
             &last_entry
                 .model
@@ -238,7 +357,13 @@ pub async fn get_usage_details(
             total_input_tokens,
             total_output_tokens,
             total_cache_read_tokens,
-        );
+        ) {
+            Ok(v) => v,
+            Err(err) => {
+                eprintln!("⚠️ 計算成本失敗: {}", err);
+                0.0
+            }
+        };
         summary.total_cost_usd += cost_usd;
 
         sessions_summary.push(SessionSummary {
@@ -290,7 +415,7 @@ fn get_git_info(cwd_str: &str) -> (Option<String>, Option<String>) {
     }
 
     let branch = std::process::Command::new("git")
-        .args(&["symbolic-ref", "--short", "HEAD"])
+        .args(["symbolic-ref", "--short", "HEAD"])
         .current_dir(path)
         .output()
         .ok()
@@ -303,7 +428,7 @@ fn get_git_info(cwd_str: &str) -> (Option<String>, Option<String>) {
         });
 
     let repo = std::process::Command::new("git")
-        .args(&["config", "--get", "remote.origin.url"])
+        .args(["config", "--get", "remote.origin.url"])
         .current_dir(path)
         .output()
         .ok()
@@ -321,18 +446,52 @@ fn get_git_info(cwd_str: &str) -> (Option<String>, Option<String>) {
 pub async fn get_session_details(
     Path((assistant, session_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
+    let assistant = normalize_assistant_name(&assistant);
+    if !is_supported_assistant(&assistant) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "不支援的助理類型" })),
+        )
+            .into_response();
+    }
+
+    if !is_safe_session_id(&session_id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "非法的 session_id 格式。" })),
+        )
+            .into_response();
+    }
+
     let session_info: Result<(String, Option<String>), String> = tokio::task::spawn_blocking({
         let sid = session_id.clone();
+        let assistant_name = assistant.clone();
         move || {
             let conn = db::get_db_conn()?;
-            db::get_session_assistant_and_transcript(&conn, &sid)
+            db::get_session_assistant_and_transcript(&conn, &assistant_name, &sid)
         }
-    }).await.unwrap_or_else(|_| Err("執行緒執行失敗".to_string()));
+    })
+    .await
+    .unwrap_or_else(|_| Err("執行緒執行失敗".to_string()));
 
     let (resolved_assistant, transcript_path_db) = match session_info {
         Ok(info) => info,
-        Err(_) => (assistant.clone(), None), // 若查不到則採用路徑參數
+        Err(e) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": e })),
+            )
+                .into_response();
+        }
     };
+
+    if resolved_assistant != assistant {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "找不到該會話資料或助理類型不符" })),
+        )
+            .into_response();
+    }
 
     // 2. 準備讀取檔案的完整路徑
     let filepath = match resolved_assistant.as_str() {
@@ -357,14 +516,53 @@ pub async fn get_session_details(
             path
         }
         "codex" => {
-            if let Some(ref p_str) = transcript_path_db {
-                PathBuf::from(p_str)
-            } else {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({ "error": "找不到 Codex 會話日誌檔案路徑。" })),
-                )
-                    .into_response();
+            let codex_dir = db::get_codex_dir();
+            match transcript_path_db {
+                Some(ref p_str) => match resolve_codex_transcript_path(&codex_dir, p_str) {
+                    Ok(path) => path,
+                    Err(err) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({ "error": err })),
+                        )
+                            .into_response();
+                    }
+                },
+                None => {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(serde_json::json!({
+                            "error": "找不到 Codex CLI 會話日誌檔案路徑。"
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+        "claude" => {
+            let claude_dir = db::get_claude_dir();
+            match transcript_path_db {
+                Some(ref p_str) => {
+                    match resolve_claude_transcript_path(&claude_dir, &session_id, p_str) {
+                        Ok(path) => path,
+                        Err(err) => {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({ "error": err })),
+                            )
+                                .into_response();
+                        }
+                    }
+                }
+                None => {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(serde_json::json!({
+                            "error": "找不到 Claude Code 會話日誌檔案路徑。"
+                        })),
+                    )
+                        .into_response();
+                }
             }
         }
         _ => {
@@ -406,15 +604,18 @@ pub async fn get_session_details(
 
     // 3. 預先載入 SQLite 中的回合 (turn_no) 增量 token 數據
     let sid_clone = session_id.clone();
-    let (db_entries, session_cwd): (HashMap<u32, (TokenStats, String)>, Option<String>) = tokio::task::spawn_blocking(move || {
-        if let Ok(conn) = db::get_db_conn() {
-            let session_cwd = db::get_session_cwd(&conn, &sid_clone).unwrap_or(None);
-            let map = db::get_session_turns_token_stats(&conn, &sid_clone).unwrap_or_default();
-            (map, session_cwd)
-        } else {
-            (HashMap::new(), None)
-        }
-    }).await.unwrap_or_else(|_| (HashMap::new(), None));
+    let (db_entries, session_cwd): (HashMap<u32, (TokenStats, String)>, Option<String>) =
+        tokio::task::spawn_blocking(move || {
+            if let Ok(conn) = db::get_db_conn() {
+                let session_cwd = db::get_session_cwd(&conn, &sid_clone).unwrap_or(None);
+                let map = db::get_session_turns_token_stats(&conn, &sid_clone).unwrap_or_default();
+                (map, session_cwd)
+            } else {
+                (HashMap::new(), None)
+            }
+        })
+        .await
+        .unwrap_or_else(|_| (HashMap::new(), None));
 
     let reader = BufReader::new(file);
     let mut timeline = Vec::new();
@@ -430,6 +631,9 @@ pub async fn get_session_details(
         }
         "codex" => {
             parse_codex_timeline(reader, &db_entries, &mut timeline, &mut metadata);
+        }
+        "claude" => {
+            parse_claude_timeline(reader, &db_entries, &mut timeline, &mut metadata);
         }
         _ => {}
     }
@@ -460,7 +664,7 @@ pub async fn get_session_details(
     let mut total_output_tokens = 0;
     let mut total_reasoning_tokens = 0;
 
-    for (_, (stats, _)) in &db_entries {
+    for (stats, _) in db_entries.values() {
         total_tokens += stats.total;
         total_cache_read_tokens += stats.cache_read.unwrap_or(0);
         total_input_tokens += stats.input;

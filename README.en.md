@@ -202,7 +202,7 @@ Once you have configured the `statusLine` and interact with your AI assistant (G
 
 **Visual Example:**
 ```text
-🤖 gemini-1.5-pro • #3 • ↑ 12.3k • c 4.5k/0 • ↓ 1.2k • r 500 • total 18.5k • +2.1k • last 1.5k/200 • ctx 15%
+🤖 gemini-1.5-pro • #3 • ↑ 12.3k • c 4.5k/0 • ↓ 1.2k • r 500 • total 18.5k • +2.1k • last 1.5k/0/200 • ctx 15%
 ```
 
 **Field Breakdown:**
@@ -214,7 +214,7 @@ Once you have configured the `statusLine` and interact with your AI assistant (G
 * **r Reasoning Tokens** (`r 500`): Cumulative reasoning tokens.
 * **total Total Tokens** (`total 18.5k`): Total cumulative tokens consumed in the current session.
 * **+ Delta Tokens** (`+2.1k`): Tokens consumed by the most recent prompt/turn.
-* **last Last API Call** (`last 1.5k/200`): Input/output tokens of the last API request.
+* **last Last API Call** (`last 1.5k/0/200`): Input/cache read/output tokens of the last API request.
 * **ctx Context Usage** (`ctx 15%` or `from <old_model>`): Percentage of the context window size used; or a model switch indicator (e.g., `• from gemini-1.5-flash`) if the model changes.
 
 ---

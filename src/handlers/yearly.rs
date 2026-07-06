@@ -7,10 +7,21 @@ use crate::pricing::{calculate_cost, load_pricing_rules};
 
 /// API 12: 獲取可用的有使用記錄年份
 pub async fn get_available_years(Path(assistant): Path<String>) -> impl IntoResponse {
+    let assistant = normalize_assistant_name(&assistant);
+    if !is_supported_assistant(&assistant) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "不支援的助理類型" })),
+        )
+            .into_response();
+    }
+
     let res: Result<Vec<String>, String> = tokio::task::spawn_blocking(move || {
         let conn = db::get_db_conn()?;
         db::get_available_years(&conn, &assistant)
-    }).await.unwrap_or_else(|_| Err("執行緒執行失敗".to_string()));
+    })
+    .await
+    .unwrap_or_else(|_| Err("執行緒執行失敗".to_string()));
 
     match res {
         Ok(year_list) => Json(YearListResponse { years: year_list }).into_response(),
@@ -26,13 +37,25 @@ pub async fn get_available_years(Path(assistant): Path<String>) -> impl IntoResp
 pub async fn get_yearly_details(
     Path((assistant, year)): Path<(String, String)>,
 ) -> impl IntoResponse {
+    let assistant = normalize_assistant_name(&assistant);
+    if !is_supported_assistant(&assistant) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "不支援的助理類型" })),
+        )
+            .into_response();
+    }
+
     let assistant_clone = assistant.clone();
     let year_clone = year.clone();
 
-    let entries_res: Result<Vec<(UsageEntry, String, String)>, String> = tokio::task::spawn_blocking(move || {
-        let conn = db::get_db_conn()?;
-        db::get_usage_entries_by_year(&conn, &year_clone, &assistant_clone)
-    }).await.unwrap_or_else(|_| Err("執行緒執行失敗".to_string()));
+    let entries_res: Result<Vec<(UsageEntry, String, String)>, String> =
+        tokio::task::spawn_blocking(move || {
+            let conn = db::get_db_conn()?;
+            db::get_usage_entries_by_year(&conn, &year_clone, &assistant_clone)
+        })
+        .await
+        .unwrap_or_else(|_| Err("執行緒執行失敗".to_string()));
 
     let entries_with_type = match entries_res {
         Ok(e) => e,
@@ -74,8 +97,10 @@ pub async fn get_yearly_details(
     }
 
     let mut monthly_breakdown = Vec::new();
-    let mut yearly_summary = DaySummary::default();
-    yearly_summary.total_sessions = sessions_map.len();
+    let mut yearly_summary = DaySummary {
+        total_sessions: sessions_map.len(),
+        ..Default::default()
+    };
 
     let mut session_last_entries: HashMap<String, UsageEntry> = HashMap::new();
     for (e, _, _) in &entries_with_type {
@@ -179,7 +204,7 @@ pub async fn get_yearly_details(
                 last_entry.tokens.as_ref().map(|t| t.total).unwrap_or(0)
             };
 
-            let cost_usd = calculate_cost(
+            let cost_usd = match calculate_cost(
                 &pricing_rules,
                 &last_entry
                     .model
@@ -188,7 +213,13 @@ pub async fn get_yearly_details(
                 final_input,
                 final_output,
                 final_cache,
-            );
+            ) {
+                Ok(v) => v,
+                Err(err) => {
+                    eprintln!("⚠️ 計算成本失敗: {}", err);
+                    0.0
+                }
+            };
 
             m_tokens += final_total;
             m_input += final_input;
@@ -295,7 +326,7 @@ pub async fn get_yearly_details(
             last_entry.tokens.as_ref().map(|t| t.total).unwrap_or(0)
         };
 
-        let cost_usd = calculate_cost(
+        let cost_usd = match calculate_cost(
             &pricing_rules,
             &last_entry
                 .model
@@ -304,7 +335,13 @@ pub async fn get_yearly_details(
             final_input,
             final_output,
             final_cache,
-        );
+        ) {
+            Ok(v) => v,
+            Err(err) => {
+                eprintln!("⚠️ 計算成本失敗: {}", err);
+                0.0
+            }
+        };
 
         let cwd = last_entry.cwd.unwrap_or_else(|| "Unknown CWD".to_string());
         let project_stat = project_map_stats.entry(cwd).or_insert((0, 0, 0.0));
@@ -342,7 +379,7 @@ pub async fn get_yearly_details(
             cost_usd,
         });
     }
-    project_summaries.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens));
+    project_summaries.sort_by_key(|item| std::cmp::Reverse(item.total_tokens));
 
     let mut model_summaries = Vec::new();
     for (
@@ -367,7 +404,7 @@ pub async fn get_yearly_details(
             cost_usd,
         });
     }
-    model_summaries.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens));
+    model_summaries.sort_by_key(|item| std::cmp::Reverse(item.total_tokens));
 
     Json(YearlyDetailsResponse {
         year,

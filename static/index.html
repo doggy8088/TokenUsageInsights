@@ -4,43 +4,66 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Token Usage Insights</title>
+  <meta name="description" content="Local dashboard for reviewing AI CLI token usage, estimated cost, cache usage, and session timelines.">
+  <meta property="og:title" content="Token Usage Insights">
+  <meta property="og:description" content="Local dashboard for AI CLI token usage and session analysis.">
+  <meta property="og:type" content="website">
   <!-- Favicon -->
-  <link rel="icon" type="image/x-icon" href="/static/favicon.ico">
-  <!-- Google Fonts: Outfit & Inter -->
+  <link rel="icon" type="image/x-icon" href="/static/favicon-v2.ico">
+  <!-- Google Fonts: IBM Plex Sans & Mono -->
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
   <!-- Prevent flash of theme mode -->
   <script>
     const savedTheme = localStorage.getItem('theme') || 'dark';
     document.documentElement.setAttribute('data-theme', savedTheme);
   </script>
   <!-- CSS Stylesheet -->
-  <link rel="stylesheet" href="/static/styles.css?v=4">
+  <link rel="stylesheet" href="/static/styles.css?v=8">
   <!-- Chart.js for beautiful charts -->
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <!-- Marked.js for rendering markdown response -->
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <!-- DOMPurify to sanitize rendered markdown -->
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.3/dist/purify.min.js"></script>
 </head>
 <body>
+  <a class="skip-link" href="#main-content">跳到主要內容</a>
+  <button id="sidebar-toggle-btn" class="sidebar-toggle-btn sidebar-edge-toggle" title="切換側邊欄" aria-label="切換側邊欄">
+    <span class="toggle-icon"><span class="icon-glyph icon-chevron-left" aria-hidden="true"></span></span>
+  </button>
   <div class="app-container">
     <!-- Sidebar: Date selector & Overview Cards -->
     <aside class="app-sidebar">
       <div class="brand">
-        <div class="logo"><img id="brand-logo-img" src="/static/favicon.ico" /></div>
+        <div class="logo"><img id="brand-logo-img" src="/static/favicon-v2.png" /></div>
         <div class="title-group">
-          <h1 data-i18n="title">AI CLI Insights</h1>
+          <h1>Token 戰情室</h1>
         </div>
-        <button id="sidebar-close-btn" class="sidebar-close-btn" title="關閉側邊欄">❌</button>
+        <button id="sidebar-close-btn" class="sidebar-close-btn" title="關閉側邊欄" aria-label="關閉側邊欄"><span class="icon-glyph icon-close" aria-hidden="true"></span></button>
       </div>
 
-      <!-- Section 0: Assistant Selector (Hidden, logic runs in background) -->
-      <div class="sidebar-section" style="display: none !important;">
-        <h3 data-i18n="select_assistant">選擇 Agent 類型</h3>
+      <!-- Section 0: Assistant Selector -->
+      <div class="sidebar-section agent-selector-section">
+        <h3 data-i18n="select_assistant_label">Agent 類型</h3>
         <div class="assistant-badges-container" id="assistant-badges-container">
-          <button class="assistant-badge-btn active" data-value="antigravity" data-i18n="assistant_antigravity"><img class="assistant-logo" src="/static/antigravity.webp" alt="Antigravity" /> Antigravity CLI</button>
-          <button class="assistant-badge-btn" data-value="copilot" data-i18n="assistant_copilot"><img class="assistant-logo" src="/static/githubcopilot.webp" alt="Copilot" /> GitHub Copilot CLI</button>
-          <button class="assistant-badge-btn" data-value="codex" data-i18n="assistant_codex"><img class="assistant-logo" src="/static/codex.webp" alt="Codex" /> Codex CLI</button>
+          <button class="assistant-badge-btn active" data-value="antigravity" title="Antigravity CLI" aria-label="Antigravity CLI">
+            <img class="assistant-logo" src="/static/antigravity.webp" alt="Antigravity" />
+            <span class="agent-name-tooltip">Antigravity CLI</span>
+          </button>
+          <button class="assistant-badge-btn" data-value="copilot" title="GitHub Copilot CLI" aria-label="GitHub Copilot CLI">
+            <img class="assistant-logo" src="/static/githubcopilot.webp" alt="Copilot" />
+            <span class="agent-name-tooltip">GitHub Copilot CLI</span>
+          </button>
+          <button class="assistant-badge-btn" data-value="codex" title="Codex CLI" aria-label="Codex CLI">
+            <img class="assistant-logo" src="/static/codex.webp" alt="Codex" />
+            <span class="agent-name-tooltip">Codex CLI</span>
+          </button>
+          <button class="assistant-badge-btn" data-value="claude" title="Claude Code" aria-label="Claude Code">
+            <img class="assistant-logo" src="/static/claude-code-logo.svg" alt="Claude Code" />
+            <span class="agent-name-tooltip">Claude Code</span>
+          </button>
         </div>
       </div>
 
@@ -53,24 +76,6 @@
         </div>
       </div>
 
-      <!-- Section 0.5: Combined Agent Dropdown -->
-      <div class="sidebar-section" style="padding-bottom: 0; margin-bottom: -10px; display: flex; flex-direction: column; gap: 16px;">
-        <!-- Row 1: Agent Select -->
-        <div style="display: flex; flex-direction: column; gap: 6px; position: relative; width: 100%;">
-          <span style="font-size: 11px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px;" data-i18n="select_assistant_label">Agent 類型</span>
-          <div class="hover-dropdown" id="agent-hover-dropdown">
-            <div class="hover-dropdown-trigger" id="agent-dropdown-trigger">
-              <span id="agent-dropdown-label">Antigravity CLI</span>
-            </div>
-            <div class="hover-dropdown-options">
-              <div class="hover-dropdown-option" data-value="antigravity" data-i18n="agent_antigravity">Antigravity CLI</div>
-              <div class="hover-dropdown-option" data-value="copilot" data-i18n="agent_copilot">GitHub Copilot CLI</div>
-              <div class="hover-dropdown-option" data-value="codex" data-i18n="agent_codex">Codex CLI</div>
-            </div>
-          </div>
-        </div>
-      </div>
-
       <!-- Section 1: Daily Selector (for daily tab) -->
       <div class="sidebar-section" id="daily-selector-section">
         <h3 data-i18n="select_date">選擇日期</h3>
@@ -79,7 +84,7 @@
             <div class="hover-dropdown tab-hover-dropdown" style="flex: 0 0 75px; min-width: 75px;">
               <div class="hover-dropdown-trigger" style="height: 100%; display: flex; align-items: center; justify-content: space-between; border-radius: 12px; padding: 12px 10px; background: var(--bg-select); border: 1px solid var(--glass-border); color: var(--text-primary); font-family: var(--font-body); font-weight: 500;">
                 <span class="tab-dropdown-label">每日</span>
-                <span style="font-size: 8px; opacity: 0.6; margin-left: 4px;">▼</span>
+                <span class="dropdown-caret"><span class="icon-glyph icon-chevron-down" aria-hidden="true"></span></span>
               </div>
               <div class="hover-dropdown-options">
                 <div class="hover-dropdown-option" data-value="daily" data-i18n="tab_daily">每日</div>
@@ -90,19 +95,19 @@
             <input type="date" id="date-select" class="premium-date-input" style="flex: 1.5; min-width: 120px; margin: 0; box-sizing: border-box;">
           </div>
           <div style="display: flex; gap: 8px; width: 100%;">
-            <button id="btn-prev-day" class="today-btn" style="flex: 1; padding: 12px 8px;" title="前一天">◀</button>
+            <button id="btn-prev-day" class="today-btn" style="flex: 1; padding: 12px 8px;" title="前一天" aria-label="前一天"><span class="icon-glyph icon-chevron-left" aria-hidden="true"></span></button>
             <button id="btn-today" class="today-btn" style="flex: 2; padding: 12px 8px;">
               <span data-i18n="today_btn">今日</span>
             </button>
-            <button id="btn-next-day" class="today-btn" style="flex: 1; padding: 12px 8px;" title="後一天">▶</button>
-            <button id="btn-reload-daily" class="reload-btn" style="width: 45px; height: auto;" data-i18n-title="reload_data" title="重新載入數據">🔄</button>
+            <button id="btn-next-day" class="today-btn" style="flex: 1; padding: 12px 8px;" title="後一天" aria-label="後一天"><span class="icon-glyph icon-chevron-right" aria-hidden="true"></span></button>
+            <button id="btn-reload-daily" class="reload-btn" style="width: 45px; height: auto;" data-i18n-title="reload_data" title="重新載入數據" aria-label="重新載入數據"><span class="icon-glyph icon-refresh" aria-hidden="true"></span></button>
           </div>
         </div>
         
         <!-- Live Monitor Toggle -->
         <div class="live-monitor-container">
           <div class="live-status-row">
-            <span class="live-label">🔴 <span data-i18n="live_refresh">即時自動刷新</span></span>
+            <span class="live-label"><span class="live-status-dot" aria-hidden="true"></span><span data-i18n="live_refresh">即時自動刷新</span></span>
             <label class="switch-toggle">
               <input type="checkbox" id="live-toggle">
               <span class="slider-round"></span>
@@ -138,7 +143,7 @@
             <div class="hover-dropdown tab-hover-dropdown" style="flex: 0 0 75px; min-width: 75px;">
               <div class="hover-dropdown-trigger" style="height: 100%; display: flex; align-items: center; justify-content: space-between; border-radius: 12px; padding: 12px 10px; background: var(--bg-select); border: 1px solid var(--glass-border); color: var(--text-primary); font-family: var(--font-body); font-weight: 500;">
                 <span class="tab-dropdown-label">月度</span>
-                <span style="font-size: 8px; opacity: 0.6; margin-left: 4px;">▼</span>
+                <span class="dropdown-caret"><span class="icon-glyph icon-chevron-down" aria-hidden="true"></span></span>
               </div>
               <div class="hover-dropdown-options">
                 <div class="hover-dropdown-option" data-value="daily" data-i18n="tab_daily">每日</div>
@@ -151,12 +156,12 @@
             </select>
           </div>
           <div style="display: flex; gap: 8px; width: 100%;">
-            <button id="btn-prev-month" class="today-btn" style="flex: 1; padding: 12px 8px;" data-i18n-title="prev_month_btn" title="上個月">◀</button>
+            <button id="btn-prev-month" class="today-btn" style="flex: 1; padding: 12px 8px;" data-i18n-title="prev_month_btn" title="上個月" aria-label="上個月"><span class="icon-glyph icon-chevron-left" aria-hidden="true"></span></button>
             <button id="btn-this-month" class="today-btn" style="flex: 2; padding: 12px 8px;">
               <span data-i18n="this_month_btn">今月</span>
             </button>
-            <button id="btn-next-month" class="today-btn" style="flex: 1; padding: 12px 8px;" data-i18n-title="next_month_btn" title="下個月">▶</button>
-            <button id="btn-reload-monthly" class="reload-btn" style="width: 45px; height: auto;" data-i18n-title="reload_data" title="重新載入數據">🔄</button>
+            <button id="btn-next-month" class="today-btn" style="flex: 1; padding: 12px 8px;" data-i18n-title="next_month_btn" title="下個月" aria-label="下個月"><span class="icon-glyph icon-chevron-right" aria-hidden="true"></span></button>
+            <button id="btn-reload-monthly" class="reload-btn" style="width: 45px; height: auto;" data-i18n-title="reload_data" title="重新載入數據" aria-label="重新載入數據"><span class="icon-glyph icon-refresh" aria-hidden="true"></span></button>
           </div>
         </div>
       </div>
@@ -169,7 +174,7 @@
             <div class="hover-dropdown tab-hover-dropdown" style="flex: 0 0 75px; min-width: 75px;">
               <div class="hover-dropdown-trigger" style="height: 100%; display: flex; align-items: center; justify-content: space-between; border-radius: 12px; padding: 12px 10px; background: var(--bg-select); border: 1px solid var(--glass-border); color: var(--text-primary); font-family: var(--font-body); font-weight: 500;">
                 <span class="tab-dropdown-label">年度</span>
-                <span style="font-size: 8px; opacity: 0.6; margin-left: 4px;">▼</span>
+                <span class="dropdown-caret"><span class="icon-glyph icon-chevron-down" aria-hidden="true"></span></span>
               </div>
               <div class="hover-dropdown-options">
                 <div class="hover-dropdown-option" data-value="daily" data-i18n="tab_daily">每日</div>
@@ -182,12 +187,12 @@
             </select>
           </div>
           <div style="display: flex; gap: 8px; width: 100%;">
-            <button id="btn-prev-year" class="today-btn" style="flex: 1; padding: 12px 8px;" data-i18n-title="prev_year_btn" title="上一年">◀</button>
+            <button id="btn-prev-year" class="today-btn" style="flex: 1; padding: 12px 8px;" data-i18n-title="prev_year_btn" title="上一年" aria-label="上一年"><span class="icon-glyph icon-chevron-left" aria-hidden="true"></span></button>
             <button id="btn-this-year" class="today-btn" style="flex: 2; padding: 12px 8px;">
               <span data-i18n="this_year_btn">今年</span>
             </button>
-            <button id="btn-next-year" class="today-btn" style="flex: 1; padding: 12px 8px;" data-i18n-title="next_year_btn" title="下一年">▶</button>
-            <button id="btn-reload-yearly" class="reload-btn" style="width: 45px; height: auto;" data-i18n-title="reload_data" title="重新載入數據">🔄</button>
+            <button id="btn-next-year" class="today-btn" style="flex: 1; padding: 12px 8px;" data-i18n-title="next_year_btn" title="下一年" aria-label="下一年"><span class="icon-glyph icon-chevron-right" aria-hidden="true"></span></button>
+            <button id="btn-reload-yearly" class="reload-btn" style="width: 45px; height: auto;" data-i18n-title="reload_data" title="重新載入數據" aria-label="重新載入數據"><span class="icon-glyph icon-refresh" aria-hidden="true"></span></button>
           </div>
         </div>
       </div>
@@ -196,7 +201,7 @@
       <div class="sidebar-section hidden" id="codex-control-panel">
         <h3 style="display: flex; align-items: center; gap: 4px; width: 100%;">
           <span data-i18n="codex_control_title">Codex 憑證</span>
-          <span id="codex-auth-tip" style="cursor: help; opacity: 0.8; font-size: 11px;" data-i18n-title="codex_auth_tip_title" title="💡 提示：您可以在 ~/.codex/auth/ 目錄下放入多個不同的 JSON 憑證檔（例如 (a)auth.json、(b)auth.json），並透過下拉選單在看板上即時切換套用，系統將自動覆蓋並套用至 ~/.codex/auth.json。">💡</span>
+          <span id="codex-auth-tip" style="cursor: help; opacity: 0.8; font-size: 11px;" data-i18n-title="codex_auth_tip_title" title="提示：您可以在 ~/.codex/auth/ 目錄下放入多個不同的 JSON 憑證檔（例如 (a)auth.json、(b)auth.json），並透過下拉選單在看板上即時切換套用，系統將自動覆蓋並套用至 ~/.codex/auth.json。"><span class="icon-glyph icon-help" aria-hidden="true"></span></span>
         </h3>
         
         <!-- Auth Switcher -->
@@ -220,7 +225,7 @@
           <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 2px;">
             <span style="font-size: 12px; font-weight: 600; color: var(--text-secondary); display: flex; align-items: center; gap: 4px;">
               <span data-i18n="codex_rate_limit_title">API 額度限制</span>
-              <span id="codex-rate-limit-tip" style="cursor: help; opacity: 0.8; font-size: 11px;" data-i18n-title="codex_rate_limit_tip_title" title="💡 提示：此處顯示的 API 額度剩餘數據來源是最後一次本地會話的日誌紀錄，而非向伺服器發起即時線上查詢。">💡</span>
+              <span id="codex-rate-limit-tip" style="cursor: help; opacity: 0.8; font-size: 11px;" data-i18n-title="codex_rate_limit_tip_title" title="提示：此處顯示的 API 額度剩餘數據來源是最後一次本地會話的日誌紀錄，而非向伺服器發起即時線上查詢。"><span class="icon-glyph icon-help" aria-hidden="true"></span></span>
             </span>
             <span class="text-muted" style="font-size: 10px;" id="codex-rate-limit-updated">更新: --</span>
           </div>
@@ -256,7 +261,7 @@
             <span style="font-size: 12px; font-weight: 600; color: var(--text-secondary); display: flex; align-items: center; gap: 4px;">
               <span data-i18n="codex_resets_title">手動重置額度</span>
             </span>
-            <button id="btn-codex-resets-refresh" class="reload-btn" style="width: 20px; height: 20px; min-width: 20px; padding: 0; display: flex; align-items: center; justify-content: center; font-size: 11px; margin: 0; border-radius: 50%;" data-i18n-title="codex_resets_refresh_title" title="即時查詢 Codex 重置額度">🔄</button>
+            <button id="btn-codex-resets-refresh" class="reload-btn" style="width: 20px; height: 20px; min-width: 20px; padding: 0; display: flex; align-items: center; justify-content: center; font-size: 11px; margin: 0; border-radius: 50%;" data-i18n-title="codex_resets_refresh_title" title="即時查詢 Codex 重置額度" aria-label="即時查詢 Codex 重置額度"><span class="icon-glyph icon-refresh" aria-hidden="true"></span></button>
           </div>
           
           <div style="display: flex; justify-content: space-between; font-size: 11px; margin-bottom: 2px;">
@@ -300,33 +305,25 @@
     </aside>
 
     <!-- Main Content Area -->
-    <main class="app-main">
+    <main class="app-main" id="main-content">
       <header class="main-header">
         <div class="header-title-container" style="display: flex; align-items: center; gap: 16px;">
-          <button id="sidebar-toggle-btn" class="sidebar-toggle-btn" title="切換側邊欄">
-            <span class="toggle-icon">◀</span>
-          </button>
           <div class="header-info">
             <h2 id="current-date-title">
-              <span class="title-icon">📅</span>
               <span class="title-text" data-i18n="select_date_prompt">請選擇日期以載入數據</span>
             </h2>
             <p class="description" data-i18n="header_description">一站式監控與分析您本地終端 AI Agent 的 Token 消耗與會話詳細數據</p>
           </div>
         </div>
         <div class="header-controls" style="display: flex; align-items: center; gap: 10px;">
-          <select id="lang-select" class="premium-select-mini" title="切換語言 / Switch Language">
-            <option value="zh-TW">繁中</option>
-            <option value="en">EN</option>
-          </select>
-          <button id="btn-pricing-sheet" class="icon-btn has-tooltip" data-i18n-title="btn_pricing_sheet" title="費用標準">💰</button>
-          <button id="btn-setup-guide" class="icon-btn has-tooltip" data-i18n-title="setup_guide_title" title="前置作業啟用教學">⚙️</button>
-          <button id="btn-sync-db" class="icon-btn has-tooltip" data-i18n-title="sync_db_title" title="立即手動同步日誌檔到 SQLite 資料庫">⚡</button>
-          <button id="theme-toggle-btn" class="icon-btn has-tooltip" data-i18n-title="theme_toggle_title_dark" title="切換主題">🌞</button>
+          <button id="lang-toggle-btn" class="flag-lang-btn" title="切換語言" aria-label="切換語言">🇹🇼</button>
+          <button id="btn-pricing-sheet" class="icon-btn has-tooltip" data-i18n-title="btn_pricing_sheet" title="費用標準" aria-label="費用標準"><span class="icon-glyph icon-currency" aria-hidden="true"></span></button>
+          <button id="btn-setup-guide" class="icon-btn has-tooltip" data-i18n-title="setup_guide_title" title="前置作業啟用教學" aria-label="前置作業啟用教學"><span class="icon-glyph icon-help" aria-hidden="true"></span></button>
+          <button id="btn-sync-db" class="icon-btn has-tooltip" data-i18n-title="sync_db_title" title="立即手動同步日誌檔到 SQLite 資料庫" aria-label="立即手動同步日誌檔到 SQLite 資料庫"><span class="icon-glyph icon-sync" aria-hidden="true"></span></button>
+          <button id="theme-toggle-btn" class="icon-btn has-tooltip" data-i18n-title="theme_toggle_title_dark" title="切換主題" aria-label="切換主題"><span class="icon-glyph icon-theme" aria-hidden="true"></span></button>
           <a id="github-repo-btn" class="icon-btn has-tooltip" href="https://github.com/wengct/TokenUsageInsights" target="_blank" rel="noopener noreferrer" data-i18n-title="github_repo_title" title="GitHub Repo">
-            <svg class="github-icon" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0c4.42 0 8 3.58 8 8a8.013 8.013 0 0 1-5.45 7.59c-.4.08-.55-.17-.55-.38 0-.27.01-1.13.01-2.2 0-.75-.25-1.23-.54-1.48 1.78-.2 3.65-.88 3.65-3.95 0-.88-.31-1.59-.82-2.15.08-.2.36-1.02-.08-2.12 0 0-.67-.22-2.2.82-.64-.18-1.32-.27-2-.27-.68 0-1.36.09-2 .27-1.53-1.03-2.2-.82-2.2-.82-.44 1.1-.16 1.92-.08 2.12-.51.56-.82 1.28-.82 2.15 0 3.06 1.86 3.75 3.64 3.95-.23.2-.44.55-.51 1.07-.46.21-1.61.55-2.33-.66-.15-.24-.6-.83-1.23-.82-.67.01-.27.38.01.53.34.19.73.9.82 1.13.16.45.68 1.31 2.69.94 0 .67.01 1.3.01 1.49 0 .21-.15.45-.55.38A7.995 7.995 0 0 1 0 8c0-4.42 3.58-8 8-8Z"></path></svg>
+            <span class="icon-glyph icon-github" aria-hidden="true"></span>
           </a>
-          <div class="header-badge" id="assistant-version-badge">Version --</div>
         </div>
       </header>
 
@@ -342,7 +339,7 @@
         <section class="dashboard-grid">
           <!-- Metric Cards -->
           <div class="stat-card highlight">
-            <div class="card-icon">⚡</div>
+            <div class="card-icon"><span class="icon-glyph icon-total" aria-hidden="true"></span></div>
             <div class="stat-info">
               <span class="label" data-i18n="total_tokens_label">總消耗 Token</span>
               <span class="value" id="stat-total-tokens">0</span>
@@ -351,7 +348,7 @@
           </div>
 
           <div class="stat-card">
-            <div class="card-icon">📥</div>
+            <div class="card-icon"><span class="icon-glyph icon-input" aria-hidden="true"></span></div>
             <div class="stat-info">
               <span class="label" data-i18n="input_tokens_label">輸入 Token</span>
               <span class="value" id="stat-input-tokens">0</span>
@@ -360,7 +357,7 @@
           </div>
 
           <div class="stat-card">
-            <div class="card-icon">📤</div>
+            <div class="card-icon"><span class="icon-glyph icon-output" aria-hidden="true"></span></div>
             <div class="stat-info">
               <span class="label" data-i18n="output_tokens_label">輸出 Token</span>
               <span class="value" id="stat-output-tokens">0</span>
@@ -369,7 +366,7 @@
           </div>
 
           <div class="stat-card">
-            <div class="card-icon">💡</div>
+            <div class="card-icon"><span class="icon-glyph icon-reasoning" aria-hidden="true"></span></div>
             <div class="stat-info">
               <span class="label" data-i18n="reasoning_tokens_label">推理 Token</span>
               <span class="value" id="stat-reasoning-tokens">0</span>
@@ -378,11 +375,10 @@
           </div>
 
           <div class="stat-card highlight-gold">
-            <div class="card-icon">💰</div>
+            <div class="card-icon"><span class="icon-glyph icon-cost" aria-hidden="true"></span></div>
             <div class="stat-info">
               <span class="label" data-i18n="estimated_cost_label">估算費用 (美金)</span>
               <span class="value" id="stat-total-cost">$0.00</span>
-              <span class="sub-label" id="stat-cost-desc" data-i18n="stat_cost_desc">⚠️ 此為預估試算僅供參考 (基於 pricing.csv)</span>
             </div>
           </div>
         </section>
@@ -409,7 +405,7 @@
                 <tr>
                   <th class="sortable" data-sort="session_name"><span data-i18n="col_session">會話</span> <span class="sort-icon"></span></th>
                   <th class="sortable" data-sort="assistant_type" id="col-assistant-header"><span data-i18n="col_assistant">Agent</span> <span class="sort-icon"></span></th>
-                  <th class="sortable" data-sort="model"><span data-i18n="col_model">Model</span> <span class="sort-icon"></span></th>
+                  <th class="sortable model-column" data-sort="model"><span data-i18n="col_model">Model</span> <span class="sort-icon"></span></th>
                   <th class="sortable" data-sort="max_turn_no"><span data-i18n="col_turns">Turn 數</span> <span class="sort-icon"></span></th>
                   <th class="sortable" data-sort="total_input_tokens"><span data-i18n="col_input">輸入</span> <span class="sort-icon"></span></th>
                   <th class="sortable" data-sort="total_output_tokens"><span data-i18n="col_output">輸出</span> <span class="sort-icon"></span></th>
@@ -436,7 +432,7 @@
         <!-- Monthly Metrics Grid -->
         <section class="dashboard-grid">
           <div class="stat-card highlight">
-            <div class="card-icon">📆</div>
+            <div class="card-icon"><span class="icon-glyph icon-calendar" aria-hidden="true"></span></div>
             <div class="stat-info">
               <span class="label" data-i18n="monthly_tokens_label">月總消耗 Token</span>
               <span class="value" id="monthly-stat-total-tokens">0</span>
@@ -445,7 +441,7 @@
           </div>
 
           <div class="stat-card">
-            <div class="card-icon">📥</div>
+            <div class="card-icon"><span class="icon-glyph icon-input" aria-hidden="true"></span></div>
             <div class="stat-info">
               <span class="label" data-i18n="monthly_input_label">月輸入 Token</span>
               <span class="value" id="monthly-stat-input-tokens">0</span>
@@ -454,7 +450,7 @@
           </div>
 
           <div class="stat-card">
-            <div class="card-icon">📤</div>
+            <div class="card-icon"><span class="icon-glyph icon-output" aria-hidden="true"></span></div>
             <div class="stat-info">
               <span class="label" data-i18n="monthly_output_label">月輸出 Token</span>
               <span class="value" id="monthly-stat-output-tokens">0</span>
@@ -463,7 +459,7 @@
           </div>
 
           <div class="stat-card">
-            <div class="card-icon">👥</div>
+            <div class="card-icon"><span class="icon-glyph icon-sessions" aria-hidden="true"></span></div>
             <div class="stat-info">
               <span class="label" data-i18n="monthly_sessions_label">月總會話數</span>
               <span class="value" id="monthly-stat-sessions">0</span>
@@ -472,11 +468,10 @@
           </div>
 
           <div class="stat-card highlight-gold">
-            <div class="card-icon">💰</div>
+            <div class="card-icon"><span class="icon-glyph icon-cost" aria-hidden="true"></span></div>
             <div class="stat-info">
               <span class="label" data-i18n="estimated_cost_label">估算費用 (美金)</span>
               <span class="value" id="monthly-stat-total-cost">$0.00</span>
-              <span class="sub-label" id="monthly-stat-cost-desc" data-i18n="stat_cost_desc">⚠️ 此為預估試算僅供參考 (基於 pricing.csv)</span>
             </div>
           </div>
         </section>
@@ -495,7 +490,7 @@
         <section class="monthly-daily-summary-section" style="margin-top: 24px;">
           <div class="glass-card">
             <div class="section-header">
-              <h3 style="margin-bottom: 0px;" data-i18n="monthly_daily_summary_title">📅 當月每日彙總</h3>
+              <h3 style="margin-bottom: 0px;" data-i18n="monthly_daily_summary_title">當月每日彙總</h3>
             </div>
             <div class="table-wrapper" style="margin-top: 18px;">
               <table class="premium-table">
@@ -525,7 +520,7 @@
           <!-- Top Projects -->
           <div class="glass-card">
             <div class="section-header">
-              <h3 style="margin-bottom: 0px;" data-i18n="monthly_projects_title">🏢 最常活動的專案目錄</h3>
+              <h3 style="margin-bottom: 0px;" data-i18n="monthly_projects_title">最常活動的專案目錄</h3>
             </div>
             <div class="table-wrapper" style="margin-top: 18px;">
               <table class="premium-table">
@@ -549,7 +544,7 @@
           <!-- Top Models -->
           <div class="glass-card">
             <div class="section-header">
-              <h3 style="margin-bottom: 0px;" data-i18n="monthly_models_title">🤖 使用的模型佔比</h3>
+              <h3 style="margin-bottom: 0px;" data-i18n="monthly_models_title">使用的模型佔比</h3>
             </div>
             <div class="table-wrapper" style="margin-top: 18px;">
               <table class="premium-table">
@@ -578,7 +573,7 @@
         <!-- Yearly Metrics Grid -->
         <section class="dashboard-grid">
           <div class="stat-card highlight">
-            <div class="card-icon">📆</div>
+            <div class="card-icon"><span class="icon-glyph icon-calendar" aria-hidden="true"></span></div>
             <div class="stat-info">
               <span class="label" data-i18n="yearly_tokens_label">年總消耗 Token</span>
               <span class="value" id="yearly-stat-total-tokens">0</span>
@@ -587,7 +582,7 @@
           </div>
 
           <div class="stat-card">
-            <div class="card-icon">📥</div>
+            <div class="card-icon"><span class="icon-glyph icon-input" aria-hidden="true"></span></div>
             <div class="stat-info">
               <span class="label" data-i18n="yearly_input_label">年輸入 Token</span>
               <span class="value" id="yearly-stat-input-tokens">0</span>
@@ -596,7 +591,7 @@
           </div>
 
           <div class="stat-card">
-            <div class="card-icon">📤</div>
+            <div class="card-icon"><span class="icon-glyph icon-output" aria-hidden="true"></span></div>
             <div class="stat-info">
               <span class="label" data-i18n="yearly_output_label">年輸出 Token</span>
               <span class="value" id="yearly-stat-output-tokens">0</span>
@@ -605,7 +600,7 @@
           </div>
 
           <div class="stat-card">
-            <div class="card-icon">👥</div>
+            <div class="card-icon"><span class="icon-glyph icon-sessions" aria-hidden="true"></span></div>
             <div class="stat-info">
               <span class="label" data-i18n="yearly_sessions_label">年總會話數</span>
               <span class="value" id="yearly-stat-sessions">0</span>
@@ -614,11 +609,10 @@
           </div>
 
           <div class="stat-card highlight-gold">
-            <div class="card-icon">💰</div>
+            <div class="card-icon"><span class="icon-glyph icon-cost" aria-hidden="true"></span></div>
             <div class="stat-info">
               <span class="label" data-i18n="estimated_cost_label">估算費用 (美金)</span>
               <span class="value" id="yearly-stat-total-cost">$0.00</span>
-              <span class="sub-label" id="yearly-stat-cost-desc" data-i18n="stat_cost_desc">⚠️ 此為預估試算僅供參考 (基於 pricing.csv)</span>
             </div>
           </div>
         </section>
@@ -637,7 +631,7 @@
         <section class="monthly-daily-summary-section" style="margin-top: 24px;">
           <div class="glass-card">
             <div class="section-header">
-              <h3 style="margin-bottom: 0px;" data-i18n="yearly_monthly_summary_title">📅 當年每月彙總</h3>
+              <h3 style="margin-bottom: 0px;" data-i18n="yearly_monthly_summary_title">當年每月彙總</h3>
             </div>
             <div class="table-wrapper" style="margin-top: 18px;">
               <table class="premium-table">
@@ -667,7 +661,7 @@
           <!-- Top Projects -->
           <div class="glass-card">
             <div class="section-header">
-              <h3 style="margin-bottom: 0px;" data-i18n="yearly_projects_title">🏢 年度最常活動的專案目錄</h3>
+              <h3 style="margin-bottom: 0px;" data-i18n="yearly_projects_title">年度最常活動的專案目錄</h3>
             </div>
             <div class="table-wrapper" style="margin-top: 18px;">
               <table class="premium-table">
@@ -691,7 +685,7 @@
           <!-- Top Models -->
           <div class="glass-card">
             <div class="section-header">
-              <h3 style="margin-bottom: 0px;" data-i18n="yearly_models_title">🤖 使用的模型佔比</h3>
+              <h3 style="margin-bottom: 0px;" data-i18n="yearly_models_title">使用的模型佔比</h3>
             </div>
             <div class="table-wrapper" style="margin-top: 18px;">
               <table class="premium-table">
@@ -726,7 +720,7 @@
           <h2 id="drawer-session-name">Session Name</h2>
           <span class="session-id" id="drawer-session-id">Session ID</span>
         </div>
-        <button class="close-btn" id="close-drawer-btn">&times;</button>
+        <button class="close-btn" id="close-drawer-btn" aria-label="關閉"><span class="icon-glyph icon-close" aria-hidden="true"></span></button>
       </div>
 
       <div class="drawer-body">
@@ -748,7 +742,7 @@
             <span class="lbl" data-i18n="drawer_model">Model</span>
             <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 4px;">
               <span class="val" id="meta-model" style="margin-top: 0;">-</span>
-              <span class="val" id="meta-effort" style="display: none; background: rgba(167, 139, 250, 0.15); color: #a78bfa; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; text-transform: uppercase;">-</span>
+              <span class="val" id="meta-effort" style="display: none; background: rgba(127, 142, 163, 0.15); color: #aeb9c8; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600;">-</span>
             </div>
           </div>
           <div class="meta-item" id="drawer-meta-nickname-container" style="display: none;">
@@ -802,55 +796,63 @@
     <div class="modal-content">
       <div class="modal-header">
         <div class="modal-title-group">
-          <h2 data-i18n="setup_modal_title">⚙️ Google Antigravity CLI 前置設定與啟用教學</h2>
+          <h2 id="setup-modal-title" data-i18n="setup_modal_title">Google Antigravity CLI 前置設定與啟用教學</h2>
         </div>
-        <button class="close-btn" id="close-setup-modal-btn">&times;</button>
+        <button class="close-btn" id="close-setup-modal-btn" aria-label="關閉"><span class="icon-glyph icon-close" aria-hidden="true"></span></button>
       </div>
       <!-- Status Line Setup Content (Antigravity & Copilot) -->
       <div class="modal-body" id="setup-body-statusline">
         <div class="modal-text">
-          <p data-i18n="setup_modal_intro">本 Dashboard 主要是解析並呈現 Google Antigravity CLI 的 <strong>Status Line (狀態列)</strong> 所收集的 Token 數據。我們將使用 <code>~/.antigravity/statusline-token.sh</code> 進行每日數據統計與會話紀錄。</p>
+          <p id="setup-modal-intro" data-i18n="setup_modal_intro">本看板主要解析並呈現 Google Antigravity CLI 的 <strong>Status Line (狀態列)</strong> 所收集的 Token 數據。我們將使用 <code>~/.gemini/antigravity-cli/statusline-token.sh</code> 進行每日數據統計與會話紀錄。</p>
         </div>
 
+        <!-- 步驟 1：複製專案到本地 -->
         <div class="modal-section">
-          <h3 data-i18n="setup_step_1"><span>1️⃣</span> 1. 確認 script 有執行權限</h3>
-          <p class="modal-text" data-i18n="setup_step_1_desc">首先建立設定目錄，並將專案中的收集腳本複製至家目錄 of <code>.antigravity</code> 目錄下，最後賦予執行權限：</p>
+          <h3 id="setup-step-clone" data-i18n="setup_step_clone"><span>01</span> 1. 複製專案到本地</h3>
+          <p class="modal-text" id="setup-step-clone-desc" data-i18n="setup_step_clone_desc">請先在終端機中執行以下指令複製專案並進入專案目錄，以取得腳本檔案：</p>
           <div class="code-block-container">
-            <button class="copy-code-btn" data-i18n="btn_copy_cmd" title="複製指令">📋 複製指令</button>
-            <pre><code id="code-setup-cmd">mkdir -p ~/.antigravity && cp shell/statusline-token.sh ~/.antigravity/statusline-token.sh && chmod +x ~/.antigravity/statusline-token.sh</code></pre>
+            <button class="copy-code-btn" data-i18n="btn_copy_cmd" title="複製指令">複製指令</button>
+            <pre><code>git clone https://github.com/doggy8088/TokenUsageInsights.git && cd TokenUsageInsights</code></pre>
           </div>
         </div>
 
+        <!-- 步驟 2：確認 script 有執行權限 -->
         <div class="modal-section">
-          <h3 data-i18n="setup_step_2"><span>2️⃣</span> 2. 編輯設定檔</h3>
-          <p class="modal-text" data-i18n="setup_step_2_desc">編輯或新增 Antigravity CLI 的設定檔 <code>~/.gemini/antigravity-cli/settings.json</code>：</p>
+          <h3 id="setup-step-1" data-i18n="setup_step_1"><span>02</span> 2. 確認 script 有執行權限</h3>
+          <p class="modal-text" id="setup-step-1-desc" data-i18n="setup_step_1_desc">首先建立設定目錄，並將專案中的收集腳本複製至家目錄的 <code>.gemini/antigravity-cli</code> 目錄下，最後賦予執行權限：</p>
+          <div class="code-block-container">
+            <button class="copy-code-btn" data-i18n="btn_copy_cmd" title="複製指令">複製指令</button>
+            <pre><code id="code-setup-cmd">mkdir -p ~/.gemini/antigravity-cli && cp shell/antigravity/statusline-token.sh ~/.gemini/antigravity-cli/statusline-token.sh && chmod +x ~/.gemini/antigravity-cli/statusline-token.sh</code></pre>
+          </div>
+        </div>
+
+        <!-- 步驟 3：編輯設定檔 -->
+        <div class="modal-section">
+          <h3 id="setup-step-2" data-i18n="setup_step_2"><span>03</span> 3. 編輯設定檔</h3>
+          <p class="modal-text" id="setup-step-2-desc" data-i18n="setup_step_2_desc">編輯或新增 Antigravity CLI 的設定檔 <code>~/.gemini/antigravity-cli/settings.json</code>：</p>
           <div class="code-block-container" style="margin-bottom: 8px;">
-            <button class="copy-code-btn" data-i18n="btn_copy_cmd" title="複製指令">📋 複製指令</button>
-            <pre><code>nano ~/.gemini/antigravity-cli/settings.json</code></pre>
+            <button class="copy-code-btn" data-i18n="btn_copy_cmd" title="複製指令">複製指令</button>
+            <pre><code id="code-edit-settings">vi ~/.gemini/antigravity-cli/settings.json</code></pre>
           </div>
           <p class="modal-text" data-i18n="setup_step_2_desc2">在設定檔中加入以下 <code>statusLine</code> 設定內容：</p>
           <div class="code-block-container">
-            <button class="copy-code-btn" id="btn-copy-json" data-i18n="btn_copy_config" title="複製配置">📋 複製配置 JSON</button>
+            <button class="copy-code-btn" id="btn-copy-json" data-i18n="btn_copy_config" title="複製配置">複製配置 JSON</button>
             <pre><code id="code-setup-json">{
   "statusLine": {
     "type": "command",
-    "command": "$HOME/.antigravity/statusline-token.sh",
+    "command": "$HOME/.gemini/antigravity-cli/statusline-token.sh",
     "padding": 1
   }
 }</code></pre>
           </div>
-          <div style="margin-top: 10px; padding: 12px; background: rgba(0, 242, 254, 0.05); border-left: 3px solid var(--accent-cyan); border-radius: 4px;" class="modal-text">
-            <strong data-i18n="setup_home_hint_title">💡 Home 目錄路徑提示：</strong><br>
-            <span data-i18n="setup_home_hint_desc">如果您的 <code>$HOME</code> 家目錄不是 <code id="lbl-detected-home">/home/&lt;username&gt;</code>，可在終端機執行 
-            <code style="background: rgba(255,255,255,0.15)">echo $HOME</code> 查詢您的家目錄路徑，並對應修改 <code>command</code> 欄位的值。</span>
-          </div>
         </div>
 
+        <!-- 步驟 4：已經有其他設定時（不要覆蓋） -->
         <div class="modal-section">
-          <h3 data-i18n="setup_step_3"><span>3️⃣</span> 3. 已經有其他設定時（不要覆蓋）</h3>
+          <h3 id="setup-step-3" data-i18n="setup_step_3"><span>04</span> 4. 已經有其他設定時（不要覆蓋）</h3>
           <p class="modal-text" data-i18n="setup_step_3_desc">若您的 <code>settings.json</code> 中已經有其他現成設定，<strong>請勿整檔覆蓋</strong>，只需將 <code>statusLine</code> 屬性合併加入即可，例如：</p>
           <div class="code-block-container">
-            <button class="copy-code-btn" id="btn-copy-json-merge" data-i18n="btn_copy_merge_example" title="複製合併範例">📋 複製合併範例</button>
+            <button class="copy-code-btn" id="btn-copy-json-merge" data-i18n="btn_copy_merge_example" title="複製合併範例">複製合併範例</button>
             <pre><code id="code-setup-json-merge">{
   "footer": {
     "showDirectory": true,
@@ -858,36 +860,38 @@
   },
   "statusLine": {
     "type": "command",
-    "command": "$HOME/.antigravity/statusline-token.sh",
+    "command": "$HOME/.gemini/antigravity-cli/statusline-token.sh",
     "padding": 1
   }
 }</code></pre>
           </div>
         </div>
 
+        <!-- 步驟 5：重開 CLI -->
         <div class="modal-section">
-          <h3 data-i18n="setup_step_4"><span>4️⃣</span> 4. 重開 Antigravity CLI</h3>
-          <p class="modal-text" data-i18n="setup_step_4_desc">設定完成並存檔後，請<strong>退出目前的 Antigravity CLI 聊天會話，並重新進入</strong>以套用全新設定。</p>
+          <h3 id="setup-step-4" data-i18n="setup_step_4"><span>05</span> 5. 重開 Antigravity CLI</h3>
+          <p class="modal-text" id="setup-step-4-desc" data-i18n="setup_step_4_desc">設定完成並存檔後，請<strong>退出目前的 Antigravity CLI 聊天會話，並重新進入</strong>以套用全新設定。</p>
         </div>
 
+        <!-- 步驟 6：檢查是否成功 -->
         <div class="modal-section">
-          <h3 data-i18n="setup_step_5"><span>5️⃣</span> 5. 檢查是否成功</h3>
-          <p class="modal-text" data-i18n="setup_step_5_desc">進入 Antigravity CLI 會話聊天後，畫面底部應該會看到由本專案腳本收集並精緻渲染出的狀態列，如：</p>
+          <h3 id="setup-step-5" data-i18n="setup_step_5"><span>06</span> 6. 檢查是否成功</h3>
+          <p class="modal-text" id="setup-step-5-desc" data-i18n="setup_step_5_desc">進入 Antigravity CLI 會話後，畫面底部應該會顯示由本專案腳本產生的狀態列，如：</p>
           <div class="code-block-container" style="background: rgba(255,255,255,0.02);">
-            <pre style="color: var(--neon-green);"><code>🤖 Auto → GPT-5.3-Codex • #1 • ↑ 22.8k • c 22.0k/0 • ↓ 61 • r 29 • total 22.9k • +22.9k • last 22.8k/61 • ctx 9%</code></pre>
+            <pre style="color: var(--neon-green);"><code>Auto > GPT-5.3-Codex | #1 | in 22.8k | cache 22.0k/0 | out 61 | reasoning 29 | total 22.9k | ctx 9%</code></pre>
           </div>
           
           <div style="margin-top: 10px;" class="modal-text">
-            <strong data-i18n="setup_troubleshooting">⚠️ 除錯與檢查 (Troubleshooting)：</strong>
-            <p style="margin-top: 6px; margin-left: 12px;" data-i18n="setup_troubleshoot_a">🔍 <strong>A. 若狀態列未正常出現，請先單獨測試腳本是否能正常執行：</strong></p>
+            <strong data-i18n="setup_troubleshooting">除錯與檢查 (Troubleshooting)：</strong>
+            <p style="margin-top: 6px; margin-left: 12px;" data-i18n="setup_troubleshoot_a"><strong>A. 若狀態列未正常出現，請先單獨測試腳本是否能正常執行：</strong></p>
             <div class="code-block-container" style="margin-left: 12px; margin-top: 4px;">
-              <button class="copy-code-btn" data-i18n="btn_copy_cmd" title="複製">📋 複製</button>
-              <pre><code id="code-troubleshoot-a">echo '{}' | ~/.antigravity/statusline-token.sh</code></pre>
+              <button class="copy-code-btn" data-i18n="btn_copy_cmd" title="複製">複製</button>
+              <pre><code id="code-troubleshoot-a">echo '{}' | ~/.gemini/antigravity-cli/statusline-token.sh</code></pre>
             </div>
             
-            <p style="margin-top: 8px; margin-left: 12px;" data-i18n="setup_troubleshoot_b">🔍 <strong>B. 請確認 <code>settings.json</code> 是合法的 JSON 格式：</strong></p>
+            <p style="margin-top: 8px; margin-left: 12px;" data-i18n="setup_troubleshoot_b"><strong>B. 請確認 <code>settings.json</code> 是合法的 JSON 格式：</strong></p>
             <div class="code-block-container" style="margin-left: 12px; margin-top: 4px;">
-              <button class="copy-code-btn" data-i18n="btn_copy_cmd" title="複製">📋 複製</button>
+              <button class="copy-code-btn" data-i18n="btn_copy_cmd" title="複製">複製</button>
               <pre><code id="code-troubleshoot-b">jq . ~/.gemini/antigravity-cli/settings.json</code></pre>
             </div>
           </div>
@@ -897,22 +901,44 @@
       <!-- Codex Setup Content -->
       <div class="modal-body" id="setup-body-codex" style="display: none;">
         <div class="modal-text">
-          <p data-i18n="codex_setup_modal_intro">本 Dashboard 主要是解析並呈現 Codex CLI 的本地會話事件與 Token 數據。因為 Codex CLI 會自動將會話記錄在 <code>~/.codex/sessions</code> 目錄下，您不需要進行任何腳本設定或狀態列修改，本 Dashboard 就會自動讀取並進行即時同步！</p>
+          <p data-i18n="codex_setup_modal_intro">本看板主要解析並呈現 Codex CLI 的本地會話事件與 Token 數據。Codex CLI 會自動將會話記錄在 <code>~/.codex/sessions</code> 目錄下，不需要額外設定腳本或狀態列。</p>
         </div>
 
         <div class="modal-section">
-          <h3 data-i18n="codex_setup_step_1"><span>1️⃣</span> 1. 確認 Codex CLI 已在使用</h3>
-          <p class="modal-text" data-i18n="codex_setup_step_1_desc">只要您在終端機中執行過 Codex CLI 進行過對話，會話檔案就會自動生成在此目錄中。</p>
+          <h3 data-i18n="codex_setup_step_1"><span>01</span> 1. 確認 Codex CLI 已在使用</h3>
+          <p class="modal-text" data-i18n="codex_setup_step_1_desc">只要您在終端機中執行過 Codex CLI 進行對話，會話檔案就會自動生成在此目錄中。</p>
         </div>
 
         <div class="modal-section">
-          <h3 data-i18n="codex_setup_step_2"><span>2️⃣</span> 2. 偵測路徑狀態</h3>
-          <p class="modal-text" data-i18n="codex_setup_step_2_desc">目前偵測到的 Codex 目錄為：<code id="lbl-detected-home-codex">~/.codex</code>。本系統會以極高效率對該目錄進行即時掃描與分析。</p>
+          <h3 data-i18n="codex_setup_step_2"><span>02</span> 2. 偵測路徑狀態</h3>
+          <p class="modal-text" data-i18n="codex_setup_step_2_desc">目前偵測到的 Codex CLI 目錄為：<code id="lbl-detected-home-codex">~/.codex/sessions</code>。本系統會以極高效率對該目錄進行即時掃描與分析。</p>
         </div>
 
         <div class="modal-section">
-          <h3 data-i18n="codex_setup_step_3"><span>3️⃣</span> 3. 費用估算邏輯</h3>
+          <h3 data-i18n="codex_setup_step_3"><span>03</span> 3. 費用估算邏輯</h3>
           <p class="modal-text" data-i18n="codex_setup_step_3_desc">費用會根據您的對話模型以 Token 數量為基準進行即時估算，排除快取部分後得出實際成本。</p>
+        </div>
+      </div>
+
+      <!-- Claude Code Setup Content -->
+      <div class="modal-body" id="setup-body-claude" style="display: none;">
+        <div class="modal-text">
+          <p data-i18n="claude_setup_modal_intro">本看板主要解析並呈現 Claude Code 的本地會話事件與 Token 數據。Claude Code 會自動將會話記錄在 <code>~/.claude/projects</code> 目錄下，不需要額外設定腳本或狀態列。</p>
+        </div>
+
+        <div class="modal-section">
+          <h3 data-i18n="claude_setup_step_1"><span>01</span> 1. 確認 Claude Code 已在使用</h3>
+          <p class="modal-text" data-i18n="claude_setup_step_1_desc">只要您在終端機中執行過 Claude Code 進行對話，會話檔案就會自動生成在此目錄中。</p>
+        </div>
+
+        <div class="modal-section">
+          <h3 data-i18n="claude_setup_step_2"><span>02</span> 2. 偵測路徑狀態</h3>
+          <p class="modal-text" data-i18n="claude_setup_step_2_desc">目前偵測到的 Claude Code 目錄為：<code id="lbl-detected-home-claude">~/.claude/projects</code>。本系統會以極高效率對該目錄進行即時掃描與分析。</p>
+        </div>
+
+        <div class="modal-section">
+          <h3 data-i18n="claude_setup_step_3"><span>03</span> 3. 費用估算邏輯</h3>
+          <p class="modal-text" data-i18n="claude_setup_step_3_desc">費用會根據您的對話模型以 Token 數量為基準進行即時估算，排除快取部分後得出實際成本。</p>
         </div>
       </div>
     </div>
@@ -923,13 +949,13 @@
     <div class="modal-content" style="max-width: 800px;">
       <div class="modal-header">
         <div class="modal-title-group">
-          <h2 data-i18n="pricing_sheet_title">💰 AI 模型費用標準表</h2>
+          <h2 data-i18n="pricing_sheet_title">AI 模型費用標準表</h2>
         </div>
-        <button class="close-btn" id="close-pricing-modal-btn">&times;</button>
+        <button class="close-btn" id="close-pricing-modal-btn" aria-label="關閉"><span class="icon-glyph icon-close" aria-hidden="true"></span></button>
       </div>
       <div class="modal-body">
         <p class="modal-text" style="margin-bottom: 16px;" data-i18n="pricing_intro">
-          此費用為本地估算，單價依據 <code>pricing.csv</code> 載入。單位為 1M Tokens (每百萬個 Token) 的美金價格。<br><strong style="color: var(--neon-gold, #fbbf24);">⚠️ 註：此為預估試算僅供參考。</strong>
+          此費用為本地估算，單價依據 <code>pricing.csv</code> 載入。單位為 1M Tokens (每百萬個 Token) 的美金價格。<br><strong style="color: var(--neon-gold, #fbbf24);">註：此為預估試算僅供參考。</strong>
         </p>
         <div class="table-wrapper">
           <table class="premium-table">
@@ -959,6 +985,6 @@
   <div class="sidebar-overlay" id="sidebar-overlay"></div>
 
   <!-- Frontend Javascript logic -->
-  <script type="module" src="/static/app.js?v=4"></script>
+  <script type="module" src="/static/app.js?v=8"></script>
 </body>
 </html>

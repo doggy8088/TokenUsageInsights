@@ -29,7 +29,7 @@ pub fn load_pricing_rules() -> Vec<PricingRule> {
         let reader = BufReader::new(file);
         let mut lines = reader.lines();
         if let Some(Ok(_header)) = lines.next() {
-            for line in lines.flatten() {
+            for line in lines.map_while(Result::ok) {
                 let parts: Vec<&str> = line.split(',').collect();
                 if parts.len() >= 6 {
                     let input_price = parts[3].trim().parse::<f64>().unwrap_or(0.0);
@@ -113,10 +113,13 @@ pub fn calculate_cost(
     input: u64,
     output: u64,
     cache_read: u64,
-) -> f64 {
+) -> Result<f64, String> {
     let (m_base, _) = parse_threshold_rule(model_name);
     if m_base.is_empty() {
-        return 0.0;
+        return Err(format!(
+            "模型名稱為空，無法估算成本。來源模型：{}",
+            model_name
+        ));
     }
 
     let total_context = input + cache_read + output;
@@ -171,8 +174,8 @@ pub fn calculate_cost(
         let input_cost = (input as f64 / 1_000_000.0) * r.input_price;
         let cache_cost = (cache_read as f64 / 1_000_000.0) * r.cache_input_price;
         let output_cost = (output as f64 / 1_000_000.0) * r.output_price;
-        input_cost + cache_cost + output_cost
+        Ok(input_cost + cache_cost + output_cost)
     } else {
-        0.0 // 未知模型暫估為 0 元
+        Err(format!("找不到可用的模型價格規則：{}", model_name))
     }
 }

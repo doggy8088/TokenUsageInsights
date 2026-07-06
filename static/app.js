@@ -1,8 +1,19 @@
-import i18n from './i18n.js';
+import i18n from './i18n.js?v=8';
 
 // Globals
 let tokenChartInstance = null;
 let monthlyChartInstance = null;
+
+const chartPalette = {
+  tokenFill: 'rgba(47, 184, 197, 0.24)',
+  tokenStroke: '#2fb8c5',
+  cacheFill: 'rgba(137, 151, 172, 0.62)',
+  cacheStroke: '#8997ac',
+  trendFill: 'rgba(246, 190, 79, 0.14)',
+  trendStroke: '#f6be4f',
+};
+
+const chartFontFamily = 'IBM Plex Sans';
 
 // Cookie helper functions
 function setCookie(name, value, days = 365) {
@@ -23,10 +34,127 @@ function getCookie(name) {
   return null;
 }
 
-const savedAgent = getCookie('selected_agent');
-let currentAssistant = ['antigravity', 'copilot', 'codex'].includes(savedAgent) ? savedAgent : 'antigravity';
+const assistantAliasMap = {
+  'claude-code': 'claude',
+  'claude_code': 'claude',
+  'claudecode': 'claude',
+};
 
-const savedTab = getCookie('active_tab');
+const assistantMeta = {
+  antigravity: {
+    logo: '/static/antigravity.webp',
+    label: 'Antigravity CLI',
+    shortLabel: 'Antigravity',
+    alt: 'Antigravity',
+    badgeStyle: 'background: rgba(47, 184, 197, 0.13); color: #2fb8c5; border: 1px solid rgba(47, 184, 197, 0.26); display: inline-flex; align-items: center;',
+    senderName: 'ANTIGRAVITY AGENT',
+  },
+  copilot: {
+    logo: '/static/githubcopilot.webp',
+    label: 'GitHub Copilot CLI',
+    shortLabel: 'Copilot',
+    alt: 'Copilot',
+    badgeStyle: 'background: rgba(185, 43, 39, 0.15); color: #b92b27; border: 1px solid rgba(185, 43, 39, 0.3); display: inline-flex; align-items: center;',
+    senderName: 'COPILOT AGENT',
+  },
+  codex: {
+    logo: '/static/codex.webp',
+    label: 'Codex CLI',
+    shortLabel: 'Codex',
+    alt: 'Codex',
+    badgeStyle: 'background: rgba(16, 185, 129, 0.15); color: #10b981; border: 1px solid rgba(16, 185, 129, 0.3); display: inline-flex; align-items: center;',
+    senderName: 'CODEX AGENT',
+  },
+  claude: {
+    logo: '/static/claude-code-logo.svg',
+    label: 'Claude Code',
+    shortLabel: 'Claude Code',
+    alt: 'Claude Code',
+    badgeStyle: 'background: rgba(79, 126, 168, 0.15); color: #7aa7cf; border: 1px solid rgba(79, 126, 168, 0.3); display: inline-flex; align-items: center;',
+    senderName: 'CLAUDE CODE AGENT',
+  },
+};
+
+function normalizeAssistant(rawValue) {
+  const normalized = String(rawValue || '').trim().toLowerCase();
+  return assistantAliasMap[normalized] || normalized;
+}
+
+function isSupportedAssistant(rawValue) {
+  const normalized = normalizeAssistant(rawValue);
+  return Object.prototype.hasOwnProperty.call(assistantMeta, normalized);
+}
+
+function getAssistantMeta(rawValue) {
+  const normalized = normalizeAssistant(rawValue);
+  return assistantMeta[normalized] || {
+    logo: '/static/favicon-v2.png',
+    label: normalized || 'Agent',
+    shortLabel: normalized || 'Agent',
+    alt: normalized || 'Agent',
+    badgeStyle: 'display: inline-flex; align-items: center;',
+    senderName: 'AGENT',
+  };
+}
+
+function getAssistantLogoHtml(rawValue, className = 'badge-logo') {
+  const meta = getAssistantMeta(rawValue);
+  return `<img class="${className}" src="${meta.logo}" alt="${meta.alt}" />`;
+}
+
+function getUrlDateForTab(tab) {
+  const urlParams = new URLSearchParams(window.location.search);
+  const urlDate = urlParams.get('date');
+  if (!urlDate) return null;
+  
+  if (tab === 'daily') {
+    return urlDate;
+  } else if (tab === 'monthly') {
+    if (/^\d{4}-\d{2}-\d{2}$/.test(urlDate)) {
+      return urlDate.substring(0, 7);
+    }
+    return urlDate;
+  } else if (tab === 'yearly') {
+    if (/^\d{4}-\d{2}(-\d{2})?$/.test(urlDate)) {
+      return urlDate.substring(0, 4);
+    }
+    return urlDate;
+  }
+  return urlDate;
+}
+
+function updateUrlParams() {
+  const url = new URL(window.location.href);
+  url.searchParams.set('agent', currentAssistant);
+  url.searchParams.set('tab', activeTab);
+  
+  if (activeTab === 'daily') {
+    const dateSelect = document.getElementById('date-select');
+    if (dateSelect && dateSelect.value) {
+      url.searchParams.set('date', dateSelect.value);
+    }
+  } else if (activeTab === 'monthly') {
+    const monthSelect = document.getElementById('month-select');
+    if (monthSelect && monthSelect.value) {
+      url.searchParams.set('date', monthSelect.value);
+    }
+  } else if (activeTab === 'yearly') {
+    const yearSelect = document.getElementById('year-select');
+    if (yearSelect && yearSelect.value) {
+      url.searchParams.set('date', yearSelect.value);
+    }
+  }
+  
+  window.history.replaceState(null, '', url.toString());
+}
+
+const urlParams = new URLSearchParams(window.location.search);
+const urlAgent = urlParams.get('agent');
+const savedAgent = isSupportedAssistant(urlAgent) ? urlAgent : getCookie('selected_agent');
+let currentAssistant = isSupportedAssistant(savedAgent) ? normalizeAssistant(savedAgent) : 'antigravity';
+
+const urlTab = urlParams.get('tab');
+const savedTab = ['daily', 'monthly', 'yearly'].includes(urlTab) ? urlTab : getCookie('active_tab');
 let activeTab = ['daily', 'monthly', 'yearly'].includes(savedTab) ? savedTab : 'daily'; // 'daily' or 'monthly' or 'yearly'
 let isEmptyState = false;
 let currentChartSessions = [];
@@ -47,6 +175,19 @@ function getLocalDateString(date = new Date()) {
   const month = String(date.getMonth() + 1).padStart(2, '0');
   const day = String(date.getDate()).padStart(2, '0');
   return `${year}-${month}-${day}`;
+}
+
+function renderSafeMarkdown(markdownText) {
+  const rawText = markdownText || '';
+  const parsedHtml = typeof marked === 'undefined'
+    ? escapeHtml(String(rawText))
+    : marked.parse(String(rawText));
+
+  if (typeof DOMPurify === 'undefined') {
+    return escapeHtml(String(rawText));
+  }
+
+  return DOMPurify.sanitize(parsedHtml);
 }
 
 // Session table sorting state
@@ -83,7 +224,7 @@ let isQueryingCodexResets = false;
 // i18n localization dictionary is now loaded from /static/i18n.js
 
 function t(key) {
-  const isSingle = ['antigravity', 'copilot', 'codex'].includes(currentAssistant);
+  const isSingle = isSupportedAssistant(currentAssistant);
   if (isSingle) {
     const prefix = currentAssistant + '_';
     return i18n[currentLang][prefix + key] || i18n[currentLang][key] || i18n['zh-TW'][prefix + key] || i18n['zh-TW'][key] || key;
@@ -91,23 +232,83 @@ function t(key) {
   return i18n[currentLang][key] || i18n['zh-TW'][key] || key;
 }
 
+function iconMarkup(name, extraClass = '') {
+  const classes = ['icon-glyph', `icon-${name}`, extraClass].filter(Boolean).join(' ');
+  return `<span class="${classes}" aria-hidden="true"></span>`;
+}
+
+function cardIconMarkup(name, extraClass = '') {
+  const classes = ['card-icon', extraClass].filter(Boolean).join(' ');
+  return `<div class="${classes}">${iconMarkup(name)}</div>`;
+}
+
+function setTitleMarkup(iconName, textHtml) {
+  const titleEl = document.getElementById('current-date-title');
+  if (titleEl) {
+    titleEl.innerHTML = `<span class="title-text">${textHtml}</span>`;
+  }
+}
+
+function setDisclosureIcon(target, expanded) {
+  if (target) {
+    target.innerHTML = iconMarkup(expanded ? 'chevron-up' : 'chevron-down', 'toggle-arrow-icon');
+  }
+}
+
 function updateBrandLogo() {
   const brandLogo = document.getElementById('brand-logo-img');
   if (!brandLogo) return;
-  
-  if (currentAssistant === 'antigravity') {
-    brandLogo.src = '/static/antigravity.webp';
-    brandLogo.alt = 'Antigravity';
-  } else if (currentAssistant === 'copilot') {
-    brandLogo.src = '/static/githubcopilot.webp';
-    brandLogo.alt = 'Copilot';
-  } else if (currentAssistant === 'codex') {
-    brandLogo.src = '/static/codex.webp';
-    brandLogo.alt = 'Codex';
-  } else {
-    brandLogo.src = '/static/favicon.ico';
-    brandLogo.alt = 'Logo';
-  }
+
+  const meta = getAssistantMeta(currentAssistant);
+  brandLogo.src = meta.logo;
+  brandLogo.alt = meta.alt;
+}
+
+function languageMeta(lang) {
+  return lang === 'en'
+    ? { flag: '🇺🇸', label: '美國', next: 'zh-TW' }
+    : { flag: '🇹🇼', label: '臺灣', next: 'en' };
+}
+
+function updateLanguageToggle() {
+  const langToggle = document.getElementById('lang-toggle-btn');
+  if (!langToggle) return;
+
+  const meta = languageMeta(currentLang);
+  const label = currentLang === 'en'
+    ? `Switch language, current: United States`
+    : `切換語言，目前：${meta.label}`;
+  langToggle.textContent = meta.flag;
+  langToggle.title = label;
+  langToggle.setAttribute('aria-label', label);
+}
+
+function syncSidebarToggleButton() {
+  const sidebarToggleBtn = document.getElementById('sidebar-toggle-btn');
+  const appContainer = document.querySelector('.app-container');
+  if (!sidebarToggleBtn || !appContainer) return;
+
+  const isCollapsed = appContainer.classList.contains('sidebar-collapsed');
+  sidebarToggleBtn.classList.toggle('is-collapsed', isCollapsed);
+  sidebarToggleBtn.title = isCollapsed ? '開啟側邊欄' : '收合側邊欄';
+  sidebarToggleBtn.setAttribute('aria-label', sidebarToggleBtn.title);
+  sidebarToggleBtn.setAttribute('aria-expanded', String(!isCollapsed));
+}
+
+function isEditableShortcutTarget(target) {
+  if (!(target instanceof HTMLElement)) return false;
+  const tagName = target.tagName.toLowerCase();
+  return tagName === 'input'
+    || tagName === 'textarea'
+    || tagName === 'select'
+    || target.isContentEditable;
+}
+
+function toggleSidebar() {
+  const appContainer = document.querySelector('.app-container');
+  if (!appContainer) return;
+  appContainer.classList.toggle('sidebar-collapsed');
+  syncSidebarToggleButton();
 }
 
 function updateLanguageUI() {
@@ -120,7 +321,11 @@ function updateLanguageUI() {
 
   document.querySelectorAll('[data-i18n-title]').forEach(el => {
     const key = el.getAttribute('data-i18n-title');
-    el.title = t(key);
+    const label = t(key);
+    el.title = label;
+    if (el.hasAttribute('aria-label')) {
+      el.setAttribute('aria-label', label);
+    }
   });
 
   document.querySelectorAll('[data-i18n-placeholder]').forEach(el => {
@@ -129,13 +334,14 @@ function updateLanguageUI() {
   });
 
   // Specific dynamic text updates
-  const langSelect = document.getElementById('lang-select');
-  if (langSelect) langSelect.value = currentLang;
+  updateLanguageToggle();
 
   const themeBtn = document.getElementById('theme-toggle-btn');
   if (themeBtn) {
     const currentTheme = document.documentElement.getAttribute('data-theme') || 'dark';
-    themeBtn.title = currentTheme === 'dark' ? t('theme_toggle_title_dark') : t('theme_toggle_title_light');
+    const title = currentTheme === 'dark' ? t('theme_toggle_title_dark') : t('theme_toggle_title_light');
+    themeBtn.title = title;
+    themeBtn.setAttribute('aria-label', title);
   }
 
   // Update dynamic placeholders/empty state if they are currently displayed
@@ -235,7 +441,7 @@ function initApp() {
     // 初始化：找到第一個符合 currentAssistant 的按鈕，或預設第一個
     badgeButtons.forEach(btn => {
       const val = btn.getAttribute('data-value');
-      if (val === currentAssistant) {
+      if (normalizeAssistant(val) === currentAssistant) {
         btn.classList.add('active');
       } else {
         btn.classList.remove('active');
@@ -245,6 +451,7 @@ function initApp() {
     if (!document.querySelector('.assistant-badge-btn.active')) {
       badgeButtons[0].classList.add('active');
       currentAssistant = badgeButtons[0].getAttribute('data-value');
+      currentAssistant = normalizeAssistant(currentAssistant);
       setCookie('selected_agent', currentAssistant);
     }
 
@@ -254,24 +461,10 @@ function initApp() {
         badgeButtons.forEach(b => b.classList.remove('active'));
         btn.classList.add('active');
 
-        currentAssistant = btn.getAttribute('data-value');
+        currentAssistant = normalizeAssistant(btn.getAttribute('data-value'));
         setCookie('selected_agent', currentAssistant);
+        updateUrlParams();
         
-        // Update custom hover dropdown UI
-        const agentLabelEl = document.getElementById('agent-dropdown-label');
-        const agentHoverOpts = document.querySelectorAll('#agent-hover-dropdown .hover-dropdown-option');
-        if (agentHoverOpts.length > 0) {
-          agentHoverOpts.forEach(opt => {
-            if (opt.getAttribute('data-value') === currentAssistant) {
-              opt.classList.add('active');
-              if (agentLabelEl) {
-                agentLabelEl.setAttribute('data-i18n', 'agent_' + currentAssistant);
-              }
-            } else {
-              opt.classList.remove('active');
-            }
-          });
-        }
         updateLanguageUI();
         fetchPricingRules();
 
@@ -288,12 +481,12 @@ function initApp() {
     });
   }
 
-  // Language selector
-  const langSelect = document.getElementById('lang-select');
-  if (langSelect) {
-    langSelect.value = currentLang;
-    langSelect.addEventListener('change', (e) => {
-      currentLang = e.target.value;
+  // Language toggle
+  const langToggle = document.getElementById('lang-toggle-btn');
+  if (langToggle) {
+    updateLanguageToggle();
+    langToggle.addEventListener('click', () => {
+      currentLang = languageMeta(currentLang).next;
       localStorage.setItem('lang', currentLang);
       updateLanguageUI();
       
@@ -316,26 +509,8 @@ function initApp() {
   fetchYears();
 
   // Initialize and synchronize custom hover-dropdown selectors
-  const agentHoverOpts = document.querySelectorAll('#agent-hover-dropdown .hover-dropdown-option');
   const tabHoverOpts = document.querySelectorAll('.tab-hover-dropdown .hover-dropdown-option');
-  const agentLabelEl = document.getElementById('agent-dropdown-label');
   const tabLabelEls = document.querySelectorAll('.tab-dropdown-label');
-
-  if (agentLabelEl) {
-    agentLabelEl.setAttribute('data-i18n', 'agent_' + currentAssistant);
-  }
-  agentHoverOpts.forEach(opt => {
-    if (opt.getAttribute('data-value') === currentAssistant) {
-      opt.classList.add('active');
-    } else {
-      opt.classList.remove('active');
-    }
-    opt.addEventListener('click', () => {
-      const val = opt.getAttribute('data-value');
-      const btn = document.querySelector(`.assistant-badge-btn[data-value="${val}"]`);
-      if (btn) btn.click();
-    });
-  });
 
   if (tabLabelEls.length > 0) {
     tabLabelEls.forEach(labelEl => {
@@ -701,67 +876,6 @@ function initApp() {
     });
   }
 
-  // 監聽 Codex 憑證切換按鈕
-  const btnCodexAuthSwitch = document.getElementById('btn-codex-auth-switch');
-  if (btnCodexAuthSwitch) {
-    btnCodexAuthSwitch.addEventListener('click', async () => {
-      const selectEl = document.getElementById('codex-auth-select');
-      if (!selectEl || !selectEl.value) {
-        showNotification(t('codex_select_auth_label') || '請選擇憑證帳號', 'warning');
-        return;
-      }
-      
-      const targetName = selectEl.value;
-      btnCodexAuthSwitch.disabled = true;
-      const originalText = btnCodexAuthSwitch.textContent;
-      btnCodexAuthSwitch.textContent = '🔄...';
-      
-      try {
-        const res = await fetch(`/api/codex/auth-switch`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({ name: targetName })
-        });
-        
-        if (res.ok) {
-          showNotification(`成功切換至 "${targetName}"！`, 'success');
-          cachedCodexResets = null;
-          await updateCodexAuthSwitcher();
-          await updateCodexRateLimit();
-          updateCodexResets(true);
-          // 手動觸發一次同步以取得最新數據
-          if (btnSyncDb) {
-            btnSyncDb.click();
-          }
-        } else {
-          let errMsg = '切換失敗';
-          try {
-            const data = await res.json();
-            if (data && data.message) errMsg = data.message;
-            else if (data && data.error) errMsg = data.error;
-          } catch (_) {}
-          showNotification(errMsg, 'error');
-        }
-      } catch (err) {
-        console.error('Switch auth failed:', err);
-        showNotification('切換時發生錯誤: ' + err.message, 'error');
-      } finally {
-        btnCodexAuthSwitch.disabled = false;
-        btnCodexAuthSwitch.textContent = originalText;
-      }
-    });
-  }
-
-  // 監聽 Codex 重置額度重新整理按鈕
-  const btnCodexResetsRefresh = document.getElementById('btn-codex-resets-refresh');
-  if (btnCodexResetsRefresh) {
-    btnCodexResetsRefresh.addEventListener('click', () => {
-      updateCodexResets(true);
-    });
-  }
-
   // 監聽 Live 重新整理切換
   liveToggle.addEventListener('change', (e) => {
     toggleLiveRefresh(e.target.checked);
@@ -787,11 +901,18 @@ function initApp() {
 
   // 支援 ESC 鍵關閉抽屜與關閉行動端側欄
   window.addEventListener('keydown', (e) => {
+    if ((e.ctrlKey || e.metaKey) && !e.altKey && e.key.toLowerCase() === 'b' && !isEditableShortcutTarget(e.target)) {
+      e.preventDefault();
+      toggleSidebar();
+      return;
+    }
+
     if (e.key === 'Escape') {
       closeDrawer();
       const container = document.querySelector('.app-container');
       if (container && window.innerWidth <= 992) {
         container.classList.add('sidebar-collapsed');
+        syncSidebarToggleButton();
       }
     }
   });
@@ -800,20 +921,20 @@ function initApp() {
   const sidebarToggleBtn = document.getElementById('sidebar-toggle-btn');
   const appContainer = document.querySelector('.app-container');
   if (sidebarToggleBtn && appContainer) {
-    sidebarToggleBtn.addEventListener('click', () => {
-      appContainer.classList.toggle('sidebar-collapsed');
-    });
+    sidebarToggleBtn.addEventListener('click', toggleSidebar);
 
     // Collapse by default on medium/small screens (<= 1024px)
     if (window.innerWidth <= 1024) {
       appContainer.classList.add('sidebar-collapsed');
     }
+    syncSidebarToggleButton();
   }
 
   // 自動依視窗大小變化調整收合狀態
   window.addEventListener('resize', () => {
     if (appContainer && window.innerWidth <= 992) {
       appContainer.classList.add('sidebar-collapsed');
+      syncSidebarToggleButton();
     }
   });
 
@@ -824,12 +945,14 @@ function initApp() {
   if (sidebarOverlay && appContainer) {
     sidebarOverlay.addEventListener('click', () => {
       appContainer.classList.add('sidebar-collapsed');
+      syncSidebarToggleButton();
     });
   }
 
   if (sidebarCloseBtn && appContainer) {
     sidebarCloseBtn.addEventListener('click', () => {
       appContainer.classList.add('sidebar-collapsed');
+      syncSidebarToggleButton();
     });
   }
 
@@ -861,6 +984,7 @@ function switchTab(tab) {
   if (activeTab === tab) return;
   activeTab = tab;
   setCookie('active_tab', tab);
+  updateUrlParams();
 
   // Update custom hover dropdown UI
   const tabLabelEls = document.querySelectorAll('.tab-dropdown-label');
@@ -1122,8 +1246,9 @@ async function fetchDates(selectedDate = null, keepDate = false) {
       // 切換 agent：保留目前日期，不自動跳轉
       dateToLoad = dateSelect.value || todayStr;
     } else {
-      dateToLoad = selectedDate || dateSelect.value;
-      if (!dateToLoad || !availableDates.includes(dateToLoad)) {
+      const urlDate = getUrlDateForTab('daily');
+      dateToLoad = selectedDate || urlDate || dateSelect.value;
+      if (!dateToLoad || (!selectedDate && !urlDate && !availableDates.includes(dateToLoad))) {
         // 若有啟用即時刷新，預設為今日；否則預設為最新有日誌的日期
         const liveToggle = document.getElementById('live-toggle');
         if (liveToggle && liveToggle.checked) {
@@ -1161,9 +1286,10 @@ async function loadUsageData(date) {
   if (!date || date === 'undefined' || date === 'null') {
     return;
   }
+  updateUrlParams();
   try {
     // 顯示加載動畫 (可在此擴展)
-    document.getElementById('current-date-title').innerHTML = `<span class="title-icon">⌛</span> <span class="title-text">${t('loading_prefix')}${date}...</span>`;
+    setTitleMarkup('sync', date);
 
     const res = await fetch(`/api/${currentAssistant}/usage/${date}`);
     if (res.status === 404) {
@@ -1186,15 +1312,12 @@ async function loadUsageData(date) {
 
 // 顯示「此 Agent 於當日無資料」的提示畫面
 function showNoDataForDate(date) {
-  const agentNames = {
-    antigravity: '<img class="badge-logo" src="/static/antigravity.webp" alt="Antigravity" /> Antigravity CLI',
-    copilot: '<img class="badge-logo" src="/static/githubcopilot.webp" alt="Copilot" /> GitHub Copilot CLI',
-    codex: '<img class="badge-logo" src="/static/codex.webp" alt="Codex" /> Codex CLI',
-  };
-  const agentLabel = agentNames[currentAssistant] || currentAssistant;
-  const desc = t('no_data_for_date_desc')
-    .replace('{agent}', agentLabel)
+  const meta = getAssistantMeta(currentAssistant);
+  const title = t('no_data_for_date')
+    .replace('{agent}', meta.label)
     .replace('{date}', date);
+  const desc = t('no_data_for_date_desc');
+  const logoMarkup = `<div class="card-icon"><img src="${meta.logo}" alt="${meta.alt}" style="width: 56px; height: 56px; object-fit: contain;" /></div>`;
 
   const emptyContainer = document.getElementById('empty-state-container');
   const dailyView = document.getElementById('daily-view-container');
@@ -1204,29 +1327,51 @@ function showNoDataForDate(date) {
   if (emptyContainer) {
     emptyContainer.classList.remove('hidden');
     emptyContainer.innerHTML = `
-      <div class="welcome-setup-card no-agent-card">
-        <div class="card-icon">📭</div>
-        <h2>${t('no_data_for_date')}</h2>
-        <p>${desc}</p>
+      <div class="welcome-setup-card no-agent-card" style="align-items: center; text-align: center;">
+        ${logoMarkup}
+        <h2>${title}</h2>
+        <p style="text-align: center; max-width: 100%;">${desc}</p>
+        <div class="action-buttons">
+          <button class="primary-btn" id="btn-no-data-setup-guide">${t('btn_empty_setup')}</button>
+          <button class="secondary-btn" id="btn-no-data-refresh">${t('btn_empty_refresh')}</button>
+        </div>
       </div>
     `;
+
+    const noDataGuideBtn = document.getElementById('btn-no-data-setup-guide');
+    if (noDataGuideBtn) {
+      noDataGuideBtn.addEventListener('click', openSetupModal);
+    }
+
+    const noDataRefreshBtn = document.getElementById('btn-no-data-refresh');
+    if (noDataRefreshBtn) {
+      noDataRefreshBtn.addEventListener('click', async () => {
+        noDataRefreshBtn.classList.add('loading');
+        try {
+          const dateSelect = document.getElementById('date-select');
+          if (dateSelect) {
+            dateSelect.value = date;
+          }
+          await fetchDates(null, true);
+        } finally {
+          noDataRefreshBtn.classList.remove('loading');
+        }
+      });
+    }
   }
   if (dailyView) dailyView.classList.add('hidden');
   if (monthlyView) monthlyView.classList.add('hidden');
   if (yearlyView) yearlyView.classList.add('hidden');
 
   // 更新標題
-  const titleEl = document.getElementById('current-date-title');
-  if (titleEl) {
-    titleEl.innerHTML = `<span class="title-icon">📭</span> <span class="title-text">${agentLabel} · ${date}</span>`;
-  }
+  setTitleMarkup('empty', date);
 }
 
 // Helpers to render metrics values (handling agent breakdown when multiple agents are active)
 function getActiveAgents() {
   const activeAgents = [];
   document.querySelectorAll('.assistant-badge-btn.active').forEach(b => {
-    activeAgents.push(b.getAttribute('data-value'));
+    activeAgents.push(normalizeAssistant(b.getAttribute('data-value')));
   });
   return activeAgents;
 }
@@ -1252,15 +1397,9 @@ function renderMetricValue(elementId, getValFn, formatFn, sessions, activeAgents
     
     let html = '<div class="stat-value-list">';
     activeAgents.forEach(a => {
-      let logoUrl = '/static/antigravity.webp';
-      let displayName = 'Antigravity CLI';
-      if (a === 'copilot') {
-        logoUrl = '/static/githubcopilot.webp';
-        displayName = 'Copilot CLI';
-      } else if (a === 'codex') {
-        logoUrl = '/static/codex.webp';
-        displayName = 'Codex CLI';
-      }
+      const meta = getAssistantMeta(a);
+      let logoUrl = meta.logo;
+      let displayName = meta.label;
       html += `
         <div class="stat-value-item">
           <span class="agent-name" title="${displayName}"><img class="badge-logo" src="${logoUrl}" alt="${displayName}" /></span>
@@ -1284,15 +1423,9 @@ function renderMonthlyMetricValue(elementId, getValFn, formatFn, agentBreakdown,
   } else {
     let html = '<div class="stat-value-list">';
     activeAgents.forEach(a => {
-      let logoUrl = '/static/antigravity.webp';
-      let displayName = 'Antigravity CLI';
-      if (a === 'copilot') {
-        logoUrl = '/static/githubcopilot.webp';
-        displayName = 'Copilot CLI';
-      } else if (a === 'codex') {
-        logoUrl = '/static/codex.webp';
-        displayName = 'Codex CLI';
-      }
+      const meta = getAssistantMeta(a);
+      let logoUrl = meta.logo;
+      let displayName = meta.label;
       
       const val = (agentBreakdown && agentBreakdown[a]) ? getValFn(agentBreakdown[a]) : 0;
       html += `
@@ -1314,26 +1447,8 @@ function renderDashboard(data) {
   currentUsageData = data;
   const { date, summary, sessions } = data;
 
-  // 1. 更新標題與版本
-  document.getElementById('current-date-title').innerHTML = `<span class="title-icon">📅</span> <span class="title-text">${t('usage_report')}${date}</span>`;
-  const versionBadge = document.getElementById('assistant-version-badge');
-  if (versionBadge) {
-    if (currentAssistant === 'all' || currentAssistant.includes(',')) {
-      versionBadge.textContent = 'Multi-Agent';
-    } else {
-      const entryWithVer = (data.raw_entries || []).find(e => e.version);
-      const ver = entryWithVer ? entryWithVer.version : null;
-      if (currentAssistant === 'antigravity') {
-        versionBadge.textContent = `Antigravity CLI v${ver || '1.0.x'}`;
-      } else if (currentAssistant === 'copilot') {
-        versionBadge.textContent = `Copilot CLI v${ver || '1.0.x'}`;
-      } else if (currentAssistant === 'codex') {
-        versionBadge.textContent = `Codex CLI v${ver || '1.0.x'}`;
-      } else {
-        versionBadge.textContent = 'Agent --';
-      }
-    }
-  }
+  // 1. 更新標題
+  setTitleMarkup('calendar', date);
 
   // 2. 更新側邊欄指標卡片
   document.getElementById('mini-sessions').textContent = summary.total_sessions;
@@ -1446,8 +1561,8 @@ function renderChart(sessions) {
         {
           label: t('chart_token_label'),
           data: tokenData,
-          backgroundColor: 'rgba(0, 242, 254, 0.22)',
-          borderColor: '#00f2fe',
+          backgroundColor: chartPalette.tokenFill,
+          borderColor: chartPalette.tokenStroke,
           borderWidth: 1.5,
           borderRadius: 6,
           yAxisID: 'y',
@@ -1457,8 +1572,8 @@ function renderChart(sessions) {
         {
           label: t('chart_cache_label'),
           data: cacheData,
-          backgroundColor: 'rgba(129, 140, 248, 0.75)',
-          borderColor: '#818cf8',
+          backgroundColor: chartPalette.cacheFill,
+          borderColor: chartPalette.cacheStroke,
           borderWidth: 1.5,
           borderRadius: 6,
           yAxisID: 'y',
@@ -1469,10 +1584,10 @@ function renderChart(sessions) {
           label: t('chart_turn_label'),
           data: maxTurnData,
           type: 'line',
-          borderColor: '#9b51e0',
-          backgroundColor: 'rgba(155, 81, 224, 0.2)',
+          borderColor: chartPalette.trendStroke,
+          backgroundColor: chartPalette.trendFill,
           borderWidth: 2,
-          pointBackgroundColor: '#9b51e0',
+          pointBackgroundColor: chartPalette.trendStroke,
           pointRadius: 4,
           tension: 0.3,
           yAxisID: 'y1',
@@ -1499,14 +1614,14 @@ function renderChart(sessions) {
           labels: {
             color: '#f3f4f6',
             font: {
-              family: 'Outfit'
+              family: chartFontFamily
             }
           }
         },
         tooltip: {
           padding: 12,
           backgroundColor: 'rgba(15, 18, 29, 0.95)',
-          titleColor: '#00f2fe',
+          titleColor: chartPalette.tokenStroke,
           bodyColor: '#f3f4f6',
           borderColor: 'rgba(255, 255, 255, 0.1)',
           borderWidth: 1,
@@ -1706,13 +1821,13 @@ function updateSortHeadersUI() {
     if (column === currentSortColumn) {
       if (currentSortDirection === 'asc') {
         th.classList.add('sorted-asc');
-        icon.innerHTML = '▴';
+        icon.innerHTML = iconMarkup('chevron-up', 'sort-glyph');
       } else {
         th.classList.add('sorted-desc');
-        icon.innerHTML = '▾';
+        icon.innerHTML = iconMarkup('chevron-down', 'sort-glyph');
       }
     } else {
-      icon.innerHTML = '<span class="sort-icon-placeholder">▴▾</span>';
+      icon.innerHTML = `<span class="sort-icon-placeholder">${iconMarkup('chevron-up', 'sort-glyph')}${iconMarkup('chevron-down', 'sort-glyph')}</span>`;
     }
   });
 }
@@ -1766,12 +1881,9 @@ function renderSessionTable(sessions) {
     const timeFormatted = s.timestamp ? formatLocalTime(s.timestamp, true) : '-';
 
     let assistantBadge = "";
-    if (s.assistant_type === "antigravity") {
-      assistantBadge = `<span class="badge" style="background: rgba(0, 242, 254, 0.15); color: #00f2fe; border: 1px solid rgba(0, 242, 254, 0.3); display: inline-flex; align-items: center;"><img class="badge-logo" src="/static/antigravity.webp" alt="Antigravity" /> Antigravity</span>`;
-    } else if (s.assistant_type === "copilot") {
-      assistantBadge = `<span class="badge" style="background: rgba(185, 43, 39, 0.15); color: #b92b27; border: 1px solid rgba(185, 43, 39, 0.3); display: inline-flex; align-items: center;"><img class="badge-logo" src="/static/githubcopilot.webp" alt="Copilot" /> Copilot</span>`;
-    } else if (s.assistant_type === "codex") {
-      assistantBadge = `<span class="badge" style="background: rgba(79, 172, 254, 0.15); color: #4facfe; border: 1px solid rgba(79, 172, 254, 0.3); display: inline-flex; align-items: center;"><img class="badge-logo" src="/static/codex.webp" alt="Codex" /> Codex</span>`;
+    if (isSupportedAssistant(s.assistant_type)) {
+      const meta = getAssistantMeta(s.assistant_type);
+      assistantBadge = `<span class="badge" style="${meta.badgeStyle}">${getAssistantLogoHtml(s.assistant_type)} ${meta.shortLabel}</span>`;
     }
 
     const astColumn = (currentAssistant === 'all' || currentAssistant.includes(',')) ? `<td>${assistantBadge}</td>` : '';
@@ -1809,16 +1921,16 @@ function renderSessionTable(sessions) {
         ${nameCellContent}
       </td>
       ${astColumn}
-      <td>
-        <div style="display: flex; align-items: center; justify-content: center; gap: 6px; flex-wrap: wrap;">
+      <td class="model-column">
+        <div class="model-cell-content">
           <span class="badge highlight">${escapeHtml(s.model)}</span>
-          ${s.reasoning_effort ? `<span class="badge" style="background: rgba(167, 139, 250, 0.15); color: #a78bfa; font-size: 11px; font-weight: 600; text-transform: uppercase;">${escapeHtml(s.reasoning_effort)}</span>` : ''}
+          ${s.reasoning_effort ? `<span class="badge" style="background: rgba(127, 142, 163, 0.15); color: #aeb9c8; font-size: 11px; font-weight: 600;">${escapeHtml(s.reasoning_effort)}</span>` : ''}
         </div>
       </td>
       <td><span class="badge">${s.max_turn_no}</span></td>
       <td style="color: var(--text-secondary);">${formatToken(s.total_input_tokens || 0)}</td>
       <td style="color: var(--text-secondary);">${formatToken(s.total_output_tokens || 0)}</td>
-      <td style="color: #a78bfa;">${formatToken(s.total_reasoning_tokens || 0)}</td>
+      <td style="color: #aeb9c8;">${formatToken(s.total_reasoning_tokens || 0)}</td>
       <td style="color: #34d399;">${formatToken(s.total_cache_read_tokens || 0)}</td>
       <td style="font-weight: 700; color: #fbbf24;">${formatToken(s.total_tokens)}</td>
       <td style="font-weight: 700; color: var(--accent-cyan);">${formatCost(s.cost_usd || 0)}</td>
@@ -1937,7 +2049,7 @@ async function openSessionTimeline(sessionId, sessionName, totalTokens, cacheRea
 
   try {
     const resolvedAssistant = assistantType || currentAssistant;
-    const res = await fetch(`/api/${resolvedAssistant}/session/${sessionId}`);
+    const res = await fetch(`/api/${encodeURIComponent(resolvedAssistant)}/session/${encodeURIComponent(sessionId)}`);
     if (res.status === 404) {
       const errData = await res.json().catch(() => ({}));
       if (errData.reason === 'no_events_yet') {
@@ -2056,7 +2168,7 @@ function renderTimeline(data) {
             const attType = att.type || 'file';
             attachmentsHTML += `
               <div class="attachment-badge" title="${escapeHtml(path)}">
-                📎 <strong>[${escapeHtml(attType)}]</strong> ${escapeHtml(basename)}
+                <strong>[${escapeHtml(attType)}]</strong> ${escapeHtml(basename)}
               </div>
             `;
           });
@@ -2071,7 +2183,7 @@ function renderTimeline(data) {
                 <span class="turn-no-badge">#${turnNo}</span>
                 <span class="sender">${t('sender_user')}</span>
                 <button class="header-collapse-btn" style="display: none; margin-left: 8px;">
-                  ${t('collapse_reply')} ▲
+                  <span class="btn-text">${t('collapse_reply')}</span> <span class="arrow">${iconMarkup('chevron-up', 'toggle-arrow-icon')}</span>
                 </button>
               </div>
               <span class="time">${timeStr}</span>
@@ -2079,7 +2191,7 @@ function renderTimeline(data) {
             <div class="prompt-content-wrapper">
               <div class="prompt-text collapsed">${escapeHtml(prompt)}</div>
               <button class="prompt-toggle-btn">
-                <span class="btn-text">${t('expand_reply')}</span> <span class="arrow">▼</span>
+                <span class="btn-text">${t('expand_reply')}</span> <span class="arrow">${iconMarkup('chevron-down', 'toggle-arrow-icon')}</span>
               </button>
             </div>
             ${attachmentsHTML}
@@ -2097,14 +2209,14 @@ function renderTimeline(data) {
             promptText.classList.add('collapsed');
             promptToggleBtn.classList.remove('expanded');
             promptToggleBtn.querySelector('.btn-text').textContent = t('expand_reply');
-            promptToggleBtn.querySelector('.arrow').textContent = '▼';
+            setDisclosureIcon(promptToggleBtn.querySelector('.arrow'), false);
             if (headerCollapseBtn) headerCollapseBtn.style.display = 'none';
           } else {
             promptText.classList.remove('collapsed');
             promptText.classList.add('expanded');
             promptToggleBtn.classList.add('expanded');
             promptToggleBtn.querySelector('.btn-text').textContent = t('collapse_reply');
-            promptToggleBtn.querySelector('.arrow').textContent = '▲';
+            setDisclosureIcon(promptToggleBtn.querySelector('.arrow'), true);
             if (headerCollapseBtn) headerCollapseBtn.style.display = 'inline-flex';
           }
         };
@@ -2144,15 +2256,10 @@ function renderTimeline(data) {
         const finalAssistantType = metadata.assistant_type || currentSessionAssistantType || currentAssistant;
         let senderLogoHtml = '';
         let senderNameText = 'AGENT';
-        if (finalAssistantType === 'antigravity') {
-          senderLogoHtml = `<img class="badge-logo" src="/static/antigravity.webp" alt="Antigravity" />`;
-          senderNameText = 'ANTIGRAVITY AGENT';
-        } else if (finalAssistantType === 'copilot') {
-          senderLogoHtml = `<img class="badge-logo" src="/static/githubcopilot.webp" alt="Copilot" />`;
-          senderNameText = 'COPILOT AGENT';
-        } else if (finalAssistantType === 'codex') {
-          senderLogoHtml = `<img class="badge-logo" src="/static/codex.webp" alt="Codex" />`;
-          senderNameText = 'CODEX AGENT';
+        if (isSupportedAssistant(finalAssistantType)) {
+          const meta = getAssistantMeta(finalAssistantType);
+          senderLogoHtml = getAssistantLogoHtml(finalAssistantType);
+          senderNameText = meta.senderName;
         }
 
         // 如果 content 為空但有 Tool 呼叫，代表助理正在使用工具
@@ -2163,7 +2270,7 @@ function renderTimeline(data) {
         if (!replyMarkdown && hasTools) {
           replyHtml = `<span style="font-style: italic; color: var(--text-muted);">${t('thinking_tools')}</span>`;
         } else {
-          replyHtml = marked.parse(replyMarkdown || '');
+          replyHtml = renderSafeMarkdown(replyMarkdown || '');
         }
 
         // 建立詳細 Token 資訊區塊 (in, out, reasoning, cache, total)
@@ -2184,7 +2291,7 @@ function renderTimeline(data) {
         if (replyMarkdown) {
           copyButtonHtml = `
             <button class="copy-markdown-btn" title="${t('copy_markdown_title')}">
-              📋 <span class="btn-text">${t('copy_markdown')}</span>
+              <span class="btn-text">${t('copy_markdown')}</span>
             </button>
           `;
         }
@@ -2206,7 +2313,7 @@ function renderTimeline(data) {
             <div class="reply-content-wrapper">
               <div class="reply-content collapsed">${replyHtml}</div>
               <button class="reply-toggle-btn">
-                <span class="btn-text">${t('expand_reply')}</span> <span class="arrow">▼</span>
+                <span class="btn-text">${t('expand_reply')}</span> <span class="arrow">${iconMarkup('chevron-down', 'toggle-arrow-icon')}</span>
               </button>
             </div>
           </div>
@@ -2223,13 +2330,13 @@ function renderTimeline(data) {
               replyContent.classList.add('expanded');
               toggleBtn.classList.add('expanded');
               toggleBtn.querySelector('.btn-text').textContent = t('collapse_reply');
-              toggleBtn.querySelector('.arrow').textContent = '▲';
+              setDisclosureIcon(toggleBtn.querySelector('.arrow'), true);
             } else {
               replyContent.classList.remove('expanded');
               replyContent.classList.add('collapsed');
               toggleBtn.classList.remove('expanded');
               toggleBtn.querySelector('.btn-text').textContent = t('expand_reply');
-              toggleBtn.querySelector('.arrow').textContent = '▼';
+              setDisclosureIcon(toggleBtn.querySelector('.arrow'), false);
             }
           });
         }
@@ -2296,10 +2403,10 @@ function renderTimeline(data) {
           <div class="tool-step-bubble">
             <div class="tool-header">
               <div class="tool-info">
-                🔧 <span class="tool-name">${escapeHtml(toolName)}</span>
+                <span class="tool-name">${escapeHtml(toolName)}</span>
                 <span class="${badgeClass}">${badgeText}</span>
               </div>
-              <span class="toggle-icon">▶</span>
+              <span class="toggle-icon">${iconMarkup('chevron-right', 'tool-toggle-icon')}</span>
             </div>
             <div class="tool-details">
               <div class="detail-section">
@@ -2319,8 +2426,6 @@ function renderTimeline(data) {
         header.addEventListener('click', () => {
           const bubble = header.closest('.tool-step-bubble');
           bubble.classList.toggle('expanded');
-          const icon = header.querySelector('.toggle-icon');
-          icon.textContent = bubble.classList.contains('expanded') ? '▼' : '▶';
         });
 
         break;
@@ -2336,16 +2441,16 @@ function renderTimeline(data) {
           message = t('session_compaction');
         }
 
-        let emoji = '⚙️';
+        let statusLabel = 'System';
         if (item.event_data.status_type === 'session_compaction') {
-          emoji = '🗜️';
+          statusLabel = 'Compaction';
         }
 
         div.innerHTML = `
           <div class="timeline-dot"></div>
           <div class="system-bubble">
             <div class="system-badge">
-              ${emoji} ${escapeHtml(message)} <span class="time">${timeStr}</span>
+              <span class="system-kind">${statusLabel}</span> ${escapeHtml(message)} <span class="time">${timeStr}</span>
             </div>
           </div>
         `;
@@ -2445,7 +2550,8 @@ async function fetchMonths(selectedMonth = null) {
     const data = await res.json();
     
     const monthSelect = document.getElementById('month-select');
-    const targetMonth = selectedMonth || monthSelect.value;
+    const urlMonth = getUrlDateForTab('monthly');
+    const targetMonth = selectedMonth || urlMonth || monthSelect.value;
     
     monthSelect.innerHTML = '';
 
@@ -2501,7 +2607,8 @@ async function fetchYears(selectedYear = null) {
     
     const yearSelect = document.getElementById('year-select');
     if (!yearSelect) return;
-    const targetYear = selectedYear || yearSelect.value;
+    const urlYear = getUrlDateForTab('yearly');
+    const targetYear = selectedYear || urlYear || yearSelect.value;
     
     yearSelect.innerHTML = '';
 
@@ -2556,8 +2663,9 @@ async function loadYearlyData(year) {
   if (!year || year === 'undefined' || year === 'null') {
     return;
   }
+  updateUrlParams();
   try {
-    document.getElementById('current-date-title').innerHTML = `<span class="title-icon">⌛</span> <span class="title-text">${t('loading_year_prefix')}${year}...</span>`;
+    setTitleMarkup('sync', year);
 
     const res = await fetch(`/api/${currentAssistant}/yearly/${year}`);
     if (res.status === 404) {
@@ -2582,10 +2690,8 @@ function renderYearlyDashboard(data) {
   currentYearlyData = data;
   const { year, summary, monthly_breakdown, models, projects, agent_breakdown } = data;
 
-  // 1. 更新標題與版本
-  document.getElementById('current-date-title').innerHTML = `<span class="title-icon">📅</span> <span class="title-text">${t('yearly_report')}${year}</span>`;
-  const badge = document.getElementById('assistant-version-badge');
-  if (badge) badge.textContent = `Yearly Summary`;
+  // 1. 更新標題
+  setTitleMarkup('calendar', year);
 
   // 2. 更新指標卡片
   const activeAgents = getActiveAgents();
@@ -2612,15 +2718,9 @@ function renderYearlyDashboard(data) {
     // For sessions: show individual session count list
     let sessionsHtml = '<div class="stat-value-list">';
     activeAgents.forEach(a => {
-      let logoUrl = '/static/antigravity.webp';
-      let displayName = 'Antigravity CLI';
-      if (a === 'copilot') {
-        logoUrl = '/static/githubcopilot.webp';
-        displayName = 'Copilot CLI';
-      } else if (a === 'codex') {
-        logoUrl = '/static/codex.webp';
-        displayName = 'Codex CLI';
-      }
+      const meta = getAssistantMeta(a);
+      let logoUrl = meta.logo;
+      let displayName = meta.label;
       const val = (agent_breakdown && agent_breakdown[a]) ? agent_breakdown[a].total_sessions : 0;
       sessionsHtml += `
         <div class="stat-value-item">
@@ -2681,15 +2781,9 @@ function renderYearlyDashboard(data) {
 function renderYearlyMetricValue(elementId, getter, formatter, agentBreakdown, activeAgents) {
   let html = '<div class="stat-value-list">';
   activeAgents.forEach(a => {
-    let logoUrl = '/static/antigravity.webp';
-    let displayName = 'Antigravity CLI';
-    if (a === 'copilot') {
-      logoUrl = '/static/githubcopilot.webp';
-      displayName = 'Copilot CLI';
-    } else if (a === 'codex') {
-      logoUrl = '/static/codex.webp';
-      displayName = 'Codex CLI';
-    }
+    const meta = getAssistantMeta(a);
+      let logoUrl = meta.logo;
+      let displayName = meta.label;
     const val = (agentBreakdown && agentBreakdown[a]) ? getter(agentBreakdown[a]) : 0;
     html += `
       <div class="stat-value-item">
@@ -2743,8 +2837,8 @@ function renderYearlyChart(monthlyBreakdown) {
         {
           label: t('chart_yearly_token_label'),
           data: tokenData,
-          backgroundColor: 'rgba(0, 242, 254, 0.22)',
-          borderColor: '#00f2fe',
+          backgroundColor: chartPalette.tokenFill,
+          borderColor: chartPalette.tokenStroke,
           borderWidth: 1.5,
           borderRadius: 6,
           yAxisID: 'y',
@@ -2754,8 +2848,8 @@ function renderYearlyChart(monthlyBreakdown) {
         {
           label: t('chart_cache_label'),
           data: cacheData,
-          backgroundColor: 'rgba(129, 140, 248, 0.75)',
-          borderColor: '#818cf8',
+          backgroundColor: chartPalette.cacheFill,
+          borderColor: chartPalette.cacheStroke,
           borderWidth: 1.5,
           borderRadius: 6,
           yAxisID: 'y',
@@ -2766,10 +2860,10 @@ function renderYearlyChart(monthlyBreakdown) {
           label: t('chart_yearly_session_label'),
           data: sessionData,
           type: 'line',
-          borderColor: '#fbbf24',
-          backgroundColor: 'rgba(251, 191, 36, 0.1)',
+          borderColor: chartPalette.trendStroke,
+          backgroundColor: chartPalette.trendFill,
           borderWidth: 3,
-          pointBackgroundColor: '#fbbf24',
+          pointBackgroundColor: chartPalette.trendStroke,
           pointBorderColor: '#fff',
           pointBorderWidth: 1.5,
           pointRadius: 4,
@@ -2803,14 +2897,14 @@ function renderYearlyChart(monthlyBreakdown) {
           position: 'top',
           labels: {
             color: '#94a3b8',
-            font: { family: 'Outfit, system-ui, sans-serif', size: 12 }
+            font: { family: chartFontFamily, size: 12 }
           }
         },
         tooltip: {
           backgroundColor: 'rgba(15, 23, 42, 0.92)',
           borderColor: 'rgba(255, 255, 255, 0.08)',
           borderWidth: 1,
-          titleColor: '#fff',
+          titleColor: chartPalette.tokenStroke,
           titleFont: { size: 14, weight: 'bold' },
           bodyFont: { size: 13 },
           padding: 12,
@@ -2968,7 +3062,7 @@ function renderYearlyMonthlySummaryTable(monthlyBreakdown) {
       <td style="font-weight: 600; color: var(--accent-cyan);">${escapeHtml(entry.month)}</td>
       <td style="color: var(--text-secondary);">${formatToken(entry.total_input_tokens || 0)}</td>
       <td style="color: var(--text-secondary);">${formatToken(entry.total_output_tokens || 0)}</td>
-      <td style="color: #a78bfa;">${formatToken(entry.total_reasoning_tokens || 0)}</td>
+      <td style="color: #aeb9c8;">${formatToken(entry.total_reasoning_tokens || 0)}</td>
       <td style="color: #34d399;">${formatToken(entry.total_cache_read_tokens || 0)}</td>
       <td style="font-weight: 700; color: #fbbf24;">${formatToken(entry.total_tokens)}</td>
       <td style="font-weight: 700; color: var(--neon-gold);">${formatCost(entry.cost_usd || 0)}</td>
@@ -3063,13 +3157,13 @@ function updateYearlySortHeadersUI() {
     if (column === yearlyMonthlySortColumn) {
       if (yearlyMonthlySortDirection === 'asc') {
         th.classList.add('sorted-asc');
-        icon.innerHTML = '▴';
+        icon.innerHTML = iconMarkup('chevron-up', 'sort-glyph');
       } else {
         th.classList.add('sorted-desc');
-        icon.innerHTML = '▾';
+        icon.innerHTML = iconMarkup('chevron-down', 'sort-glyph');
       }
     } else {
-      icon.innerHTML = '<span class="sort-icon-placeholder">▴▾</span>';
+      icon.innerHTML = `<span class="sort-icon-placeholder">${iconMarkup('chevron-up', 'sort-glyph')}${iconMarkup('chevron-down', 'sort-glyph')}</span>`;
     }
   });
 }
@@ -3081,8 +3175,9 @@ async function loadMonthlyData(month) {
   if (!month || month === 'undefined' || month === 'null') {
     return;
   }
+  updateUrlParams();
   try {
-    document.getElementById('current-date-title').innerHTML = `<span class="title-icon">⌛</span> <span class="title-text">${t('loading_month_prefix')}${month}...</span>`;
+    setTitleMarkup('sync', month);
 
     const res = await fetch(`/api/${currentAssistant}/monthly/${month}`);
     if (res.status === 404) {
@@ -3107,9 +3202,8 @@ function renderMonthlyDashboard(data) {
   currentMonthlyData = data;
   const { year_month, summary, daily_breakdown, models, projects, agent_breakdown } = data;
 
-  // 1. 更新標題與版本
-  document.getElementById('current-date-title').innerHTML = `<span class="title-icon">📅</span> <span class="title-text">${t('monthly_report')}${year_month}</span>`;
-  document.getElementById('assistant-version-badge').textContent = `Monthly Summary`;
+  // 1. 更新標題
+  setTitleMarkup('calendar', year_month);
 
   // 2. 更新指標卡片
   const activeAgents = getActiveAgents();
@@ -3130,15 +3224,9 @@ function renderMonthlyDashboard(data) {
     // For sessions: show individual session count list
     let sessionsHtml = '<div class="stat-value-list">';
     activeAgents.forEach(a => {
-      let logoUrl = '/static/antigravity.webp';
-      let displayName = 'Antigravity CLI';
-      if (a === 'copilot') {
-        logoUrl = '/static/githubcopilot.webp';
-        displayName = 'Copilot CLI';
-      } else if (a === 'codex') {
-        logoUrl = '/static/codex.webp';
-        displayName = 'Codex CLI';
-      }
+      const meta = getAssistantMeta(a);
+      let logoUrl = meta.logo;
+      let displayName = meta.label;
       const val = (agent_breakdown && agent_breakdown[a]) ? agent_breakdown[a].total_sessions : 0;
       sessionsHtml += `
         <div class="stat-value-item">
@@ -3236,8 +3324,8 @@ function renderMonthlyChart(dailyBreakdown) {
         {
           label: t('chart_monthly_token_label'),
           data: tokenData,
-          backgroundColor: 'rgba(0, 242, 254, 0.22)',
-          borderColor: '#00f2fe',
+          backgroundColor: chartPalette.tokenFill,
+          borderColor: chartPalette.tokenStroke,
           borderWidth: 1.5,
           borderRadius: 6,
           yAxisID: 'y',
@@ -3247,8 +3335,8 @@ function renderMonthlyChart(dailyBreakdown) {
         {
           label: t('chart_cache_label'),
           data: cacheData,
-          backgroundColor: 'rgba(129, 140, 248, 0.75)',
-          borderColor: '#818cf8',
+          backgroundColor: chartPalette.cacheFill,
+          borderColor: chartPalette.cacheStroke,
           borderWidth: 1.5,
           borderRadius: 6,
           yAxisID: 'y',
@@ -3259,10 +3347,10 @@ function renderMonthlyChart(dailyBreakdown) {
           label: t('chart_monthly_session_label'),
           data: sessionData,
           type: 'line',
-          borderColor: '#ff4b5c',
-          backgroundColor: 'rgba(255, 75, 92, 0.2)',
+          borderColor: chartPalette.trendStroke,
+          backgroundColor: chartPalette.trendFill,
           borderWidth: 2,
-          pointBackgroundColor: '#ff4b5c',
+          pointBackgroundColor: chartPalette.trendStroke,
           pointRadius: 4,
           tension: 0.2,
           yAxisID: 'y1',
@@ -3289,14 +3377,14 @@ function renderMonthlyChart(dailyBreakdown) {
           labels: {
             color: '#f3f4f6',
             font: {
-              family: 'Outfit'
+              family: chartFontFamily
             }
           }
         },
         tooltip: {
           padding: 12,
           backgroundColor: 'rgba(15, 18, 29, 0.95)',
-          titleColor: '#00f2fe',
+          titleColor: chartPalette.tokenStroke,
           bodyColor: '#f3f4f6',
           borderColor: 'rgba(255, 255, 255, 0.1)',
           borderWidth: 1,
@@ -3454,7 +3542,7 @@ function renderMonthlyDailySummaryTable(dailyBreakdown) {
       <td style="font-weight: 600; color: var(--accent-cyan);">${escapeHtml(entry.date)}</td>
       <td style="color: var(--text-secondary);">${formatToken(entry.total_input_tokens || 0)}</td>
       <td style="color: var(--text-secondary);">${formatToken(entry.total_output_tokens || 0)}</td>
-      <td style="color: #a78bfa;">${formatToken(entry.total_reasoning_tokens || 0)}</td>
+      <td style="color: #aeb9c8;">${formatToken(entry.total_reasoning_tokens || 0)}</td>
       <td style="color: #34d399;">${formatToken(entry.total_cache_read_tokens || 0)}</td>
       <td style="font-weight: 700; color: #fbbf24;">${formatToken(entry.total_tokens)}</td>
       <td style="font-weight: 700; color: var(--neon-gold);">${formatCost(entry.cost_usd || 0)}</td>
@@ -3517,13 +3605,13 @@ function updateMonthlySortHeadersUI() {
     if (column === monthlyDailySortColumn) {
       if (monthlyDailySortDirection === 'asc') {
         th.classList.add('sorted-asc');
-        icon.innerHTML = '▴';
+        icon.innerHTML = iconMarkup('chevron-up', 'sort-glyph');
       } else {
         th.classList.add('sorted-desc');
-        icon.innerHTML = '▾';
+        icon.innerHTML = iconMarkup('chevron-down', 'sort-glyph');
       }
     } else {
-      icon.innerHTML = '<span class="sort-icon-placeholder">▴▾</span>';
+      icon.innerHTML = `<span class="sort-icon-placeholder">${iconMarkup('chevron-up', 'sort-glyph')}${iconMarkup('chevron-down', 'sort-glyph')}</span>`;
     }
   });
 }
@@ -3577,17 +3665,17 @@ function showNotification(message, type = 'info') {
     document.head.appendChild(style);
   }
 
-  let icon = 'ℹ️';
+  let icon = 'INFO';
   let color = 'var(--accent-cyan)';
   if (type === 'success') {
-    icon = '✅';
+    icon = 'OK';
     color = 'var(--neon-green)';
   } else if (type === 'error') {
-    icon = '❌';
+    icon = 'ERR';
     color = 'var(--neon-red)';
   }
 
-  toast.innerHTML = `<span style="font-size: 16px;">${icon}</span> <span style="color: ${color}; font-family: var(--font-display);">${message}</span>`;
+  toast.innerHTML = `<span class="toast-kind" style="color: ${color};">${icon}</span> <span style="color: ${color}; font-family: var(--font-display);">${message}</span>`;
   container.appendChild(toast);
 
   setTimeout(() => {
@@ -3624,8 +3712,10 @@ function initThemeToggle() {
 function updateThemeButton(theme) {
   const themeBtn = document.getElementById('theme-toggle-btn');
   if (themeBtn) {
-    themeBtn.textContent = theme === 'dark' ? '🌞' : '🌙';
-    themeBtn.title = theme === 'dark' ? t('theme_toggle_title_dark') : t('theme_toggle_title_light');
+    const title = theme === 'dark' ? t('theme_toggle_title_dark') : t('theme_toggle_title_light');
+    themeBtn.innerHTML = iconMarkup('theme');
+    themeBtn.title = title;
+    themeBtn.setAttribute('aria-label', title);
   }
 }
 
@@ -3633,9 +3723,9 @@ function updateChartsTheme(theme) {
   const isLight = theme === 'light';
   const textColor = isLight ? '#1e293b' : '#f3f4f6';
   const mutedColor = isLight ? '#64748b' : '#9ca3af';
-  const gridColor = isLight ? 'rgba(0, 0, 0, 0.05)' : 'rgba(255, 255, 255, 0.05)';
+  const gridColor = isLight ? 'rgba(15, 23, 42, 0.05)' : 'rgba(255, 255, 255, 0.05)';
   const tooltipBg = isLight ? 'rgba(255, 255, 255, 0.95)' : 'rgba(15, 18, 29, 0.95)';
-  const tooltipBorder = isLight ? 'rgba(0, 0, 0, 0.1)' : 'rgba(255, 255, 255, 0.1)';
+  const tooltipBorder = isLight ? 'rgba(15, 23, 42, 0.1)' : 'rgba(255, 255, 255, 0.1)';
 
   [tokenChartInstance, monthlyChartInstance, yearlyChartInstance].forEach(chart => {
     if (chart) {
@@ -3646,7 +3736,7 @@ function updateChartsTheme(theme) {
       // 更新 Tooltip 樣式
       if (chart.options.plugins.tooltip) {
         chart.options.plugins.tooltip.backgroundColor = tooltipBg;
-        chart.options.plugins.tooltip.titleColor = isLight ? '#0284c7' : '#00f2fe';
+        chart.options.plugins.tooltip.titleColor = chartPalette.tokenStroke;
         chart.options.plugins.tooltip.bodyColor = textColor;
         chart.options.plugins.tooltip.borderColor = tooltipBorder;
       }
@@ -3710,12 +3800,18 @@ function openSetupModal() {
   if (modal) {
     const statuslineBody = document.getElementById('setup-body-statusline');
     const codexBody = document.getElementById('setup-body-codex');
+    const claudeBody = document.getElementById('setup-body-claude');
+    if (statuslineBody) statuslineBody.style.display = 'none';
+    if (codexBody) codexBody.style.display = 'none';
+    if (claudeBody) claudeBody.style.display = 'none';
+
     if (currentAssistant === 'codex') {
-      if (statuslineBody) statuslineBody.style.display = 'none';
       if (codexBody) codexBody.style.display = 'block';
+    } else if (currentAssistant === 'claude') {
+      if (claudeBody) claudeBody.style.display = 'block';
     } else {
+      if (statuslineBody) statuslineBody.style.display = 'none';
       if (statuslineBody) statuslineBody.style.display = 'block';
-      if (codexBody) codexBody.style.display = 'none';
     }
     loadSetupInfo();
     modal.classList.add('active');
@@ -3731,16 +3827,30 @@ function closeSetupModal() {
 
 async function loadSetupInfo() {
   try {
-    const resolvedAssistant = ['antigravity', 'copilot', 'codex'].includes(currentAssistant) ? currentAssistant : 'antigravity';
+    const resolvedAssistant = isSupportedAssistant(currentAssistant) ? currentAssistant : 'antigravity';
     const res = await fetch(`/api/${resolvedAssistant}/setup-info`);
     const data = await res.json();
     
     // Dynamic values based on home_dir
     const homeDir = data.home_dir || '/home/user';
+
+    // Localize modal title based on selected assistant
+    const titleH2 = document.getElementById('setup-modal-title');
+    if (titleH2) {
+      if (currentAssistant === 'copilot') {
+        titleH2.setAttribute('data-i18n', 'copilot_setup_modal_title');
+      } else if (currentAssistant === 'codex') {
+        titleH2.setAttribute('data-i18n', 'codex_setup_modal_title');
+      } else if (currentAssistant === 'claude') {
+        titleH2.setAttribute('data-i18n', 'claude_setup_modal_title');
+      } else {
+        titleH2.setAttribute('data-i18n', 'setup_modal_title');
+      }
+    }
     
     if (currentAssistant === 'antigravity' || currentAssistant === 'copilot') {
-      const folder = currentAssistant === 'copilot' ? '.copilot' : '.antigravity';
-      const targetScriptPath = `${homeDir}/${folder}/statusline-token.sh`;
+      const folder = currentAssistant === 'copilot' ? '.copilot' : '.gemini/antigravity-cli';
+      const targetScriptPath = `$HOME/${folder}/statusline-token.sh`;
 
       const settingsJson = JSON.stringify({
         "statusLine": {
@@ -3762,8 +3872,49 @@ async function loadSetupInfo() {
         }
       }, null, 2);
 
+      // Localize step instructions dynamically
+      const introP = document.getElementById('setup-modal-intro');
+      const stepCloneH3 = document.getElementById('setup-step-clone');
+      const stepCloneDescP = document.getElementById('setup-step-clone-desc');
+      const step1H3 = document.getElementById('setup-step-1');
+      const step1DescP = document.getElementById('setup-step-1-desc');
+      const step2H3 = document.getElementById('setup-step-2');
+      const step2DescP = document.getElementById('setup-step-2-desc');
+      const step3H3 = document.getElementById('setup-step-3');
+      const step4H3 = document.getElementById('setup-step-4');
+      const step4DescP = document.getElementById('setup-step-4-desc');
+      const step5H3 = document.getElementById('setup-step-5');
+      const step5DescP = document.getElementById('setup-step-5-desc');
+
+      if (currentAssistant === 'copilot') {
+        if (introP) introP.setAttribute('data-i18n', 'copilot_setup_modal_intro');
+        if (stepCloneH3) stepCloneH3.setAttribute('data-i18n', 'copilot_setup_step_clone');
+        if (stepCloneDescP) stepCloneDescP.setAttribute('data-i18n', 'copilot_setup_step_clone_desc');
+        if (step1H3) step1H3.setAttribute('data-i18n', 'copilot_setup_step_1');
+        if (step1DescP) step1DescP.setAttribute('data-i18n', 'copilot_setup_step_1_desc');
+        if (step2H3) step2H3.setAttribute('data-i18n', 'copilot_setup_step_2');
+        if (step2DescP) step2DescP.setAttribute('data-i18n', 'copilot_setup_step_2_desc');
+        if (step3H3) step3H3.setAttribute('data-i18n', 'copilot_setup_step_3');
+        if (step4H3) step4H3.setAttribute('data-i18n', 'copilot_setup_step_4');
+        if (step4DescP) step4DescP.setAttribute('data-i18n', 'copilot_setup_step_4_desc');
+        if (step5H3) step5H3.setAttribute('data-i18n', 'copilot_setup_step_5');
+        if (step5DescP) step5DescP.setAttribute('data-i18n', 'copilot_setup_step_5_desc');
+      } else {
+        if (introP) introP.setAttribute('data-i18n', 'setup_modal_intro');
+        if (stepCloneH3) stepCloneH3.setAttribute('data-i18n', 'setup_step_clone');
+        if (stepCloneDescP) stepCloneDescP.setAttribute('data-i18n', 'setup_step_clone_desc');
+        if (step1H3) step1H3.setAttribute('data-i18n', 'setup_step_1');
+        if (step1DescP) step1DescP.setAttribute('data-i18n', 'setup_step_1_desc');
+        if (step2H3) step2H3.setAttribute('data-i18n', 'setup_step_2');
+        if (step2DescP) step2DescP.setAttribute('data-i18n', 'setup_step_2_desc');
+        if (step3H3) step3H3.setAttribute('data-i18n', 'setup_step_3');
+        if (step4H3) step4H3.setAttribute('data-i18n', 'setup_step_4');
+        if (step4DescP) step4DescP.setAttribute('data-i18n', 'setup_step_4_desc');
+        if (step5H3) step5H3.setAttribute('data-i18n', 'setup_step_5');
+        if (step5DescP) step5DescP.setAttribute('data-i18n', 'setup_step_5_desc');
+      }
+
       // Render to DOM
-      const homeLabel = document.getElementById('lbl-detected-home');
       const jsonCodeEl = document.getElementById('code-setup-json');
       const mergeCodeEl = document.getElementById('code-setup-json-merge');
       const setupCmdEl = document.getElementById('code-setup-cmd');
@@ -3773,15 +3924,20 @@ async function loadSetupInfo() {
       const copyJsonBtn = document.getElementById('btn-copy-json');
       const copyMergeBtn = document.getElementById('btn-copy-json-merge');
 
-      if (homeLabel) homeLabel.textContent = homeDir;
       if (jsonCodeEl) jsonCodeEl.textContent = settingsJson;
       if (copyJsonBtn) copyJsonBtn.setAttribute('data-clipboard-text', settingsJson);
       
       if (mergeCodeEl) mergeCodeEl.textContent = mergedJson;
       if (copyMergeBtn) copyMergeBtn.setAttribute('data-clipboard-text', mergedJson);
 
+      const editCmdEl = document.getElementById('code-edit-settings');
+      if (editCmdEl) {
+        editCmdEl.textContent = `vi ~/${folder}/settings.json`;
+      }
+
       if (setupCmdEl) {
-        setupCmdEl.textContent = `mkdir -p ~/${folder} && cp shell/statusline-token.sh ~/${folder}/statusline-token.sh && chmod +x ~/${folder}/statusline-token.sh`;
+        const srcScript = `shell/${currentAssistant === 'copilot' ? 'copilot' : 'antigravity'}/statusline-token.sh`;
+        setupCmdEl.textContent = `mkdir -p ~/${folder} && cp ${srcScript} ~/${folder}/statusline-token.sh && chmod +x ~/${folder}/statusline-token.sh`;
       }
       if (troubleshootAEl) {
         troubleshootAEl.textContent = `echo '{}' | ~/${folder}/statusline-token.sh`;
@@ -3794,8 +3950,14 @@ async function loadSetupInfo() {
       }
     } else if (currentAssistant === 'codex') {
       const homeLabelCodex = document.getElementById('lbl-detected-home-codex');
-      if (homeLabelCodex) homeLabelCodex.textContent = `${homeDir}/.codex`;
+      if (homeLabelCodex) homeLabelCodex.textContent = `${homeDir}/.codex/sessions`;
+    } else if (currentAssistant === 'claude') {
+      const homeLabelClaude = document.getElementById('lbl-detected-home-claude');
+      if (homeLabelClaude) homeLabelClaude.textContent = `${homeDir}/.claude/projects`;
     }
+
+    // Apply updated language translations
+    updateLanguageUI();
 
   } catch (err) {
     console.error('Failed to load dynamic setup paths:', err);
@@ -3844,22 +4006,18 @@ function toggleEmptyState(showEmpty) {
       if (currentAssistant === 'none') {
         emptyContainer.innerHTML = `
           <div class="welcome-setup-card no-agent-card">
-            <div class="card-icon">⚠️</div>
+            ${cardIconMarkup('alert')}
             <h2>${t('no_agent_selected_title')}</h2>
             <p>${t('no_agent_selected_desc')}</p>
           </div>
         `;
       } else {
-        let emptyLogoUrl = '/static/antigravity.webp';
-        if (currentAssistant === 'copilot') {
-          emptyLogoUrl = '/static/githubcopilot.webp';
-        } else if (currentAssistant === 'codex') {
-          emptyLogoUrl = '/static/codex.webp';
-        }
+        const meta = getAssistantMeta(currentAssistant);
+        let emptyLogoUrl = meta.logo;
         emptyContainer.innerHTML = `
           <div class="welcome-setup-card">
             <div class="card-icon" style="display: flex; justify-content: center; align-items: center; filter: drop-shadow(0 0 10px rgba(255,255,255,0.1)); margin-bottom: 12px;">
-              <img src="${emptyLogoUrl}" alt="${currentAssistant}" style="width: 48px; height: 48px; border-radius: 8px; object-fit: cover;" />
+              <img src="${emptyLogoUrl}" alt="${meta.alt}" style="width: 48px; height: 48px; border-radius: 8px; object-fit: cover;" />
             </div>
             <h2>${t('empty_title')}</h2>
             <p>${t('empty_desc')}</p>
@@ -4002,7 +4160,7 @@ function renderPricingModalTable() {
       <td>${escapeHtml(r.unit)}</td>
       <td style="color: var(--accent-cyan); font-weight: 600;">$${r.input_price.toFixed(2)}</td>
       <td style="color: #34d399; font-weight: 600;">$${r.cache_input_price.toFixed(2)}</td>
-      <td style="color: #a78bfa; font-weight: 600;">$${r.output_price.toFixed(2)}</td>
+      <td style="color: #aeb9c8; font-weight: 600;">$${r.output_price.toFixed(2)}</td>
       <td style="color: var(--text-secondary);">${escapeHtml(r.batch_api_price)}</td>
     `;
     tbody.appendChild(tr);
@@ -4021,191 +4179,15 @@ function formatCost(cost) {
 
 async function updateCodexRateLimit() {
   const container = document.getElementById('codex-control-panel');
-  if (!container) return;
-
-  if (currentAssistant !== 'codex' || activeTab !== 'daily' || isEmptyState) {
-    container.classList.add('hidden');
-    return;
-  }
-
-  // 更新 Codex 憑證切換器
-  updateCodexAuthSwitcher();
-
-  try {
-    const res = await fetch(`/api/codex/rate-limit`);
-    if (!res.ok) {
-      if (res.status === 404) {
-        document.getElementById('codex-rate-limit-primary-val').textContent = '--';
-        document.getElementById('codex-rate-limit-primary-bar').style.width = '0%';
-        document.getElementById('codex-rate-limit-primary-reset').textContent = t('codex_reset_time') + ' --';
-        document.getElementById('codex-rate-limit-secondary-val').textContent = '--';
-        document.getElementById('codex-rate-limit-secondary-bar').style.width = '0%';
-        document.getElementById('codex-rate-limit-secondary-reset').textContent = t('codex_reset_time') + ' --';
-        document.getElementById('codex-rate-limit-updated').textContent = t('codex_rate_limit_updated') + ' --';
-        container.classList.remove('hidden');
-      }
-      return;
-    }
-    const data = await res.json();
-    
-    if (data.primary) {
-      const remainingPercent = Math.max(0, 100.0 - data.primary.used_percent);
-      const remainingPercentText = remainingPercent.toFixed(1) + '%';
-      document.getElementById('codex-rate-limit-primary-val').textContent = t('codex_rate_limit_remaining').replace('{percent}', remainingPercent.toFixed(1));
-      document.getElementById('codex-rate-limit-primary-bar').style.width = remainingPercentText;
-      const resetTime = new Date(data.primary.resets_at * 1000);
-      document.getElementById('codex-rate-limit-primary-reset').textContent = t('codex_reset_time') + ' ' + formatDateTime(resetTime);
-    } else {
-      document.getElementById('codex-rate-limit-primary-val').textContent = t('codex_rate_limit_unlimited');
-      document.getElementById('codex-rate-limit-primary-bar').style.width = '100%';
-      document.getElementById('codex-rate-limit-primary-reset').textContent = t('codex_reset_time') + ' --';
-    }
-
-    if (data.secondary) {
-      const remainingPercent = Math.max(0, 100.0 - data.secondary.used_percent);
-      const remainingPercentText = remainingPercent.toFixed(1) + '%';
-      document.getElementById('codex-rate-limit-secondary-val').textContent = t('codex_rate_limit_remaining').replace('{percent}', remainingPercent.toFixed(1));
-      document.getElementById('codex-rate-limit-secondary-bar').style.width = remainingPercentText;
-      const resetTime = new Date(data.secondary.resets_at * 1000);
-      document.getElementById('codex-rate-limit-secondary-reset').textContent = t('codex_reset_time') + ' ' + formatDateTime(resetTime);
-    } else {
-      document.getElementById('codex-rate-limit-secondary-val').textContent = t('codex_rate_limit_unlimited');
-      document.getElementById('codex-rate-limit-secondary-bar').style.width = '100%';
-      document.getElementById('codex-rate-limit-secondary-reset').textContent = t('codex_reset_time') + ' --';
-    }
-
-    if (data.timestamp) {
-      const updateTime = new Date(data.timestamp);
-      document.getElementById('codex-rate-limit-updated').textContent = t('codex_rate_limit_updated') + ' ' + formatDateTime(updateTime);
-    } else {
-      document.getElementById('codex-rate-limit-updated').textContent = t('codex_rate_limit_updated') + ' --';
-    }
-
-    container.classList.remove('hidden');
-    updateCodexResets(false);
-  } catch (err) {
-    console.error('更新 Codex Rate Limit 失敗:', err);
-  }
+  if (container) container.classList.add('hidden');
 }
 
 async function updateCodexResets(forceRefresh = false) {
-  if (currentAssistant !== 'codex' || activeTab !== 'daily' || isEmptyState) {
-    return;
-  }
-
-  const listContainer = document.getElementById('codex-resets-list');
-  const availableVal = document.getElementById('codex-resets-available-val');
-  const updatedVal = document.getElementById('codex-resets-updated');
-  const refreshBtn = document.getElementById('btn-codex-resets-refresh');
-
-  if (!listContainer || !availableVal || !updatedVal) return;
-
-  if (isQueryingCodexResets) return;
-
-  if (cachedCodexResets && !forceRefresh) {
-    renderCodexResets(cachedCodexResets);
-    return;
-  }
-
-  isQueryingCodexResets = true;
-  if (refreshBtn) refreshBtn.classList.add('loading');
-  listContainer.innerHTML = `<div style="text-align: center; color: var(--text-muted); font-size: 11px; padding: 10px 0;">${t('codex_resets_querying')}</div>`;
-
-  try {
-    const res = await fetch(`/api/codex/reset-info`);
-    if (!res.ok) {
-      let errMsg = res.statusText;
-      try {
-        const errData = await res.json();
-        if (errData && errData.error) errMsg = errData.error;
-      } catch (_) {}
-      throw new Error(errMsg);
-    }
-    const data = await res.json();
-    cachedCodexResets = {
-      data,
-      timestamp: new Date()
-    };
-    renderCodexResets(cachedCodexResets);
-  } catch (err) {
-    console.error('Fetch Codex Reset Info failed:', err);
-    availableVal.textContent = '--';
-    listContainer.innerHTML = `<div style="text-align: center; color: #ef4444; font-size: 11px; padding: 10px 0;">${t('codex_resets_query_failed').replace('{msg}', err.message)}</div>`;
-    updatedVal.textContent = t('codex_resets_updated') + ' --';
-  } finally {
-    isQueryingCodexResets = false;
-    if (refreshBtn) refreshBtn.classList.remove('loading');
-  }
+  return Promise.resolve(forceRefresh);
 }
 
 function renderCodexResets(cachedData) {
-  const listContainer = document.getElementById('codex-resets-list');
-  const availableVal = document.getElementById('codex-resets-available-val');
-  const updatedVal = document.getElementById('codex-resets-updated');
-
-  if (!listContainer || !availableVal || !updatedVal) return;
-
-  const { data, timestamp } = cachedData;
-  availableVal.textContent = data.available_count !== undefined ? data.available_count + ' ' + (currentLang === 'zh-TW' ? '次' : 'times') : '--';
-  updatedVal.textContent = t('codex_resets_updated') + ' ' + formatDateTime(timestamp);
-
-  const credits = data.credits || [];
-  if (credits.length === 0) {
-    listContainer.innerHTML = `<div style="text-align: center; color: var(--text-muted); font-size: 11px; padding: 10px 0;">${t('codex_resets_empty')}</div>`;
-    return;
-  }
-
-  let html = '';
-  credits.forEach((credit, idx) => {
-    const isAvailable = credit.status === 'available';
-    const statusText = isAvailable ? t('codex_resets_status_available') : t('codex_resets_status_used');
-    const statusColor = isAvailable ? 'var(--accent-cyan)' : 'var(--text-muted)';
-    const bgOpacity = isAvailable ? 'rgba(0, 242, 254, 0.05)' : 'rgba(255, 255, 255, 0.02)';
-    const borderColor = isAvailable ? 'rgba(0, 242, 254, 0.2)' : 'rgba(255, 255, 255, 0.08)';
-
-    let remainingText = '';
-    if (credit.expires_at) {
-      const expiry = new Date(credit.expires_at);
-      const now = new Date();
-      const diffMs = expiry.getTime() - now.getTime();
-      if (diffMs > 0) {
-        const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
-        const diffHrs = Math.floor((diffMs % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
-        const diffMins = Math.round((diffMs % (1000 * 60 * 60)) / (1000 * 60));
-        let timeStr = '';
-        if (diffDays > 0) {
-          timeStr += diffDays + 'd ';
-        }
-        if (diffHrs > 0 || diffDays > 0) {
-          timeStr += diffHrs + 'h ';
-        }
-        timeStr += diffMins + 'm';
-        remainingText = t('codex_resets_remaining').replace('{time}', timeStr);
-      } else {
-        remainingText = currentLang === 'zh-TW' ? '已過期' : 'Expired';
-      }
-    }
-
-    const titleStr = credit.title || 'Full Reset';
-    const grantedStr = credit.granted_at ? formatDateTime(new Date(credit.granted_at)) : '--';
-    const expiresStr = credit.expires_at ? formatDateTime(new Date(credit.expires_at)) : '--';
-
-    html += `
-      <div style="background: ${bgOpacity}; border: 1px solid ${borderColor}; border-radius: 6px; padding: 6px 8px; font-size: 10.5px; display: flex; flex-direction: column; gap: 4px;">
-        <div style="display: flex; justify-content: space-between; align-items: center; font-weight: 500;">
-          <span style="color: var(--text-secondary); max-width: 120px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${titleStr}">#${idx + 1} ${titleStr}</span>
-          <span style="color: ${statusColor}; font-size: 10px; font-weight: 600; background: ${isAvailable ? 'rgba(0, 242, 254, 0.1)' : 'rgba(255,255,255,0.05)'}; padding: 1px 4px; border-radius: 4px;">${statusText}</span>
-        </div>
-        ${remainingText ? `<div style="color: var(--neon-gold); font-size: 10px;">⏳ ${remainingText}</div>` : ''}
-        <div style="display: flex; flex-direction: column; font-size: 9px; color: var(--text-muted); gap: 1px;">
-          <span>${t('codex_resets_granted')} ${grantedStr}</span>
-          <span>${t('codex_resets_expires')} ${expiresStr}</span>
-        </div>
-      </div>
-    `;
-  });
-
-  listContainer.innerHTML = html;
+  return cachedData;
 }
 
 function formatDateTime(dateObj) {
@@ -4221,70 +4203,5 @@ function formatDateTime(dateObj) {
 }
 
 async function updateCodexAuthSwitcher() {
-  if (currentAssistant !== 'codex' || activeTab !== 'daily' || isEmptyState) {
-    return;
-  }
-
-  try {
-    const res = await fetch(`/api/codex/auth-configs`);
-    if (!res.ok) {
-      return;
-    }
-    const data = await res.json();
-    const selectEl = document.getElementById('codex-auth-select');
-    if (!selectEl) return;
-
-    // Preserve the currently selected value if any
-    const prevSelected = selectEl.value;
-
-    selectEl.innerHTML = '';
-
-    if (!data.configs || data.configs.length === 0) {
-      const opt = document.createElement('option');
-      opt.value = '';
-      opt.disabled = true;
-      opt.selected = true;
-      opt.textContent = t('auth_status_none') || 'No auth files found';
-      selectEl.appendChild(opt);
-      document.getElementById('codex-auth-switcher-status').textContent = t('auth_status_none');
-      return;
-    }
-
-    let activeFound = false;
-    let activeName = '';
-    let activeEmail = '';
-    data.configs.forEach(cfg => {
-      const opt = document.createElement('option');
-      opt.value = cfg.name;
-      opt.textContent = cfg.display_name || cfg.name;
-      if (cfg.email) {
-        opt.title = cfg.email;
-      }
-      if (cfg.active) {
-        opt.selected = true;
-        activeFound = true;
-        activeName = cfg.display_name || cfg.name;
-        activeEmail = cfg.email || '';
-      }
-      selectEl.appendChild(opt);
-    });
-
-    // If active is not found but we had a selection previously, keep it
-    if (!activeFound && prevSelected && data.configs.some(c => c.name === prevSelected)) {
-      selectEl.value = prevSelected;
-    }
-
-    const statusEl = document.getElementById('codex-auth-switcher-status');
-    if (statusEl) {
-      if (activeFound) {
-        statusEl.textContent = t('auth_status').replace('{name}', activeName);
-        statusEl.title = activeEmail || activeName;
-      } else {
-        statusEl.textContent = t('auth_status_custom');
-        statusEl.removeAttribute('title');
-      }
-    }
-  } catch (err) {
-    console.error('更新 Codex Auth Switcher 失敗:', err);
-  }
+  return Promise.resolve();
 }

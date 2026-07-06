@@ -1,6 +1,6 @@
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -53,24 +53,32 @@ pub struct UsageEntry {
     pub reasoning_effort: Option<String>,
 }
 
-// Codex helper structs
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct TokenCountUsage {
+// Claude Code helper structs
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ClaudeUsage {
+    #[serde(default)]
     input_tokens: u64,
-    cached_input_tokens: u64,
+    #[serde(default)]
+    cache_creation_input_tokens: u64,
+    #[serde(default)]
+    cache_read_input_tokens: u64,
+    #[serde(default)]
     output_tokens: u64,
-    reasoning_output_tokens: u64,
-    total_tokens: u64,
 }
 
-struct ParsedTurnData {
-    turn_no: u32,
-    timestamp: String,
-    model: Option<String>,
-    cwd: Option<String>,
-    duration_ms: Option<u64>,
-    total_token_usage: Option<TokenCountUsage>,
-    reasoning_effort: Option<String>,
+// Codex CLI helper structs
+#[derive(Debug, Clone, Default, Deserialize)]
+struct CodexTokenUsage {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    cached_input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+    #[serde(default)]
+    reasoning_output_tokens: u64,
+    #[serde(default)]
+    total_tokens: u64,
 }
 
 /// Directory resolution helpers
@@ -127,6 +135,18 @@ pub fn get_codex_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+pub fn get_claude_dir() -> PathBuf {
+    if let Ok(val) = std::env::var("CLAUDE_DIR") {
+        let p = PathBuf::from(val);
+        if p.exists() {
+            return p;
+        }
+    }
+    dirs::home_dir()
+        .map(|h| h.join(".claude"))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
 /// Get connection to centralized SQLite DB
 pub fn get_db_conn() -> Result<Connection, String> {
     let dir = get_insights_dir();
@@ -160,7 +180,7 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS usage_entries (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            assistant_type TEXT NOT NULL, -- 'antigravity', 'copilot', 'codex'
+            assistant_type TEXT NOT NULL, -- 'antigravity', 'copilot', 'codex', 'claude'
             timestamp TEXT NOT NULL,
             date TEXT NOT NULL,
             session_id TEXT NOT NULL,
@@ -470,28 +490,6 @@ fn sync_hook_usage_logs(
     Ok(())
 }
 
-/// Codex sync helper: parse filename
-fn parse_codex_filename(filename: &str) -> Option<(String, String, String)> {
-    if !filename.starts_with("rollout-") || !filename.ends_with(".jsonl") {
-        return None;
-    }
-    let core = filename.strip_prefix("rollout-")?.strip_suffix(".jsonl")?;
-    if core.len() < 20 {
-        return None;
-    }
-    let date_part = &core[0..10]; // YYYY-MM-DD
-    let time_part = &core[11..19]; // HH-mm-ss
-    let uuid_part = &core[20..]; // UUID
-
-    let date = date_part.to_string();
-    let time_formatted = time_part.replace('-', ":");
-    let session_name = format!("Rollout {} {}", date, time_formatted);
-    let session_id = uuid_part.to_string();
-
-    Some((session_id, date, session_name))
-}
-
-/// Codex sync helper: recursively find session rollout jsonl files
 fn find_codex_session_files(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     if let Ok(entries) = fs::read_dir(dir) {
@@ -499,361 +497,262 @@ fn find_codex_session_files(dir: &Path) -> Vec<PathBuf> {
             let path = entry.path();
             if path.is_dir() {
                 files.extend(find_codex_session_files(&path));
-            } else if path.is_file() {
-                if let Some(filename) = path.file_name().and_then(|f| f.to_str()) {
-                    if filename.starts_with("rollout-") && filename.ends_with(".jsonl") {
-                        files.push(path);
-                    }
-                }
+            } else if path.is_file()
+                && path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
+            {
+                files.push(path);
             }
         }
     }
     files
 }
 
-/// Codex sync helper: parse rollout session events
-fn parse_codex_session_file(
-    filepath: &Path,
-    session_id: &str,
-    session_name: &str,
-    _session_date: &str,
-) -> Result<Vec<UsageEntry>, String> {
+fn codex_content_to_text(content: &serde_json::Value) -> String {
+    if let Some(text) = content.as_str() {
+        return text.replace('\r', "").replace('\n', " ");
+    }
+
+    let mut parts = Vec::new();
+    if let Some(items) = content.as_array() {
+        for item in items {
+            match item.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+                "input_text" | "output_text" | "text" => {
+                    if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                        parts.push(text.replace('\r', "").replace('\n', " "));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    parts.join(" ")
+}
+
+fn codex_usage_to_stats(usage: CodexTokenUsage) -> TokenStats {
+    let cache_read = usage.cached_input_tokens;
+    let input = usage.input_tokens.saturating_sub(cache_read);
+    let output = usage.output_tokens;
+    let total = if usage.total_tokens > 0 {
+        usage.total_tokens
+    } else {
+        input.saturating_add(cache_read).saturating_add(output)
+    };
+
+    TokenStats {
+        input,
+        output,
+        cache_read: Some(cache_read),
+        cache_write: None,
+        reasoning: Some(usage.reasoning_output_tokens),
+        total,
+    }
+}
+
+fn parse_codex_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String> {
     let file = File::open(filepath).map_err(|e| format!("無法開啟檔案: {}", e))?;
     let reader = BufReader::new(file);
+    let fallback_session_id = filepath
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("unknown-session")
+        .trim_start_matches("rollout-")
+        .to_string();
 
-    let mut cli_version = None;
-    let mut session_meta_cwd = None;
-    let mut parent_session_id = None;
-    let mut agent_nickname = None;
-    let mut agent_role = None;
-    let mut first_user_message = None;
-
-    let mut seen_turn_ids = Vec::new();
-    let mut active_turn_id: Option<String> = None;
-    let mut turn_data_map: HashMap<String, ParsedTurnData> = HashMap::new();
-
+    let mut events = Vec::new();
     for line_res in reader.lines() {
         let line = match line_res {
-            Ok(l) => l,
+            Ok(line) => line,
             Err(_) => continue,
         };
-        let event: serde_json::Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
-        let timestamp = event
-            .get("timestamp")
-            .and_then(|t| t.as_str())
-            .unwrap_or("")
-            .to_string();
-        let payload = event.get("payload");
-
-        if event_type == "event_msg" && first_user_message.is_none() {
-            if let Some(p) = payload {
-                let is_user_msg = if let Some(t) = p.get("type") {
-                    if let Some(s) = t.as_str() {
-                        s == "user_message"
-                    } else if let Some(arr) = t.as_array() {
-                        arr.first().and_then(|v| v.as_str()) == Some("user_message")
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
-                if is_user_msg {
-                    if let Some(msg) = p.get("message").and_then(|m| m.as_str()) {
-                        let cleaned = msg.replace('\r', "").replace('\n', " ");
-                        let truncated = cleaned.chars().take(100).collect::<String>();
-                        first_user_message = Some(truncated);
-                    }
-                }
-            }
+        if let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) {
+            events.push(event);
         }
+    }
+
+    let mut session_id = fallback_session_id.clone();
+    let mut session_name: Option<String> = None;
+    let mut session_cwd: Option<String> = None;
+    let mut session_version: Option<String> = None;
+    let mut parent_session_id: Option<String> = None;
+    let mut agent_nickname: Option<String> = None;
+    let mut agent_role: Option<String> = None;
+    let mut current_model = "Codex CLI".to_string();
+    let mut reasoning_effort: Option<String> = None;
+
+    for event in &events {
+        let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let payload = match event.get("payload") {
+            Some(payload) => payload,
+            None => continue,
+        };
+        let payload_type = payload.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
         if event_type == "session_meta" {
-            if let Some(p) = payload {
-                if cli_version.is_none() {
-                    cli_version = p
-                        .get("cli_version")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
+            if let Some(id) = payload
+                .get("session_id")
+                .or_else(|| payload.get("id"))
+                .and_then(|id| id.as_str())
+            {
+                session_id = id.to_string();
+            }
+            session_cwd = payload
+                .get("cwd")
+                .and_then(|cwd| cwd.as_str())
+                .map(|cwd| cwd.to_string())
+                .or(session_cwd);
+            session_version = payload
+                .get("cli_version")
+                .and_then(|version| version.as_str())
+                .map(|version| version.to_string())
+                .or(session_version);
+            parent_session_id = payload
+                .get("parent_thread_id")
+                .and_then(|id| id.as_str())
+                .map(|id| id.to_string())
+                .or(parent_session_id);
+            agent_nickname = payload
+                .get("agent_nickname")
+                .and_then(|name| name.as_str())
+                .map(|name| name.to_string())
+                .or(agent_nickname);
+            agent_role = payload
+                .get("agent_role")
+                .and_then(|role| role.as_str())
+                .map(|role| role.to_string())
+                .or(agent_role);
+            if let Some(model) = payload.get("model").and_then(|model| model.as_str()) {
+                current_model = model.to_string();
+            }
+        } else if event_type == "turn_context" {
+            session_cwd = payload
+                .get("cwd")
+                .and_then(|cwd| cwd.as_str())
+                .map(|cwd| cwd.to_string())
+                .or(session_cwd);
+            if let Some(model) = payload.get("model").and_then(|model| model.as_str()) {
+                current_model = model.to_string();
+            }
+            reasoning_effort = payload
+                .get("effort")
+                .or_else(|| payload.get("reasoning_effort"))
+                .and_then(|effort| effort.as_str())
+                .map(|effort| effort.to_string())
+                .or(reasoning_effort);
+        } else if session_name.is_none()
+            && event_type == "event_msg"
+            && payload_type == "user_message"
+        {
+            if let Some(message) = payload.get("message").and_then(|message| message.as_str()) {
+                let cleaned = message.trim().replace('\r', "").replace('\n', " ");
+                if !cleaned.is_empty() {
+                    session_name = Some(cleaned.chars().take(100).collect());
                 }
-                if session_meta_cwd.is_none() {
-                    session_meta_cwd = p.get("cwd").and_then(|c| c.as_str()).map(|s| s.to_string());
-                }
-                let p_sid = p.get("session_id").and_then(|v| v.as_str());
-                let p_id = p.get("id").and_then(|v| v.as_str());
-                if let (Some(psid), Some(pid)) = (p_sid, p_id) {
-                    if psid != pid {
-                        parent_session_id = Some(psid.to_string());
-                    }
-                }
-                if agent_nickname.is_none() {
-                    agent_nickname = p
-                        .get("agent_nickname")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
-                        .or_else(|| {
-                            p.get("source")
-                                .and_then(|s| s.get("subagent"))
-                                .and_then(|s| s.get("thread_spawn"))
-                                .and_then(|t| t.get("agent_nickname"))
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string())
-                        });
-                }
-                if agent_role.is_none() {
-                    agent_role = p
-                        .get("agent_role")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
-                        .or_else(|| {
-                            p.get("source")
-                                .and_then(|s| s.get("subagent"))
-                                .and_then(|s| s.get("thread_spawn"))
-                                .and_then(|t| t.get("agent_role"))
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string())
-                        });
-                }
             }
-            continue;
-        }
-
-        let mut turn_id = None;
-        if event_type == "turn_context" {
-            if let Some(p) = payload {
-                turn_id = p
-                    .get("turn_id")
-                    .and_then(|id| id.as_str())
-                    .map(|s| s.to_string());
-            }
-        } else if event_type == "event_msg" {
-            if let Some(p) = payload {
-                turn_id = p
-                    .get("turn_id")
-                    .and_then(|id| id.as_str())
-                    .map(|s| s.to_string());
-            }
-        } else if event_type == "response_item" {
-            if let Some(meta) = event.get("metadata") {
-                turn_id = meta
-                    .get("turn_id")
-                    .and_then(|id| id.as_str())
-                    .map(|s| s.to_string());
-            }
-            if turn_id.is_none() {
-                turn_id = event
-                    .get("internal_chat_message_metadata_passthrough")
-                    .and_then(|m| m.get("turn_id"))
-                    .and_then(|id| id.as_str())
-                    .map(|s| s.to_string());
-            }
-        }
-
-        if let Some(tid) = turn_id {
-            active_turn_id = Some(tid.clone());
-            if !seen_turn_ids.contains(&tid) {
-                seen_turn_ids.push(tid.clone());
-                let turn_no = seen_turn_ids.len() as u32;
-                turn_data_map.insert(
-                    tid.clone(),
-                    ParsedTurnData {
-                        turn_no,
-                        timestamp: timestamp.clone(),
-                        model: None,
-                        cwd: None,
-                        duration_ms: None,
-                        total_token_usage: None,
-                        reasoning_effort: None,
-                    },
-                );
-            }
-        }
-
-        if let Some(ref active_tid) = active_turn_id {
-            if let Some(td) = turn_data_map.get_mut(active_tid) {
-                if event_type == "turn_context" {
-                    if let Some(p) = payload {
-                        if td.model.is_none() {
-                            td.model = p
-                                .get("model")
-                                .and_then(|m| m.as_str())
-                                .map(|s| s.to_string());
-                        }
-                        if td.cwd.is_none() {
-                            td.cwd = p.get("cwd").and_then(|c| c.as_str()).map(|s| s.to_string());
-                        }
-                        if td.reasoning_effort.is_none() {
-                            td.reasoning_effort = p
-                                .get("effort")
-                                .or_else(|| {
-                                    p.get("collaboration_mode")
-                                        .and_then(|cm| cm.get("settings"))
-                                        .and_then(|s| s.get("reasoning_effort"))
-                                })
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string());
-                        }
-                    }
-                } else if event_type == "response_item" {
-                    if let Some(p) = payload {
-                        if p.get("role").and_then(|r| r.as_str()) == Some("assistant")
-                            && td.model.is_none()
-                        {
-                            td.model = p
-                                .get("model")
-                                .and_then(|m| m.as_str())
-                                .map(|s| s.to_string());
-                        }
-                    }
-                } else if event_type == "event_msg" {
-                    if let Some(p) = payload {
-                        let sub_type = p.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                        if sub_type == "token_count" {
-                            if let Some(info) = p.get("info") {
-                                if let Some(usage_val) = info.get("total_token_usage") {
-                                    if let Ok(usage) =
-                                        serde_json::from_value::<TokenCountUsage>(usage_val.clone())
-                                    {
-                                        td.total_token_usage = Some(usage);
-                                    }
-                                }
-                            }
-                        } else if sub_type == "task_complete" || sub_type == "turn_aborted" {
-                            if let Some(dur) = p.get("duration_ms").and_then(|d| d.as_u64()) {
-                                td.duration_ms = Some(dur);
-                            }
-                        }
-                    }
+        } else if session_name.is_none()
+            && event_type == "response_item"
+            && payload_type == "message"
+            && payload.get("role").and_then(|role| role.as_str()) == Some("user")
+        {
+            if let Some(content) = payload.get("content") {
+                let cleaned = codex_content_to_text(content);
+                if !cleaned.trim().is_empty() {
+                    session_name = Some(cleaned.trim().chars().take(100).collect());
                 }
             }
         }
     }
 
     let mut results = Vec::new();
-    let mut cumulative_usage = TokenCountUsage {
-        input_tokens: 0,
-        cached_input_tokens: 0,
-        output_tokens: 0,
-        reasoning_output_tokens: 0,
-        total_tokens: 0,
-    };
+    let mut model_for_turn = current_model.clone();
+    let mut effort_for_turn = reasoning_effort.clone();
 
-    let mut prev_cli_input = 0u64;
-    let mut prev_cli_cached = 0u64;
-    let mut prev_cli_output = 0u64;
-    let mut prev_cli_reasoning = 0u64;
-    let mut prev_cli_total = 0u64;
+    for event in events {
+        let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let timestamp = event
+            .get("timestamp")
+            .and_then(|timestamp| timestamp.as_str())
+            .unwrap_or("")
+            .to_string();
+        let payload = match event.get("payload") {
+            Some(payload) => payload,
+            None => continue,
+        };
+        let payload_type = payload.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
-    for tid in &seen_turn_ids {
-        if let Some(td) = turn_data_map.get(tid) {
-            if let Some(ref usage) = td.total_token_usage {
-                cumulative_usage = usage.clone();
+        if event_type == "turn_context" {
+            if let Some(model) = payload.get("model").and_then(|model| model.as_str()) {
+                model_for_turn = model.to_string();
             }
-
-            let cli_input = cumulative_usage
-                .input_tokens
-                .saturating_sub(cumulative_usage.cached_input_tokens);
-            let cli_cached = cumulative_usage.cached_input_tokens;
-            let cli_output = cumulative_usage.output_tokens;
-            let cli_reasoning = cumulative_usage.reasoning_output_tokens;
-            let cli_total = cli_input + cli_output;
-
-            let delta_input = cli_input.saturating_sub(prev_cli_input);
-            let delta_cached = cli_cached.saturating_sub(prev_cli_cached);
-            let delta_output = cli_output.saturating_sub(prev_cli_output);
-            let delta_reasoning = cli_reasoning.saturating_sub(prev_cli_reasoning);
-            let delta_total = cli_total.saturating_sub(prev_cli_total);
-
-            prev_cli_input = cli_input;
-            prev_cli_cached = cli_cached;
-            prev_cli_output = cli_output;
-            prev_cli_reasoning = cli_reasoning;
-            prev_cli_total = cli_total;
-
-            let turn_tokens = TokenStats {
-                input: cli_input,
-                output: cli_output,
-                cache_read: Some(cli_cached),
-                cache_write: None,
-                reasoning: Some(cli_reasoning),
-                total: cli_total,
-            };
-
-            let turn_delta = TokenStats {
-                input: delta_input,
-                output: delta_output,
-                cache_read: Some(delta_cached),
-                cache_write: None,
-                reasoning: Some(delta_reasoning),
-                total: delta_total,
-            };
-
-            let cost = if td.duration_ms.is_some() {
-                Some(CostStats {
-                    total_api_duration_ms: td.duration_ms.map(|d| d as f64),
-                    total_duration_ms: None,
-                    total_premium_requests: Some(0.0),
-                })
-            } else {
-                None
-            };
-
-            let actual_session_name = first_user_message
-                .clone()
-                .unwrap_or_else(|| session_name.to_string());
-            results.push(UsageEntry {
-                timestamp: td.timestamp.clone(),
-                session_id: session_id.to_string(),
-                session_name: Some(actual_session_name),
-                transcript_path: Some(filepath.to_string_lossy().into_owned()),
-                cwd: td.cwd.clone().or_else(|| session_meta_cwd.clone()),
-                version: cli_version.clone(),
-                turn_no: td.turn_no,
-                model: td.model.clone(),
-                model_id: td.model.clone(),
-                tokens: Some(turn_tokens),
-                delta_tokens: Some(turn_delta),
-                context: None,
-                cost,
-                parent_session_id: parent_session_id.clone(),
-                agent_nickname: agent_nickname.clone(),
-                agent_role: agent_role.clone(),
-                reasoning_effort: td.reasoning_effort.clone(),
-            });
+            effort_for_turn = payload
+                .get("effort")
+                .or_else(|| payload.get("reasoning_effort"))
+                .and_then(|effort| effort.as_str())
+                .map(|effort| effort.to_string())
+                .or(effort_for_turn);
+            continue;
         }
+
+        if event_type != "event_msg" || payload_type != "token_count" {
+            continue;
+        }
+
+        let info = match payload.get("info") {
+            Some(info) => info,
+            None => continue,
+        };
+        let total_usage = match info
+            .get("total_token_usage")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<CodexTokenUsage>(value).ok())
+        {
+            Some(usage) => usage,
+            None => continue,
+        };
+        let last_usage = info
+            .get("last_token_usage")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<CodexTokenUsage>(value).ok())
+            .unwrap_or_else(|| total_usage.clone());
+
+        let context = info
+            .get("model_context_window")
+            .and_then(|window| window.as_u64())
+            .map(|window| ContextStats {
+                current_context_tokens: None,
+                displayed_context_limit: Some(window),
+                current_context_used_percentage: None,
+            });
+
+        results.push(UsageEntry {
+            timestamp,
+            session_id: session_id.clone(),
+            session_name: session_name
+                .clone()
+                .or_else(|| Some(fallback_session_id.clone())),
+            transcript_path: Some(filepath.to_string_lossy().into_owned()),
+            cwd: session_cwd.clone(),
+            version: session_version.clone(),
+            turn_no: (results.len() + 1) as u32,
+            model: Some(model_for_turn.clone()),
+            model_id: Some(model_for_turn.clone()),
+            tokens: Some(codex_usage_to_stats(total_usage)),
+            delta_tokens: Some(codex_usage_to_stats(last_usage)),
+            context,
+            cost: None,
+            parent_session_id: parent_session_id.clone(),
+            agent_nickname: agent_nickname.clone(),
+            agent_role: agent_role.clone(),
+            reasoning_effort: effort_for_turn.clone(),
+        });
     }
 
     Ok(results)
 }
 
-/// Sync usage logs for directory-based assistant (Codex)
 fn sync_codex_usage_logs(conn: &mut Connection) -> Result<(), String> {
-    // Perform migration if we haven't tracked it yet to update session names with user messages
-    let migration_done: bool = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = 'migration:codex_user_message_names')",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(false);
-
-    if !migration_done {
-        let _ = conn.execute("DELETE FROM sync_state WHERE filename LIKE 'codex:%'", []);
-        let _ = conn.execute(
-            "DELETE FROM usage_entries WHERE assistant_type = 'codex'",
-            [],
-        );
-        let _ = conn.execute(
-            "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time) VALUES ('migration:codex_user_message_names', 1, 0)",
-            [],
-        );
-    }
-
     let codex_dir = get_codex_dir();
     let sessions_dir = codex_dir.join("sessions");
     if !sessions_dir.exists() {
@@ -863,17 +762,12 @@ fn sync_codex_usage_logs(conn: &mut Connection) -> Result<(), String> {
     let files = find_codex_session_files(&sessions_dir);
 
     for filepath in files {
-        let filename = match filepath.file_name().and_then(|f| f.to_str()) {
-            Some(name) => name.to_string(),
-            None => continue,
-        };
-
-        let (session_id, session_date, session_name) = match parse_codex_filename(&filename) {
-            Some(res) => res,
-            None => continue,
-        };
-
-        let state_key = format!("codex:{}", filename);
+        let state_path = filepath
+            .strip_prefix(&codex_dir)
+            .unwrap_or(&filepath)
+            .to_string_lossy()
+            .into_owned();
+        let state_key = format!("codex:{}", state_path);
 
         let last_synced_size: u64 = conn
             .query_row(
@@ -884,21 +778,16 @@ fn sync_codex_usage_logs(conn: &mut Connection) -> Result<(), String> {
             .unwrap_or(0u64);
 
         let metadata = match fs::metadata(&filepath) {
-            Ok(m) => m,
+            Ok(metadata) => metadata,
             Err(_) => continue,
         };
         let current_size = metadata.len();
 
         if current_size != last_synced_size {
-            let parsed_entries = match parse_codex_session_file(
-                &filepath,
-                &session_id,
-                &session_name,
-                &session_date,
-            ) {
+            let parsed_entries = match parse_codex_session_file(&filepath) {
                 Ok(entries) => entries,
                 Err(e) => {
-                    eprintln!("解析 Codex 會話檔案 {} 失敗: {}", filename, e);
+                    eprintln!("解析 Codex CLI 會話檔案 {:?} 失敗: {}", filepath, e);
                     continue;
                 }
             };
@@ -907,15 +796,20 @@ fn sync_codex_usage_logs(conn: &mut Connection) -> Result<(), String> {
                 .transaction()
                 .map_err(|e| format!("Transaction BEGIN 失敗: {}", e))?;
 
-            // First delete old entries for this session
-            let delete_res = tx.execute(
-                "DELETE FROM usage_entries WHERE assistant_type = 'codex' AND session_id = ?",
-                params![session_id],
-            );
+            let session_ids: HashSet<String> = parsed_entries
+                .iter()
+                .map(|entry| entry.session_id.clone())
+                .collect();
+            for session_id in session_ids {
+                let delete_res = tx.execute(
+                    "DELETE FROM usage_entries WHERE assistant_type = 'codex' AND session_id = ?",
+                    params![session_id],
+                );
 
-            if let Err(e) = delete_res {
-                eprintln!("清空舊 Codex Session 資料失敗: {}", e);
-                continue;
+                if let Err(e) = delete_res {
+                    eprintln!("清空舊 Codex CLI Session 資料失敗: {}", e);
+                    continue;
+                }
             }
 
             let mut success = true;
@@ -933,7 +827,7 @@ fn sync_codex_usage_logs(conn: &mut Connection) -> Result<(), String> {
                     ) VALUES ('codex', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     params![
                         entry.timestamp,
-                        session_date,
+                        entry.timestamp.get(0..10).unwrap_or("unknown"),
                         entry.session_id,
                         entry.session_name.as_deref(),
                         entry.transcript_path.as_deref(),
@@ -962,7 +856,10 @@ fn sync_codex_usage_logs(conn: &mut Connection) -> Result<(), String> {
                 );
 
                 if let Err(e) = insert_res {
-                    eprintln!("寫入 Codex 資料庫失敗 (turn_no {}): {}", entry.turn_no, e);
+                    eprintln!(
+                        "寫入 Codex CLI 資料庫失敗 (turn_no {}): {}",
+                        entry.turn_no, e
+                    );
                     success = false;
                     break;
                 }
@@ -991,7 +888,386 @@ fn sync_codex_usage_logs(conn: &mut Connection) -> Result<(), String> {
     Ok(())
 }
 
-/// Unified sync function triggering sync for all three assistants
+fn find_claude_session_files(dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                files.extend(find_claude_session_files(&path));
+            } else if path.is_file()
+                && path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
+            {
+                files.push(path);
+            }
+        }
+    }
+    files
+}
+
+fn claude_content_to_text(content: &serde_json::Value) -> String {
+    if let Some(text) = content.as_str() {
+        return text.replace('\r', "").replace('\n', " ");
+    }
+
+    let mut parts = Vec::new();
+    if let Some(items) = content.as_array() {
+        for item in items {
+            match item.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+                "text" => {
+                    if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                        parts.push(text.replace('\r', "").replace('\n', " "));
+                    }
+                }
+                "tool_result" => {
+                    if let Some(text) = item.get("content").and_then(|c| c.as_str()) {
+                        parts.push(text.replace('\r', "").replace('\n', " "));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    parts.join(" ")
+}
+
+fn parse_claude_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String> {
+    let file = File::open(filepath).map_err(|e| format!("無法開啟檔案: {}", e))?;
+    let reader = BufReader::new(file);
+    let fallback_session_id = filepath
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("unknown-session")
+        .to_string();
+
+    let mut session_name: Option<String> = None;
+    let mut session_cwd: Option<String> = None;
+    let mut session_version: Option<String> = None;
+    let mut seen_response_keys = HashSet::new();
+    let mut results = Vec::new();
+
+    for line_res in reader.lines() {
+        let line = match line_res {
+            Ok(line) => line,
+            Err(_) => continue,
+        };
+        let event: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+
+        if session_cwd.is_none() {
+            session_cwd = event
+                .get("cwd")
+                .and_then(|cwd| cwd.as_str())
+                .map(|cwd| cwd.to_string());
+        }
+        if session_version.is_none() {
+            session_version = event
+                .get("version")
+                .and_then(|version| version.as_str())
+                .map(|version| version.to_string());
+        }
+
+        let message = match event.get("message") {
+            Some(message) => message,
+            None => continue,
+        };
+        let role = message
+            .get("role")
+            .and_then(|role| role.as_str())
+            .unwrap_or("");
+
+        if role == "user" && session_name.is_none() {
+            if let Some(content) = message.get("content") {
+                let first_message = claude_content_to_text(content);
+                if !first_message.trim().is_empty() {
+                    session_name = Some(first_message.chars().take(100).collect());
+                }
+            }
+        }
+
+        if role != "assistant" {
+            continue;
+        }
+
+        let usage_value = match message.get("usage") {
+            Some(usage) => usage.clone(),
+            None => continue,
+        };
+        let usage = match serde_json::from_value::<ClaudeUsage>(usage_value) {
+            Ok(usage) => usage,
+            Err(_) => continue,
+        };
+
+        let response_key = event
+            .get("requestId")
+            .and_then(|id| id.as_str())
+            .or_else(|| message.get("id").and_then(|id| id.as_str()))
+            .or_else(|| event.get("uuid").and_then(|id| id.as_str()))
+            .unwrap_or("");
+        if response_key.is_empty() || !seen_response_keys.insert(response_key.to_string()) {
+            continue;
+        }
+
+        let timestamp = event
+            .get("timestamp")
+            .and_then(|timestamp| timestamp.as_str())
+            .unwrap_or("")
+            .to_string();
+        let session_id = event
+            .get("sessionId")
+            .and_then(|id| id.as_str())
+            .unwrap_or(&fallback_session_id)
+            .to_string();
+        let cwd = event
+            .get("cwd")
+            .and_then(|cwd| cwd.as_str())
+            .map(|cwd| cwd.to_string())
+            .or_else(|| session_cwd.clone());
+        let version = event
+            .get("version")
+            .and_then(|version| version.as_str())
+            .map(|version| version.to_string())
+            .or_else(|| session_version.clone());
+        let model = message
+            .get("model")
+            .and_then(|model| model.as_str())
+            .map(|model| model.to_string());
+
+        let input = usage
+            .input_tokens
+            .saturating_add(usage.cache_creation_input_tokens);
+        let cache_read = usage.cache_read_input_tokens;
+        let output = usage.output_tokens;
+        let total = input.saturating_add(cache_read).saturating_add(output);
+        let tokens = TokenStats {
+            input,
+            output,
+            cache_read: Some(cache_read),
+            cache_write: Some(usage.cache_creation_input_tokens),
+            reasoning: None,
+            total,
+        };
+
+        results.push(UsageEntry {
+            timestamp,
+            session_id,
+            session_name: session_name
+                .clone()
+                .or_else(|| Some(fallback_session_id.clone())),
+            transcript_path: Some(filepath.to_string_lossy().into_owned()),
+            cwd,
+            version,
+            turn_no: (results.len() + 1) as u32,
+            model: model.clone(),
+            model_id: model,
+            tokens: Some(tokens.clone()),
+            delta_tokens: Some(tokens),
+            context: None,
+            cost: None,
+            parent_session_id: None,
+            agent_nickname: None,
+            agent_role: None,
+            reasoning_effort: None,
+        });
+    }
+
+    Ok(results)
+}
+
+/// Sync Claude Code local transcripts into the dashboard's Claude Code assistant slot.
+fn sync_claude_usage_logs(conn: &mut Connection) -> Result<(), String> {
+    // Move Claude Code data that was previously written into the Codex slot.
+    let migration_done: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = 'migration:claude_code_source_v2')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    if !migration_done {
+        let _ = conn.execute(
+            "UPDATE usage_entries SET assistant_type = 'claude'
+             WHERE assistant_type = 'codex'
+               AND transcript_path IS NOT NULL
+               AND (transcript_path LIKE '%.claude/%' OR transcript_path LIKE '%/claude/%')",
+            [],
+        );
+        let mut migrated_states = Vec::new();
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT filename, last_synced_size, last_synced_time FROM sync_state WHERE filename LIKE 'codex:claude:%'",
+        ) {
+            if let Ok(mut rows) = stmt.query([]) {
+                while let Ok(Some(row)) = rows.next() {
+                    let filename = row.get::<_, String>(0).unwrap_or_default();
+                    let size = row.get::<_, i64>(1).unwrap_or_default();
+                    let time = row.get::<_, i64>(2).unwrap_or_default();
+                    migrated_states.push((
+                        filename.replacen("codex:claude:", "claude:", 1),
+                        size,
+                        time,
+                    ));
+                }
+            }
+        }
+        for (filename, size, time) in migrated_states {
+            let _ = conn.execute(
+                "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time) VALUES (?, ?, ?)",
+                params![filename, size, time],
+            );
+        }
+        let _ = conn.execute(
+            "DELETE FROM sync_state WHERE filename LIKE 'codex:claude:%'",
+            [],
+        );
+        let _ = conn.execute(
+            "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time) VALUES ('migration:claude_code_source_v2', 1, 0)",
+            [],
+        );
+    }
+
+    let claude_dir = get_claude_dir();
+    let projects_dir = claude_dir.join("projects");
+    if !projects_dir.exists() {
+        return Ok(());
+    }
+
+    let files = find_claude_session_files(&projects_dir);
+
+    for filepath in files {
+        let state_path = filepath
+            .strip_prefix(&claude_dir)
+            .unwrap_or(&filepath)
+            .to_string_lossy()
+            .into_owned();
+        let state_key = format!("claude:{}", state_path);
+
+        let last_synced_size: u64 = conn
+            .query_row(
+                "SELECT last_synced_size FROM sync_state WHERE filename = ?",
+                params![state_key],
+                |row| row.get(0),
+            )
+            .unwrap_or(0u64);
+
+        let metadata = match fs::metadata(&filepath) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let current_size = metadata.len();
+
+        if current_size != last_synced_size {
+            let parsed_entries = match parse_claude_session_file(&filepath) {
+                Ok(entries) => entries,
+                Err(e) => {
+                    eprintln!("解析 Claude Code 會話檔案 {:?} 失敗: {}", filepath, e);
+                    continue;
+                }
+            };
+
+            let tx = conn
+                .transaction()
+                .map_err(|e| format!("Transaction BEGIN 失敗: {}", e))?;
+
+            // First delete old entries for this session
+            let session_ids: HashSet<String> = parsed_entries
+                .iter()
+                .map(|entry| entry.session_id.clone())
+                .collect();
+            for session_id in session_ids {
+                let delete_res = tx.execute(
+                    "DELETE FROM usage_entries WHERE assistant_type = 'claude' AND session_id = ?",
+                    params![session_id],
+                );
+
+                if let Err(e) = delete_res {
+                    eprintln!("清空舊 Claude Code Session 資料失敗: {}", e);
+                    continue;
+                }
+            }
+
+            let mut success = true;
+            for entry in &parsed_entries {
+                let tokens = entry.tokens.as_ref();
+                let delta = entry.delta_tokens.as_ref();
+                let cost = entry.cost.as_ref();
+
+                let insert_res = tx.execute(
+                    "INSERT INTO usage_entries (
+                        assistant_type, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
+                        tokens_input, tokens_output, tokens_cache_read, tokens_reasoning, tokens_total,
+                        delta_input, delta_output, delta_cache_read, delta_reasoning, delta_total,
+                        duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, reasoning_effort
+                    ) VALUES ('claude', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    params![
+                        entry.timestamp,
+                        entry.timestamp.get(0..10).unwrap_or("unknown"),
+                        entry.session_id,
+                        entry.session_name.as_deref(),
+                        entry.transcript_path.as_deref(),
+                        entry.cwd.as_deref(),
+                        entry.version.as_deref(),
+                        entry.turn_no as i64,
+                        entry.model.as_deref(),
+                        entry.model_id.as_deref(),
+                        tokens.map(|t| t.input as i64),
+                        tokens.map(|t| t.output as i64),
+                        tokens.and_then(|t| t.cache_read.map(|v| v as i64)),
+                        tokens.and_then(|t| t.reasoning.map(|v| v as i64)),
+                        tokens.map(|t| t.total as i64),
+                        delta.map(|t| t.input as i64),
+                        delta.map(|t| t.output as i64),
+                        delta.and_then(|t| t.cache_read.map(|v| v as i64)),
+                        delta.and_then(|t| t.reasoning.map(|v| v as i64)),
+                        delta.map(|t| t.total as i64),
+                        cost.and_then(|c| c.total_api_duration_ms.map(|d| d as i64)),
+                        cost.and_then(|c| c.total_premium_requests.map(|r| r as i64)),
+                        entry.parent_session_id.as_deref(),
+                        entry.agent_nickname.as_deref(),
+                        entry.agent_role.as_deref(),
+                        entry.reasoning_effort.as_deref()
+                    ],
+                );
+
+                if let Err(e) = insert_res {
+                    eprintln!(
+                        "寫入 Claude Code 資料庫失敗 (turn_no {}): {}",
+                        entry.turn_no, e
+                    );
+                    success = false;
+                    break;
+                }
+            }
+
+            if success {
+                let now = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+
+                let update_state_res = tx.execute(
+                    "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time) VALUES (?, ?, ?)",
+                    params![state_key, current_size as i64, now],
+                );
+
+                if update_state_res.is_ok() {
+                    if let Err(e) = tx.commit() {
+                        eprintln!("Transaction COMMIT 失敗: {}", e);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Unified sync function triggering sync for all supported assistants
 pub fn sync_usage_logs(conn: &mut Connection) -> Result<(), String> {
     // 1. Sync Google Antigravity CLI
     let antigravity_dir = get_antigravity_dir();
@@ -1007,7 +1283,12 @@ pub fn sync_usage_logs(conn: &mut Connection) -> Result<(), String> {
 
     // 3. Sync Codex CLI
     if let Err(e) = sync_codex_usage_logs(conn) {
-        eprintln!("❌ 同步 Codex 失敗: {}", e);
+        eprintln!("❌ 同步 Codex CLI 失敗: {}", e);
+    }
+
+    // 4. Sync Claude Code
+    if let Err(e) = sync_claude_usage_logs(conn) {
+        eprintln!("❌ 同步 Claude Code 失敗: {}", e);
     }
 
     Ok(())
@@ -1201,58 +1482,6 @@ fn migrate_records(
 }
 
 pub fn get_latest_codex_rate_limit() -> Option<serde_json::Value> {
-    let codex_dir = get_codex_dir();
-    let sessions_dir = codex_dir.join("sessions");
-    let mut files = find_codex_session_files(&sessions_dir);
-
-    // Sort descending so that the newest session files are processed first
-    files.sort_by(|a, b| b.cmp(a));
-
-    for filepath in files {
-        if let Ok(file) = File::open(&filepath) {
-            let reader = BufReader::new(file);
-            let mut last_valid_rate_limit = None;
-            for line_res in reader.lines() {
-                let line = match line_res {
-                    Ok(l) => l,
-                    Err(_) => continue,
-                };
-                let event: serde_json::Value = match serde_json::from_str(&line) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-
-                let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                if event_type == "event_msg" {
-                    if let Some(payload) = event.get("payload") {
-                        if payload.get("type").and_then(|t| t.as_str()) == Some("token_count") {
-                            if let Some(rate_limits) = payload.get("rate_limits") {
-                                // We check if rate_limits is an object and primary is not null
-                                if let Some(primary) = rate_limits.get("primary") {
-                                    if !primary.is_null() {
-                                        let mut res = rate_limits.clone();
-                                        // Include the timestamp of the event for display
-                                        if let Some(obj) = res.as_object_mut() {
-                                            if let Some(timestamp) = event.get("timestamp") {
-                                                obj.insert(
-                                                    "timestamp".to_string(),
-                                                    timestamp.clone(),
-                                                );
-                                            }
-                                        }
-                                        last_valid_rate_limit = Some(res);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            if last_valid_rate_limit.is_some() {
-                return last_valid_rate_limit;
-            }
-        }
-    }
     None
 }
 
@@ -1260,11 +1489,18 @@ pub fn get_latest_codex_rate_limit() -> Option<serde_json::Value> {
 // Encapsulated SQL Queries (Phase 2 Refactoring)
 // =========================================================================
 
-pub fn get_available_dates(conn: &rusqlite::Connection, assistant: &str) -> Result<Vec<String>, String> {
+pub fn get_available_dates(
+    conn: &rusqlite::Connection,
+    assistant: &str,
+) -> Result<Vec<String>, String> {
     let mut dates = Vec::new();
     if assistant == "all" {
-        let mut stmt = conn.prepare("SELECT DISTINCT date FROM usage_entries ORDER BY date DESC").map_err(|e| e.to_string())?;
-        let date_iter = stmt.query_map([], |row| row.get::<_, String>(0)).map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare("SELECT DISTINCT date FROM usage_entries ORDER BY date DESC")
+            .map_err(|e| e.to_string())?;
+        let date_iter = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
         for d in date_iter {
             dates.push(d.map_err(|e| e.to_string())?);
         }
@@ -1281,7 +1517,11 @@ pub fn get_available_dates(conn: &rusqlite::Connection, assistant: &str) -> Resu
             placeholders.join(",")
         );
         let mut stmt = conn.prepare(&query).map_err(|e| e.to_string())?;
-        let date_iter = stmt.query_map(rusqlite::params_from_iter(params_vec), |row| row.get::<_, String>(0)).map_err(|e| e.to_string())?;
+        let date_iter = stmt
+            .query_map(rusqlite::params_from_iter(params_vec), |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|e| e.to_string())?;
         for d in date_iter {
             dates.push(d.map_err(|e| e.to_string())?);
         }
@@ -1289,7 +1529,11 @@ pub fn get_available_dates(conn: &rusqlite::Connection, assistant: &str) -> Resu
     Ok(dates)
 }
 
-pub fn get_usage_entries_by_date(conn: &rusqlite::Connection, date: &str, assistant: &str) -> Result<Vec<(UsageEntry, String)>, String> {
+pub fn get_usage_entries_by_date(
+    conn: &rusqlite::Connection,
+    date: &str,
+    assistant: &str,
+) -> Result<Vec<(UsageEntry, String)>, String> {
     let mut query = "SELECT 
             timestamp, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
             tokens_input, tokens_output, tokens_cache_read, tokens_reasoning, tokens_total,
@@ -1306,75 +1550,151 @@ pub fn get_usage_entries_by_date(conn: &rusqlite::Connection, date: &str, assist
             placeholders.push("?");
             params_vec.push(rusqlite::types::Value::Text(a.to_string()));
         }
-        query.push_str(&format!(" AND assistant_type IN ({})", placeholders.join(",")));
+        query.push_str(&format!(
+            " AND assistant_type IN ({})",
+            placeholders.join(",")
+        ));
     }
     query.push_str(" ORDER BY timestamp ASC");
 
     let mut stmt = conn.prepare(&query).map_err(|e| e.to_string())?;
-    let mut rows = stmt.query(rusqlite::params_from_iter(params_vec)).map_err(|e| e.to_string())?;
+    let mut rows = stmt
+        .query(rusqlite::params_from_iter(params_vec))
+        .map_err(|e| e.to_string())?;
 
     let mut entries = Vec::new();
     while let Some(row) = rows.next().map_err(|e| e.to_string())? {
         let ast_type = row.get::<_, String>(24).map_err(|e| e.to_string())?;
-        let tokens_input: Option<u64> = row.get::<_, Option<i64>>(9).map_err(|e| e.to_string())?.map(|v| v as u64);
-        let tokens_output: Option<u64> = row.get::<_, Option<i64>>(10).map_err(|e| e.to_string())?.map(|v| v as u64);
-        let tokens_cache_read: Option<u64> = row.get::<_, Option<i64>>(11).map_err(|e| e.to_string())?.map(|v| v as u64);
-        let tokens_reasoning: Option<u64> = row.get::<_, Option<i64>>(12).map_err(|e| e.to_string())?.map(|v| v as u64);
-        let tokens_total: Option<u64> = row.get::<_, Option<i64>>(13).map_err(|e| e.to_string())?.map(|v| v as u64);
+        let tokens_input: Option<u64> = row
+            .get::<_, Option<i64>>(9)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let tokens_output: Option<u64> = row
+            .get::<_, Option<i64>>(10)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let tokens_cache_read: Option<u64> = row
+            .get::<_, Option<i64>>(11)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let tokens_reasoning: Option<u64> = row
+            .get::<_, Option<i64>>(12)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let tokens_total: Option<u64> = row
+            .get::<_, Option<i64>>(13)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
 
-        let tokens = if let (Some(input), Some(output), Some(total)) = (tokens_input, tokens_output, tokens_total) {
-            Some(TokenStats { input, output, cache_read: tokens_cache_read, cache_write: None, reasoning: tokens_reasoning, total })
+        let tokens = if let (Some(input), Some(output), Some(total)) =
+            (tokens_input, tokens_output, tokens_total)
+        {
+            Some(TokenStats {
+                input,
+                output,
+                cache_read: tokens_cache_read,
+                cache_write: None,
+                reasoning: tokens_reasoning,
+                total,
+            })
         } else {
             None
         };
 
-        let delta_input: Option<u64> = row.get::<_, Option<i64>>(14).map_err(|e| e.to_string())?.map(|v| v as u64);
-        let delta_output: Option<u64> = row.get::<_, Option<i64>>(15).map_err(|e| e.to_string())?.map(|v| v as u64);
-        let delta_cache_read: Option<u64> = row.get::<_, Option<i64>>(16).map_err(|e| e.to_string())?.map(|v| v as u64);
-        let delta_reasoning: Option<u64> = row.get::<_, Option<i64>>(17).map_err(|e| e.to_string())?.map(|v| v as u64);
-        let delta_total: Option<u64> = row.get::<_, Option<i64>>(18).map_err(|e| e.to_string())?.map(|v| v as u64);
+        let delta_input: Option<u64> = row
+            .get::<_, Option<i64>>(14)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let delta_output: Option<u64> = row
+            .get::<_, Option<i64>>(15)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let delta_cache_read: Option<u64> = row
+            .get::<_, Option<i64>>(16)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let delta_reasoning: Option<u64> = row
+            .get::<_, Option<i64>>(17)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let delta_total: Option<u64> = row
+            .get::<_, Option<i64>>(18)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
 
-        let delta_tokens = if let (Some(input), Some(output), Some(total)) = (delta_input, delta_output, delta_total) {
-            Some(TokenStats { input, output, cache_read: delta_cache_read, cache_write: None, reasoning: delta_reasoning, total })
+        let delta_tokens = if let (Some(input), Some(output), Some(total)) =
+            (delta_input, delta_output, delta_total)
+        {
+            Some(TokenStats {
+                input,
+                output,
+                cache_read: delta_cache_read,
+                cache_write: None,
+                reasoning: delta_reasoning,
+                total,
+            })
         } else {
             None
         };
 
-        let duration_ms: Option<f64> = row.get::<_, Option<i64>>(19).map_err(|e| e.to_string())?.map(|v| v as f64);
-        let premium_requests: Option<f64> = row.get::<_, Option<i64>>(20).map_err(|e| e.to_string())?.map(|v| v as f64);
+        let duration_ms: Option<f64> = row
+            .get::<_, Option<i64>>(19)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as f64);
+        let premium_requests: Option<f64> = row
+            .get::<_, Option<i64>>(20)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as f64);
 
         let cost = if duration_ms.is_some() || premium_requests.is_some() {
-            Some(CostStats { total_api_duration_ms: duration_ms, total_duration_ms: None, total_premium_requests: premium_requests })
+            Some(CostStats {
+                total_api_duration_ms: duration_ms,
+                total_duration_ms: None,
+                total_premium_requests: premium_requests,
+            })
         } else {
             None
         };
 
-        entries.push((UsageEntry {
-            timestamp: row.get(0).map_err(|e| e.to_string())?,
-            session_id: row.get(1).map_err(|e| e.to_string())?,
-            session_name: row.get(2).ok(),
-            transcript_path: row.get(3).ok(),
-            cwd: row.get(4).ok(),
-            version: row.get(5).ok(),
-            turn_no: row.get::<_, i64>(6).map_err(|e| e.to_string())? as u32,
-            model: row.get(7).ok(),
-            model_id: row.get(8).ok(),
-            tokens,
-            delta_tokens,
-            context: None,
-            cost,
-            parent_session_id: row.get(21).ok(),
-            agent_nickname: row.get(22).ok(),
-            agent_role: row.get(23).ok(),
-            reasoning_effort: row.get(25).ok(),
-        }, ast_type));
+        entries.push((
+            UsageEntry {
+                timestamp: row.get(0).map_err(|e| e.to_string())?,
+                session_id: row.get(1).map_err(|e| e.to_string())?,
+                session_name: row.get(2).ok(),
+                transcript_path: row.get(3).ok(),
+                cwd: row.get(4).ok(),
+                version: row.get(5).ok(),
+                turn_no: row.get::<_, i64>(6).map_err(|e| e.to_string())? as u32,
+                model: row.get(7).ok(),
+                model_id: row.get(8).ok(),
+                tokens,
+                delta_tokens,
+                context: None,
+                cost,
+                parent_session_id: row.get(21).ok(),
+                agent_nickname: row.get(22).ok(),
+                agent_role: row.get(23).ok(),
+                reasoning_effort: row.get(25).ok(),
+            },
+            ast_type,
+        ));
     }
     Ok(entries)
 }
 
-pub fn get_session_assistant_and_transcript(conn: &rusqlite::Connection, session_id: &str) -> Result<(String, Option<String>), String> {
-    let mut stmt = conn.prepare("SELECT assistant_type, transcript_path FROM usage_entries WHERE session_id = ? LIMIT 1").map_err(|e| e.to_string())?;
-    let mut rows = stmt.query(params![session_id]).map_err(|e| e.to_string())?;
+pub fn get_session_assistant_and_transcript(
+    conn: &rusqlite::Connection,
+    assistant: &str,
+    session_id: &str,
+) -> Result<(String, Option<String>), String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT assistant_type, transcript_path FROM usage_entries WHERE session_id = ? AND assistant_type = ? LIMIT 1",
+        )
+        .map_err(|e| e.to_string())?;
+    let mut rows = stmt
+        .query(params![session_id, assistant])
+        .map_err(|e| e.to_string())?;
     if let Some(row) = rows.next().map_err(|e| e.to_string())? {
         let ast: String = row.get(0).map_err(|e| e.to_string())?;
         let path: Option<String> = row.get(1).ok();
@@ -1384,10 +1704,13 @@ pub fn get_session_assistant_and_transcript(conn: &rusqlite::Connection, session
     }
 }
 
-pub fn get_session_cwd(conn: &rusqlite::Connection, session_id: &str) -> Result<Option<String>, String> {
-    let mut stmt = conn.prepare(
-        "SELECT cwd FROM usage_entries WHERE session_id = ? AND cwd IS NOT NULL LIMIT 1"
-    ).map_err(|e| e.to_string())?;
+pub fn get_session_cwd(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+) -> Result<Option<String>, String> {
+    let mut stmt = conn
+        .prepare("SELECT cwd FROM usage_entries WHERE session_id = ? AND cwd IS NOT NULL LIMIT 1")
+        .map_err(|e| e.to_string())?;
     let mut rows = stmt.query(params![session_id]).map_err(|e| e.to_string())?;
     if let Some(row) = rows.next().map_err(|e| e.to_string())? {
         Ok(row.get::<_, String>(0).ok())
@@ -1396,7 +1719,10 @@ pub fn get_session_cwd(conn: &rusqlite::Connection, session_id: &str) -> Result<
     }
 }
 
-pub fn get_session_turns_token_stats(conn: &rusqlite::Connection, session_id: &str) -> Result<HashMap<u32, (TokenStats, String)>, String> {
+pub fn get_session_turns_token_stats(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+) -> Result<HashMap<u32, (TokenStats, String)>, String> {
     let mut map = HashMap::new();
     let mut stmt = conn.prepare(
         "SELECT turn_no, delta_input, delta_output, delta_cache_read, delta_reasoning, delta_total, model 
@@ -1408,24 +1734,57 @@ pub fn get_session_turns_token_stats(conn: &rusqlite::Connection, session_id: &s
             row.get::<_, i64>(0),
             row.get::<_, Option<i64>>(1),
             row.get::<_, Option<i64>>(2),
-            row.get::<_, Option<i64>>(5)
+            row.get::<_, Option<i64>>(5),
         ) {
-            if let (Some(input), Some(output), Some(total)) = (delta_input, delta_output, delta_total) {
-                let cache_read = row.get::<_, Option<i64>>(3).ok().flatten().map(|v| v as u64);
-                let reasoning = row.get::<_, Option<i64>>(4).ok().flatten().map(|v| v as u64);
-                let model = row.get::<_, Option<String>>(6).unwrap_or(None).unwrap_or_else(|| "Gemini".to_string());
-                map.insert(turn_no as u32, (TokenStats { input: input as u64, output: output as u64, cache_read, cache_write: None, reasoning, total: total as u64 }, model));
+            if let (Some(input), Some(output), Some(total)) =
+                (delta_input, delta_output, delta_total)
+            {
+                let cache_read = row
+                    .get::<_, Option<i64>>(3)
+                    .ok()
+                    .flatten()
+                    .map(|v| v as u64);
+                let reasoning = row
+                    .get::<_, Option<i64>>(4)
+                    .ok()
+                    .flatten()
+                    .map(|v| v as u64);
+                let model = row
+                    .get::<_, Option<String>>(6)
+                    .unwrap_or(None)
+                    .unwrap_or_else(|| "Gemini".to_string());
+                map.insert(
+                    turn_no as u32,
+                    (
+                        TokenStats {
+                            input: input as u64,
+                            output: output as u64,
+                            cache_read,
+                            cache_write: None,
+                            reasoning,
+                            total: total as u64,
+                        },
+                        model,
+                    ),
+                );
             }
         }
     }
     Ok(map)
 }
 
-pub fn get_available_months(conn: &rusqlite::Connection, assistant: &str) -> Result<Vec<String>, String> {
+pub fn get_available_months(
+    conn: &rusqlite::Connection,
+    assistant: &str,
+) -> Result<Vec<String>, String> {
     let mut months = Vec::new();
     if assistant == "all" {
-        let mut stmt = conn.prepare("SELECT DISTINCT substr(date, 1, 7) FROM usage_entries ORDER BY date DESC").map_err(|e| e.to_string())?;
-        let month_iter = stmt.query_map([], |row| row.get::<_, String>(0)).map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare("SELECT DISTINCT substr(date, 1, 7) FROM usage_entries ORDER BY date DESC")
+            .map_err(|e| e.to_string())?;
+        let month_iter = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
         for m in month_iter {
             months.push(m.map_err(|e| e.to_string())?);
         }
@@ -1442,7 +1801,11 @@ pub fn get_available_months(conn: &rusqlite::Connection, assistant: &str) -> Res
             placeholders.join(",")
         );
         let mut stmt = conn.prepare(&query).map_err(|e| e.to_string())?;
-        let month_iter = stmt.query_map(rusqlite::params_from_iter(params_vec), |row| row.get::<_, String>(0)).map_err(|e| e.to_string())?;
+        let month_iter = stmt
+            .query_map(rusqlite::params_from_iter(params_vec), |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|e| e.to_string())?;
         for m in month_iter {
             months.push(m.map_err(|e| e.to_string())?);
         }
@@ -1450,7 +1813,11 @@ pub fn get_available_months(conn: &rusqlite::Connection, assistant: &str) -> Res
     Ok(months)
 }
 
-pub fn get_usage_entries_by_month(conn: &rusqlite::Connection, year_month: &str, assistant: &str) -> Result<Vec<(UsageEntry, String, String)>, String> {
+pub fn get_usage_entries_by_month(
+    conn: &rusqlite::Connection,
+    year_month: &str,
+    assistant: &str,
+) -> Result<Vec<(UsageEntry, String, String)>, String> {
     let query_month = format!("{}-%", year_month);
     let mut query = "SELECT 
             timestamp, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
@@ -1469,79 +1836,153 @@ pub fn get_usage_entries_by_month(conn: &rusqlite::Connection, year_month: &str,
             placeholders.push("?");
             params_vec.push(rusqlite::types::Value::Text(a.to_string()));
         }
-        query.push_str(&format!(" AND assistant_type IN ({})", placeholders.join(",")));
+        query.push_str(&format!(
+            " AND assistant_type IN ({})",
+            placeholders.join(",")
+        ));
     }
     query.push_str(" ORDER BY timestamp ASC");
 
     let mut stmt = conn.prepare(&query).map_err(|e| e.to_string())?;
-    let mut rows = stmt.query(rusqlite::params_from_iter(params_vec)).map_err(|e| e.to_string())?;
+    let mut rows = stmt
+        .query(rusqlite::params_from_iter(params_vec))
+        .map_err(|e| e.to_string())?;
 
     let mut entries = Vec::new();
     while let Some(row) = rows.next().map_err(|e| e.to_string())? {
         let ast_type = row.get::<_, String>(24).map_err(|e| e.to_string())?;
-        let tokens_input: Option<u64> = row.get::<_, Option<i64>>(9).map_err(|e| e.to_string())?.map(|v| v as u64);
-        let tokens_output: Option<u64> = row.get::<_, Option<i64>>(10).map_err(|e| e.to_string())?.map(|v| v as u64);
-        let tokens_cache_read: Option<u64> = row.get::<_, Option<i64>>(11).map_err(|e| e.to_string())?.map(|v| v as u64);
-        let tokens_reasoning: Option<u64> = row.get::<_, Option<i64>>(12).map_err(|e| e.to_string())?.map(|v| v as u64);
-        let tokens_total: Option<u64> = row.get::<_, Option<i64>>(13).map_err(|e| e.to_string())?.map(|v| v as u64);
+        let tokens_input: Option<u64> = row
+            .get::<_, Option<i64>>(9)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let tokens_output: Option<u64> = row
+            .get::<_, Option<i64>>(10)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let tokens_cache_read: Option<u64> = row
+            .get::<_, Option<i64>>(11)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let tokens_reasoning: Option<u64> = row
+            .get::<_, Option<i64>>(12)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let tokens_total: Option<u64> = row
+            .get::<_, Option<i64>>(13)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
 
-        let tokens = if let (Some(input), Some(output), Some(total)) = (tokens_input, tokens_output, tokens_total) {
-            Some(TokenStats { input, output, cache_read: tokens_cache_read, cache_write: None, reasoning: tokens_reasoning, total })
+        let tokens = if let (Some(input), Some(output), Some(total)) =
+            (tokens_input, tokens_output, tokens_total)
+        {
+            Some(TokenStats {
+                input,
+                output,
+                cache_read: tokens_cache_read,
+                cache_write: None,
+                reasoning: tokens_reasoning,
+                total,
+            })
         } else {
             None
         };
 
-        let delta_input: Option<u64> = row.get::<_, Option<i64>>(14).map_err(|e| e.to_string())?.map(|v| v as u64);
-        let delta_output: Option<u64> = row.get::<_, Option<i64>>(15).map_err(|e| e.to_string())?.map(|v| v as u64);
-        let delta_cache_read: Option<u64> = row.get::<_, Option<i64>>(16).map_err(|e| e.to_string())?.map(|v| v as u64);
-        let delta_reasoning: Option<u64> = row.get::<_, Option<i64>>(17).map_err(|e| e.to_string())?.map(|v| v as u64);
-        let delta_total: Option<u64> = row.get::<_, Option<i64>>(18).map_err(|e| e.to_string())?.map(|v| v as u64);
+        let delta_input: Option<u64> = row
+            .get::<_, Option<i64>>(14)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let delta_output: Option<u64> = row
+            .get::<_, Option<i64>>(15)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let delta_cache_read: Option<u64> = row
+            .get::<_, Option<i64>>(16)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let delta_reasoning: Option<u64> = row
+            .get::<_, Option<i64>>(17)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let delta_total: Option<u64> = row
+            .get::<_, Option<i64>>(18)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
 
-        let delta_tokens = if let (Some(input), Some(output), Some(total)) = (delta_input, delta_output, delta_total) {
-            Some(TokenStats { input, output, cache_read: delta_cache_read, cache_write: None, reasoning: delta_reasoning, total })
+        let delta_tokens = if let (Some(input), Some(output), Some(total)) =
+            (delta_input, delta_output, delta_total)
+        {
+            Some(TokenStats {
+                input,
+                output,
+                cache_read: delta_cache_read,
+                cache_write: None,
+                reasoning: delta_reasoning,
+                total,
+            })
         } else {
             None
         };
 
-        let duration_ms: Option<f64> = row.get::<_, Option<i64>>(19).map_err(|e| e.to_string())?.map(|v| v as f64);
-        let premium_requests: Option<f64> = row.get::<_, Option<i64>>(20).map_err(|e| e.to_string())?.map(|v| v as f64);
+        let duration_ms: Option<f64> = row
+            .get::<_, Option<i64>>(19)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as f64);
+        let premium_requests: Option<f64> = row
+            .get::<_, Option<i64>>(20)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as f64);
 
         let cost = if duration_ms.is_some() || premium_requests.is_some() {
-            Some(CostStats { total_api_duration_ms: duration_ms, total_duration_ms: None, total_premium_requests: premium_requests })
+            Some(CostStats {
+                total_api_duration_ms: duration_ms,
+                total_duration_ms: None,
+                total_premium_requests: premium_requests,
+            })
         } else {
             None
         };
 
         let entry_date = row.get::<_, String>(26).map_err(|e| e.to_string())?;
 
-        entries.push((UsageEntry {
-            timestamp: row.get(0).map_err(|e| e.to_string())?,
-            session_id: row.get(1).map_err(|e| e.to_string())?,
-            session_name: row.get(2).ok(),
-            transcript_path: row.get(3).ok(),
-            cwd: row.get(4).ok(),
-            version: row.get(5).ok(),
-            turn_no: row.get::<_, i64>(6).map_err(|e| e.to_string())? as u32,
-            model: row.get(7).ok(),
-            model_id: row.get(8).ok(),
-            tokens,
-            delta_tokens,
-            context: None,
-            cost,
-            parent_session_id: row.get(21).ok(),
-            agent_nickname: row.get(22).ok(),
-            agent_role: row.get(23).ok(),
-            reasoning_effort: row.get(25).ok(),
-        }, ast_type, entry_date));
+        entries.push((
+            UsageEntry {
+                timestamp: row.get(0).map_err(|e| e.to_string())?,
+                session_id: row.get(1).map_err(|e| e.to_string())?,
+                session_name: row.get(2).ok(),
+                transcript_path: row.get(3).ok(),
+                cwd: row.get(4).ok(),
+                version: row.get(5).ok(),
+                turn_no: row.get::<_, i64>(6).map_err(|e| e.to_string())? as u32,
+                model: row.get(7).ok(),
+                model_id: row.get(8).ok(),
+                tokens,
+                delta_tokens,
+                context: None,
+                cost,
+                parent_session_id: row.get(21).ok(),
+                agent_nickname: row.get(22).ok(),
+                agent_role: row.get(23).ok(),
+                reasoning_effort: row.get(25).ok(),
+            },
+            ast_type,
+            entry_date,
+        ));
     }
     Ok(entries)
 }
 
-pub fn get_available_years(conn: &rusqlite::Connection, assistant: &str) -> Result<Vec<String>, String> {
+pub fn get_available_years(
+    conn: &rusqlite::Connection,
+    assistant: &str,
+) -> Result<Vec<String>, String> {
     let mut years = Vec::new();
     if assistant == "all" {
-        let mut stmt = conn.prepare("SELECT DISTINCT substr(date, 1, 4) FROM usage_entries ORDER BY date DESC").map_err(|e| e.to_string())?;
-        let year_iter = stmt.query_map([], |row| row.get::<_, String>(0)).map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare("SELECT DISTINCT substr(date, 1, 4) FROM usage_entries ORDER BY date DESC")
+            .map_err(|e| e.to_string())?;
+        let year_iter = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
         for y in year_iter {
             years.push(y.map_err(|e| e.to_string())?);
         }
@@ -1558,7 +1999,11 @@ pub fn get_available_years(conn: &rusqlite::Connection, assistant: &str) -> Resu
             placeholders.join(",")
         );
         let mut stmt = conn.prepare(&query).map_err(|e| e.to_string())?;
-        let year_iter = stmt.query_map(rusqlite::params_from_iter(params_vec), |row| row.get::<_, String>(0)).map_err(|e| e.to_string())?;
+        let year_iter = stmt
+            .query_map(rusqlite::params_from_iter(params_vec), |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|e| e.to_string())?;
         for y in year_iter {
             years.push(y.map_err(|e| e.to_string())?);
         }
@@ -1566,7 +2011,11 @@ pub fn get_available_years(conn: &rusqlite::Connection, assistant: &str) -> Resu
     Ok(years)
 }
 
-pub fn get_usage_entries_by_year(conn: &rusqlite::Connection, year: &str, assistant: &str) -> Result<Vec<(UsageEntry, String, String)>, String> {
+pub fn get_usage_entries_by_year(
+    conn: &rusqlite::Connection,
+    year: &str,
+    assistant: &str,
+) -> Result<Vec<(UsageEntry, String, String)>, String> {
     let query_year = format!("{}-%", year);
     let mut query = "SELECT 
             timestamp, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
@@ -1585,70 +2034,176 @@ pub fn get_usage_entries_by_year(conn: &rusqlite::Connection, year: &str, assist
             placeholders.push("?");
             params_vec.push(rusqlite::types::Value::Text(a.to_string()));
         }
-        query.push_str(&format!(" AND assistant_type IN ({})", placeholders.join(",")));
+        query.push_str(&format!(
+            " AND assistant_type IN ({})",
+            placeholders.join(",")
+        ));
     }
     query.push_str(" ORDER BY timestamp ASC");
 
     let mut stmt = conn.prepare(&query).map_err(|e| e.to_string())?;
-    let mut rows = stmt.query(rusqlite::params_from_iter(params_vec)).map_err(|e| e.to_string())?;
+    let mut rows = stmt
+        .query(rusqlite::params_from_iter(params_vec))
+        .map_err(|e| e.to_string())?;
 
     let mut entries = Vec::new();
     while let Some(row) = rows.next().map_err(|e| e.to_string())? {
         let ast_type = row.get::<_, String>(24).map_err(|e| e.to_string())?;
-        let tokens_input: Option<u64> = row.get::<_, Option<i64>>(9).map_err(|e| e.to_string())?.map(|v| v as u64);
-        let tokens_output: Option<u64> = row.get::<_, Option<i64>>(10).map_err(|e| e.to_string())?.map(|v| v as u64);
-        let tokens_cache_read: Option<u64> = row.get::<_, Option<i64>>(11).map_err(|e| e.to_string())?.map(|v| v as u64);
-        let tokens_reasoning: Option<u64> = row.get::<_, Option<i64>>(12).map_err(|e| e.to_string())?.map(|v| v as u64);
-        let tokens_total: Option<u64> = row.get::<_, Option<i64>>(13).map_err(|e| e.to_string())?.map(|v| v as u64);
+        let tokens_input: Option<u64> = row
+            .get::<_, Option<i64>>(9)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let tokens_output: Option<u64> = row
+            .get::<_, Option<i64>>(10)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let tokens_cache_read: Option<u64> = row
+            .get::<_, Option<i64>>(11)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let tokens_reasoning: Option<u64> = row
+            .get::<_, Option<i64>>(12)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let tokens_total: Option<u64> = row
+            .get::<_, Option<i64>>(13)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
 
-        let tokens = if let (Some(input), Some(output), Some(total)) = (tokens_input, tokens_output, tokens_total) {
-            Some(TokenStats { input, output, cache_read: tokens_cache_read, cache_write: None, reasoning: tokens_reasoning, total })
+        let tokens = if let (Some(input), Some(output), Some(total)) =
+            (tokens_input, tokens_output, tokens_total)
+        {
+            Some(TokenStats {
+                input,
+                output,
+                cache_read: tokens_cache_read,
+                cache_write: None,
+                reasoning: tokens_reasoning,
+                total,
+            })
         } else {
             None
         };
 
-        let delta_input: Option<u64> = row.get::<_, Option<i64>>(14).map_err(|e| e.to_string())?.map(|v| v as u64);
-        let delta_output: Option<u64> = row.get::<_, Option<i64>>(15).map_err(|e| e.to_string())?.map(|v| v as u64);
-        let delta_cache_read: Option<u64> = row.get::<_, Option<i64>>(16).map_err(|e| e.to_string())?.map(|v| v as u64);
-        let delta_reasoning: Option<u64> = row.get::<_, Option<i64>>(17).map_err(|e| e.to_string())?.map(|v| v as u64);
-        let delta_total: Option<u64> = row.get::<_, Option<i64>>(18).map_err(|e| e.to_string())?.map(|v| v as u64);
+        let delta_input: Option<u64> = row
+            .get::<_, Option<i64>>(14)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let delta_output: Option<u64> = row
+            .get::<_, Option<i64>>(15)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let delta_cache_read: Option<u64> = row
+            .get::<_, Option<i64>>(16)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let delta_reasoning: Option<u64> = row
+            .get::<_, Option<i64>>(17)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let delta_total: Option<u64> = row
+            .get::<_, Option<i64>>(18)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
 
-        let delta_tokens = if let (Some(input), Some(output), Some(total)) = (delta_input, delta_output, delta_total) {
-            Some(TokenStats { input, output, cache_read: delta_cache_read, cache_write: None, reasoning: delta_reasoning, total })
+        let delta_tokens = if let (Some(input), Some(output), Some(total)) =
+            (delta_input, delta_output, delta_total)
+        {
+            Some(TokenStats {
+                input,
+                output,
+                cache_read: delta_cache_read,
+                cache_write: None,
+                reasoning: delta_reasoning,
+                total,
+            })
         } else {
             None
         };
 
-        let duration_ms: Option<f64> = row.get::<_, Option<i64>>(19).map_err(|e| e.to_string())?.map(|v| v as f64);
-        let premium_requests: Option<f64> = row.get::<_, Option<i64>>(20).map_err(|e| e.to_string())?.map(|v| v as f64);
+        let duration_ms: Option<f64> = row
+            .get::<_, Option<i64>>(19)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as f64);
+        let premium_requests: Option<f64> = row
+            .get::<_, Option<i64>>(20)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as f64);
 
         let cost = if duration_ms.is_some() || premium_requests.is_some() {
-            Some(CostStats { total_api_duration_ms: duration_ms, total_duration_ms: None, total_premium_requests: premium_requests })
+            Some(CostStats {
+                total_api_duration_ms: duration_ms,
+                total_duration_ms: None,
+                total_premium_requests: premium_requests,
+            })
         } else {
             None
         };
 
         let entry_date = row.get::<_, String>(26).map_err(|e| e.to_string())?;
 
-        entries.push((UsageEntry {
-            timestamp: row.get(0).map_err(|e| e.to_string())?,
-            session_id: row.get(1).map_err(|e| e.to_string())?,
-            session_name: row.get(2).ok(),
-            transcript_path: row.get(3).ok(),
-            cwd: row.get(4).ok(),
-            version: row.get(5).ok(),
-            turn_no: row.get::<_, i64>(6).map_err(|e| e.to_string())? as u32,
-            model: row.get(7).ok(),
-            model_id: row.get(8).ok(),
-            tokens,
-            delta_tokens,
-            context: None,
-            cost,
-            parent_session_id: row.get(21).ok(),
-            agent_nickname: row.get(22).ok(),
-            agent_role: row.get(23).ok(),
-            reasoning_effort: row.get(25).ok(),
-        }, ast_type, entry_date));
+        entries.push((
+            UsageEntry {
+                timestamp: row.get(0).map_err(|e| e.to_string())?,
+                session_id: row.get(1).map_err(|e| e.to_string())?,
+                session_name: row.get(2).ok(),
+                transcript_path: row.get(3).ok(),
+                cwd: row.get(4).ok(),
+                version: row.get(5).ok(),
+                turn_no: row.get::<_, i64>(6).map_err(|e| e.to_string())? as u32,
+                model: row.get(7).ok(),
+                model_id: row.get(8).ok(),
+                tokens,
+                delta_tokens,
+                context: None,
+                cost,
+                parent_session_id: row.get(21).ok(),
+                agent_nickname: row.get(22).ok(),
+                agent_role: row.get(23).ok(),
+                reasoning_effort: row.get(25).ok(),
+            },
+            ast_type,
+            entry_date,
+        ));
     }
     Ok(entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_claude_session_file_deduplicates_request_usage() {
+        let mut path = std::env::temp_dir();
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        path.push(format!("claude-parser-{}.jsonl", unique));
+
+        let content = r#"{"type":"user","sessionId":"session-1","cwd":"/tmp/project","version":"2.1.201","timestamp":"2026-07-04T19:28:48.190Z","uuid":"u1","message":{"role":"user","content":"Build the report"}}
+{"type":"assistant","sessionId":"session-1","cwd":"/tmp/project","version":"2.1.201","timestamp":"2026-07-04T19:28:51.753Z","uuid":"a1","requestId":"req_1","message":{"id":"msg_1","role":"assistant","model":"claude-haiku-4-5-20251001","content":[{"type":"thinking","thinking":"working"}],"usage":{"input_tokens":10,"cache_creation_input_tokens":3,"cache_read_input_tokens":7,"output_tokens":5}}}
+{"type":"assistant","sessionId":"session-1","cwd":"/tmp/project","version":"2.1.201","timestamp":"2026-07-04T19:28:51.948Z","uuid":"a2","requestId":"req_1","message":{"id":"msg_1","role":"assistant","model":"claude-haiku-4-5-20251001","content":[{"type":"text","text":"Done"}],"usage":{"input_tokens":10,"cache_creation_input_tokens":3,"cache_read_input_tokens":7,"output_tokens":5}}}
+"#;
+
+        fs::write(&path, content).unwrap();
+        let entries = parse_claude_session_file(&path).unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry.session_id, "session-1");
+        assert_eq!(entry.session_name.as_deref(), Some("Build the report"));
+        assert_eq!(entry.cwd.as_deref(), Some("/tmp/project"));
+        assert_eq!(entry.version.as_deref(), Some("2.1.201"));
+        assert_eq!(entry.model.as_deref(), Some("claude-haiku-4-5-20251001"));
+
+        let tokens = entry.tokens.as_ref().unwrap();
+        assert_eq!(tokens.input, 13);
+        assert_eq!(tokens.cache_write, Some(3));
+        assert_eq!(tokens.cache_read, Some(7));
+        assert_eq!(tokens.output, 5);
+        assert_eq!(tokens.total, 25);
+    }
 }

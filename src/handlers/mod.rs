@@ -1,18 +1,31 @@
+use crate::db::UsageEntry;
 use serde::Serialize;
 use std::collections::HashMap;
-use crate::db::UsageEntry;
 
 pub mod daily;
+pub mod misc;
 pub mod monthly;
 pub mod yearly;
-pub mod codex;
-pub mod misc;
 
 pub use daily::*;
+pub use misc::*;
 pub use monthly::*;
 pub use yearly::*;
-pub use codex::*;
-pub use misc::*;
+
+pub fn normalize_assistant_name(assistant: &str) -> String {
+    let normalized = assistant.trim().to_lowercase();
+    match normalized.as_str() {
+        "claude-code" | "claude_code" | "claudecode" => "claude".to_string(),
+        _ => normalized,
+    }
+}
+
+pub fn is_supported_assistant(assistant: &str) -> bool {
+    matches!(
+        normalize_assistant_name(assistant).as_str(),
+        "antigravity" | "copilot" | "codex" | "claude"
+    )
+}
 
 #[derive(Serialize)]
 pub struct DateListResponse {
@@ -31,6 +44,7 @@ pub struct SetupInfoResponse {
     pub antigravity: AssistantSetupStatus,
     pub copilot: AssistantSetupStatus,
     pub codex: AssistantSetupStatus,
+    pub claude: AssistantSetupStatus,
 }
 
 #[derive(Serialize)]
@@ -164,14 +178,21 @@ pub struct YearListResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::db;
     use std::env;
     use std::fs;
-    use axum::{extract::Path, response::IntoResponse};
+    use std::sync::OnceLock;
+    use tokio::sync::{Mutex, MutexGuard};
+
+    static TEST_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    async fn lock_test_env() -> MutexGuard<'static, ()> {
+        TEST_ENV_LOCK.get_or_init(|| Mutex::new(())).lock().await
+    }
 
     #[tokio::test]
     async fn test_yearly_handlers() {
+        let _guard = lock_test_env().await;
         let temp_dir = std::path::PathBuf::from("temp_test_insights");
         if temp_dir.exists() {
             let _ = fs::remove_dir_all(&temp_dir);
@@ -234,105 +255,6 @@ mod tests {
             years.push(row.get::<_, String>(0).unwrap());
         }
         assert_eq!(years, vec!["2026", "2025"]);
-
-        // Cleanup
-        let _ = fs::remove_dir_all(&temp_dir);
-    }
-
-    #[tokio::test]
-    async fn test_codex_auth_configs_copy() {
-        let temp_dir = std::path::PathBuf::from("temp_test_codex_auth");
-        if temp_dir.exists() {
-            let _ = fs::remove_dir_all(&temp_dir);
-        }
-        fs::create_dir_all(&temp_dir).unwrap();
-        env::set_var("CODEX_DIR", temp_dir.to_str().unwrap());
-
-        // 1. Initially, auth.json does not exist. We call get_codex_auth_configs.
-        // It shouldn't copy anything, auth/ should be created but empty.
-        let _res = get_codex_auth_configs(Path("codex".to_string())).await;
-        let auth_dir = temp_dir.join("auth");
-        assert!(auth_dir.exists());
-        let count = fs::read_dir(&auth_dir).unwrap().count();
-        assert_eq!(count, 0);
-
-        // 2. Now write a fake auth.json (representing active_auth_file)
-        let active_auth_file = temp_dir.join("auth.json");
-        fs::write(&active_auth_file, b"test-credentials").unwrap();
-
-        // 3. Since auth/ is empty and auth.json exists, calling get_codex_auth_configs
-        // should copy auth.json into auth/auth.json
-        let _res2 = get_codex_auth_configs(Path("codex".to_string())).await;
-        let dest_auth_file = auth_dir.join("auth.json");
-        assert!(dest_auth_file.exists());
-        let copied_content = fs::read_to_string(&dest_auth_file).unwrap();
-        assert_eq!(copied_content, "test-credentials");
-
-        // 4. Overwrite copied file with different content to simulate an existing non-empty directory.
-        fs::write(&dest_auth_file, b"different-credentials").unwrap();
-
-        // 5. Calling get_codex_auth_configs again should NOT overwrite it because the directory is not empty.
-        let _res3 = get_codex_auth_configs(Path("codex".to_string())).await;
-        let copied_content_after = fs::read_to_string(&dest_auth_file).unwrap();
-        assert_eq!(copied_content_after, "different-credentials");
-
-        // Cleanup
-        let _ = fs::remove_dir_all(&temp_dir);
-    }
-
-    #[tokio::test]
-    async fn test_switch_codex_auth_expiration() {
-        let temp_dir = std::path::PathBuf::from("temp_test_codex_auth_exp");
-        if temp_dir.exists() {
-            let _ = fs::remove_dir_all(&temp_dir);
-        }
-        let auth_dir = temp_dir.join("auth");
-        fs::create_dir_all(&auth_dir).unwrap();
-        env::set_var("CODEX_DIR", temp_dir.to_str().unwrap());
-
-        // Write expired token JSON (exp: 1000, which is in 1970)
-        let expired_json = r#"{
-            "tokens": {
-                "access_token": "header.eyJleHAiOjEwMDB9.signature"
-            }
-        }"#;
-        fs::write(auth_dir.join("expired.json"), expired_json).unwrap();
-
-        // Write valid token JSON (exp: 2783039221, which is in 2058)
-        let valid_json = r#"{
-            "tokens": {
-                "access_token": "header.eyJleHAiOjI3ODMwMzkyMjF9.signature"
-            }
-        }"#;
-        fs::write(auth_dir.join("valid.json"), valid_json).unwrap();
-
-        // 1. Try to switch to expired credential
-        let req_expired = axum::Json(SwitchAuthRequest {
-            name: "expired.json".to_string(),
-        });
-        let res_expired = switch_codex_auth(Path("codex".to_string()), req_expired)
-            .await
-            .into_response();
-        assert_eq!(
-            res_expired.status(),
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR
-        );
-
-        // Assert that the destination auth.json was NOT created (switch blocked)
-        let active_auth_file = temp_dir.join("auth.json");
-        assert!(!active_auth_file.exists());
-
-        // 2. Try to switch to valid credential
-        let req_valid = axum::Json(SwitchAuthRequest {
-            name: "valid.json".to_string(),
-        });
-        let res_valid = switch_codex_auth(Path("codex".to_string()), req_valid)
-            .await
-            .into_response();
-        assert_eq!(res_valid.status(), axum::http::StatusCode::OK);
-
-        // Assert that the destination auth.json WAS created (switch successful)
-        assert!(active_auth_file.exists());
 
         // Cleanup
         let _ = fs::remove_dir_all(&temp_dir);

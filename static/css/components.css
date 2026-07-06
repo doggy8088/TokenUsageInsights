@@ -11,9 +11,9 @@
   display: flex;
   background: rgba(255, 255, 255, 0.03);
   border: 1px solid var(--glass-border);
-  border-radius: 10px;
-  padding: 3px;
-  margin-bottom: 8px;
+  border-radius: 9px;
+  padding: 2px;
+  margin-bottom: 4px;
 }
 .nav-tab {
   flex: 1;
@@ -21,9 +21,9 @@
   border: none;
   outline: none;
   color: var(--text-secondary);
-  padding: 8px 4px;
+  padding: 6px 4px;
   font-family: var(--font-display);
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 600;
   border-radius: 8px;
   cursor: pointer;
@@ -45,12 +45,12 @@
 .live-monitor-container {
   background: rgba(255, 255, 255, 0.02);
   border: 1px solid var(--glass-border);
-  border-radius: 12px;
-  padding: 12px;
-  margin-top: 12px;
+  border-radius: 10px;
+  padding: 9px 10px;
+  margin-top: 8px;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 8px;
 }
 .live-status-row {
   display: flex;
@@ -58,7 +58,7 @@
   align-items: center;
 }
 .live-label {
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 500;
 }
 .switch-toggle {
@@ -800,10 +800,11 @@ input:checked + .slider-round:before {
 /* Premium Date Input & Today Button styles */
 .premium-date-input {
   width: 100%;
-  padding: 12px 16px;
+  height: 38px;
+  padding: 8px 12px;
   background: var(--bg-select);
   border: 1px solid var(--glass-border);
-  border-radius: 12px;
+  border-radius: 10px;
   color: var(--text-primary);
   font-family: var(--font-body);
   font-weight: 500;
@@ -854,13 +855,13 @@ input:checked + .slider-round:before {
   color: var(--text-primary);
   font-family: var(--font-display);
   font-weight: 600;
-  padding: 10px 16px;
-  border-radius: 12px;
+  padding: 8px 10px;
+  border-radius: 10px;
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 6px;
-  font-size: 14px;
+  gap: 5px;
+  font-size: 12.5px;
   cursor: pointer;
   transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
   box-shadow: var(--shadow-sm);
@@ -1203,9 +1204,9 @@ input:checked + .slider-round:before {
 
 /* Brand Logo Image Size */
 .brand .logo img {
-  width: 64px;
-  height: 64px;
-  border-radius: 12px;
+  width: 46px;
+  height: 46px;
+  border-radius: 10px;
   object-fit: cover;
   display: block;
 }
@@ -1216,14 +1217,14 @@ input:checked + .slider-round:before {
 }
 .hover-dropdown-trigger {
   width: 100%;
-  height: 36px;
-  padding: 6px 12px;
-  font-size: 13px;
+  height: 34px;
+  padding: 6px 10px;
+  font-size: 12.5px;
   margin: 0;
   background: var(--glass-bg);
   border: 1px solid var(--glass-border);
   color: var(--text-main);
-  border-radius: 8px;
+  border-radius: 9px;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -1274,8 +1275,8 @@ input:checked + .slider-round:before {
   display: block;
 }
 .hover-dropdown-option {
-  padding: 8px 12px;
-  font-size: 13px;
+  padding: 7px 10px;
+  font-size: 12.5px;
   cursor: pointer;
   transition: all 0.2s ease;
   color: var(--text-main);
@@ -1289,4 +1290,172 @@ input:checked + .slider-round:before {
   background: rgba(255, 255, 255, 0.05);
   color: var(--accent-cyan);
   font-weight: 600;
+}
+
+/* Compact sidebar rhythm */
+.app-sidebar .sidebar-section[style] {
+  gap: 10px !important;
+  margin-bottom: 0 !important;
+}
+
+.app-sidebar #daily-selector-section {
+  gap: 9px;
+}
+
+.app-sidebar [data-i18n="select_assistant_label"],
+.app-sidebar .sidebar-section h3 {
+  line-height: 1.1;
+}
+
+.app-sidebar .date-selector-wrapper {
+  gap: 7px !important;
+}
+
+.app-sidebar .date-selector-wrapper > div {
+  gap: 6px !important;
+}
+
+.app-sidebar .tab-hover-dropdown {
+  flex-basis: 68px !important;
+  min-width: 68px !important;
+}
+
+.app-sidebar .tab-hover-dropdown .hover-dropdown-trigger {
+  padding: 8px 8px !important;
+  border-radius: 10px !important;
+}
+
+.app-sidebar .today-btn {
+  min-height: 36px;
+  padding: 8px 7px !important;
+}
+
+.app-sidebar #btn-reload-daily,
+.app-sidebar #btn-reload-monthly,
+.app-sidebar #btn-reload-yearly {
+  width: 38px !important;
+  min-width: 38px;
+}
+
+/* Compact main area rhythm */
+.main-content,
+.app-main,
+.content-area,
+main {
+  padding: 18px 22px !important;
+}
+
+.main-content,
+.app-main,
+.content-area,
+#daily-view-container,
+#monthly-view-container,
+#yearly-view-container {
+  gap: 14px !important;
+}
+
+.content-header,
+.dashboard-header,
+.page-header,
+.header-section {
+  margin-bottom: 12px !important;
+  padding: 14px 16px !important;
+  border-radius: 14px !important;
+}
+
+#current-date-title,
+.current-date-title,
+.section-title,
+.card-title {
+  line-height: 1.15 !important;
+  margin: 0 !important;
+}
+
+#current-date-title {
+  font-size: clamp(20px, 2.1vw, 28px) !important;
+  letter-spacing: -0.02em;
+}
+
+#quick-stats-section,
+.quick-stats-section,
+.stats-grid,
+.quick-stats-grid,
+.metrics-grid,
+.dashboard-grid {
+  gap: 12px !important;
+  margin-bottom: 14px !important;
+}
+
+.stat-card:not(.mini),
+.metric-card,
+.chart-card,
+.panel-card,
+.table-card,
+.content-card {
+  padding: 14px 16px !important;
+  border-radius: 14px !important;
+}
+
+.stat-card:not(.mini) {
+  gap: 6px !important;
+  min-height: unset !important;
+}
+
+.stat-card:not(.mini) .label,
+.metric-card .label {
+  font-size: 11px !important;
+  line-height: 1.15 !important;
+  margin-bottom: 3px !important;
+}
+
+.stat-card:not(.mini) .value,
+.metric-card .value {
+  font-size: clamp(20px, 2vw, 28px) !important;
+  line-height: 1.05 !important;
+}
+
+.chart-section,
+.chart-container,
+.table-section,
+.sessions-section,
+.monthly-section,
+.yearly-section {
+  margin-top: 14px !important;
+  margin-bottom: 14px !important;
+}
+
+.chart-container,
+.chart-card {
+  min-height: unset !important;
+}
+
+.table-container,
+.sessions-table-container,
+.data-table-wrapper {
+  border-radius: 14px !important;
+}
+
+table th,
+table td,
+.sessions-table th,
+.sessions-table td,
+.data-table th,
+.data-table td {
+  padding-top: 9px !important;
+  padding-bottom: 9px !important;
+  line-height: 1.25 !important;
+}
+
+.session-name-wrapper,
+.model-cell,
+.project-cell {
+  line-height: 1.25 !important;
+}
+
+.action-bar,
+.toolbar,
+.controls-row,
+.filters-row {
+  gap: 8px !important;
+  margin-bottom: 12px !important;
 }
