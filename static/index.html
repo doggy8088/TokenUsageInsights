@@ -20,7 +20,7 @@
     document.documentElement.setAttribute('data-theme', savedTheme);
   </script>
   <!-- CSS Stylesheet -->
-  <link rel="stylesheet" href="/static/styles.css?v=8">
+  <link rel="stylesheet" href="/static/styles.css?v=11">
   <!-- Chart.js for beautiful charts -->
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <!-- Marked.js for rendering markdown response -->
@@ -30,7 +30,7 @@
 </head>
 <body>
   <a class="skip-link" href="#main-content">跳到主要內容</a>
-  <button id="sidebar-toggle-btn" class="sidebar-toggle-btn sidebar-edge-toggle" title="切換側邊欄" aria-label="切換側邊欄">
+  <button id="sidebar-toggle-btn" class="sidebar-toggle-btn sidebar-edge-toggle" title="收合側邊欄（快速鍵：⌘B / Ctrl+B）" aria-label="收合側邊欄（快速鍵：⌘B / Ctrl+B）">
     <span class="toggle-icon"><span class="icon-glyph icon-chevron-left" aria-hidden="true"></span></span>
   </button>
   <div class="app-container">
@@ -39,7 +39,7 @@
       <div class="brand">
         <div class="logo"><img id="brand-logo-img" src="/static/favicon-v2.png" /></div>
         <div class="title-group">
-          <h1>Token 戰情室</h1>
+          <h1 data-i18n="brand_title">Token 戰情室</h1>
         </div>
         <button id="sidebar-close-btn" class="sidebar-close-btn" title="關閉側邊欄" aria-label="關閉側邊欄"><span class="icon-glyph icon-close" aria-hidden="true"></span></button>
       </div>
@@ -343,34 +343,32 @@
             <div class="stat-info">
               <span class="label" data-i18n="total_tokens_label">總消耗 Token</span>
               <span class="value" id="stat-total-tokens">0</span>
-              <span class="sub-label" id="stat-cache-read">快取讀取: -</span>
             </div>
           </div>
 
           <div class="stat-card">
             <div class="card-icon"><span class="icon-glyph icon-input" aria-hidden="true"></span></div>
             <div class="stat-info">
-              <span class="label" data-i18n="input_tokens_label">輸入 Token</span>
+              <span class="label" id="stat-input-label" data-i18n="input_tokens_label">輸入 Token</span>
               <span class="value" id="stat-input-tokens">0</span>
-              <span class="sub-label" id="stat-input-pct">佔比: 0%</span>
+              <span class="sub-label hidden" id="stat-input-reasoning" data-i18n="reasoning_tokens_label">推理 Token</span>
+            </div>
+          </div>
+
+          <div class="stat-card">
+            <div class="card-icon"><span class="icon-glyph icon-cache" aria-hidden="true"></span></div>
+            <div class="stat-info">
+              <span class="label" id="stat-cache-read-label" data-i18n="chart_cache_label">快取讀取 Token</span>
+              <span class="value" id="stat-cache-read-tokens">0</span>
+              <span class="sub-label hidden" id="stat-cache-write"></span>
             </div>
           </div>
 
           <div class="stat-card">
             <div class="card-icon"><span class="icon-glyph icon-output" aria-hidden="true"></span></div>
             <div class="stat-info">
-              <span class="label" data-i18n="output_tokens_label">輸出 Token</span>
+              <span class="label" id="stat-output-label" data-i18n="output_tokens_label">輸出 Token</span>
               <span class="value" id="stat-output-tokens">0</span>
-              <span class="sub-label" id="stat-output-pct">佔比: 0%</span>
-            </div>
-          </div>
-
-          <div class="stat-card">
-            <div class="card-icon"><span class="icon-glyph icon-reasoning" aria-hidden="true"></span></div>
-            <div class="stat-info">
-              <span class="label" data-i18n="reasoning_tokens_label">推理 Token</span>
-              <span class="value" id="stat-reasoning-tokens">0</span>
-              <span class="sub-label" id="stat-reasoning-pct">佔比: 0%</span>
             </div>
           </div>
 
@@ -436,7 +434,6 @@
             <div class="stat-info">
               <span class="label" data-i18n="monthly_tokens_label">月總消耗 Token</span>
               <span class="value" id="monthly-stat-total-tokens">0</span>
-              <span class="sub-label" id="monthly-stat-cache-read">快取讀取: -</span>
             </div>
           </div>
 
@@ -450,20 +447,20 @@
           </div>
 
           <div class="stat-card">
+            <div class="card-icon"><span class="icon-glyph icon-cache" aria-hidden="true"></span></div>
+            <div class="stat-info">
+              <span class="label" data-i18n="monthly_cache_input_label">月快取輸入 Token</span>
+              <span class="value" id="monthly-stat-cache-input-tokens">0</span>
+              <span class="sub-label" id="monthly-stat-cache-input-pct">佔比: 0%</span>
+            </div>
+          </div>
+
+          <div class="stat-card">
             <div class="card-icon"><span class="icon-glyph icon-output" aria-hidden="true"></span></div>
             <div class="stat-info">
               <span class="label" data-i18n="monthly_output_label">月輸出 Token</span>
               <span class="value" id="monthly-stat-output-tokens">0</span>
               <span class="sub-label" id="monthly-stat-output-pct">佔比: 0%</span>
-            </div>
-          </div>
-
-          <div class="stat-card">
-            <div class="card-icon"><span class="icon-glyph icon-sessions" aria-hidden="true"></span></div>
-            <div class="stat-info">
-              <span class="label" data-i18n="monthly_sessions_label">月總會話數</span>
-              <span class="value" id="monthly-stat-sessions">0</span>
-              <span class="sub-label" id="monthly-stat-requests">總請求: 0 次</span>
             </div>
           </div>
 
@@ -479,7 +476,13 @@
         <!-- Monthly Charts Section -->
         <section class="charts-section">
           <div class="chart-container glass-card">
-            <h3 data-i18n="chart_monthly_title">單月每日 Token 消耗與會話數趨勢</h3>
+            <div class="chart-title-row">
+              <h3 data-i18n="chart_monthly_title">單月每日 Token 消耗與會話數趨勢</h3>
+              <div class="chart-title-stat" aria-live="polite">
+                <span class="chart-title-stat-label" data-i18n="monthly_sessions_label">月總會話數</span>
+                <span class="chart-title-stat-value" id="monthly-chart-total-sessions">0</span>
+              </div>
+            </div>
             <div class="canvas-wrapper">
               <canvas id="monthlyTokenChart"></canvas>
             </div>
@@ -985,6 +988,6 @@
   <div class="sidebar-overlay" id="sidebar-overlay"></div>
 
   <!-- Frontend Javascript logic -->
-  <script type="module" src="/static/app.js?v=8"></script>
+  <script type="module" src="/static/app.js?v=20"></script>
 </body>
 </html>

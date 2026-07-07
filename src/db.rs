@@ -196,6 +196,7 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
             tokens_input INTEGER,
             tokens_output INTEGER,
             tokens_cache_read INTEGER,
+            tokens_cache_write INTEGER,
             tokens_reasoning INTEGER,
             tokens_total INTEGER,
             
@@ -203,6 +204,7 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
             delta_input INTEGER,
             delta_output INTEGER,
             delta_cache_read INTEGER,
+            delta_cache_write INTEGER,
             delta_reasoning INTEGER,
             delta_total INTEGER,
             
@@ -223,6 +225,14 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
     // Ensure reasoning_effort column is present in case database already exists
     let _ = conn.execute(
         "ALTER TABLE usage_entries ADD COLUMN reasoning_effort TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE usage_entries ADD COLUMN tokens_cache_write INTEGER",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE usage_entries ADD COLUMN delta_cache_write INTEGER",
         [],
     );
 
@@ -428,10 +438,10 @@ fn sync_hook_usage_logs(
                     let insert_res = tx.execute(
                         "INSERT OR IGNORE INTO usage_entries (
                             assistant_type, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
-                            tokens_input, tokens_output, tokens_cache_read, tokens_reasoning, tokens_total,
-                            delta_input, delta_output, delta_cache_read, delta_reasoning, delta_total,
+                            tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_reasoning, tokens_total,
+                            delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total,
                             duration_ms, premium_requests
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         params![
                             assistant_type,
                             entry.timestamp,
@@ -447,11 +457,13 @@ fn sync_hook_usage_logs(
                             tokens.map(|t| t.input as i64),
                             tokens.map(|t| t.output as i64),
                             tokens.and_then(|t| t.cache_read.map(|v| v as i64)),
+                            tokens.and_then(|t| t.cache_write.map(|v| v as i64)),
                             tokens.and_then(|t| t.reasoning.map(|v| v as i64)),
                             tokens.map(|t| t.total as i64),
                             delta.map(|t| t.input as i64),
                             delta.map(|t| t.output as i64),
                             delta.and_then(|t| t.cache_read.map(|v| v as i64)),
+                            delta.and_then(|t| t.cache_write.map(|v| v as i64)),
                             delta.and_then(|t| t.reasoning.map(|v| v as i64)),
                             delta.map(|t| t.total as i64),
                             cost.and_then(|c| c.total_api_duration_ms.map(|d| d as i64)),
@@ -821,10 +833,10 @@ fn sync_codex_usage_logs(conn: &mut Connection) -> Result<(), String> {
                 let insert_res = tx.execute(
                     "INSERT INTO usage_entries (
                         assistant_type, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
-                        tokens_input, tokens_output, tokens_cache_read, tokens_reasoning, tokens_total,
-                        delta_input, delta_output, delta_cache_read, delta_reasoning, delta_total,
+                        tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_reasoning, tokens_total,
+                        delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total,
                         duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, reasoning_effort
-                    ) VALUES ('codex', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    ) VALUES ('codex', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     params![
                         entry.timestamp,
                         entry.timestamp.get(0..10).unwrap_or("unknown"),
@@ -839,11 +851,13 @@ fn sync_codex_usage_logs(conn: &mut Connection) -> Result<(), String> {
                         tokens.map(|t| t.input as i64),
                         tokens.map(|t| t.output as i64),
                         tokens.and_then(|t| t.cache_read.map(|v| v as i64)),
+                        tokens.and_then(|t| t.cache_write.map(|v| v as i64)),
                         tokens.and_then(|t| t.reasoning.map(|v| v as i64)),
                         tokens.map(|t| t.total as i64),
                         delta.map(|t| t.input as i64),
                         delta.map(|t| t.output as i64),
                         delta.and_then(|t| t.cache_read.map(|v| v as i64)),
+                        delta.and_then(|t| t.cache_write.map(|v| v as i64)),
                         delta.and_then(|t| t.reasoning.map(|v| v as i64)),
                         delta.map(|t| t.total as i64),
                         cost.and_then(|c| c.total_api_duration_ms.map(|d| d as i64)),
@@ -1200,10 +1214,10 @@ fn sync_claude_usage_logs(conn: &mut Connection) -> Result<(), String> {
                 let insert_res = tx.execute(
                     "INSERT INTO usage_entries (
                         assistant_type, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
-                        tokens_input, tokens_output, tokens_cache_read, tokens_reasoning, tokens_total,
-                        delta_input, delta_output, delta_cache_read, delta_reasoning, delta_total,
+                        tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_reasoning, tokens_total,
+                        delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total,
                         duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, reasoning_effort
-                    ) VALUES ('claude', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    ) VALUES ('claude', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     params![
                         entry.timestamp,
                         entry.timestamp.get(0..10).unwrap_or("unknown"),
@@ -1218,11 +1232,13 @@ fn sync_claude_usage_logs(conn: &mut Connection) -> Result<(), String> {
                         tokens.map(|t| t.input as i64),
                         tokens.map(|t| t.output as i64),
                         tokens.and_then(|t| t.cache_read.map(|v| v as i64)),
+                        tokens.and_then(|t| t.cache_write.map(|v| v as i64)),
                         tokens.and_then(|t| t.reasoning.map(|v| v as i64)),
                         tokens.map(|t| t.total as i64),
                         delta.map(|t| t.input as i64),
                         delta.map(|t| t.output as i64),
                         delta.and_then(|t| t.cache_read.map(|v| v as i64)),
+                        delta.and_then(|t| t.cache_write.map(|v| v as i64)),
                         delta.and_then(|t| t.reasoning.map(|v| v as i64)),
                         delta.map(|t| t.total as i64),
                         cost.and_then(|c| c.total_api_duration_ms.map(|d| d as i64)),
@@ -1536,8 +1552,8 @@ pub fn get_usage_entries_by_date(
 ) -> Result<Vec<(UsageEntry, String)>, String> {
     let mut query = "SELECT 
             timestamp, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
-            tokens_input, tokens_output, tokens_cache_read, tokens_reasoning, tokens_total,
-            delta_input, delta_output, delta_cache_read, delta_reasoning, delta_total,
+            tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_reasoning, tokens_total,
+            delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total,
             duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, assistant_type, reasoning_effort
          FROM usage_entries WHERE date = ?".to_string();
     let mut params_vec = Vec::new();
@@ -1564,7 +1580,7 @@ pub fn get_usage_entries_by_date(
 
     let mut entries = Vec::new();
     while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-        let ast_type = row.get::<_, String>(24).map_err(|e| e.to_string())?;
+        let ast_type = row.get::<_, String>(26).map_err(|e| e.to_string())?;
         let tokens_input: Option<u64> = row
             .get::<_, Option<i64>>(9)
             .map_err(|e| e.to_string())?
@@ -1577,12 +1593,16 @@ pub fn get_usage_entries_by_date(
             .get::<_, Option<i64>>(11)
             .map_err(|e| e.to_string())?
             .map(|v| v as u64);
-        let tokens_reasoning: Option<u64> = row
+        let tokens_cache_write: Option<u64> = row
             .get::<_, Option<i64>>(12)
             .map_err(|e| e.to_string())?
             .map(|v| v as u64);
-        let tokens_total: Option<u64> = row
+        let tokens_reasoning: Option<u64> = row
             .get::<_, Option<i64>>(13)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let tokens_total: Option<u64> = row
+            .get::<_, Option<i64>>(14)
             .map_err(|e| e.to_string())?
             .map(|v| v as u64);
 
@@ -1593,7 +1613,7 @@ pub fn get_usage_entries_by_date(
                 input,
                 output,
                 cache_read: tokens_cache_read,
-                cache_write: None,
+                cache_write: tokens_cache_write,
                 reasoning: tokens_reasoning,
                 total,
             })
@@ -1602,23 +1622,27 @@ pub fn get_usage_entries_by_date(
         };
 
         let delta_input: Option<u64> = row
-            .get::<_, Option<i64>>(14)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let delta_output: Option<u64> = row
             .get::<_, Option<i64>>(15)
             .map_err(|e| e.to_string())?
             .map(|v| v as u64);
-        let delta_cache_read: Option<u64> = row
+        let delta_output: Option<u64> = row
             .get::<_, Option<i64>>(16)
             .map_err(|e| e.to_string())?
             .map(|v| v as u64);
-        let delta_reasoning: Option<u64> = row
+        let delta_cache_read: Option<u64> = row
             .get::<_, Option<i64>>(17)
             .map_err(|e| e.to_string())?
             .map(|v| v as u64);
-        let delta_total: Option<u64> = row
+        let delta_cache_write: Option<u64> = row
             .get::<_, Option<i64>>(18)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let delta_reasoning: Option<u64> = row
+            .get::<_, Option<i64>>(19)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let delta_total: Option<u64> = row
+            .get::<_, Option<i64>>(20)
             .map_err(|e| e.to_string())?
             .map(|v| v as u64);
 
@@ -1629,7 +1653,7 @@ pub fn get_usage_entries_by_date(
                 input,
                 output,
                 cache_read: delta_cache_read,
-                cache_write: None,
+                cache_write: delta_cache_write,
                 reasoning: delta_reasoning,
                 total,
             })
@@ -1638,11 +1662,11 @@ pub fn get_usage_entries_by_date(
         };
 
         let duration_ms: Option<f64> = row
-            .get::<_, Option<i64>>(19)
+            .get::<_, Option<i64>>(21)
             .map_err(|e| e.to_string())?
             .map(|v| v as f64);
         let premium_requests: Option<f64> = row
-            .get::<_, Option<i64>>(20)
+            .get::<_, Option<i64>>(22)
             .map_err(|e| e.to_string())?
             .map(|v| v as f64);
 
@@ -1671,10 +1695,10 @@ pub fn get_usage_entries_by_date(
                 delta_tokens,
                 context: None,
                 cost,
-                parent_session_id: row.get(21).ok(),
-                agent_nickname: row.get(22).ok(),
-                agent_role: row.get(23).ok(),
-                reasoning_effort: row.get(25).ok(),
+                parent_session_id: row.get(23).ok(),
+                agent_nickname: row.get(24).ok(),
+                agent_role: row.get(25).ok(),
+                reasoning_effort: row.get(27).ok(),
             },
             ast_type,
         ));
@@ -1725,7 +1749,7 @@ pub fn get_session_turns_token_stats(
 ) -> Result<HashMap<u32, (TokenStats, String)>, String> {
     let mut map = HashMap::new();
     let mut stmt = conn.prepare(
-        "SELECT turn_no, delta_input, delta_output, delta_cache_read, delta_reasoning, delta_total, model 
+        "SELECT turn_no, delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total, model
          FROM usage_entries WHERE session_id = ? ORDER BY turn_no ASC"
     ).map_err(|e| e.to_string())?;
     let mut rows = stmt.query(params![session_id]).map_err(|e| e.to_string())?;
@@ -1734,7 +1758,7 @@ pub fn get_session_turns_token_stats(
             row.get::<_, i64>(0),
             row.get::<_, Option<i64>>(1),
             row.get::<_, Option<i64>>(2),
-            row.get::<_, Option<i64>>(5),
+            row.get::<_, Option<i64>>(6),
         ) {
             if let (Some(input), Some(output), Some(total)) =
                 (delta_input, delta_output, delta_total)
@@ -1744,13 +1768,18 @@ pub fn get_session_turns_token_stats(
                     .ok()
                     .flatten()
                     .map(|v| v as u64);
-                let reasoning = row
+                let cache_write = row
                     .get::<_, Option<i64>>(4)
                     .ok()
                     .flatten()
                     .map(|v| v as u64);
+                let reasoning = row
+                    .get::<_, Option<i64>>(5)
+                    .ok()
+                    .flatten()
+                    .map(|v| v as u64);
                 let model = row
-                    .get::<_, Option<String>>(6)
+                    .get::<_, Option<String>>(7)
                     .unwrap_or(None)
                     .unwrap_or_else(|| "Gemini".to_string());
                 map.insert(
@@ -1760,7 +1789,7 @@ pub fn get_session_turns_token_stats(
                             input: input as u64,
                             output: output as u64,
                             cache_read,
-                            cache_write: None,
+                            cache_write,
                             reasoning,
                             total: total as u64,
                         },

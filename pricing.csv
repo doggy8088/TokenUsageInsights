@@ -43,3 +43,32 @@ Kimi K2.7 Code,Global,1M Tokens,0.95,0.19,4.00,N/A
 MAI-Code-1-Flash,Global,1M Tokens,0.75,0.075,4.50,N/A
 Gemini 1.5 Pro,Google AI,1M Tokens,1.25,0.3125,5.00,0.625/0.15625/2.50
 GLM 5.2 (Cloud),Cloud,1M Tokens,0.9086,0.16874,2.8556,N/A
+glm-5.2,Cloud,1M Tokens,1.12,0.56,3.92,N/A
+kimi-k2.7-code,Global,1M Tokens,0.95,0.19,4.00,N/A
+gemma4,Local/OSS,1M Tokens,0.00,0.00,0.00,N/A
+qwen3.5,Cloud,1M Tokens,0.26,0.065,1.56,N/A
+glm-5.1,Cloud,1M Tokens,1.12,0.56,3.92,N/A
+minimax-m2.7,Cloud,1M Tokens,0.30,0.075,1.20,N/A
+nemotron-3-super,Local/OSS,1M Tokens,0.00,0.00,0.00,N/A
+glm-5,Cloud,1M Tokens,0.84,0.42,3.08,N/A
+minimax-m2.5,Cloud,1M Tokens,0.30,0.075,1.20,N/A
+minimax-m3,Cloud,1M Tokens,0.30,0.075,1.20,N/A
+kimi-k2.6,Global,1M Tokens,0.95,0.16,4.00,N/A
+deepseek-v4-flash,Cloud,1M Tokens,0.14,0.0028,0.28,N/A
+deepseek-v4-pro,Cloud,1M Tokens,0.435,0.003625,0.87,N/A
+kimi-k2.5,Global,1M Tokens,0.58,0.10,3.10,N/A
+nemotron-3-ultra,Local/OSS,1M Tokens,0.00,0.00,0.00,N/A
+gpt-oss,Local/OSS,1M Tokens,0.00,0.00,0.00,N/A
+qwen3-coder,Cloud,1M Tokens,0.22,0.055,1.80,N/A
+glm-4.7,Cloud,1M Tokens,0.56,0.28,2.24,N/A
+gemini-3-flash-preview,Google AI,1M Tokens,0.50,0.125,3.00,N/A
+minimax-m2.1,Cloud,1M Tokens,0.30,0.075,1.20,N/A
+deepseek-v3.2,Cloud,1M Tokens,0.14,0.0028,0.28,N/A
+ministral-3,Cloud,1M Tokens,0.15,0.0375,0.15,N/A
+devstral-small-2,Cloud,1M Tokens,0.10,0.025,0.30,N/A
+nemotron-3-nano,Local/OSS,1M Tokens,0.00,0.00,0.00,N/A
+deepseek-v3.1,Cloud,1M Tokens,0.14,0.0028,0.28,N/A
+devstral-2,Cloud,1M Tokens,0.40,0.10,2.00,N/A
+mistral-large-3,Cloud,1M Tokens,0.50,0.125,1.50,N/A
+gemma3,Local/OSS,1M Tokens,0.00,0.00,0.00,N/A
+qwen3-coder-next,Cloud,1M Tokens,0.144,0.036,0.574,N/A

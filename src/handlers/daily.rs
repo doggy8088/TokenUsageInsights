@@ -247,6 +247,7 @@ pub async fn get_usage_details(
             summary.total_input_tokens += tokens.input;
             summary.total_output_tokens += tokens.output;
             summary.total_cache_read_tokens += tokens.cache_read.unwrap_or(0);
+            summary.total_cache_write_tokens += tokens.cache_write.unwrap_or(0);
             summary.total_reasoning_tokens += tokens.reasoning.unwrap_or(0);
         } else if let Some(ref tokens) = e.tokens {
             if e.turn_no == 1 {
@@ -254,6 +255,7 @@ pub async fn get_usage_details(
                 summary.total_input_tokens += tokens.input;
                 summary.total_output_tokens += tokens.output;
                 summary.total_cache_read_tokens += tokens.cache_read.unwrap_or(0);
+                summary.total_cache_write_tokens += tokens.cache_write.unwrap_or(0);
                 summary.total_reasoning_tokens += tokens.reasoning.unwrap_or(0);
             }
         }
@@ -295,6 +297,15 @@ pub async fn get_usage_details(
                     .unwrap_or(0)
             })
             .sum::<u64>();
+        let session_cache_write = s_entries
+            .iter()
+            .map(|e| {
+                e.delta_tokens
+                    .as_ref()
+                    .and_then(|t| t.cache_write)
+                    .unwrap_or(0)
+            })
+            .sum::<u64>();
         let session_reasoning = s_entries
             .iter()
             .map(|e| {
@@ -326,6 +337,15 @@ pub async fn get_usage_details(
                 .tokens
                 .as_ref()
                 .and_then(|t| t.cache_read)
+                .unwrap_or(0)
+        };
+        let total_cache_write_tokens = if session_tokens > 0 {
+            session_cache_write
+        } else {
+            last_entry
+                .tokens
+                .as_ref()
+                .and_then(|t| t.cache_write)
                 .unwrap_or(0)
         };
         let total_reasoning_tokens = if session_tokens > 0 {
@@ -384,6 +404,7 @@ pub async fn get_usage_details(
             total_input_tokens,
             total_output_tokens,
             total_cache_read_tokens,
+            total_cache_write_tokens,
             total_reasoning_tokens,
             max_turn_no: s_entries.iter().map(|e| e.turn_no).max().unwrap_or(1),
             timestamp: s_entries[0].timestamp.clone(),

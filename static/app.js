@@ -1,4 +1,4 @@
-import i18n from './i18n.js?v=8';
+import i18n from './i18n.js?v=14';
 
 // Globals
 let tokenChartInstance = null;
@@ -289,9 +289,10 @@ function syncSidebarToggleButton() {
   if (!sidebarToggleBtn || !appContainer) return;
 
   const isCollapsed = appContainer.classList.contains('sidebar-collapsed');
+  const label = t(isCollapsed ? 'sidebar_toggle_open' : 'sidebar_toggle_collapse');
   sidebarToggleBtn.classList.toggle('is-collapsed', isCollapsed);
-  sidebarToggleBtn.title = isCollapsed ? '開啟側邊欄' : '收合側邊欄';
-  sidebarToggleBtn.setAttribute('aria-label', sidebarToggleBtn.title);
+  sidebarToggleBtn.title = label;
+  sidebarToggleBtn.setAttribute('aria-label', label);
   sidebarToggleBtn.setAttribute('aria-expanded', String(!isCollapsed));
 }
 
@@ -352,6 +353,7 @@ function updateLanguageUI() {
 
   // Update dynamic brand logo in sidebar
   updateBrandLogo();
+  syncSidebarToggleButton();
   updateCodexRateLimit();
 }
 
@@ -1461,47 +1463,94 @@ function renderDashboard(data) {
   // 3. 更新主看板 Metric Cards
   const activeAgents = getActiveAgents();
   const isMulti = activeAgents.length > 1;
+  const rawInputTokens = summary.total_input_tokens || 0;
+  const cacheReadTokens = summary.total_cache_read_tokens || 0;
+  const reasoningTokens = summary.total_reasoning_tokens || 0;
+  const netInputTokens = getNetInputTokens(rawInputTokens, cacheReadTokens);
+  const combinedInputTokens = netInputTokens + reasoningTokens;
 
   if (!isMulti) {
     document.getElementById('stat-total-tokens').textContent = formatToken(summary.total_tokens);
-    document.getElementById('stat-input-tokens').textContent = formatToken(summary.total_input_tokens);
+    document.getElementById('stat-input-tokens').textContent = formatToken(combinedInputTokens);
+    document.getElementById('stat-cache-read-tokens').textContent = formatToken(cacheReadTokens);
     document.getElementById('stat-output-tokens').textContent = formatToken(summary.total_output_tokens);
-    document.getElementById('stat-reasoning-tokens').textContent = formatToken(summary.total_reasoning_tokens);
     document.getElementById('stat-total-cost').textContent = formatCost(summary.total_cost_usd || 0);
   } else {
     renderMetricValue('stat-total-tokens', s => s.total_tokens, formatToken, sessions, activeAgents);
-    renderMetricValue('stat-input-tokens', s => s.total_input_tokens, formatToken, sessions, activeAgents);
+    renderMetricValue('stat-input-tokens', getDisplayedInputTokens, formatToken, sessions, activeAgents);
+    renderMetricValue('stat-cache-read-tokens', s => s.total_cache_read_tokens || 0, formatToken, sessions, activeAgents);
     renderMetricValue('stat-output-tokens', s => s.total_output_tokens, formatToken, sessions, activeAgents);
-    renderMetricValue('stat-reasoning-tokens', s => s.total_reasoning_tokens || 0, formatToken, sessions, activeAgents);
     renderMetricValue('stat-total-cost', s => s.cost_usd || 0, formatCost, sessions, activeAgents);
   }
 
-  const statCacheRead = document.getElementById('stat-cache-read');
-  const statInputPct = document.getElementById('stat-input-pct');
-  const statOutputPct = document.getElementById('stat-output-pct');
-  const statReasoningPct = document.getElementById('stat-reasoning-pct');
+  const statInputReasoning = document.getElementById('stat-input-reasoning');
+  const statInputLabel = document.getElementById('stat-input-label');
+  const statInputTokens = document.getElementById('stat-input-tokens');
+  const statCacheReadLabel = document.getElementById('stat-cache-read-label');
+  const statCacheWrite = document.getElementById('stat-cache-write');
+  const statOutputLabel = document.getElementById('stat-output-label');
+  const inputPercent = calculatePercentage(combinedInputTokens, summary.total_tokens);
+  const cacheReadPercent = calculatePercentage(cacheReadTokens, summary.total_tokens);
+  const outputPercent = calculatePercentage(summary.total_output_tokens || 0, summary.total_tokens);
+  const reasoningPercent = calculatePercentage(reasoningTokens, summary.total_tokens);
+
+  if (statInputLabel) {
+    const inputTooltip = t('input_tokens_percentage_formula')
+      .replace('{input}', formatNumber(rawInputTokens))
+      .replace('{cacheRead}', formatNumber(cacheReadTokens))
+      .replace('{netInput}', formatNumber(netInputTokens))
+      .replace('{reasoning}', formatNumber(reasoningTokens))
+      .replace('{combined}', formatNumber(combinedInputTokens))
+      .replace('{total}', formatNumber(summary.total_tokens || 0))
+      .replace('{percent}', inputPercent);
+    statInputLabel.textContent = `${t('input_tokens_label')} (${inputPercent})`;
+    statInputLabel.title = inputTooltip;
+    statInputLabel.setAttribute('aria-label', inputTooltip);
+  }
+  if (statInputTokens) {
+    const inputValueTooltip = t('reasoning_tokens_value_tooltip')
+      .replace('{netInput}', formatToken(netInputTokens))
+      .replace('{reasoning}', formatToken(reasoningTokens))
+      .replace('{percent}', reasoningPercent);
+    statInputTokens.title = inputValueTooltip;
+    statInputTokens.setAttribute('aria-label', `${formatToken(combinedInputTokens)}; ${inputValueTooltip}`);
+  }
+  if (statCacheReadLabel) {
+    const cacheReadTooltip = t('cache_read_percentage_formula')
+      .replace('{cacheRead}', formatNumber(cacheReadTokens))
+      .replace('{total}', formatNumber(summary.total_tokens || 0))
+      .replace('{percent}', cacheReadPercent);
+    statCacheReadLabel.textContent = `${t('chart_cache_label')} (${cacheReadPercent})`;
+    statCacheReadLabel.title = cacheReadTooltip;
+    statCacheReadLabel.setAttribute('aria-label', cacheReadTooltip);
+  }
+  if (statOutputLabel) {
+    const outputTooltip = t('output_tokens_percentage_formula')
+      .replace('{output}', formatNumber(summary.total_output_tokens || 0))
+      .replace('{total}', formatNumber(summary.total_tokens || 0))
+      .replace('{percent}', outputPercent);
+    statOutputLabel.textContent = `${t('output_tokens_label')} (${outputPercent})`;
+    statOutputLabel.title = outputTooltip;
+    statOutputLabel.setAttribute('aria-label', outputTooltip);
+  }
 
   if (isMulti) {
-    if (statCacheRead) statCacheRead.classList.add('hidden');
-    if (statInputPct) statInputPct.classList.add('hidden');
-    if (statOutputPct) statOutputPct.classList.add('hidden');
-    if (statReasoningPct) statReasoningPct.classList.add('hidden');
+    if (statInputReasoning) statInputReasoning.classList.add('hidden');
+    if (statCacheWrite) statCacheWrite.classList.add('hidden');
   } else {
-    if (statCacheRead) {
-      statCacheRead.classList.remove('hidden');
-      statCacheRead.textContent = `${t('cache_read_label')}: ${formatToken(summary.total_cache_read_tokens)} (${calculatePercentage(summary.total_cache_read_tokens, summary.total_tokens)})`;
+    if (statInputReasoning) {
+      statInputReasoning.classList.add('hidden');
+      statInputReasoning.textContent = '';
     }
-    if (statInputPct) {
-      statInputPct.classList.remove('hidden');
-      statInputPct.textContent = `${t('ratio_label')}: ${calculatePercentage(summary.total_input_tokens, summary.total_tokens)}`;
-    }
-    if (statOutputPct) {
-      statOutputPct.classList.remove('hidden');
-      statOutputPct.textContent = `${t('ratio_label')}: ${calculatePercentage(summary.total_output_tokens, summary.total_tokens)}`;
-    }
-    if (statReasoningPct) {
-      statReasoningPct.classList.remove('hidden');
-      statReasoningPct.textContent = `${t('ratio_label')}: ${calculatePercentage(summary.total_reasoning_tokens, summary.total_tokens)}`;
+    if (statCacheWrite) {
+      const cacheWriteTokens = summary.total_cache_write_tokens || 0;
+      if (cacheWriteTokens > 0) {
+        statCacheWrite.classList.remove('hidden');
+        statCacheWrite.textContent = `${t('cache_write_label')}: ${formatToken(cacheWriteTokens)}`;
+      } else {
+        statCacheWrite.classList.add('hidden');
+        statCacheWrite.textContent = '';
+      }
     }
   }
 
@@ -2474,20 +2523,45 @@ function formatToken(num) {
   if (num === null || num === undefined) return '-';
   const n = Number(num);
   if (isNaN(n)) return '-';
-  if (n >= 1000000) {
-    const val = n / 1000000;
-    return (val % 1 === 0 ? val : val.toFixed(1)) + 'm';
+  const thousand = 1000;
+  const million = 1000000;
+  const billion = 1000000000;
+  const billionThreshold = 1024 * million;
+  const formatCompactValue = (value) => {
+    const rounded = Number(value.toFixed(1));
+    return Number.isInteger(rounded) ? rounded.toString() : rounded.toFixed(1);
+  };
+
+  if (n > billionThreshold) {
+    return `${(n / billion).toFixed(2)}b`;
   }
-  if (n >= 1000) {
-    const val = n / 1000;
-    return (val % 1 === 0 ? val : val.toFixed(1)) + 'k';
+  if (n >= million) {
+    return `${formatCompactValue(n / million)}m`;
+  }
+  if (n >= thousand) {
+    return `${formatCompactValue(n / thousand)}k`;
   }
   return n.toString();
 }
 
 function calculatePercentage(part, total) {
-  if (!total) return '0%';
-  return `${Math.round((part / total) * 100)}%`;
+  const denominator = Number(total) || 0;
+  if (!denominator) return '0.00%';
+  const percent = ((Number(part) || 0) / denominator) * 100;
+  if (percent < 10) return `${percent.toFixed(2)}%`;
+  if (percent < 100) return `${percent.toFixed(1)}%`;
+  return `${Math.round(percent)}%`;
+}
+
+function getNetInputTokens(inputTokens, cacheReadTokens) {
+  const input = Number(inputTokens) || 0;
+  const cacheRead = Number(cacheReadTokens) || 0;
+  return input >= cacheRead ? input - cacheRead : input;
+}
+
+function getDisplayedInputTokens(stats) {
+  return getNetInputTokens(stats?.total_input_tokens, stats?.total_cache_read_tokens)
+    + (Number(stats?.total_reasoning_tokens) || 0);
 }
 
 function formatDuration(ms) {
@@ -2696,6 +2770,7 @@ function renderYearlyDashboard(data) {
   // 2. 更新指標卡片
   const activeAgents = getActiveAgents();
   const isMulti = activeAgents.length > 1;
+  const yearlyInputTokens = getNetInputTokens(summary.total_input_tokens, summary.total_cache_read_tokens);
 
   if (!isMulti) {
     const totalTokensEl = document.getElementById('yearly-stat-total-tokens');
@@ -2705,13 +2780,13 @@ function renderYearlyDashboard(data) {
     const totalCostEl = document.getElementById('yearly-stat-total-cost');
 
     if (totalTokensEl) totalTokensEl.textContent = formatToken(summary.total_tokens);
-    if (inputTokensEl) inputTokensEl.textContent = formatToken(summary.total_input_tokens);
+    if (inputTokensEl) inputTokensEl.textContent = formatToken(yearlyInputTokens);
     if (outputTokensEl) outputTokensEl.textContent = formatToken(summary.total_output_tokens);
     if (sessionsEl) sessionsEl.textContent = summary.total_sessions;
     if (totalCostEl) totalCostEl.textContent = formatCost(summary.total_cost_usd || 0);
   } else {
     renderYearlyMetricValue('yearly-stat-total-tokens', a => a.total_tokens, formatToken, agent_breakdown, activeAgents);
-    renderYearlyMetricValue('yearly-stat-input-tokens', a => a.total_input_tokens, formatToken, agent_breakdown, activeAgents);
+    renderYearlyMetricValue('yearly-stat-input-tokens', a => getNetInputTokens(a.total_input_tokens, a.total_cache_read_tokens), formatToken, agent_breakdown, activeAgents);
     renderYearlyMetricValue('yearly-stat-output-tokens', a => a.total_output_tokens, formatToken, agent_breakdown, activeAgents);
     renderYearlyMetricValue('yearly-stat-total-cost', a => a.total_cost_usd, formatCost, agent_breakdown, activeAgents);
     
@@ -2751,7 +2826,7 @@ function renderYearlyDashboard(data) {
     }
     if (statInputPct) {
       statInputPct.classList.remove('hidden');
-      statInputPct.textContent = `${t('ratio_label')}: ${calculatePercentage(summary.total_input_tokens, summary.total_tokens)}`;
+      statInputPct.textContent = `${t('ratio_label')}: ${calculatePercentage(yearlyInputTokens, summary.total_tokens)}`;
     }
     if (statOutputPct) {
       statOutputPct.classList.remove('hidden');
@@ -3208,63 +3283,47 @@ function renderMonthlyDashboard(data) {
   // 2. 更新指標卡片
   const activeAgents = getActiveAgents();
   const isMulti = activeAgents.length > 1;
+  const monthlyInputTokens = getNetInputTokens(summary.total_input_tokens, summary.total_cache_read_tokens);
 
   if (!isMulti) {
     document.getElementById('monthly-stat-total-tokens').textContent = formatToken(summary.total_tokens);
-    document.getElementById('monthly-stat-input-tokens').textContent = formatToken(summary.total_input_tokens);
+    document.getElementById('monthly-stat-input-tokens').textContent = formatToken(monthlyInputTokens);
+    document.getElementById('monthly-stat-cache-input-tokens').textContent = formatToken(summary.total_cache_read_tokens || 0);
     document.getElementById('monthly-stat-output-tokens').textContent = formatToken(summary.total_output_tokens);
-    document.getElementById('monthly-stat-sessions').textContent = summary.total_sessions;
     document.getElementById('monthly-stat-total-cost').textContent = formatCost(summary.total_cost_usd || 0);
   } else {
     renderMonthlyMetricValue('monthly-stat-total-tokens', a => a.total_tokens, formatToken, agent_breakdown, activeAgents);
-    renderMonthlyMetricValue('monthly-stat-input-tokens', a => a.total_input_tokens, formatToken, agent_breakdown, activeAgents);
+    renderMonthlyMetricValue('monthly-stat-input-tokens', a => getNetInputTokens(a.total_input_tokens, a.total_cache_read_tokens), formatToken, agent_breakdown, activeAgents);
+    renderMonthlyMetricValue('monthly-stat-cache-input-tokens', a => a.total_cache_read_tokens || 0, formatToken, agent_breakdown, activeAgents);
     renderMonthlyMetricValue('monthly-stat-output-tokens', a => a.total_output_tokens, formatToken, agent_breakdown, activeAgents);
     renderMonthlyMetricValue('monthly-stat-total-cost', a => a.total_cost_usd, formatCost, agent_breakdown, activeAgents);
-    
-    // For sessions: show individual session count list
-    let sessionsHtml = '<div class="stat-value-list">';
-    activeAgents.forEach(a => {
-      const meta = getAssistantMeta(a);
-      let logoUrl = meta.logo;
-      let displayName = meta.label;
-      const val = (agent_breakdown && agent_breakdown[a]) ? agent_breakdown[a].total_sessions : 0;
-      sessionsHtml += `
-        <div class="stat-value-item">
-          <span class="agent-name" title="${displayName}"><img class="badge-logo" src="${logoUrl}" alt="${displayName}" /></span>
-          <span class="val">${formatNumber(val)}</span>
-        </div>
-      `;
-    });
-    sessionsHtml += '</div>';
-    document.getElementById('monthly-stat-sessions').innerHTML = sessionsHtml;
   }
 
-  const statCacheRead = document.getElementById('monthly-stat-cache-read');
   const statInputPct = document.getElementById('monthly-stat-input-pct');
+  const statCacheInputPct = document.getElementById('monthly-stat-cache-input-pct');
   const statOutputPct = document.getElementById('monthly-stat-output-pct');
-  const statRequests = document.getElementById('monthly-stat-requests');
+  const chartTotalSessions = document.getElementById('monthly-chart-total-sessions');
+
+  if (chartTotalSessions) {
+    chartTotalSessions.textContent = formatNumber(summary.total_sessions || 0);
+  }
 
   if (isMulti) {
-    if (statCacheRead) statCacheRead.classList.add('hidden');
     if (statInputPct) statInputPct.classList.add('hidden');
+    if (statCacheInputPct) statCacheInputPct.classList.add('hidden');
     if (statOutputPct) statOutputPct.classList.add('hidden');
-    if (statRequests) statRequests.classList.add('hidden');
   } else {
-    if (statCacheRead) {
-      statCacheRead.classList.remove('hidden');
-      statCacheRead.textContent = `${t('cache_read_label')}: ${formatToken(summary.total_cache_read_tokens)} (${calculatePercentage(summary.total_cache_read_tokens, summary.total_tokens)})`;
-    }
     if (statInputPct) {
       statInputPct.classList.remove('hidden');
-      statInputPct.textContent = `${t('ratio_label')}: ${calculatePercentage(summary.total_input_tokens, summary.total_tokens)}`;
+      statInputPct.textContent = `${t('ratio_label')}: ${calculatePercentage(monthlyInputTokens, summary.total_tokens)}`;
+    }
+    if (statCacheInputPct) {
+      statCacheInputPct.classList.remove('hidden');
+      statCacheInputPct.textContent = `${t('ratio_label')}: ${calculatePercentage(summary.total_cache_read_tokens, summary.total_tokens)}`;
     }
     if (statOutputPct) {
       statOutputPct.classList.remove('hidden');
       statOutputPct.textContent = `${t('ratio_label')}: ${calculatePercentage(summary.total_output_tokens, summary.total_tokens)}`;
-    }
-    if (statRequests) {
-      statRequests.classList.remove('hidden');
-      statRequests.textContent = t('monthly_requests_count').replace('{count}', formatNumber(summary.total_requests));
     }
   }
 
@@ -4171,10 +4230,9 @@ function formatCost(cost) {
   if (cost === null || cost === undefined) return '-';
   const c = Number(cost);
   if (isNaN(c)) return '-';
-  if (c === 0) return '$0.00';
-  if (c < 0.001) return '$' + c.toFixed(5);
-  if (c < 0.01) return '$' + c.toFixed(4);
-  return '$' + c.toFixed(3);
+  if (c < 1000) return '$' + c.toFixed(2);
+  if (c < 10000) return '$' + c.toFixed(1);
+  return '$' + c.toFixed(0);
 }
 
 async function updateCodexRateLimit() {
