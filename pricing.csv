@@ -103,6 +103,19 @@ gpt-5.3-codex,Cursor,1M Tokens,1.75,0.175,14.00,N/A
 gpt-5.4,Cursor,1M Tokens,2.50,0.25,15.00,N/A
 gpt-5.4-mini,Cursor,1M Tokens,0.75,0.075,4.50,N/A
 gpt-5.5,Cursor,1M Tokens,5.00,0.50,30.00,N/A
+claude-sonnet-5,Cursor,1M Tokens,3.00,0.30,15.00,N/A
+claude-4-6-sonnet,Cursor,1M Tokens,3.00,0.30,15.00,N/A
+claude-4-5-sonnet,Cursor,1M Tokens,3.00,0.30,15.00,N/A
+claude-4-sonnet,Cursor,1M Tokens,3.00,0.30,15.00,N/A
+claude-4-sonnet-1m,Cursor,1M Tokens,3.00,0.30,15.00,N/A
+claude-4-5-haiku,Cursor,1M Tokens,1.00,0.10,5.00,N/A
+claude-fable-5,Cursor,1M Tokens,10.00,1.00,50.00,N/A
+claude-opus-4-8,Cursor,1M Tokens,5.00,0.50,25.00,N/A
+claude-opus-4-7-fast,Cursor,1M Tokens,10.00,1.00,50.00,N/A
+claude-opus-4-7,Cursor,1M Tokens,5.00,0.50,25.00,N/A
+claude-opus-4-6,Cursor,1M Tokens,5.00,0.50,25.00,N/A
+claude-opus-4-5,Cursor,1M Tokens,5.00,0.50,25.00,N/A
+
 
 
 
