@@ -16,6 +16,7 @@ pub fn normalize_assistant_name(assistant: &str) -> String {
     let normalized = assistant.trim().to_lowercase();
     match normalized.as_str() {
         "claude-code" | "claude_code" | "claudecode" => "claude".to_string(),
+        "cursor" => "cursor".to_string(),
         _ => normalized,
     }
 }
@@ -23,7 +24,7 @@ pub fn normalize_assistant_name(assistant: &str) -> String {
 pub fn is_supported_assistant(assistant: &str) -> bool {
     matches!(
         normalize_assistant_name(assistant).as_str(),
-        "antigravity" | "copilot" | "codex" | "claude"
+        "antigravity" | "copilot" | "codex" | "claude" | "cursor"
     )
 }
 
@@ -45,6 +46,7 @@ pub struct SetupInfoResponse {
     pub copilot: AssistantSetupStatus,
     pub codex: AssistantSetupStatus,
     pub claude: AssistantSetupStatus,
+    pub cursor: AssistantSetupStatus,
 }
 
 #[derive(Serialize)]

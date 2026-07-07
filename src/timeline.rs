@@ -1,4 +1,4 @@
-use crate::db::TokenStats;
+use crate::db::{parse_cursor_timestamp, TokenStats};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -1173,4 +1173,166 @@ pub fn parse_claude_timeline(
         "selected_model".to_string(),
         serde_json::Value::String(current_model),
     );
+}
+
+pub fn parse_cursor_timeline(
+    reader: BufReader<std::fs::File>,
+    db_entries: &HashMap<u32, (TokenStats, String)>,
+    timeline: &mut Vec<TimelineItem>,
+    metadata: &mut HashMap<String, serde_json::Value>,
+) {
+    let mut current_model = "Cursor Agent".to_string();
+    let mut user_turn_no = 0u32;
+    let mut agent_turn_no = 0u32;
+
+    let mut current_timestamp = String::new();
+
+    for line_res in reader.lines() {
+        let line = match line_res {
+            Ok(line) => line,
+            Err(_) => continue,
+        };
+        let event: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+
+        let role = event.get("role").and_then(|r| r.as_str()).unwrap_or("");
+
+        if role == "user" {
+            let content_val = event.get("message").and_then(|m| m.get("content"));
+            let text = cursor_content_to_text(content_val.unwrap_or(&serde_json::Value::Null));
+
+            let mut extracted_ts = String::new();
+            if let Some(start_idx) = text.find("<timestamp>") {
+                let actual_start = start_idx + "<timestamp>".len();
+                if let Some(end_idx) = text[actual_start..].find("</timestamp>") {
+                    extracted_ts = text[actual_start..(actual_start + end_idx)].to_string();
+                }
+            }
+
+            if !extracted_ts.is_empty() {
+                current_timestamp = parse_cursor_timestamp(&extracted_ts);
+            }
+
+            let mut clean_prompt = text.clone();
+            if let Some(start_idx) = clean_prompt.find("<user_query>") {
+                let actual_start = start_idx + "<user_query>".len();
+                if let Some(end_idx) = clean_prompt[actual_start..].find("</user_query>") {
+                    clean_prompt = clean_prompt[actual_start..(actual_start + end_idx)].to_string();
+                }
+            }
+
+            let prompt = clean_prompt.trim().to_string();
+            if !prompt.is_empty() {
+                user_turn_no += 1;
+                timeline.push(TimelineItem::UserPrompt {
+                    timestamp: current_timestamp.clone(),
+                    prompt,
+                    context: None,
+                    turn_no: user_turn_no,
+                });
+            }
+        } else if role == "assistant" {
+            let message = match event.get("message") {
+                Some(message) => message,
+                None => continue,
+            };
+            let content = message.get("content");
+
+            agent_turn_no += 1;
+            let mut reply_parts = Vec::new();
+
+            if let Some(content) = content {
+                if let Some(items) = content.as_array() {
+                    for item in items {
+                        match item.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+                            "text" => {
+                                if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                                    reply_parts.push(text.to_string());
+                                }
+                            }
+                            "tool_use" => {
+                                let name = item
+                                    .get("name")
+                                    .and_then(|name| name.as_str())
+                                    .unwrap_or("tool_use")
+                                    .to_string();
+                                let args = item
+                                    .get("input")
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Null);
+
+                                timeline.push(TimelineItem::ToolStep {
+                                    timestamp: current_timestamp.clone(),
+                                    tool_name: name,
+                                    arguments: args,
+                                    env: None,
+                                    exit_code: Some(0),
+                                    stdout: "".to_string(),
+                                    stderr: "".to_string(),
+                                    tool_call_id: None,
+                                    status: "success".to_string(),
+                                });
+                            }
+                            _ => {}
+                        }
+                    }
+                } else if let Some(text) = content.as_str() {
+                    reply_parts.push(text.to_string());
+                }
+            }
+
+            let reply = reply_parts.join("\n");
+            let stats = db_entries.get(&agent_turn_no).map(|(s, _)| s.clone());
+            if let Some((_, model_name)) = db_entries.get(&agent_turn_no) {
+                current_model = model_name.clone();
+            }
+
+            timeline.push(TimelineItem::AgentReply {
+                timestamp: current_timestamp.clone(),
+                reply,
+                reasoning: None,
+                turn_no: agent_turn_no,
+                model: current_model.clone(),
+                tokens: stats,
+                duration_ms: None,
+                reasoning_effort: None,
+            });
+        } else {
+            let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            if event_type == "turn_ended" {
+                if let Some(err) = event.get("error").and_then(|e| e.as_str()) {
+                    timeline.push(TimelineItem::SystemStatus {
+                        timestamp: current_timestamp.clone(),
+                        status_type: "error".to_string(),
+                        message: err.to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    metadata.insert(
+        "selected_model".to_string(),
+        serde_json::Value::String(current_model),
+    );
+}
+
+fn cursor_content_to_text(content: &serde_json::Value) -> String {
+    if let Some(text) = content.as_str() {
+        return text.to_string();
+    }
+    let mut parts = Vec::new();
+    if let Some(items) = content.as_array() {
+        for item in items {
+            let itype = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            if itype == "text" {
+                if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                    parts.push(text.to_string());
+                }
+            }
+        }
+    }
+    parts.join(" ")
 }

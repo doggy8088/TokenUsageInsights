@@ -64,6 +64,10 @@
             <img class="assistant-logo" src="/static/claude-code-logo.svg" alt="Claude Code" />
             <span class="agent-name-tooltip">Claude Code</span>
           </button>
+          <button class="assistant-badge-btn" data-value="cursor" title="Cursor" aria-label="Cursor">
+            <img class="assistant-logo" src="/static/cursor-logo.svg" alt="Cursor" />
+            <span class="agent-name-tooltip">Cursor</span>
+          </button>
         </div>
       </div>
 
@@ -942,6 +946,28 @@
         <div class="modal-section">
           <h3 data-i18n="claude_setup_step_3"><span>03</span> 3. 費用估算邏輯</h3>
           <p class="modal-text" data-i18n="claude_setup_step_3_desc">費用會根據您的對話模型以 Token 數量為基準進行即時估算，排除快取部分後得出實際成本。</p>
+        </div>
+      </div>
+
+      <!-- Cursor Setup Content -->
+      <div class="modal-body" id="setup-body-cursor" style="display: none;">
+        <div class="modal-text">
+          <p data-i18n="cursor_setup_modal_intro">本看板主要解析並呈現 Cursor 的本地會話事件。Cursor 會自動將會話記錄在 <code>~/.cursor/projects</code> 目錄下，不需要額外設定腳本或狀態列。</p>
+        </div>
+
+        <div class="modal-section">
+          <h3 data-i18n="cursor_setup_step_1"><span>01</span> 1. 確認 Cursor 已在使用</h3>
+          <p class="modal-text" data-i18n="cursor_setup_step_1_desc">只要您在 Cursor 中執行過對話或 Agent，會話檔案就會自動生成在專案的 agent-transcripts 目錄中。</p>
+        </div>
+
+        <div class="modal-section">
+          <h3 data-i18n="cursor_setup_step_2"><span>02</span> 2. 偵測路徑狀態</h3>
+          <p class="modal-text" data-i18n="cursor_setup_step_2_desc">目前偵測到的 Cursor 目錄為：<code id="lbl-detected-home-cursor">~/.cursor/projects</code>。本系統會以極高效率對該目錄進行即時掃描與分析。</p>
+        </div>
+
+        <div class="modal-section">
+          <h3 data-i18n="cursor_setup_step_3"><span>03</span> 3. 費用估算邏輯</h3>
+          <p class="modal-text" data-i18n="cursor_setup_step_3_desc">由於 Cursor 本地日誌不包含 Token 統計，費用會根據字數估算 Token 數量，再以標準模型價格為基準進行即時成本計算。</p>
         </div>
       </div>
     </div>

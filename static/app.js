@@ -75,6 +75,14 @@ const assistantMeta = {
     badgeStyle: 'background: rgba(79, 126, 168, 0.15); color: #7aa7cf; border: 1px solid rgba(79, 126, 168, 0.3); display: inline-flex; align-items: center;',
     senderName: 'CLAUDE CODE AGENT',
   },
+  cursor: {
+    logo: '/static/cursor-logo.svg',
+    label: 'Cursor',
+    shortLabel: 'Cursor',
+    alt: 'Cursor',
+    badgeStyle: 'background: rgba(139, 92, 246, 0.15); color: #a78bfa; border: 1px solid rgba(139, 92, 246, 0.3); display: inline-flex; align-items: center;',
+    senderName: 'CURSOR AGENT',
+  },
 };
 
 function normalizeAssistant(rawValue) {
@@ -3922,14 +3930,18 @@ function openSetupModal() {
     const statuslineBody = document.getElementById('setup-body-statusline');
     const codexBody = document.getElementById('setup-body-codex');
     const claudeBody = document.getElementById('setup-body-claude');
+    const cursorBody = document.getElementById('setup-body-cursor');
     if (statuslineBody) statuslineBody.style.display = 'none';
     if (codexBody) codexBody.style.display = 'none';
     if (claudeBody) claudeBody.style.display = 'none';
+    if (cursorBody) cursorBody.style.display = 'none';
 
     if (currentAssistant === 'codex') {
       if (codexBody) codexBody.style.display = 'block';
     } else if (currentAssistant === 'claude') {
       if (claudeBody) claudeBody.style.display = 'block';
+    } else if (currentAssistant === 'cursor') {
+      if (cursorBody) cursorBody.style.display = 'block';
     } else {
       if (statuslineBody) statuslineBody.style.display = 'none';
       if (statuslineBody) statuslineBody.style.display = 'block';
@@ -3964,6 +3976,8 @@ async function loadSetupInfo() {
         titleH2.setAttribute('data-i18n', 'codex_setup_modal_title');
       } else if (currentAssistant === 'claude') {
         titleH2.setAttribute('data-i18n', 'claude_setup_modal_title');
+      } else if (currentAssistant === 'cursor') {
+        titleH2.setAttribute('data-i18n', 'cursor_setup_modal_title');
       } else {
         titleH2.setAttribute('data-i18n', 'setup_modal_title');
       }
@@ -4075,6 +4089,9 @@ async function loadSetupInfo() {
     } else if (currentAssistant === 'claude') {
       const homeLabelClaude = document.getElementById('lbl-detected-home-claude');
       if (homeLabelClaude) homeLabelClaude.textContent = `${homeDir}/.claude/projects`;
+    } else if (currentAssistant === 'cursor') {
+      const homeLabelCursor = document.getElementById('lbl-detected-home-cursor');
+      if (homeLabelCursor) homeLabelCursor.textContent = `${homeDir}/.cursor/projects`;
     }
 
     // Apply updated language translations

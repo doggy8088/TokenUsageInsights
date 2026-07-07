@@ -149,6 +149,18 @@ pub fn get_claude_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+pub fn get_cursor_dir() -> PathBuf {
+    if let Ok(val) = std::env::var("CURSOR_DIR") {
+        let p = PathBuf::from(val);
+        if p.exists() {
+            return p;
+        }
+    }
+    dirs::home_dir()
+        .map(|h| h.join(".cursor"))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
 /// Get connection to centralized SQLite DB
 pub fn get_db_conn() -> Result<Connection, String> {
     let dir = get_insights_dir();
@@ -182,7 +194,7 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS usage_entries (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            assistant_type TEXT NOT NULL, -- 'antigravity', 'copilot', 'codex', 'claude'
+            assistant_type TEXT NOT NULL, -- 'antigravity', 'copilot', 'codex', 'claude', 'cursor'
             timestamp TEXT NOT NULL,
             date TEXT NOT NULL,
             session_id TEXT NOT NULL,
@@ -1353,6 +1365,337 @@ fn sync_claude_usage_logs(conn: &mut Connection) -> Result<(), String> {
     Ok(())
 }
 
+pub fn parse_cursor_timestamp(s: &str) -> String {
+    let parts: Vec<&str> = s.split(" (UTC").collect();
+    if parts.is_empty() {
+        return s.to_string();
+    }
+    let dt_part = parts[0].trim();
+    let dt_str = if let Some(comma_idx) = dt_part.find(',') {
+        dt_part[comma_idx + 1..].trim()
+    } else {
+        dt_part
+    };
+
+    let formats = [
+        "%b %e, %Y, %l:%M %p",
+        "%b %d, %Y, %I:%M %p",
+        "%b %d, %Y, %l:%M %p",
+        "%b %e, %Y, %I:%M %p",
+        "%Y-%m-%d %H:%M:%S",
+    ];
+
+    for fmt in &formats {
+        if let Ok(naive_dt) = chrono::NaiveDateTime::parse_from_str(dt_str, fmt) {
+            if parts.len() > 1 {
+                let tz_str = parts[1].trim_end_matches(')');
+                let hours_str = if tz_str.contains(':') {
+                    tz_str.split(':').next().unwrap_or("0")
+                } else {
+                    tz_str
+                };
+                if let Ok(hours) = hours_str.parse::<i32>() {
+                    if let Some(offset) = chrono::FixedOffset::east_opt(hours * 3600) {
+                        use chrono::TimeZone;
+                        let local_dt = offset.from_local_datetime(&naive_dt);
+                        if let chrono::LocalResult::Single(dt_tz) = local_dt {
+                            return dt_tz.to_rfc3339();
+                        }
+                    }
+                }
+            }
+            return naive_dt.format("%Y-%m-%d %H:%M:%S").to_string();
+        }
+    }
+
+    s.to_string()
+}
+
+fn find_cursor_session_files(dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                files.extend(find_cursor_session_files(&path));
+            } else if path.is_file()
+                && path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
+            {
+                files.push(path);
+            }
+        }
+    }
+    files
+}
+
+fn cursor_content_to_text(content: &serde_json::Value) -> String {
+    if let Some(text) = content.as_str() {
+        return text.to_string();
+    }
+    let mut parts = Vec::new();
+    if let Some(items) = content.as_array() {
+        for item in items {
+            let itype = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            if itype == "text" {
+                if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                    parts.push(text.to_string());
+                }
+            }
+        }
+    }
+    parts.join(" ")
+}
+
+fn parse_cursor_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String> {
+    let file = File::open(filepath).map_err(|e| format!("無法開啟檔案: {}", e))?;
+    let reader = BufReader::new(file);
+    let fallback_session_id = filepath
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("unknown-session")
+        .to_string();
+
+    let mut session_name: Option<String> = None;
+    let mut results = Vec::new();
+
+    let mut current_timestamp = String::new();
+    let mut current_prompt = String::new();
+
+    for line_res in reader.lines() {
+        let line = match line_res {
+            Ok(line) => line,
+            Err(_) => continue,
+        };
+        let event: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+
+        let role = event.get("role").and_then(|r| r.as_str()).unwrap_or("");
+
+        if role == "user" {
+            let content_val = event.get("message").and_then(|m| m.get("content"));
+            let text = cursor_content_to_text(content_val.unwrap_or(&serde_json::Value::Null));
+
+            let mut extracted_ts = String::new();
+            if let Some(start_idx) = text.find("<timestamp>") {
+                let actual_start = start_idx + "<timestamp>".len();
+                if let Some(end_idx) = text[actual_start..].find("</timestamp>") {
+                    extracted_ts = text[actual_start..(actual_start + end_idx)].to_string();
+                }
+            }
+
+            if !extracted_ts.is_empty() {
+                current_timestamp = parse_cursor_timestamp(&extracted_ts);
+            }
+
+            let mut clean_prompt = text.clone();
+            if let Some(start_idx) = clean_prompt.find("<user_query>") {
+                let actual_start = start_idx + "<user_query>".len();
+                if let Some(end_idx) = clean_prompt[actual_start..].find("</user_query>") {
+                    clean_prompt = clean_prompt[actual_start..(actual_start + end_idx)].to_string();
+                }
+            }
+
+            current_prompt = clean_prompt.trim().to_string();
+            if session_name.is_none() && !current_prompt.is_empty() {
+                session_name = Some(current_prompt.chars().take(100).collect());
+            }
+        } else if role == "assistant" {
+            let content_val = event.get("message").and_then(|m| m.get("content"));
+            let reply_text =
+                cursor_content_to_text(content_val.unwrap_or(&serde_json::Value::Null));
+
+            if current_timestamp.is_empty() {
+                if let Ok(metadata) = filepath.metadata() {
+                    if let Ok(modified) = metadata.modified() {
+                        let datetime: chrono::DateTime<chrono::Utc> = modified.into();
+                        current_timestamp = datetime.format("%Y-%m-%d %H:%M:%S").to_string();
+                    }
+                }
+            }
+            if current_timestamp.is_empty() {
+                current_timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+            }
+
+            let input_tokens = (current_prompt.len() / 4).max(10) as u64;
+            let output_tokens = (reply_text.len() / 4).max(10) as u64;
+            let total_tokens = input_tokens + output_tokens;
+
+            let tokens = TokenStats {
+                input: input_tokens,
+                output: output_tokens,
+                cache_read: Some(0),
+                cache_write: Some(0),
+                reasoning: None,
+                total: total_tokens,
+            };
+
+            results.push(UsageEntry {
+                timestamp: current_timestamp.clone(),
+                session_id: fallback_session_id.clone(),
+                session_name: session_name
+                    .clone()
+                    .or_else(|| Some(fallback_session_id.clone())),
+                transcript_path: Some(filepath.to_string_lossy().into_owned()),
+                cwd: None,
+                version: None,
+                turn_no: (results.len() + 1) as u32,
+                model: Some("Cursor Agent".to_string()),
+                model_id: Some("Cursor Agent".to_string()),
+                tokens: Some(tokens.clone()),
+                delta_tokens: Some(tokens),
+                context: None,
+                cost: None,
+                parent_session_id: None,
+                agent_nickname: None,
+                agent_role: None,
+                reasoning_effort: None,
+            });
+        }
+    }
+
+    Ok(results)
+}
+
+fn sync_cursor_usage_logs(conn: &mut Connection, cursor_dir: &Path) -> Result<(), String> {
+    let projects_dir = cursor_dir.join("projects");
+    if !projects_dir.exists() {
+        return Ok(());
+    }
+
+    let files = find_cursor_session_files(&projects_dir);
+
+    for filepath in files {
+        let state_path = filepath
+            .strip_prefix(cursor_dir)
+            .unwrap_or(&filepath)
+            .to_string_lossy()
+            .into_owned();
+        let state_key = format!("cursor:{}", state_path);
+
+        let last_synced_size: u64 = conn
+            .query_row(
+                "SELECT last_synced_size FROM sync_state WHERE filename = ?",
+                params![state_key],
+                |row| row.get(0),
+            )
+            .unwrap_or(0u64);
+
+        let metadata = match fs::metadata(&filepath) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let current_size = metadata.len();
+
+        if current_size != last_synced_size {
+            let parsed_entries = match parse_cursor_session_file(&filepath) {
+                Ok(entries) => entries,
+                Err(e) => {
+                    eprintln!("解析 Cursor 會話檔案 {:?} 失敗: {}", filepath, e);
+                    continue;
+                }
+            };
+
+            let tx = conn
+                .transaction()
+                .map_err(|e| format!("Transaction BEGIN 失敗: {}", e))?;
+
+            let session_ids: HashSet<String> = parsed_entries
+                .iter()
+                .map(|entry| entry.session_id.clone())
+                .collect();
+            for session_id in session_ids {
+                let delete_res = tx.execute(
+                    "DELETE FROM usage_entries WHERE assistant_type = 'cursor' AND session_id = ?",
+                    params![session_id],
+                );
+
+                if let Err(e) = delete_res {
+                    eprintln!("清空舊 Cursor Session 資料失敗: {}", e);
+                    continue;
+                }
+            }
+
+            let mut success = true;
+            for entry in &parsed_entries {
+                let tokens = entry.tokens.as_ref();
+                let delta = entry.delta_tokens.as_ref();
+                let cost = entry.cost.as_ref();
+
+                let insert_res = tx.execute(
+                    "INSERT INTO usage_entries (
+                        assistant_type, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
+                        tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_reasoning, tokens_total,
+                        delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total,
+                        duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, reasoning_effort
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    params![
+                        "cursor",
+                        entry.timestamp,
+                        entry.timestamp.get(0..10).unwrap_or("unknown"),
+                        entry.session_id,
+                        entry.session_name.as_deref(),
+                        entry.transcript_path.as_deref(),
+                        entry.cwd.as_deref(),
+                        entry.version.as_deref(),
+                        entry.turn_no as i64,
+                        entry.model.as_deref(),
+                        entry.model_id.as_deref(),
+                        tokens.map(|t| t.input as i64),
+                        tokens.map(|t| t.output as i64),
+                        tokens.and_then(|t| t.cache_read.map(|v| v as i64)),
+                        tokens.and_then(|t| t.cache_write.map(|v| v as i64)),
+                        tokens.and_then(|t| t.reasoning.map(|v| v as i64)),
+                        tokens.map(|t| t.total as i64),
+                        delta.map(|t| t.input as i64),
+                        delta.map(|t| t.output as i64),
+                        delta.and_then(|t| t.cache_read.map(|v| v as i64)),
+                        delta.and_then(|t| t.cache_write.map(|v| v as i64)),
+                        delta.and_then(|t| t.reasoning.map(|v| v as i64)),
+                        delta.map(|t| t.total as i64),
+                        cost.and_then(|c| c.total_api_duration_ms.map(|d| d as i64)),
+                        cost.and_then(|c| c.total_premium_requests.map(|r| r as i64)),
+                        entry.parent_session_id.as_deref(),
+                        entry.agent_nickname.as_deref(),
+                        entry.agent_role.as_deref(),
+                        entry.reasoning_effort.as_deref()
+                    ],
+                );
+
+                if let Err(e) = insert_res {
+                    eprintln!("寫入 Cursor 資料庫失敗 (turn_no {}): {}", entry.turn_no, e);
+                    success = false;
+                    break;
+                }
+            }
+
+            if success {
+                let now = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+
+                let update_state_res = tx.execute(
+                    "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time) VALUES (?, ?, ?)",
+                    params![state_key, current_size as i64, now],
+                );
+
+                if update_state_res.is_ok() {
+                    if let Err(e) = tx.commit() {
+                        eprintln!("Transaction COMMIT 失敗: {}", e);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Unified sync function triggering sync for all supported assistants
 pub fn sync_usage_logs(conn: &mut Connection) -> Result<(), String> {
     // 1. Sync Google Antigravity CLI
@@ -1375,6 +1718,12 @@ pub fn sync_usage_logs(conn: &mut Connection) -> Result<(), String> {
     // 4. Sync Claude Code
     if let Err(e) = sync_claude_usage_logs(conn) {
         eprintln!("❌ 同步 Claude Code 失敗: {}", e);
+    }
+
+    // 5. Sync Cursor
+    let cursor_dir = get_cursor_dir();
+    if let Err(e) = sync_cursor_usage_logs(conn, &cursor_dir) {
+        eprintln!("❌ 同步 Cursor 失敗: {}", e);
     }
 
     Ok(())
@@ -2436,5 +2785,12 @@ mod tests {
         assert_eq!(tokens.cache_read, Some(7));
         assert_eq!(tokens.output, 5);
         assert_eq!(tokens.total, 25);
+    }
+
+    #[test]
+    fn test_parse_cursor_timestamp() {
+        let ts = "Wednesday, Jul 8, 2026, 2:24 AM (UTC+8)";
+        let parsed = parse_cursor_timestamp(ts);
+        assert_eq!(parsed, "2026-07-08T02:24:00+08:00");
     }
 }

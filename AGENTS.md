@@ -1,7 +1,7 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-`src/` contains the Rust backend: `main.rs` boots the Axum server, `handlers.rs` exposes HTTP endpoints, `db.rs` manages SQLite sync and migrations, and `pricing.rs` / `timeline.rs` handle pricing and session reconstruction. `static/` holds the frontend (`index.html`, `app.js`, `styles.css`) plus image assets. `shell/` contains helper scripts and `systemd` unit templates for Antigravity, Copilot, and the unified dashboard. Runtime pricing data lives in `pricing.csv`.
+`src/` contains the Rust backend: `main.rs` boots the Axum server, `handlers.rs` exposes HTTP endpoints, `db.rs` manages SQLite sync and migrations, and `pricing.rs` / `timeline.rs` handle pricing and session reconstruction. `static/` holds the frontend (`index.html`, `app.js`, `styles.css`) plus image assets. `shell/` contains helper scripts and `systemd` unit templates for the unified dashboard. Runtime pricing data lives in `pricing.csv`.
 
 ## Build, Test, and Development Commands
 Use `cargo run` to start the local dashboard on `http://localhost:3003`. Use `cargo build --release` for production builds or before installing the `systemd` service. Run `cargo test` to execute the current Rust test suite. Run `cargo fmt` before committing; use `cargo clippy --all-targets --all-features` for an extra lint pass when touching backend logic. For service installs, render the unit file with `sed "s|<PROJECT_DIR>|$PWD|g" shell/token-usage-insights.service`.
@@ -17,4 +17,4 @@ Recent history uses short conventional prefixes such as `feat:`, `fix:`, `style:
 **Crucial Rule**: Do not automatically commit code changes. All code modifications should be left in the working directory (staged or unstaged) for the user to review and commit manually.
 
 ## Security & Configuration Tips
-This project is local-first and reads data from `~/.token-usage-insights`, `~/.gemini/antigravity-cli`, `~/.copilot`, and `~/.codex` unless overridden by `INSIGHTS_DIR`, `ANTIGRAVITY_DIR`, `COPILOT_DIR`, or `CODEX_DIR`. Do not commit local database files, session logs, or personal paths captured during testing.
+This project is local-first and reads data from `~/.token-usage-insights`, `~/.gemini/antigravity-cli`, `~/.copilot`, `~/.codex`, `~/.claude`, and `~/.cursor` unless overridden by `INSIGHTS_DIR`, `ANTIGRAVITY_DIR`, `COPILOT_DIR`, `CODEX_DIR`, `CLAUDE_DIR`, or `CURSOR_DIR`. Do not commit local database files, session logs, or personal paths captured during testing.

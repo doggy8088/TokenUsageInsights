@@ -11,7 +11,7 @@ use crate::db::{self, TokenStats};
 use crate::pricing::{calculate_cost, load_pricing_rules};
 use crate::timeline::{
     parse_antigravity_timeline, parse_claude_timeline, parse_codex_timeline,
-    parse_copilot_timeline, TimelineItem,
+    parse_copilot_timeline, parse_cursor_timeline, TimelineItem,
 };
 
 fn is_safe_session_id(session_id: &str) -> bool {
@@ -91,6 +91,42 @@ fn resolve_codex_transcript_path(
     Ok(canonical_path)
 }
 
+fn resolve_cursor_transcript_path(
+    cursor_dir: &StdPath,
+    session_id: &str,
+    transcript_path_db: &str,
+) -> Result<PathBuf, String> {
+    let mut path = PathBuf::from(transcript_path_db);
+    if path.is_relative() {
+        path = cursor_dir.join(path);
+    }
+
+    if !path.exists() {
+        return Err("找不到該 Cursor 會話的本地日誌檔案。".to_string());
+    }
+
+    let cursor_root = cursor_dir
+        .canonicalize()
+        .map_err(|_| "無法存取 Cursor 根目錄。".to_string())?;
+    let canonical_path = path
+        .canonicalize()
+        .map_err(|_| "無法解析 Cursor 會話日誌路徑。".to_string())?;
+
+    if !canonical_path.starts_with(cursor_root) {
+        return Err("Cursor 會話日誌路徑不在預期目錄內。".to_string());
+    }
+
+    let file_name = canonical_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    if !file_name.contains(session_id) {
+        return Err("會話日誌路徑與 session id 不一致。".to_string());
+    }
+
+    Ok(canonical_path)
+}
+
 pub async fn get_available_dates(Path(assistant): Path<String>) -> impl IntoResponse {
     let assistant = normalize_assistant_name(&assistant);
     if !is_supported_assistant(&assistant) {
@@ -156,6 +192,9 @@ pub async fn get_setup_info(Path(assistant): Path<String>) -> impl IntoResponse 
     let claude_dir = db::get_claude_dir();
     let claude_exists = claude_dir.join("projects").exists();
 
+    let cursor_dir = db::get_cursor_dir();
+    let cursor_exists = cursor_dir.join("projects").exists();
+
     Json(SetupInfoResponse {
         workspace_dir,
         home_dir,
@@ -177,6 +216,11 @@ pub async fn get_setup_info(Path(assistant): Path<String>) -> impl IntoResponse 
         claude: AssistantSetupStatus {
             dir_path: claude_dir.to_string_lossy().into_owned(),
             exists: claude_exists,
+            script_path: "".to_string(),
+        },
+        cursor: AssistantSetupStatus {
+            dir_path: cursor_dir.to_string_lossy().into_owned(),
+            exists: cursor_exists,
             script_path: "".to_string(),
         },
     })
@@ -586,6 +630,32 @@ pub async fn get_session_details(
                 }
             }
         }
+        "cursor" => {
+            let cursor_dir = db::get_cursor_dir();
+            match transcript_path_db {
+                Some(ref p_str) => {
+                    match resolve_cursor_transcript_path(&cursor_dir, &session_id, p_str) {
+                        Ok(path) => path,
+                        Err(err) => {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({ "error": err })),
+                            )
+                                .into_response();
+                        }
+                    }
+                }
+                None => {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(serde_json::json!({
+                            "error": "找不到 Cursor 會話日誌檔案路徑。"
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+        }
         _ => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -655,6 +725,9 @@ pub async fn get_session_details(
         }
         "claude" => {
             parse_claude_timeline(reader, &db_entries, &mut timeline, &mut metadata);
+        }
+        "cursor" => {
+            parse_cursor_timeline(reader, &db_entries, &mut timeline, &mut metadata);
         }
         _ => {}
     }
