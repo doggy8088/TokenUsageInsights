@@ -75,12 +75,26 @@ qwen3-coder-next,Cloud,1M Tokens,0.144,0.036,0.574,N/A
 Cursor Agent,Cursor,1M Tokens,3.00,0.30,15.00,N/A
 cursor-small,Cursor,1M Tokens,0.10,0.00,0.10,N/A
 claude-3-5-sonnet,Cursor,1M Tokens,3.00,0.30,15.00,N/A
-gpt-4o,Cursor,1M Tokens,2.50,0.25,10.00,N/A
+claude-3-5-haiku,Cursor,1M Tokens,0.80,0.08,4.00,N/A
+claude-3-opus,Cursor,1M Tokens,15.00,1.50,75.00,N/A
+claude-3-haiku,Cursor,1M Tokens,0.25,0.03,1.25,N/A
+gpt-4o,Cursor,1M Tokens,2.50,1.25,10.00,N/A
+gpt-4o-mini,Cursor,1M Tokens,0.15,0.075,0.60,N/A
+gpt-4-turbo,Cursor,1M Tokens,10.00,5.00,30.00,N/A
+gpt-4,Cursor,1M Tokens,30.00,15.00,60.00,N/A
 o1-mini,Cursor,1M Tokens,3.00,0.00,12.00,N/A
+o1-preview,Cursor,1M Tokens,15.00,0.00,60.00,N/A
 o1,Cursor,1M Tokens,15.00,0.00,60.00,N/A
 o3-mini,Cursor,1M Tokens,1.10,0.00,4.40,N/A
-claude-3-opus,Cursor,1M Tokens,15.00,1.50,75.00,N/A
 gemini-1.5-pro,Cursor,1M Tokens,1.25,0.3125,5.00,N/A
+gemini-1.5-flash,Cursor,1M Tokens,0.075,0.01875,0.30,N/A
 gemini-2.0-flash,Cursor,1M Tokens,0.075,0.01875,0.30,N/A
 gemini-2.5-flash,Cursor,1M Tokens,0.075,0.01875,0.30,N/A
+deepseek-chat,Cursor,1M Tokens,0.14,0.014,0.28,N/A
+deepseek-coder,Cursor,1M Tokens,0.14,0.014,0.28,N/A
+deepseek-v3,Cursor,1M Tokens,0.14,0.014,0.28,N/A
+deepseek-r1,Cursor,1M Tokens,0.55,0.14,2.19,N/A
+grok-2,Cursor,1M Tokens,2.00,0.20,10.00,N/A
+grok-2-mini,Cursor,1M Tokens,0.05,0.005,0.10,N/A
+
 
