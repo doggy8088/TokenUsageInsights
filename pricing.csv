@@ -96,5 +96,13 @@ deepseek-v3,Cursor,1M Tokens,0.14,0.014,0.28,N/A
 deepseek-r1,Cursor,1M Tokens,0.55,0.14,2.19,N/A
 grok-2,Cursor,1M Tokens,2.00,0.20,10.00,N/A
 grok-2-mini,Cursor,1M Tokens,0.05,0.005,0.10,N/A
+gpt-5,Cursor,1M Tokens,5.00,0.50,30.00,N/A
+gpt-5-mini,Cursor,1M Tokens,0.25,0.025,2.00,N/A
+gpt-5-fast,Cursor,1M Tokens,1.00,0.10,5.00,N/A
+gpt-5.3-codex,Cursor,1M Tokens,1.75,0.175,14.00,N/A
+gpt-5.4,Cursor,1M Tokens,2.50,0.25,15.00,N/A
+gpt-5.4-mini,Cursor,1M Tokens,0.75,0.075,4.50,N/A
+gpt-5.5,Cursor,1M Tokens,5.00,0.50,30.00,N/A
+
 
 
