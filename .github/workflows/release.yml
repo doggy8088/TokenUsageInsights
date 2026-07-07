@@ -1,0 +1,189 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            executable: token-usage-insights
+            archive_ext: tar.gz
+          - os: macos-13
+            target: x86_64-apple-darwin
+            executable: token-usage-insights
+            archive_ext: tar.gz
+          - os: macos-14
+            target: aarch64-apple-darwin
+            executable: token-usage-insights
+            archive_ext: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            executable: token-usage-insights.exe
+            archive_ext: zip
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Stage release package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          package="token-usage-insights-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          stage="dist/${package}"
+          binary="target/${{ matrix.target }}/release/${{ matrix.executable }}"
+
+          mkdir -p "$stage"
+          cp "$binary" "$stage/${{ matrix.executable }}"
+
+          if [[ "${{ runner.os }}" != "Windows" ]] && command -v strip >/dev/null 2>&1; then
+            strip "$stage/${{ matrix.executable }}" || true
+          fi
+
+          cp -R static "$stage/static"
+          cp -R shell "$stage/shell"
+          cp -R scripts "$stage/scripts"
+          cp scripts/install.sh "$stage/install.sh"
+          cp scripts/install.ps1 "$stage/install.ps1"
+          chmod +x "$stage/install.sh"
+
+          for file in pricing.csv README.md LICENSE; do
+            if [[ -f "$file" ]]; then
+              cp "$file" "$stage/$file"
+            fi
+          done
+
+          printf '%s\n' "$GITHUB_REF_NAME" > "$stage/VERSION"
+
+          if [[ "${{ matrix.archive_ext }}" == "zip" ]]; then
+            powershell -NoProfile -Command "Compress-Archive -Path 'dist/${package}' -DestinationPath 'dist/${package}.zip' -Force"
+          else
+            tar -czf "dist/${package}.tar.gz" -C dist "$package"
+          fi
+
+      - name: Upload release asset artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          (
+            cd release-assets
+            find . -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) -print0 \
+              | sort -z \
+              | xargs -0 sha256sum > SHA256SUMS
+          )
+
+      - name: Create release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          cat > release-notes.md <<EOF
+          ## Token 戰情室 ${tag}
+
+          此 Release 由 GitHub Actions 在 tag 建立時自動產生。
+
+          ### 下載內容
+
+          每個平台壓縮包都包含：
+
+          - 單一平台可執行檔
+          - \`static/\` 前端資產
+          - \`pricing.csv\` 模型費用表
+          - \`shell/\` 目錄下的 Status Line 與服務腳本
+          - \`install.sh\` 與 \`install.ps1\` 安裝腳本
+          - README、LICENSE 與 VERSION
+
+          ### 安裝方式
+
+          Linux 或 macOS：
+
+          \`\`\`bash
+          tar -xzf token-usage-insights-${tag}-<target>.tar.gz
+          cd token-usage-insights-${tag}-<target>
+          ./install.sh
+          \`\`\`
+
+          Linux 如需安裝 systemd user service：
+
+          \`\`\`bash
+          ./install.sh --service
+          \`\`\`
+
+          Windows：
+
+          \`\`\`powershell
+          Expand-Archive token-usage-insights-${tag}-x86_64-pc-windows-msvc.zip
+          cd token-usage-insights-${tag}-x86_64-pc-windows-msvc
+          powershell -ExecutionPolicy Bypass -File .\\install.ps1
+          \`\`\`
+
+          ### 校驗
+
+          請使用 \`SHA256SUMS\` 驗證下載檔案。
+          EOF
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+
+          mapfile -d '' files < <(find release-assets -maxdepth 1 -type f -print0 | sort -z)
+          if [[ "${#files[@]}" -eq 0 ]]; then
+            echo "No release assets were found." >&2
+            exit 1
+          fi
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "${files[@]}" --clobber
+          else
+            gh release create "$tag" "${files[@]}" \
+              --title "Token 戰情室 ${tag}" \
+              --notes-file release-notes.md \
+              --verify-tag
+          fi
+

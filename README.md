@@ -284,6 +284,48 @@ systemctl --user stop token-usage-insights.service
 
 * * *
 
+## GitHub Release 下載安裝
+
+建立任意 Git tag 並推送後，GitHub Actions 會自動建立 Release，並產出 Linux、macOS 與 Windows 的平台壓縮包。
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+每個 Release 壓縮包都包含：
+
+- 單一平台可執行檔
+- `static/` 前端資產
+- `pricing.csv` 模型費用表
+- `shell/` 目錄下的 Status Line 與服務腳本
+- `install.sh` 與 `install.ps1` 安裝腳本
+- README、LICENSE 與 VERSION
+
+Linux 或 macOS：
+
+```bash
+tar -xzf token-usage-insights-<tag>-<target>.tar.gz
+cd token-usage-insights-<tag>-<target>
+./install.sh
+```
+
+Linux 如需安裝並啟用 systemd user service：
+
+```bash
+./install.sh --service
+```
+
+Windows：
+
+```powershell
+Expand-Archive token-usage-insights-<tag>-x86_64-pc-windows-msvc.zip
+cd token-usage-insights-<tag>-x86_64-pc-windows-msvc
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+* * *
+
 ## 舊資料遷移
 
 若你以前使用過下列獨立專案，啟動本專案時會自動嘗試遷移舊 SQLite 資料：
