@@ -171,6 +171,7 @@ jobs:
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
+          repo="${GITHUB_REPOSITORY}"
 
           mapfile -d '' files < <(find release-assets -maxdepth 1 -type f -print0 | sort -z)
           if [[ "${#files[@]}" -eq 0 ]]; then
@@ -178,10 +179,11 @@ jobs:
             exit 1
           fi
 
-          if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" "${files[@]}" --clobber
+          if gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then
+            gh release upload "$tag" "${files[@]}" --repo "$repo" --clobber
           else
             gh release create "$tag" "${files[@]}" \
+              --repo "$repo" \
               --title "Token 戰情室 ${tag}" \
               --notes-file release-notes.md \
               --verify-tag
