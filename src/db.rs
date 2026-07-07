@@ -81,6 +81,8 @@ struct CodexTokenUsage {
     total_tokens: u64,
 }
 
+const CODEX_DELTA_PARSER_MIGRATION_KEY: &str = "migration:codex_delta_from_totals_v2";
+
 /// Directory resolution helpers
 pub fn get_insights_dir() -> PathBuf {
     if let Ok(val) = std::env::var("INSIGHTS_DIR") {
@@ -563,6 +565,48 @@ fn codex_usage_to_stats(usage: CodexTokenUsage) -> TokenStats {
     }
 }
 
+fn codex_usage_delta_to_stats(
+    previous: Option<&CodexTokenUsage>,
+    current: &CodexTokenUsage,
+) -> TokenStats {
+    let (input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens) = match previous
+    {
+        Some(previous)
+            if current.input_tokens >= previous.input_tokens
+                && current.cached_input_tokens >= previous.cached_input_tokens
+                && current.output_tokens >= previous.output_tokens
+                && current.reasoning_output_tokens >= previous.reasoning_output_tokens =>
+        {
+            (
+                current.input_tokens - previous.input_tokens,
+                current.cached_input_tokens - previous.cached_input_tokens,
+                current.output_tokens - previous.output_tokens,
+                current.reasoning_output_tokens - previous.reasoning_output_tokens,
+            )
+        }
+        _ => (
+            current.input_tokens,
+            current.cached_input_tokens,
+            current.output_tokens,
+            current.reasoning_output_tokens,
+        ),
+    };
+
+    let cache_read = cached_input_tokens;
+    let input = input_tokens.saturating_sub(cache_read);
+    let output = output_tokens;
+    let total = input_tokens.saturating_add(output);
+
+    TokenStats {
+        input,
+        output,
+        cache_read: Some(cache_read),
+        cache_write: None,
+        reasoning: Some(reasoning_output_tokens),
+        total,
+    }
+}
+
 fn parse_codex_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String> {
     let file = File::open(filepath).map_err(|e| format!("無法開啟檔案: {}", e))?;
     let reader = BufReader::new(file);
@@ -680,6 +724,7 @@ fn parse_codex_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String> 
     let mut results = Vec::new();
     let mut model_for_turn = current_model.clone();
     let mut effort_for_turn = reasoning_effort.clone();
+    let mut previous_total_usage: Option<CodexTokenUsage> = None;
 
     for event in events {
         let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -723,11 +768,8 @@ fn parse_codex_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String> 
             Some(usage) => usage,
             None => continue,
         };
-        let last_usage = info
-            .get("last_token_usage")
-            .cloned()
-            .and_then(|value| serde_json::from_value::<CodexTokenUsage>(value).ok())
-            .unwrap_or_else(|| total_usage.clone());
+        let delta_tokens = codex_usage_delta_to_stats(previous_total_usage.as_ref(), &total_usage);
+        previous_total_usage = Some(total_usage.clone());
 
         let context = info
             .get("model_context_window")
@@ -751,7 +793,7 @@ fn parse_codex_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String> 
             model: Some(model_for_turn.clone()),
             model_id: Some(model_for_turn.clone()),
             tokens: Some(codex_usage_to_stats(total_usage)),
-            delta_tokens: Some(codex_usage_to_stats(last_usage)),
+            delta_tokens: Some(delta_tokens),
             context,
             cost: None,
             parent_session_id: parent_session_id.clone(),
@@ -769,6 +811,32 @@ fn sync_codex_usage_logs(conn: &mut Connection) -> Result<(), String> {
     let sessions_dir = codex_dir.join("sessions");
     if !sessions_dir.exists() {
         return Ok(());
+    }
+
+    let delta_parser_migration_done: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = ?)",
+            params![CODEX_DELTA_PARSER_MIGRATION_KEY],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    if !delta_parser_migration_done {
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("Codex parser migration BEGIN 失敗: {}", e))?;
+        tx.execute(
+            "DELETE FROM sync_state WHERE filename LIKE 'codex:sessions/%'",
+            [],
+        )
+        .map_err(|e| format!("清除 Codex 同步狀態失敗: {}", e))?;
+        tx.execute(
+            "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time) VALUES (?, 1, 0)",
+            params![CODEX_DELTA_PARSER_MIGRATION_KEY],
+        )
+        .map_err(|e| format!("寫入 Codex parser migration 狀態失敗: {}", e))?;
+        tx.commit()
+            .map_err(|e| format!("Codex parser migration COMMIT 失敗: {}", e))?;
     }
 
     let files = find_codex_session_files(&sessions_dir);
@@ -836,8 +904,9 @@ fn sync_codex_usage_logs(conn: &mut Connection) -> Result<(), String> {
                         tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_reasoning, tokens_total,
                         delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total,
                         duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, reasoning_effort
-                    ) VALUES ('codex', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     params![
+                        "codex",
                         entry.timestamp,
                         entry.timestamp.get(0..10).unwrap_or("unknown"),
                         entry.session_id,
@@ -1217,8 +1286,9 @@ fn sync_claude_usage_logs(conn: &mut Connection) -> Result<(), String> {
                         tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_reasoning, tokens_total,
                         delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total,
                         duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, reasoning_effort
-                    ) VALUES ('claude', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     params![
+                        "claude",
                         entry.timestamp,
                         entry.timestamp.get(0..10).unwrap_or("unknown"),
                         entry.session_id,
@@ -2201,15 +2271,147 @@ pub fn get_usage_entries_by_year(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex,
+    };
 
-    #[test]
-    fn parse_claude_session_file_deduplicates_request_usage() {
+    static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn temp_jsonl_path(prefix: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
         let unique = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        path.push(format!("claude-parser-{}.jsonl", unique));
+        let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        path.push(format!(
+            "{}-{}-{}-{}.jsonl",
+            prefix,
+            std::process::id(),
+            counter,
+            unique
+        ));
+        path
+    }
+
+    #[test]
+    fn parse_codex_session_file_derives_delta_from_cumulative_usage() {
+        let path = temp_jsonl_path("codex-parser");
+
+        let content = r#"{"timestamp":"2026-07-07T10:58:17.474Z","type":"session_meta","payload":{"session_id":"session-1","cwd":"/tmp/project","cli_version":"0.142.5","model":"gpt-5.5"}}
+{"timestamp":"2026-07-07T10:58:26.197Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110},"last_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110},"model_context_window":258400}}}
+{"timestamp":"2026-07-07T10:59:26.197Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110},"last_token_usage":{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":19347},"model_context_window":258400}}}
+{"timestamp":"2026-07-07T11:00:26.197Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":130,"cached_input_tokens":30,"output_tokens":15,"reasoning_output_tokens":7,"total_tokens":145},"last_token_usage":{"input_tokens":30,"cached_input_tokens":10,"output_tokens":5,"reasoning_output_tokens":3,"total_tokens":35},"model_context_window":258400}}}
+"#;
+
+        fs::write(&path, content).unwrap();
+        let entries = parse_codex_session_file(&path).unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(entries.len(), 3);
+
+        let first = entries[0].delta_tokens.as_ref().unwrap();
+        assert_eq!(first.input, 80);
+        assert_eq!(first.cache_read, Some(20));
+        assert_eq!(first.output, 10);
+        assert_eq!(first.reasoning, Some(4));
+        assert_eq!(first.total, 110);
+
+        let anomalous = entries[1].delta_tokens.as_ref().unwrap();
+        assert_eq!(anomalous.input, 0);
+        assert_eq!(anomalous.cache_read, Some(0));
+        assert_eq!(anomalous.output, 0);
+        assert_eq!(anomalous.reasoning, Some(0));
+        assert_eq!(anomalous.total, 0);
+
+        let third = entries[2].delta_tokens.as_ref().unwrap();
+        assert_eq!(third.input, 20);
+        assert_eq!(third.cache_read, Some(10));
+        assert_eq!(third.output, 5);
+        assert_eq!(third.reasoning, Some(3));
+        assert_eq!(third.total, 35);
+
+        let total = entries
+            .iter()
+            .map(|entry| entry.delta_tokens.as_ref().unwrap().total)
+            .sum::<u64>();
+        assert_eq!(total, 145);
+    }
+
+    #[test]
+    fn parse_codex_session_file_ignores_repeats_and_handles_resets() {
+        let path = temp_jsonl_path("codex-parser");
+
+        let content = r#"{"timestamp":"2026-06-17T13:50:00.000Z","type":"session_meta","payload":{"session_id":"session-2","cwd":"/tmp/project","cli_version":"0.142.5","model":"gpt-5.5"}}
+{"timestamp":"2026-06-17T13:50:51.243Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":200,"output_tokens":100,"reasoning_output_tokens":40,"total_tokens":1100},"last_token_usage":{"input_tokens":1000,"cached_input_tokens":200,"output_tokens":100,"reasoning_output_tokens":40,"total_tokens":1100},"model_context_window":121600}}}
+{"timestamp":"2026-06-17T13:50:54.339Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":200,"output_tokens":100,"reasoning_output_tokens":40,"total_tokens":1100},"last_token_usage":{"input_tokens":1000,"cached_input_tokens":200,"output_tokens":100,"reasoning_output_tokens":40,"total_tokens":1100},"model_context_window":121600}}}
+{"timestamp":"2026-06-17T13:53:01.169Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":121600},"last_token_usage":{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":0},"model_context_window":121600}}}
+{"timestamp":"2026-06-17T14:43:08.185Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":200,"cached_input_tokens":50,"output_tokens":20,"reasoning_output_tokens":8,"total_tokens":121820},"last_token_usage":{"input_tokens":200,"cached_input_tokens":50,"output_tokens":20,"reasoning_output_tokens":8,"total_tokens":220},"model_context_window":258400}}}
+"#;
+
+        fs::write(&path, content).unwrap();
+        let entries = parse_codex_session_file(&path).unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[0].delta_tokens.as_ref().unwrap().total, 1100);
+        assert_eq!(entries[1].delta_tokens.as_ref().unwrap().total, 0);
+        assert_eq!(entries[2].delta_tokens.as_ref().unwrap().total, 0);
+
+        let after_reset = entries[3].delta_tokens.as_ref().unwrap();
+        assert_eq!(after_reset.input, 150);
+        assert_eq!(after_reset.cache_read, Some(50));
+        assert_eq!(after_reset.output, 20);
+        assert_eq!(after_reset.reasoning, Some(8));
+        assert_eq!(after_reset.total, 220);
+    }
+
+    #[test]
+    fn sync_codex_usage_logs_writes_recomputed_delta_totals() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_codex_dir = std::env::var("CODEX_DIR").ok();
+        let mut codex_dir = std::env::temp_dir();
+        let unique = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        codex_dir.push(format!("codex-sync-{}-{}", std::process::id(), unique));
+
+        let sessions_dir = codex_dir.join("sessions/2026/07/07");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        let session_path = sessions_dir.join("rollout-2026-07-07T10-58-17-session-sync.jsonl");
+
+        let content = r#"{"timestamp":"2026-07-07T10:58:17.474Z","type":"session_meta","payload":{"session_id":"session-sync","cwd":"/tmp/project","cli_version":"0.142.5","model":"gpt-5.5"}}
+{"timestamp":"2026-07-07T10:58:26.197Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110},"last_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110},"model_context_window":258400}}}
+{"timestamp":"2026-07-07T10:59:26.197Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110},"last_token_usage":{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":19347},"model_context_window":258400}}}
+"#;
+
+        fs::write(&session_path, content).unwrap();
+        std::env::set_var("CODEX_DIR", &codex_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        sync_codex_usage_logs(&mut conn).unwrap();
+
+        let total: u64 = conn
+            .query_row(
+                "SELECT SUM(delta_total) FROM usage_entries WHERE assistant_type = 'codex' AND session_id = 'session-sync'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(total, 110);
+
+        if let Some(value) = old_codex_dir {
+            std::env::set_var("CODEX_DIR", value);
+        } else {
+            std::env::remove_var("CODEX_DIR");
+        }
+        let _ = fs::remove_dir_all(&codex_dir);
+    }
+
+    #[test]
+    fn parse_claude_session_file_deduplicates_request_usage() {
+        let path = temp_jsonl_path("claude-parser");
 
         let content = r#"{"type":"user","sessionId":"session-1","cwd":"/tmp/project","version":"2.1.201","timestamp":"2026-07-04T19:28:48.190Z","uuid":"u1","message":{"role":"user","content":"Build the report"}}
 {"type":"assistant","sessionId":"session-1","cwd":"/tmp/project","version":"2.1.201","timestamp":"2026-07-04T19:28:51.753Z","uuid":"a1","requestId":"req_1","message":{"id":"msg_1","role":"assistant","model":"claude-haiku-4-5-20251001","content":[{"type":"thinking","thinking":"working"}],"usage":{"input_tokens":10,"cache_creation_input_tokens":3,"cache_read_input_tokens":7,"output_tokens":5}}}
