@@ -13,7 +13,7 @@
 ### 1. 啟動看板
 
 ```bash
-git clone https://github.com/wengct/TokenUsageInsights.git
+git clone https://github.com/doggy8088/TokenUsageInsights.git
 cd TokenUsageInsights
 cargo run
 ```
