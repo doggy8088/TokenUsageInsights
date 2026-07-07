@@ -1,4 +1,4 @@
-import i18n from './i18n.js?v=14';
+import i18n from './i18n.js?v=15';
 
 // Globals
 let tokenChartInstance = null;
@@ -14,6 +14,8 @@ const chartPalette = {
 };
 
 const chartFontFamily = 'IBM Plex Sans';
+const SIDEBAR_STATE_STORAGE_KEY = 'sidebar_state';
+const utf8TextEncoder = new TextEncoder();
 
 // Cookie helper functions
 function setCookie(name, value, days = 365) {
@@ -296,6 +298,34 @@ function syncSidebarToggleButton() {
   sidebarToggleBtn.setAttribute('aria-expanded', String(!isCollapsed));
 }
 
+function getSavedSidebarState() {
+  const state = localStorage.getItem(SIDEBAR_STATE_STORAGE_KEY);
+  return state === 'collapsed' || state === 'expanded' ? state : null;
+}
+
+function saveSidebarState(isCollapsed) {
+  localStorage.setItem(SIDEBAR_STATE_STORAGE_KEY, isCollapsed ? 'collapsed' : 'expanded');
+}
+
+function setSidebarCollapsed(isCollapsed, { persist = false } = {}) {
+  const appContainer = document.querySelector('.app-container');
+  if (!appContainer) return;
+
+  appContainer.classList.toggle('sidebar-collapsed', isCollapsed);
+  if (persist) {
+    saveSidebarState(isCollapsed);
+  }
+  syncSidebarToggleButton();
+}
+
+function applyInitialSidebarState() {
+  const savedState = getSavedSidebarState();
+  const shouldCollapse = savedState
+    ? savedState === 'collapsed'
+    : window.innerWidth <= 1024;
+  setSidebarCollapsed(shouldCollapse);
+}
+
 function isEditableShortcutTarget(target) {
   if (!(target instanceof HTMLElement)) return false;
   const tagName = target.tagName.toLowerCase();
@@ -308,8 +338,7 @@ function isEditableShortcutTarget(target) {
 function toggleSidebar() {
   const appContainer = document.querySelector('.app-container');
   if (!appContainer) return;
-  appContainer.classList.toggle('sidebar-collapsed');
-  syncSidebarToggleButton();
+  setSidebarCollapsed(!appContainer.classList.contains('sidebar-collapsed'), { persist: true });
 }
 
 function updateLanguageUI() {
@@ -913,8 +942,7 @@ function initApp() {
       closeDrawer();
       const container = document.querySelector('.app-container');
       if (container && window.innerWidth <= 992) {
-        container.classList.add('sidebar-collapsed');
-        syncSidebarToggleButton();
+        setSidebarCollapsed(true, { persist: true });
       }
     }
   });
@@ -924,19 +952,13 @@ function initApp() {
   const appContainer = document.querySelector('.app-container');
   if (sidebarToggleBtn && appContainer) {
     sidebarToggleBtn.addEventListener('click', toggleSidebar);
-
-    // Collapse by default on medium/small screens (<= 1024px)
-    if (window.innerWidth <= 1024) {
-      appContainer.classList.add('sidebar-collapsed');
-    }
-    syncSidebarToggleButton();
+    applyInitialSidebarState();
   }
 
   // 自動依視窗大小變化調整收合狀態
   window.addEventListener('resize', () => {
     if (appContainer && window.innerWidth <= 992) {
-      appContainer.classList.add('sidebar-collapsed');
-      syncSidebarToggleButton();
+      setSidebarCollapsed(true);
     }
   });
 
@@ -946,15 +968,13 @@ function initApp() {
 
   if (sidebarOverlay && appContainer) {
     sidebarOverlay.addEventListener('click', () => {
-      appContainer.classList.add('sidebar-collapsed');
-      syncSidebarToggleButton();
+      setSidebarCollapsed(true, { persist: true });
     });
   }
 
   if (sidebarCloseBtn && appContainer) {
     sidebarCloseBtn.addEventListener('click', () => {
-      appContainer.classList.add('sidebar-collapsed');
-      syncSidebarToggleButton();
+      setSidebarCollapsed(true, { persist: true });
     });
   }
 
@@ -2431,18 +2451,29 @@ function renderTimeline(data) {
         const badgeText = isSuccess ? 'Success' : 'Executing';
 
         // 格式化 Args & Result 為 Pre 區塊
-        const argsStr = args ? JSON.stringify(args, null, 2) : '{}';
+        const argsStr = stringifyToolValue(args, '{}');
+        const argsBytes = getUtf8ByteLength(argsStr);
         
-        let resultStr = t('no_returned_data');
-        if (result) {
-          if (result.textResultForLlm) {
-            resultStr = result.textResultForLlm;
-          } else if (result.content) {
-            resultStr = result.content;
+        let rawResultStr = '';
+        if (result !== null && result !== undefined) {
+          if (Object.prototype.hasOwnProperty.call(result, 'textResultForLlm')) {
+            rawResultStr = stringifyToolValue(result.textResultForLlm);
+          } else if (Object.prototype.hasOwnProperty.call(result, 'content')) {
+            rawResultStr = stringifyToolValue(result.content);
           } else {
-            resultStr = JSON.stringify(result, null, 2);
+            rawResultStr = stringifyToolValue(result);
           }
         }
+        const outputBytes = getUtf8ByteLength(rawResultStr);
+        const resultStr = rawResultStr || t('no_returned_data');
+        const argsBytesLabel = formatHumanBytes(argsBytes);
+        const outputBytesLabel = formatHumanBytes(outputBytes);
+        const argsBytesTitle = t('tool_args_bytes_title')
+          .replace('{bytes}', argsBytesLabel)
+          .replace('{raw}', formatNumber(argsBytes));
+        const outputBytesTitle = t('tool_output_bytes_title')
+          .replace('{bytes}', outputBytesLabel)
+          .replace('{raw}', formatNumber(outputBytes));
 
         // 限制顯示長度，防止大日誌撐爆介面
         const truncatedResultStr = resultStr.length > 1500 ? resultStr.substring(0, 1500) + '\n' + t('data_truncated') : resultStr;
@@ -2454,6 +2485,8 @@ function renderTimeline(data) {
               <div class="tool-info">
                 <span class="tool-name">${escapeHtml(toolName)}</span>
                 <span class="${badgeClass}">${badgeText}</span>
+                <span class="badge data-size args" title="${escapeHtml(argsBytesTitle)}">${t('tool_args_size')}: ${escapeHtml(argsBytesLabel)}</span>
+                <span class="badge data-size output" title="${escapeHtml(outputBytesTitle)}">${t('tool_output_size')}: ${escapeHtml(outputBytesLabel)}</span>
               </div>
               <span class="toggle-icon">${iconMarkup('chevron-right', 'tool-toggle-icon')}</span>
             </div>
@@ -2517,6 +2550,35 @@ function renderTimeline(data) {
 function formatNumber(num) {
   if (num === null || num === undefined) return '-';
   return num.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+}
+
+function getUtf8ByteLength(value) {
+  if (value === null || value === undefined) return 0;
+  return utf8TextEncoder.encode(String(value)).length;
+}
+
+function stringifyToolValue(value, fallback = '') {
+  if (value === null || value === undefined) return fallback;
+  if (typeof value === 'string') return value;
+  const json = JSON.stringify(value, null, 2);
+  return json === undefined ? String(value) : json;
+}
+
+function formatHumanBytes(bytes) {
+  const n = Number(bytes) || 0;
+  if (n < 1024) return `${formatNumber(n)} B`;
+
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  let value = n / 1024;
+  let unitIndex = 0;
+
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex++;
+  }
+
+  const formatted = value < 10 ? value.toFixed(1) : Math.round(value).toString();
+  return `${formatted} ${units[unitIndex]}`;
 }
 
 function formatToken(num) {

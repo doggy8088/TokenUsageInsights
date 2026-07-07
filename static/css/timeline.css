@@ -694,15 +694,18 @@
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 12px;
   cursor: pointer;
 }
 
 .tool-info {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
   font-size: 12px;
   font-weight: 600;
+  min-width: 0;
 }
 
 .tool-info .tool-name {
@@ -727,6 +730,21 @@
 .tool-info .badge.success {
   color: var(--neon-green);
   border-color: rgba(0, 255, 135, 0.2);
+}
+
+.tool-info .badge.data-size {
+  color: var(--text-secondary);
+  border-color: rgba(148, 163, 184, 0.24);
+  background: rgba(148, 163, 184, 0.06);
+  font-family: var(--font-mono);
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.tool-info .badge.data-size.output {
+  color: #fbbf24;
+  border-color: rgba(251, 191, 36, 0.24);
+  background: rgba(251, 191, 36, 0.07);
 }
 
 .tool-header .toggle-icon {
