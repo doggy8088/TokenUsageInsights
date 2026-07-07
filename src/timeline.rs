@@ -645,7 +645,7 @@ pub fn parse_codex_timeline(
     timeline: &mut Vec<TimelineItem>,
     metadata: &mut HashMap<String, serde_json::Value>,
 ) {
-    let mut current_model = "Codex CLI".to_string();
+    let mut current_model = "GPT-5.3-Codex".to_string();
     let mut current_turn_no = 0u32;
     let mut next_agent_turn_no = 1u32;
     let mut tool_calls_map: HashMap<String, usize> = HashMap::new();

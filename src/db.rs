@@ -635,7 +635,7 @@ fn parse_codex_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String> 
     let mut parent_session_id: Option<String> = None;
     let mut agent_nickname: Option<String> = None;
     let mut agent_role: Option<String> = None;
-    let mut current_model = "Codex CLI".to_string();
+    let mut current_model = "GPT-5.3-Codex".to_string();
     let mut reasoning_effort: Option<String> = None;
 
     for event in &events {
