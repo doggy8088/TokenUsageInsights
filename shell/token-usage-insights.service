@@ -1,5 +1,5 @@
 [Unit]
-Description=Unified AI CLI Token Usage Insights Dashboard Service
+Description=Token 戰情室 Dashboard Service
 After=network.target
 
 [Service]

@@ -1,6 +1,6 @@
 ---
 version: alpha
-name: Token Usage Insights
+name: Token 戰情室
 description: Local-first AI CLI token usage and session reconstruction dashboard.
 colors:
   app-bg: "#07090D"
@@ -95,13 +95,13 @@ components:
     padding: "12px 16px"
 ---
 
-# Design System: Token Usage Insights
+# Design System: Token 戰情室
 
 ## Overview
 
 Creative North Star: "Local Operations Console"
 
-Token Usage Insights 的視覺系統應像本機開發者工作台上的操作主控台：資料密集、層級清楚、反應直接。重構後的介面以更克制的深色 surface 階層、青色互動狀態、側欄控制、sticky header、圖表、表格與右側 session drawer 組成；未來設計要延續這種工具型結構，而不是轉向展示型或行銷型頁面。
+Token 戰情室的視覺系統應像本機開發者工作台上的操作主控台：資料密集、層級清楚、反應直接。重構後的介面以更克制的深色 surface 階層、青色互動狀態、側欄控制、sticky header、圖表、表格與右側 session drawer 組成；未來設計要延續這種工具型結構，而不是轉向展示型或行銷型頁面。
 
 整體策略是 restrained product UI。深色主題是目前主要工作環境，淺色主題用於高環境光或偏好設定，但兩者都必須保留同一套元件語彙。毛玻璃、光暈與漸層已被壓低為結構輔助，不能作為預設裝飾。
 

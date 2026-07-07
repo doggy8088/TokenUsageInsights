@@ -135,7 +135,7 @@ async fn main() {
         .await
         .unwrap();
     println!(
-        "🚀 CLI Token Usage Insights Dashboard is running on: http://localhost:{}",
+        "🚀 Token 戰情室 is running on: http://localhost:{}",
         port
     );
 

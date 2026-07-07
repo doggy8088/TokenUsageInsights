@@ -14,7 +14,7 @@ RELEASE_BIN := target/release/$(PROJECT_NAME)
 	start-service stop-service restart-service status
 
 help:
-	@echo "Token Usage Insights Makefile"
+	@echo "Token 戰情室 Makefile"
 	@echo
 	@echo "常用指令："
 	@echo "  make run             啟動本機伺服器（預設 PORT=$(PORT)）"

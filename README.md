@@ -1,294 +1,393 @@
-# 🌟 Unified AI CLI Token Usage Insights Dashboard
+# Token 戰情室
 
-[English Version (英文版)](./README.en.md)
+**Token 戰情室是本地優先的 AI CLI Token 使用量與會話還原看板。** 它會讀取本機上的 Google Antigravity CLI、GitHub Copilot CLI、Codex CLI 與 Claude Code 記錄，集中呈現每日、月度、年度的 Token 消耗、快取使用、推理 Token、估算費用、模型分佈、專案目錄分佈與完整 Session 時間軸。
 
-這是一個專為本地終端 AI 助理（**Google Antigravity CLI**、**GitHub Copilot CLI** 與 **Codex CLI**）設計的本地 Token 消耗與會話分析綜合看板。使用高效能的 **Rust (Axum)** 作為後端，搭配 **深色毛玻璃風格 (Glassmorphism)** 前端，協助您在一處集中查看所有本地 AI 助理的 Token 使用量、命中率、對話耗時以及**還原與重建每個會話的完整歷史對話時間軸**！
+本專案不會替你呼叫 AI 供應商 API 查詢資料；核心資料來源是本機日誌、Status Line 收集檔與本機 SQLite。
 
-> [!IMPORTANT]
-> **系統環境限制 (System Requirement)**: 本專案僅支援在 **WSL (Windows Subsystem for Linux)** 或 **macOS** 環境下使用。
+> 系統環境：目前以 macOS 與 WSL 為主要支援環境。
 
----
+* * *
 
-## 🤖 給 Agent / 自動化流程的安裝提示
-如果您想讓另一個 AI Agent 或自動化工具快速完成安裝，請直接貼上以下更完整的提示詞：
+## 最短上手路徑
+
+### 1. 啟動看板
+
+```bash
+git clone https://github.com/wengct/TokenUsageInsights.git
+cd TokenUsageInsights
+cargo run
+```
+
+開啟：
 
 ```text
-請在這個環境中安裝並啟動 Unified AI CLI Token Usage Insights Dashboard，並以本地流程完成設定。
+http://localhost:3003
+```
 
-工作目標：
-- 安裝並啟動這個 Rust/Axum 專案。
-- 配置 Google Antigravity CLI 與 GitHub Copilot CLI 的 statusLine 收集腳本，以便在本地自動收集 Token 使用數據。
-- 確認看板可在 http://localhost:3003 正常開啟。
+### 2. 依你使用的 CLI 決定是否需要設定
 
-請依序完成以下步驟：
-1. 先確認目前工作目錄是這個專案的根目錄，並確認以下檔案存在：
-   - shell/antigravity/statusline-token.sh
-   - shell/copilot/statusline-token.sh
-2. 確認 Rust 工具鏈已安裝；若沒有，請使用 rustup 安裝。
-3. 執行 cargo build --release，建立 Release 版本二進位檔。
-4. 設定 Google Antigravity CLI：
-   - 建立或確認 ~/.gemini/antigravity-cli 目錄存在。
-   - 將 shell/antigravity/statusline-token.sh 複製到 ~/.gemini/antigravity-cli/statusline-token.sh。
-   - 賦予腳本可執行權限：chmod +x ~/.gemini/antigravity-cli/statusline-token.sh。
-   - 更新 ~/.gemini/antigravity-cli/settings.json：
-     - 若檔案不存在，建立一個新的 JSON 檔案，內容必須是合法的 JSON 物件，並加入 statusLine 設定。
-     - 若檔案已存在，請保留原有設定，並將 statusLine 區塊合併進去；請務必維持原本的 JSON 結構，不要把現有設定改成陣列或其他非物件格式。
-     - statusLine 的 command 應指向 ~/.gemini/antigravity-cli/statusline-token.sh，請使用實際的家目錄路徑（可由 echo $HOME 取得）。
-     - statusLine 範例如下：
-       {
-         "statusLine": {
-           "type": "command",
-           "command": "$HOME/.gemini/antigravity-cli/statusline-token.sh",
-           "padding": 1
-         }
-       }
-5. 設定 GitHub Copilot CLI：
-   - 建立或確認 ~/.copilot 目錄存在。
-   - 將 shell/copilot/statusline-token.sh 複製到 ~/.copilot/statusline-token.sh。
-   - 賦予腳本可執行權限：chmod +x ~/.copilot/statusline-token.sh。
-   - 更新 ~/.copilot/settings.json：
-     - 若檔案不存在，建立一個新的 JSON 檔案，內容必須是合法的 JSON 物件，並加入 statusLine 設定。
-     - 若檔案已存在，請保留原有設定，並將 statusLine 區塊合併進去；請務必維持原本的 JSON 結構。
-     - statusLine 的 command 應指向 ~/.copilot/statusline-token.sh，請使用實際的家目錄路徑（可由 echo $HOME 取得）。
-     - statusLine 範例如下：
-       {
-         "statusLine": {
-           "type": "command",
-           "command": "$HOME/.copilot/statusline-token.sh",
-           "padding": 1
-         }
-       }
-6. 驗證腳本與設定是否有效：
-   - 測試執行：echo '{}' | ~/.gemini/antigravity-cli/statusline-token.sh，確認腳本可正常執行。
-   - 測試執行：echo '{}' | ~/.copilot/statusline-token.sh，確認腳本可正常執行。
-   - 確認 JSON 格式正確：可以使用 jq 或 python -m json.tool 檢查 ~/.gemini/antigravity-cli/settings.json 與 ~/.copilot/settings.json。
-7. 回到專案根目錄，執行 cargo run 啟動看板服務。
-8. 確認終端輸出包含 http://localhost:3003，並在瀏覽器確認該網址可存取。
+| CLI | 是否需要額外設定 | 預設資料來源 | 說明 |
+| --- | --- | --- | --- |
+| Google Antigravity CLI | 需要 | `~/.gemini/antigravity-cli/usage/usage-YYYY-MM-DD.jsonl` | 透過本專案提供的 `statusline-token.sh` 收集 Token 資料 |
+| GitHub Copilot CLI | 需要 | `~/.copilot/usage/usage-YYYY-MM-DD.jsonl` | 透過本專案提供的 `statusline-token.sh` 收集 Token 資料 |
+| Codex CLI | 不需要 | `~/.codex/sessions` | 看板會直接掃描 Codex CLI 本機 Session 記錄 |
+| Claude Code | 不需要 | `~/.claude/projects` | 看板會直接掃描 Claude Code 本機專案 Session 記錄 |
+
+**只使用 Codex CLI 或 Claude Code 時，通常只要 `cargo run` 後打開看板即可。**
+
+* * *
+
+## 支援功能
+
+### 資料分析
+
+- 每日、月度、年度 Token 統計
+- 輸入、輸出、快取讀取、快取寫入、推理 Token 分拆
+- 依 `pricing.csv` 進行本地估算費用
+- Session 數、請求次數與 API 耗時統計
+- 模型使用量排名
+- 專案工作目錄統計
+- 可排序的 Session 清單
+
+### Session 還原
+
+- 右側抽屜式 Session 時間軸
+- 使用者提示詞、助理回覆、推理內容與工具呼叫步驟
+- 工具呼叫參數、退出碼、stdout、stderr
+- Codex subagent 相關欄位，如 parent session、agent nickname、agent role
+- Markdown 回覆渲染與內容清理
+
+### 介面操作
+
+- 四種 CLI 徽章切換
+- 每日、月度、年度視圖
+- 日期、月份、年份快速切換
+- 5 秒、10 秒、30 秒即時自動刷新
+- 手動同步本機日誌到 SQLite
+- 深色與淺色主題
+- 繁中與英文介面切換
+- 模型費用表檢視
+
+* * *
+
+## Google Antigravity CLI 設定
+
+Antigravity CLI 需要把本專案的 Status Line 腳本接到 `settings.json`。腳本會把每次對話後的 Token 累計與增量寫入：
+
+```text
+~/.gemini/antigravity-cli/usage/usage-YYYY-MM-DD.jsonl
+```
+
+### 1. 安裝收集腳本
+
+```bash
+mkdir -p ~/.gemini/antigravity-cli
+cp shell/antigravity/statusline-token.sh ~/.gemini/antigravity-cli/statusline-token.sh
+chmod +x ~/.gemini/antigravity-cli/statusline-token.sh
+```
+
+### 2. 設定 `~/.gemini/antigravity-cli/settings.json`
+
+若檔案不存在，可以建立以下內容。若檔案已存在，請只合併 `statusLine` 區塊，不要覆蓋原本設定。
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "/ABSOLUTE/HOME/.gemini/antigravity-cli/statusline-token.sh",
+    "padding": 1
+  }
+}
+```
+
+請將 `/ABSOLUTE/HOME` 替換成 `echo $HOME` 顯示的實際家目錄路徑，例如 `/Users/will` 或 `/home/will`。
+
+### 3. 驗證
+
+```bash
+echo '{}' | ~/.gemini/antigravity-cli/statusline-token.sh
+jq . ~/.gemini/antigravity-cli/settings.json
+```
+
+完成後重新進入 Antigravity CLI Session，狀態列會輸出類似格式：
+
+```text
+model-name • #3 • input 12.3k • cache 4.5k/0 • output 1.2k • reasoning 500 • total 18.5k
+```
+
+* * *
+
+## GitHub Copilot CLI 設定
+
+Copilot CLI 與 Antigravity CLI 一樣，需要把本專案的 Status Line 腳本接到 `settings.json`。腳本會把 Token 資料寫入：
+
+```text
+~/.copilot/usage/usage-YYYY-MM-DD.jsonl
+```
+
+### 1. 安裝收集腳本
+
+```bash
+mkdir -p ~/.copilot
+cp shell/copilot/statusline-token.sh ~/.copilot/statusline-token.sh
+chmod +x ~/.copilot/statusline-token.sh
+```
+
+### 2. 設定 `~/.copilot/settings.json`
+
+若檔案不存在，可以建立以下內容。若檔案已存在，請只合併 `statusLine` 區塊，不要覆蓋原本設定。
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "/ABSOLUTE/HOME/.copilot/statusline-token.sh",
+    "padding": 1
+  }
+}
+```
+
+請將 `/ABSOLUTE/HOME` 替換成 `echo $HOME` 顯示的實際家目錄路徑。
+
+### 3. 驗證
+
+```bash
+echo '{}' | ~/.copilot/statusline-token.sh
+jq . ~/.copilot/settings.json
+```
+
+完成後重新進入 Copilot CLI Session，狀態列會開始輸出並累積 Token 資料。
+
+* * *
+
+## Codex CLI 設定
+
+**Codex CLI 不需要安裝 Hook、Status Line 或額外收集腳本。**
+
+看板會直接掃描：
+
+```text
+~/.codex/sessions
+```
+
+使用方式：
+
+1. 先正常使用 Codex CLI 產生至少一個 Session。
+2. 啟動本專案。
+3. 在左側選擇 Codex CLI。
+4. 按右上角同步按鈕，或等待背景同步。
 
 注意事項：
-- Codex CLI 不需要收集腳本或 statusLine 配置，系統會自動遞迴掃描您本地的 ~/.codex/sessions 目錄。
-- 這個專案以本地資料為主，請不要假設會使用遠端 API 或外部服務。
-- 若有任何步驟失敗，請停止並回報具體錯誤訊息與你執行的指令。
-- 完成後請提供簡短摘要，包含是否成功啟動、網址是否可訪問，以及任何需要注意的事項。
-```
 
----
+- Codex CLI 的身份憑證仍由 Codex CLI 自身管理。
+- 看板只讀取本地 Session 記錄並做分析。
+- API 額度資訊若有顯示，來源是最後一次本機 Session 日誌，不是即時線上查詢。
 
-## 🌟 核心特色 (Key Features)
+* * *
 
-本看板為多個終端 AI 助理提供統一的本地數據監控與可視化，核心特色如下：
+## Claude Code 設定
 
-1. **📊 統一即時分析看板 (Consolidated Real-time Dashboard)**
-   * **一站式彙整**：在一處看板同時監控 Google Antigravity CLI、GitHub Copilot CLI 與 Codex CLI 的 Token 總消耗、輸入/輸出 Token 佔比、快取讀取 Token 以及推理 Token 使用量。
-   * **圖表與趨勢**：以 Chart.js 繪製平滑曲線，展示每日各會話的 Token 消耗波動、快取命中率與對話 Turn 數。
-   * **🔴 即時更新機制 (Live Monitor)**：支援一鍵開啟自動刷新（可自訂 5s、10s 或 30s 頻率），與您的終端機對話保持即時同步，並有倒數計時進度條。
+**Claude Code 不需要安裝 Hook、Status Line 或額外收集腳本。**
 
-2. **📅 月度數據彙整與工具費用對比 (Monthly Aggregation & Cost Comparison)**
-   * **月度趨勢**：折線圖展示當月每日的 Token 使用總量與對話會話數。
-   * **最常活動的專案目錄**：統計不同專案目錄（CWD）下的會話次數與 Token 消耗，追蹤 AI 在各專案中的使用比率。
-   * **模型佔比分析**：分析當月使用的不同 LLM（如 Gemini, GPT-4o, Claude 等）的會話與 Token 分佈。
+看板會直接掃描：
 
-3. **🔍 互動式會話歷史清單 (Interactive Session History)**
-   * 提供完整會話列表，支援會話 ID/名稱、模型、Turn 數、Token 消耗及 API 耗時（毫秒）等欄位的即時升降冪排序，幫助快速篩選高消耗會話。
-
-4. **⏱️ 三大助理時間軸還原 (Session Timeline Drawer)**
-   * 點擊會話，右側滑出詳細的歷史對話時間軸。
-   * **對話重建**：
-     * **使用者提示詞 (User Prompt)**：對話泡泡與附加的 Context 狀態。
-     * **推理與回覆 (Agent Reply)**：呈現 LLM 的思維過程與帶有代碼高亮排版的 Markdown 內容。
-     * **工具呼叫步驟 (CLI Tool Step)**：展開 CLI 本地工具呼叫細節（引數、Exit Code、Stdout、Stderr），還原 AI 本地操作路徑。
-
----
-
-## 🔄 舊專案歷史資料自動遷移
-
-如果您先前曾安裝並使用過以下獨立的 Token 統計專案：
-* [copilot-cli-token-insights](https://github.com/wengct/copilot-cli-token-insights)
-* [antigravity-cli-token-insights](https://github.com/wengct/antigravity-cli-token-insights)
-* [codex-cli-token-insights](https://github.com/wengct/codex-cli-token-insights)
-
-當您啟動本專案時，後端服務會**自動偵測並將舊有的歷史數據遷移合併**至本專案的統一資料庫中，並安全備份原有的舊資料庫檔案，確保您的歷史統計數據無縫接軌不遺失。
-
-### 🗑️ 舊服務的停用與刪除方法
-
-由於本專案已經完整整合了上述所有舊專案的功能，為了避免多個背景服務重複運行造成衝突與不必要的資源消耗，建議您在確認資料遷移完成後，手動停用並刪除舊服務的常駐設定：
-
-1. **停止並取消自動啟用 (Disable) 舊服務**：
-   根據您先前安裝的專案，依序停用對應的 systemd 使用者服務。例如：
-   ```bash
-   # 停用舊版 Copilot 統計服務
-   systemctl --user stop copilot-cli-token-insights.service
-   systemctl --user disable copilot-cli-token-insights.service
-
-   # 停用舊版 Antigravity 統計服務
-   systemctl --user stop antigravity-cli-token-insights.service
-   systemctl --user disable antigravity-cli-token-insights.service
-
-   # 停用舊版 Codex 統計服務
-   systemctl --user stop codex-cli-token-insights.service
-   systemctl --user disable codex-cli-token-insights.service
-   ```
-
-2. **刪除舊服務的描述檔**：
-   ```bash
-   rm -f ~/.config/systemd/user/copilot-cli-token-insights.service
-   rm -f ~/.config/systemd/user/antigravity-cli-token-insights.service
-   rm -f ~/.config/systemd/user/codex-cli-token-insights.service
-   ```
-
-3. **重新載入 systemd 設定**：
-   ```bash
-   systemctl --user daemon-reload
-   systemctl --user reset-failed
-   ```
-
-4. **刪除舊專案的目錄 (選用)**：
-   若您不再需要舊專案的原始碼目錄，可以將其整個資料夾刪除以釋放空間。
-
----
-
-## ⚙️ 前置作業啟用指南
-
-本專案完全運行於本地端，請按照以下步驟完成各助理的數據收集配置：
-
-### 1️⃣ Codex CLI
-* **免安裝 Hook**：Codex 採用無侵入式設計，後端會自動遞迴掃描您本地的 `~/.codex/sessions` 目錄，無須進行任何 statusline 或 hook配置。
-
-### 2️⃣ Google Antigravity CLI
-1. **複製收集腳本**：
-   ```bash
-   mkdir -p ~/.gemini/antigravity-cli
-   cp shell/antigravity/statusline-token.sh ~/.gemini/antigravity-cli/statusline-token.sh
-   chmod +x ~/.gemini/antigravity-cli/statusline-token.sh
-   ```
-2. **編輯設定檔 `~/.gemini/antigravity-cli/settings.json`**：
-   若為全新配置，請寫入以下內容；若已有設定，請將 `statusLine` 物件合併進去：
-   ```json
-   {
-     "statusLine": {
-       "type": "command",
-       "command": "$HOME/.gemini/antigravity-cli/statusline-token.sh",
-       "padding": 1
-     }
-   }
-   ```
-   > [!NOTE]
-   > 請將 command 欄位中的路徑替換成您的實際家目錄絕對路徑（可執行 `echo $HOME` 查詢）。
-
-### 3️⃣ GitHub Copilot CLI
-1. **複製收集腳本**：
-   ```bash
-   mkdir -p ~/.copilot
-   cp shell/copilot/statusline-token.sh ~/.copilot/statusline-token.sh
-   chmod +x ~/.copilot/statusline-token.sh
-   ```
-2. **編輯設定檔 `~/.copilot/settings.json`**：
-   若為全新配置，請寫入以下內容；若已有設定，請將 `statusLine` 物件合併進去：
-   ```json
-   {
-     "statusLine": {
-       "type": "command",
-       "command": "$HOME/.copilot/statusline-token.sh",
-       "padding": 1
-     }
-   }
-   ```
-   > [!NOTE]
-   > 請將 command 欄位中的路徑替換成您的實際家目錄絕對路徑（可執行 `echo $HOME` 查詢）。
-
-### 💡 Status Line 實際顯示效果
-
-當您設定好 `statusLine` 並在終端機中與 AI 助理（Google Antigravity CLI 或 GitHub Copilot CLI）進行對話時，終端機畫面最下方（或狀態欄）會即時顯示目前會話的 Token 統計資訊。
-
-**畫面效果範例：**
 ```text
-🤖 gemini-1.5-pro • #3 • ↑ 12.3k • c 4.5k/0 • ↓ 1.2k • r 500 • total 18.5k • +2.1k • last 1.5k/0/200 • ctx 15%
+~/.claude/projects
 ```
 
-**欄位說明：**
-* 🤖 **模型名稱**：目前會話所使用的 LLM 模型。
-* **#回合數** (`#3`)：當前會話已進行的問答回合數。
-* **↑ 輸入 Token** (`↑ 12.3k`)：目前為止累計輸入的 Token 數（`k` 代表千，`m` 代表百萬）。
-* **c 快取命中率/寫入** (`c 4.5k/0`)：累計快取讀取（Cache Read）與快取寫入（Cache Write）的 Token 數。
-* **↓ 輸出 Token** (`↓ 1.2k`)：目前為止累計輸出的 Token 數。
-* **r 推理 Token** (`r 500`)：累計推理用的 Token 數。
-* **total 總 Token** (`total 18.5k`)：該會話累計消耗的總 Token 數。
-* **+增量 Token** (`+2.1k`)：本次對話所額外消耗的 Token 數量。
-* **last 上次呼叫** (`last 1.5k/0/200`)：上一次 API 請求的輸入/快取讀取/輸出 Token 數。
-* **ctx 上下文佔用率** (`ctx 15%` 或 `from <舊模型>`): 目前上下文窗口的使用百分比；若更換模型，則會顯示類似 `• from gemini-1.5-flash` 的模型更換提示。
+使用方式：
 
----
+1. 先正常使用 Claude Code 產生至少一個專案 Session。
+2. 啟動本專案。
+3. 在左側選擇 Claude Code。
+4. 按右上角同步按鈕，或等待背景同步。
 
-## 🚀 啟動與常駐服務
+注意事項：
 
-### 一、本地啟動
-在專案根目錄下執行：
+- Claude Code 的身份憑證仍由 Claude Code 自身管理。
+- 看板只讀取本地專案 Session 記錄並做分析。
+- 若 `~/.claude/projects` 不存在，Claude Code 頁面會顯示無資料。
+
+* * *
+
+## 本地資料同步方式
+
+啟動服務時，後端會初始化本機 SQLite 並立即同步一次資料。服務啟動後，也會每 5 秒背景同步一次。
+
+SQLite 預設位置：
+
+```text
+~/.token-usage-insights/token_usage_insights.db
+```
+
+前端右上角的同步按鈕會呼叫：
+
+```text
+GET /api/:assistant/sync
+```
+
+這會觸發一次完整的本機日誌增量同步。
+
+* * *
+
+## 環境變數
+
+環境變數指定的資料夾必須已存在；若不存在，程式會回到預設路徑。
+
+| 變數 | 預設值 | 用途 |
+| --- | --- | --- |
+| `PORT` | `3003` | 看板服務埠號 |
+| `INSIGHTS_DIR` | `~/.token-usage-insights` | SQLite 資料庫目錄 |
+| `ANTIGRAVITY_DIR` | `~/.gemini/antigravity-cli` | Antigravity CLI 資料目錄 |
+| `COPILOT_DIR` | `~/.copilot` | Copilot CLI 資料目錄 |
+| `CODEX_DIR` | `~/.codex` | Codex CLI 資料目錄 |
+| `CLAUDE_DIR` | `~/.claude` | Claude Code 資料目錄 |
+| `CORS_ALLOWED_ORIGINS` | `http://localhost:<PORT>,http://127.0.0.1:<PORT>` | 允許的 CORS 來源，逗號分隔 |
+
+範例：
+
 ```bash
+mkdir -p /tmp/token-usage-insights
+export INSIGHTS_DIR="/tmp/token-usage-insights"
+export PORT="3010"
 cargo run
 ```
-在瀏覽器打開 [**`http://localhost:3003`**](http://localhost:3003) 即可使用您的綜合看板！
 
-### 二、配置為 Systemd 使用者常駐背景服務
-1. **編譯發行版本二進位檔**：
-   ```bash
-   cargo build --release
-   ```
-2. **配置服務描述檔**：
-   ```bash
-   mkdir -p ~/.config/systemd/user/
-   sed "s|<PROJECT_DIR>|$PWD|g" shell/token-usage-insights.service > ~/.config/systemd/user/token-usage-insights.service
-   systemctl --user daemon-reload
-   ```
-3. **服務管理命令**：
-   * **啟動服務**：`systemctl --user start token-usage-insights.service`
-   * **設定自動啟動**：`systemctl --user enable token-usage-insights.service`
-   * **查看狀態**：`systemctl --user status token-usage-insights.service`
-   * **查看日誌**：`journalctl --user -u token-usage-insights.service -n 50 -f`
-   * **重啟服務**：`systemctl --user restart token-usage-insights.service`
-   * **停止服務**：`systemctl --user stop token-usage-insights.service`
+* * *
 
-### 三、專案更新與重新建置
-當本專案有新版本時，請按照以下步驟更新與重新建置：
+## 常駐服務
 
-1. **拉取最新程式碼**：
-   ```bash
-   git pull
-   ```
-2. **重新編譯**：
-   * 如果您是使用**本地直接啟動**，直接執行 `cargo run`，Rust 就會自動偵測變更並重新編譯。
-   * 如果您是使用 **Systemd 常駐背景服務**，請重新編譯發行版本：
-     ```bash
-     cargo build --release
-     ```
-3. **重啟服務（僅限 Systemd 使用者）**：
-   ```bash
-   systemctl --user restart token-usage-insights.service
-   ```
+### 1. 建置 release 版本
 
----
-
-## ⚙️ 進階配置與環境變數
-
-您可以透過設定環境變數來覆蓋預設的本地數據目錄：
-
-- `INSIGHTS_DIR`: 看板 SQLite 資料庫的儲存路徑（預設：`~/.token-usage-insights`）
-- `ANTIGRAVITY_DIR`: Google Antigravity CLI 的資料儲存目錄（預設：`~/.gemini/antigravity-cli`）
-- `COPILOT_DIR`: GitHub Copilot CLI 的資料儲存目錄（預設：`~/.copilot`）
-- `CODEX_DIR`: Codex CLI 的資料儲存目錄（預設：`~/.codex`）
-
-例如，自訂資料庫儲存目錄並啟動看板：
 ```bash
-export INSIGHTS_DIR="/your/custom/path"
-cargo run
+cargo build --release
 ```
+
+### 2. 安裝 systemd 使用者服務
+
+```bash
+mkdir -p ~/.config/systemd/user/
+sed "s|<PROJECT_DIR>|$PWD|g" shell/token-usage-insights.service > ~/.config/systemd/user/token-usage-insights.service
+systemctl --user daemon-reload
+systemctl --user enable token-usage-insights.service
+systemctl --user start token-usage-insights.service
+```
+
+### 3. 管理服務
+
+```bash
+systemctl --user status token-usage-insights.service
+journalctl --user -u token-usage-insights.service -n 50 -f
+systemctl --user restart token-usage-insights.service
+systemctl --user stop token-usage-insights.service
+```
+
+* * *
+
+## 舊資料遷移
+
+若你以前使用過下列獨立專案，啟動本專案時會自動嘗試遷移舊 SQLite 資料：
+
+- `~/.gemini/antigravity-cli/antigravity_cli_token_insights.db`
+- `~/.copilot/copilot_cli_token_insights.db`
+- `~/.codex/codex_cli_token_insights.db`
+
+遷移成功後，舊資料庫會被改名為 `.bak`。
+
+若你已確認資料遷移完成，可以停用舊服務：
+
+```bash
+systemctl --user stop copilot-cli-token-insights.service
+systemctl --user disable copilot-cli-token-insights.service
+systemctl --user stop antigravity-cli-token-insights.service
+systemctl --user disable antigravity-cli-token-insights.service
+systemctl --user stop codex-cli-token-insights.service
+systemctl --user disable codex-cli-token-insights.service
+
+rm -f ~/.config/systemd/user/copilot-cli-token-insights.service
+rm -f ~/.config/systemd/user/antigravity-cli-token-insights.service
+rm -f ~/.config/systemd/user/codex-cli-token-insights.service
+
+systemctl --user daemon-reload
+systemctl --user reset-failed
+```
+
+* * *
+
+## 疑難排查
+
+### 看板沒有資料
+
+依 CLI 檢查資料來源是否存在：
+
+```bash
+ls ~/.gemini/antigravity-cli/usage
+ls ~/.copilot/usage
+ls ~/.codex/sessions
+ls ~/.claude/projects
+```
+
+Antigravity CLI 與 Copilot CLI 還需要確認 `settings.json` 已設定 `statusLine`，且腳本具備執行權限。
+
+### Status Line 腳本無法執行
+
+```bash
+command -v jq
+chmod +x ~/.gemini/antigravity-cli/statusline-token.sh
+chmod +x ~/.copilot/statusline-token.sh
+```
+
+Status Line 腳本依賴 `jq` 解析 CLI 傳入的 JSON。
+
+### 設定檔 JSON 格式錯誤
+
+```bash
+jq . ~/.gemini/antigravity-cli/settings.json
+jq . ~/.copilot/settings.json
+```
+
+若已經有其他設定，請合併 `statusLine` 物件，不要把整個檔案替換成陣列或純字串。
+
+### 連不上 `localhost:3003`
+
+```bash
+PORT=3010 cargo run
+```
+
+若改用其他埠號，請開啟對應網址，例如：
+
+```text
+http://localhost:3010
+```
+
+* * *
+
+## 開發指令
+
+```bash
+cargo fmt
+cargo test
+cargo clippy --all-targets --all-features
+cargo build --release
+```
+
+* * *
+
+## 專案檔案
+
+```text
+src/                 Rust 後端、API、SQLite 同步、價格與時間軸解析
+static/              前端 HTML、JavaScript、CSS 與圖片資產
+shell/               Status Line 腳本與 systemd 服務範本
+pricing.csv          模型價格表，本地估算費用依此檔案載入
+```
+
+* * *
+
 ## 畫面展示
-<img width="1920" height="869" alt="image" src="https://github.com/user-attachments/assets/0e334f40-7771-4366-82f5-6f2bcec24b81" />
 
+<img width="1920" height="869" alt="Token 戰情室每日看板" src="https://github.com/user-attachments/assets/0e334f40-7771-4366-82f5-6f2bcec24b81" />
 
-<img width="1920" height="869" alt="image" src="https://github.com/user-attachments/assets/5ebc79ea-f44b-4c59-9f12-f37b4f6bb6e0" />
+<img width="1920" height="869" alt="Token 戰情室月度看板" src="https://github.com/user-attachments/assets/5ebc79ea-f44b-4c59-9f12-f37b4f6bb6e0" />
 
-
-<img width="1920" height="869" alt="image" src="https://github.com/user-attachments/assets/92739400-be86-4306-b7d6-aadc236c1aef" />
-
-
-
+<img width="1920" height="869" alt="Token 戰情室 Session 時間軸" src="https://github.com/user-attachments/assets/92739400-be86-4306-b7d6-aadc236c1aef" />
