@@ -428,8 +428,8 @@ pricing.csv          模型價格表，本地估算費用依此檔案載入
 
 ## 畫面展示
 
-<img width="1920" height="869" alt="Token 戰情室每日看板" src="https://github.com/user-attachments/assets/0e334f40-7771-4366-82f5-6f2bcec24b81" />
+![Token 戰情室每日看板](screenshots/codex-daily-2026-07-07-desktop-chrome.png)
 
-<img width="1920" height="869" alt="Token 戰情室月度看板" src="https://github.com/user-attachments/assets/5ebc79ea-f44b-4c59-9f12-f37b4f6bb6e0" />
+![Token 戰情室月度看板](screenshots/codex-daily-2026-07-07.png)
 
-<img width="1920" height="869" alt="Token 戰情室 Session 時間軸" src="https://github.com/user-attachments/assets/92739400-be86-4306-b7d6-aadc236c1aef" />
+![Token 戰情室 Session 時間軸](screenshots/codex-daily-2026-07-07-desktop-chrome.png)
