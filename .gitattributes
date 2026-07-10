@@ -1,0 +1,155 @@
+# --- 基本：自動偵測文字檔並正規化至 LF ---
+* text=auto
+
+# --- 一致化 LF（跨平台工具與 CI 友善） ---
+*.sh         text eol=lf
+*.bash       text eol=lf
+*.zsh        text eol=lf
+*.fish       text eol=lf
+Makefile     text eol=lf
+Dockerfile   text eol=lf
+.dockerignore text eol=lf
+.editorconfig text eol=lf
+.gitattributes text eol=lf
+.gitignore   text eol=lf
+*.md         text eol=lf
+*.txt        text eol=lf
+*.json       text eol=lf
+*.jsonc      text eol=lf
+*.yaml       text eol=lf
+*.yml        text eol=lf
+*.toml       text eol=lf
+*.ini        text eol=lf
+*.cfg        text eol=lf
+*.properties text eol=lf
+*.env        text eol=lf
+*.rc         text eol=lf
+
+# 程式碼檔案
+*.c          text eol=lf
+*.h          text eol=lf
+*.cpp        text eol=lf
+*.hpp        text eol=lf
+*.cc         text eol=lf
+*.cs         text eol=lf
+*.go         text eol=lf
+*.java       text eol=lf
+*.kt         text eol=lf
+*.kts        text eol=lf
+*.js         text eol=lf
+*.jsx        text eol=lf
+*.ts         text eol=lf
+*.tsx        text eol=lf
+*.mjs        text eol=lf
+*.cjs        text eol=lf
+*.py         text eol=lf
+*.rb         text eol=lf
+*.php        text eol=lf
+*.rs         text eol=lf
+*.swift      text eol=lf
+*.m          text eol=lf
+*.mm         text eol=lf
+*.scala      text eol=lf
+*.r          text eol=lf
+*.pl         text eol=lf
+*.lua        text eol=lf
+*.gradle     text eol=lf
+
+# 標記與前端相關
+*.css        text eol=lf
+*.scss       text eol=lf
+*.less       text eol=lf
+*.html       text eol=lf
+*.xhtml      text eol=lf
+*.xml        text eol=lf
+*.svg        text eol=lf
+
+# --- Windows 專用腳本與專案檔案：檢出時使用 CRLF ---
+*.bat        text eol=crlf
+*.cmd        text eol=crlf
+*.ps1        text eol=crlf
+*.sln        text eol=crlf
+*.vcxproj    text eol=crlf
+*.vcproj     text eol=crlf
+*.csproj     text eol=crlf
+*.vbproj     text eol=crlf
+*.props      text eol=crlf
+*.targets    text eol=crlf
+
+# --- 二進位檔案：停用行尾與 diff ---
+# 影像
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.webp binary
+*.ico  binary
+*.psd  binary
+*.ai   binary
+*.eps  binary
+
+# 影音
+*.mp3  binary
+*.wav  binary
+*.flac binary
+*.ogg  binary
+*.mp4  binary
+*.mov  binary
+*.avi  binary
+*.mkv  binary
+
+# 字型
+*.ttf  binary
+*.otf  binary
+*.woff binary
+*.woff2 binary
+
+# 文件與試算表
+*.pdf  binary
+*.doc  binary
+*.docx binary
+*.xls  binary
+*.xlsx binary
+*.ppt  binary
+*.pptx binary
+
+# 壓縮與封裝
+*.zip  binary
+*.7z   binary
+*.rar  binary
+*.gz   binary
+*.bz2  binary
+*.tar  binary
+*.jar  binary
+*.apk  binary
+*.ipa  binary
+
+# 執行檔與目標檔
+*.exe  binary
+*.dll  binary
+*.pdb  binary
+*.so   binary
+*.dylib binary
+*.a    binary
+*.lib  binary
+*.o    binary
+
+# 資料庫與快取
+*.sqlite binary
+*.db     binary
+
+# --- 降噪：縮小無意義 diff ---
+*.min.js -diff
+*.min.css -diff
+*.map    -diff
+
+# --- 選用：Git LFS（如已啟用，再解除註解） ---
+#*.psd filter=lfs diff=lfs merge=lfs -text
+#*.mp4 filter=lfs diff=lfs merge=lfs -text
+#*.zip filter=lfs diff=lfs merge=lfs -text
+
+# --- 選用：打包時不包含開發輔助檔 ---
+#/.github        export-ignore
+#/.gitignore     export-ignore
+#/.gitattributes export-ignore
+#/.editorconfig  export-ignore

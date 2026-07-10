@@ -17,6 +17,9 @@ Claude Opus 4.6 (Thinking) (<272k),Global,1M Tokens,5.00,0.50,25.00,N/A
 Claude Opus 4.6 (Thinking) (>272k),Global,1M Tokens,10.00,1.00,37.50,N/A
 Claude Opus 4.6 (Thinking),Global,1M Tokens,5.00,0.50,25.00,N/A
 GPT-OSS 120B (Medium),Local/OSS,1M Tokens,0.00,0.00,0.00,N/A
+gpt-5.6-sol,Global,1M Tokens,5.00,0.50,30.00,N/A
+gpt-5.6-terra,Global,1M Tokens,2.50,0.25,15.00,N/A
+gpt-5.6-luna,Global,1M Tokens,1.00,0.10,6.00,N/A
 GPT-5.5 (<272k),Global,1M Tokens,5.00,0.50,30.00,N/A
 GPT-5.5 (>272k),Global,1M Tokens,10.00,1.00,45.00,N/A
 GPT-5.5,Global,1M Tokens,5.00,0.50,30.00,N/A
@@ -115,7 +118,6 @@ claude-opus-4-7-fast,Cursor,1M Tokens,10.00,1.00,50.00,N/A
 claude-opus-4-7,Cursor,1M Tokens,5.00,0.50,25.00,N/A
 claude-opus-4-6,Cursor,1M Tokens,5.00,0.50,25.00,N/A
 claude-opus-4-5,Cursor,1M Tokens,5.00,0.50,25.00,N/A
-
 
 
 
