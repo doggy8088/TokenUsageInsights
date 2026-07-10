@@ -86,6 +86,9 @@ pub fn find_resource(relative: impl AsRef<Path>) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    // Only used by the Windows-specific test below; avoids an unused-import
+    // warning (which is a hard error under `-D warnings`) on other platforms.
+    #[cfg(windows)]
     use super::*;
 
     #[cfg(windows)]
