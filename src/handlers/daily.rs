@@ -277,7 +277,7 @@ pub async fn get_usage_details(
     let assistant_clone = assistant.clone();
     let date_clone = date.clone();
 
-    let entries_res: Result<Vec<(UsageEntry, String)>, String> =
+    let entries_res: Result<Vec<(crate::db::UsageDayExportRecord, String)>, String> =
         tokio::task::spawn_blocking(move || {
             let conn = db::get_db_conn()?;
             db::get_usage_entries_by_date(&conn, &date_clone, &assistant_clone)
@@ -308,7 +308,8 @@ pub async fn get_usage_details(
     let mut sessions_map: HashMap<String, (Vec<UsageEntry>, String)> = HashMap::new();
     let mut entries = Vec::new();
 
-    for (e, ast_type) in &entries_with_type {
+    for (record, ast_type) in &entries_with_type {
+        let e = &record.entry;
         entries.push(e.clone());
         let (list, _) = sessions_map
             .entry(e.session_id.clone())

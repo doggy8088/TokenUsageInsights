@@ -1,13 +1,32 @@
 use axum::{extract::Path, http::StatusCode, response::IntoResponse, Json};
+use chrono::{SecondsFormat, Utc};
 use std::{
     fs::File,
     io::{BufRead, BufReader},
     path::PathBuf,
 };
+use serde::{Deserialize, Serialize};
 
 use super::*;
-use crate::db;
+use crate::db::{self, UsageDayExportRecord};
 use crate::pricing::PricingEntry;
+
+#[derive(Serialize)]
+struct UsageDayExportResponse {
+    version: u8,
+    assistant: String,
+    date: String,
+    exported_at: String,
+    records: Vec<UsageDayExportRecord>,
+}
+
+#[derive(Deserialize)]
+pub struct UsageDayImportRequest {
+    #[serde(default)]
+    pub date: Option<String>,
+    #[serde(default)]
+    pub records: Vec<UsageDayExportRecord>,
+}
 
 /// API 7: 獲取模型價格清單 ( pricing.csv 資訊)
 pub async fn get_pricing(Path(assistant): Path<String>) -> impl IntoResponse {
@@ -163,5 +182,179 @@ pub async fn get_rate_limit(Path(assistant): Path<String>) -> impl IntoResponse 
             Json(serde_json::json!({ "error": "No rate limit data found" })),
         )
             .into_response(),
+    }
+}
+
+fn is_valid_date(date: &str) -> bool {
+    let parts: Vec<&str> = date.split('-').collect();
+    if parts.len() != 3 {
+        return false;
+    }
+
+    let year: i32 = match parts[0].parse() {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let month: i32 = match parts[1].parse() {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let day: i32 = match parts[2].parse() {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+
+    if year <= 0 || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return false;
+    }
+
+    true
+}
+
+fn normalize_import_payload_date(
+    route_date: &str,
+    payload_date: Option<String>,
+) -> Result<String, String> {
+    if let Some(payload_date) = payload_date {
+        if payload_date.trim().is_empty() {
+            return Err("缺少匯入檔案日期欄位".to_string());
+        }
+        if !is_valid_date(&payload_date) {
+            return Err("匯入檔案日期格式不正確".to_string());
+        }
+        if payload_date != route_date {
+            return Err(format!(
+                "匯入檔案日期 {payload_date} 與 API 路徑日期 {route_date} 不一致"
+            ));
+        }
+        return Ok(payload_date);
+    }
+
+    if is_valid_date(route_date) {
+        return Ok(route_date.to_string());
+    }
+
+    Err("日期格式不正確".to_string())
+}
+
+pub async fn export_usage_day(Path((assistant, date)): Path<(String, String)>) -> impl IntoResponse {
+    let assistant = normalize_assistant_name(&assistant);
+    if !is_supported_assistant(&assistant) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "不支援的助理類型" })),
+        )
+            .into_response();
+    }
+
+    if !is_valid_date(&date) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "日期格式不正確，請使用 YYYY-MM-DD" })),
+        )
+            .into_response();
+    }
+
+    let assistant_clone = assistant.clone();
+    let date_clone = date.clone();
+    let export_res = tokio::task::spawn_blocking(move || {
+        let conn = db::get_db_conn()?;
+        let records = db::export_usage_day_entries(&conn, &assistant_clone, &date_clone)?;
+        Ok::<Vec<crate::db::UsageDayExportRecord>, String>(records)
+    })
+    .await
+    .unwrap_or_else(|_| Err("導出任務執行失敗".to_string()));
+
+    match export_res {
+        Ok(records) => {
+            if records.is_empty() {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({ "error": "指定日期沒有可匯出的使用紀錄" })),
+                )
+                    .into_response()
+            } else {
+                let payload = UsageDayExportResponse {
+                    version: 1,
+                    assistant: assistant.clone(),
+                    date: date.clone(),
+                    exported_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+                    records,
+                };
+                (StatusCode::OK, Json(payload)).into_response()
+            }
+        }
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": err })),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn import_usage_day(
+    Path((assistant, date)): Path<(String, String)>,
+    Json(payload): Json<UsageDayImportRequest>,
+) -> impl IntoResponse {
+    let assistant = normalize_assistant_name(&assistant);
+    if !is_supported_assistant(&assistant) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "不支援的助理類型" })),
+        )
+            .into_response();
+    }
+
+    if !is_valid_date(&date) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "日期格式不正確，請使用 YYYY-MM-DD" })),
+        )
+            .into_response();
+    }
+
+    let import_date = match normalize_import_payload_date(&date, payload.date) {
+        Ok(v) => v,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": err })),
+            )
+                .into_response();
+        }
+    };
+
+    if payload.records.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "匯入資料為空" })),
+        )
+            .into_response();
+    }
+
+    let assistant_clone = assistant.clone();
+    let import_date_clone = import_date.clone();
+    let records = payload.records;
+    let import_res = tokio::task::spawn_blocking(move || {
+        let mut conn = db::get_db_conn()?;
+        let summary = db::import_usage_day_entries(&mut conn, &assistant_clone, &import_date_clone, records)?;
+        Ok::<crate::db::UsageDayImportSummary, String>(summary)
+    })
+    .await
+    .unwrap_or_else(|_| Err("匯入任務執行失敗".to_string()));
+
+    match import_res {
+        Ok(summary) => (StatusCode::OK, Json(summary)).into_response(),
+        Err(err) => {
+            let status = if err.contains("匯入資料日期不一致")
+                || err.contains("日期")
+                || err.contains("無效")
+            {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status, Json(serde_json::json!({ "error": err }))).into_response()
+        }
     }
 }

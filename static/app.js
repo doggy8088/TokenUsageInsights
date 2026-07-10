@@ -915,6 +915,24 @@ function initApp() {
     });
   }
 
+  const btnExportUsageDay = document.getElementById('btn-export-usage-day');
+  if (btnExportUsageDay) {
+    btnExportUsageDay.addEventListener('click', async () => {
+      await exportCurrentUsageDay();
+    });
+  }
+
+  const usageImportInput = document.getElementById('usage-day-import-input');
+  const btnImportUsageDay = document.getElementById('btn-import-usage-day');
+  if (btnImportUsageDay && usageImportInput) {
+    btnImportUsageDay.addEventListener('click', () => usageImportInput.click());
+    usageImportInput.addEventListener('change', async (e) => {
+      const file = e.target && e.target.files ? e.target.files[0] : null;
+      await importUsageDayFromFile(file);
+      e.target.value = '';
+    });
+  }
+
   // 監聽 Live 重新整理切換
   liveToggle.addEventListener('change', (e) => {
     toggleLiveRefresh(e.target.checked);
@@ -1337,6 +1355,144 @@ async function loadUsageData(date) {
   } catch (err) {
     console.error('載入使用量失敗:', err);
     showNotification(t('load_failed'), 'error');
+  }
+}
+
+function getCurrentUsageDayDate() {
+  const dateSelect = document.getElementById('date-select');
+  return dateSelect && dateSelect.value ? dateSelect.value : getLocalDateString();
+}
+
+function getUsageExportFilename(payload) {
+  const safeAssistant = currentAssistant || 'unknown';
+  const date = payload?.date || getCurrentUsageDayDate();
+  return `token-usage-${safeAssistant}-${date}-day-v${payload?.version || 1}.json`;
+}
+
+async function exportCurrentUsageDay() {
+  const date = getCurrentUsageDayDate();
+  const btnExport = document.getElementById('btn-export-usage-day');
+  if (btnExport) btnExport.classList.add('loading');
+
+  try {
+    const res = await fetch(`/api/${currentAssistant}/usage/${date}/export`);
+    const payload = await res.json().catch(() => null);
+
+    if (!res.ok) {
+      const err = payload && payload.error
+        ? payload.error
+        : t('export_no_data');
+      showNotification(err || t('export_failed').replace('{msg}', `${res.status} ${res.statusText}`), 'error');
+      return;
+    }
+    
+    const records = Array.isArray(payload?.records) ? payload.records : [];
+    if (records.length === 0) {
+      showNotification(t('export_no_data'), 'info');
+      return;
+    }
+
+    const filename = getUsageExportFilename(payload);
+    const blob = new Blob([JSON.stringify(payload, null, 2)], {
+      type: 'application/json;charset=utf-8',
+    });
+    const downloadUrl = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = downloadUrl;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(downloadUrl);
+
+    showNotification(
+      t('usage_exported')
+        .replace('{count}', String(records.length))
+        .replace('{date}', payload.date || date),
+      'success'
+    );
+  } catch (err) {
+    console.error('Export failed:', err);
+    showNotification(t('export_failed').replace('{msg}', err.message || String(err)), 'error');
+  } finally {
+    if (btnExport) btnExport.classList.remove('loading');
+  }
+}
+
+async function importUsageDayFromFile(file) {
+  if (!file) {
+    showNotification(t('import_no_file'), 'info');
+    return;
+  }
+
+  const importBtn = document.getElementById('btn-import-usage-day');
+  if (importBtn) importBtn.classList.add('loading');
+
+  try {
+    const rawText = await file.text();
+    let payload = null;
+
+    try {
+      payload = JSON.parse(rawText);
+    } catch {
+      showNotification(t('import_parse_failed'), 'error');
+      return;
+    }
+
+    const targetDate = typeof payload?.date === 'string' && payload.date.trim()
+      ? payload.date.trim()
+      : getCurrentUsageDayDate();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(targetDate)) {
+      showNotification(t('import_failed').replace('{msg}', t('invalid_import_date')), 'error');
+      return;
+    }
+    const records = Array.isArray(payload?.records) ? payload.records : [];
+
+    const res = await fetch(`/api/${currentAssistant}/usage/${targetDate}/import`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        date: targetDate,
+        records,
+      }),
+    });
+
+    const summary = await res.json().catch(() => null);
+    if (!res.ok) {
+      const err = summary && summary.error
+        ? summary.error
+        : t('import_failed').replace('{msg}', `${res.status} ${res.statusText}`);
+      showNotification(`${err}`, 'error');
+      return;
+    }
+
+    const imported = summary && typeof summary.imported === 'number' ? summary.imported : 0;
+    const total = summary && typeof summary.total === 'number' ? summary.total : records.length;
+    const skipped = summary && typeof summary.skipped_duplicates === 'number' ? summary.skipped_duplicates : 0;
+    let msg = t('usage_import_success')
+      .replace('{imported}', String(imported))
+      .replace('{total}', String(total));
+    if (skipped > 0) {
+      msg = `${msg}，${t('usage_import_skipped').replace('{skipped}', String(skipped))}`;
+    }
+    showNotification(msg, 'success');
+
+    const dateSelect = document.getElementById('date-select');
+    if (dateSelect) {
+      dateSelect.value = targetDate;
+    }
+    await fetchDates(targetDate, true);
+    if (activeTab !== 'daily') {
+      switchTab('daily');
+    }
+    await loadUsageData(targetDate);
+  } catch (err) {
+    console.error('Import failed:', err);
+    showNotification(t('import_failed').replace('{msg}', err.message || String(err)), 'error');
+  } finally {
+    if (importBtn) importBtn.classList.remove('loading');
   }
 }
 

@@ -53,6 +53,21 @@ pub struct UsageEntry {
     pub reasoning_effort: Option<String>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct UsageDayExportRecord {
+    #[serde(flatten)]
+    pub entry: UsageEntry,
+    pub import_source_id: Option<String>,
+}
+
+#[derive(Serialize, Debug)]
+pub struct UsageDayImportSummary {
+    pub date: String,
+    pub total: usize,
+    pub imported: usize,
+    pub skipped_duplicates: usize,
+}
+
 // Claude Code helper structs
 #[derive(Debug, Clone, Default, Deserialize)]
 struct ClaudeUsage {
@@ -82,6 +97,65 @@ struct CodexTokenUsage {
 }
 
 const CODEX_PARSER_MIGRATION_KEY: &str = "migration:codex_session_identity_v6";
+
+fn hash_fnv1a_64(input: &str) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in input.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn normalize_import_source_id(raw: Option<&str>) -> Option<String> {
+    let value = raw?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+fn build_import_token_signature(tokens: &Option<TokenStats>) -> String {
+    if let Some(t) = tokens {
+        format!(
+            "{}|{}|{}|{}|{}|{}",
+            t.input,
+            t.output,
+            t.cache_read.unwrap_or(0),
+            t.cache_write.unwrap_or(0),
+            t.reasoning.unwrap_or(0),
+            t.total
+        )
+    } else {
+        "null".to_string()
+    }
+}
+
+fn build_usage_entry_import_source_id(
+    assistant: &str,
+    date: &str,
+    entry: &UsageEntry,
+) -> String {
+    let signature = format!(
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        assistant,
+        date,
+        entry.timestamp,
+        entry.session_id,
+        entry.turn_no,
+        entry.model.clone().unwrap_or_else(|| "".to_string()),
+        entry.model_id.clone().unwrap_or_else(|| "".to_string()),
+        entry.version.clone().unwrap_or_else(|| "".to_string()),
+        entry.cwd.clone().unwrap_or_else(|| "".to_string()),
+        entry.transcript_path.clone().unwrap_or_else(|| "".to_string()),
+        entry.parent_session_id.clone().unwrap_or_else(|| "".to_string()),
+        entry.agent_nickname.clone().unwrap_or_else(|| "".to_string()),
+        entry.agent_role.clone().unwrap_or_else(|| "".to_string()),
+        build_import_token_signature(&entry.tokens),
+        build_import_token_signature(&entry.delta_tokens)
+    );
+    format!("{:016x}", hash_fnv1a_64(&signature))
+}
 
 /// Directory resolution helpers
 pub fn get_insights_dir() -> PathBuf {
@@ -273,6 +347,10 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
         "ALTER TABLE usage_entries ADD COLUMN delta_cache_write INTEGER",
         [],
     );
+    let _ = conn.execute(
+        "ALTER TABLE usage_entries ADD COLUMN import_source_id TEXT",
+        [],
+    );
 
     // Unique index on assistant, session, and turn
     conn.execute(
@@ -294,6 +372,11 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
         [],
     )
     .map_err(|e| format!("建立助理類型索引 idx_assistant_type 失敗: {}", e))?;
+
+    let _ = conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uidx_assistant_import_source_id ON usage_entries(assistant_type, import_source_id) WHERE import_source_id IS NOT NULL",
+        [],
+    );
 
     // Sync state tracking table
     conn.execute(
@@ -2054,12 +2137,12 @@ pub fn get_usage_entries_by_date(
     conn: &rusqlite::Connection,
     date: &str,
     assistant: &str,
-) -> Result<Vec<(UsageEntry, String)>, String> {
+) -> Result<Vec<(UsageDayExportRecord, String)>, String> {
     let mut query = "SELECT 
             timestamp, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
             tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_reasoning, tokens_total,
             delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total,
-            duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, assistant_type, reasoning_effort
+            duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, assistant_type, reasoning_effort, import_source_id
          FROM usage_entries WHERE date = ?".to_string();
     let mut params_vec = Vec::new();
     params_vec.push(rusqlite::types::Value::Text(date.to_string()));
@@ -2184,9 +2267,14 @@ pub fn get_usage_entries_by_date(
         } else {
             None
         };
+        let import_source_id = normalize_import_source_id(
+            row.get::<_, Option<String>>(28)
+                .map_err(|e| e.to_string())?
+                .as_deref(),
+        );
 
-        entries.push((
-            UsageEntry {
+        let mut record = UsageDayExportRecord {
+            entry: UsageEntry {
                 timestamp: row.get(0).map_err(|e| e.to_string())?,
                 session_id: row.get(1).map_err(|e| e.to_string())?,
                 session_name: row.get(2).ok(),
@@ -2205,10 +2293,143 @@ pub fn get_usage_entries_by_date(
                 agent_role: row.get(25).ok(),
                 reasoning_effort: row.get(27).ok(),
             },
-            ast_type,
-        ));
+            import_source_id,
+        };
+
+        if record.import_source_id.is_none() {
+            record.import_source_id =
+                Some(build_usage_entry_import_source_id(assistant, date, &record.entry));
+        }
+
+        entries.push((record, ast_type));
     }
     Ok(entries)
+}
+
+fn entry_date_from_timestamp(timestamp: &str) -> Option<&str> {
+    let trimmed = timestamp.trim();
+    trimmed
+        .split(|c| c == 'T' || c == ' ')
+        .next()
+        .filter(|date_part| date_part.len() == 10)
+}
+
+pub fn export_usage_day_entries(
+    conn: &rusqlite::Connection,
+    assistant: &str,
+    date: &str,
+) -> Result<Vec<UsageDayExportRecord>, String> {
+    let rows = get_usage_entries_by_date(conn, date, assistant)?;
+    let mut records = Vec::with_capacity(rows.len());
+
+    for (mut record, _assistant_type) in rows {
+        if record.import_source_id.is_none() {
+            record.import_source_id = Some(build_usage_entry_import_source_id(assistant, date, &record.entry));
+        }
+        records.push(record);
+    }
+
+    Ok(records)
+}
+
+pub fn import_usage_day_entries(
+    conn: &mut Connection,
+    assistant: &str,
+    date: &str,
+    records: Vec<UsageDayExportRecord>,
+) -> Result<UsageDayImportSummary, String> {
+    let total = records.len();
+    if total == 0 {
+        return Err("匯入資料為空".to_string());
+    }
+
+    let mut inserted = 0usize;
+    let mut skipped_duplicates = 0usize;
+
+    let tx = conn
+        .transaction()
+        .map_err(|e| format!("建立匯入交易失敗: {}", e))?;
+
+    for record in records {
+        let entry = record.entry;
+        let normalized_id = normalize_import_source_id(record.import_source_id.as_deref());
+        let file_date = entry_date_from_timestamp(&entry.timestamp)
+            .ok_or_else(|| "無效的 timestamp 格式，無法取得日期".to_string())?;
+        if file_date != date {
+            return Err(format!(
+                "匯入資料日期不一致：預期 {date}，但資料為 {file_date}"
+            ));
+        }
+
+        let source_id = normalized_id.unwrap_or_else(|| {
+            build_usage_entry_import_source_id(assistant, date, &entry)
+        });
+
+        let imported = tx
+            .execute(
+                "INSERT OR IGNORE INTO usage_entries (
+                    assistant_type, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no,
+                    model, model_id, tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_reasoning, tokens_total,
+                    delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total,
+                    duration_ms, premium_requests,
+                    parent_session_id, agent_nickname, agent_role, reasoning_effort, import_source_id
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?
+                )",
+                rusqlite::params![
+                    assistant,
+                    entry.timestamp,
+                    date,
+                    entry.session_id,
+                    entry.session_name,
+                    entry.transcript_path,
+                    entry.cwd,
+                    entry.version,
+                    entry.turn_no as i64,
+                    entry.model,
+                    entry.model_id,
+                    entry.tokens.as_ref().and_then(|t| Some(t.input as i64)),
+                    entry.tokens.as_ref().and_then(|t| Some(t.output as i64)),
+                    entry.tokens.as_ref().and_then(|t| t.cache_read.map(|v| v as i64)),
+                    entry.tokens.as_ref().and_then(|t| t.cache_write.map(|v| v as i64)),
+                    entry.tokens.as_ref().and_then(|t| t.reasoning.map(|v| v as i64)),
+                    entry.tokens.as_ref().and_then(|t| Some(t.total as i64)),
+                    entry.delta_tokens.as_ref().and_then(|t| Some(t.input as i64)),
+                    entry.delta_tokens.as_ref().and_then(|t| Some(t.output as i64)),
+                    entry.delta_tokens.as_ref().and_then(|t| t.cache_read.map(|v| v as i64)),
+                    entry.delta_tokens.as_ref().and_then(|t| t.cache_write.map(|v| v as i64)),
+                    entry.delta_tokens.as_ref().and_then(|t| t.reasoning.map(|v| v as i64)),
+                    entry.delta_tokens.as_ref().and_then(|t| Some(t.total as i64)),
+                    entry.cost.as_ref().and_then(|c| c.total_api_duration_ms).map(|v| v as i64),
+                    entry.cost.as_ref().and_then(|c| c.total_premium_requests).map(|v| v as i64),
+                    entry.parent_session_id,
+                    entry.agent_nickname,
+                    entry.agent_role,
+                    entry.reasoning_effort,
+                    source_id,
+                ],
+            )
+            .map_err(|e| format!("匯入資料寫入失敗: {}", e))?;
+
+        if imported > 0 {
+            inserted += 1;
+        } else {
+            skipped_duplicates += 1;
+        }
+    }
+
+    tx.commit()
+        .map_err(|e| format!("提交匯入結果失敗: {}", e))?;
+
+    Ok(UsageDayImportSummary {
+        date: date.to_string(),
+        total,
+        imported: inserted,
+        skipped_duplicates,
+    })
 }
 
 pub fn get_session_assistant_and_transcript(

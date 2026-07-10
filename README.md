@@ -254,6 +254,39 @@ GET /api/:assistant/sync
 
 這會觸發一次完整的本機日誌增量同步。
 
+## CLI 匯入 / 匯出（跨機器彙整）
+
+除網頁 UI 右上角按鈕外，專案也提供 CLI 工具可直接在終端機操作：
+
+`--agent` 會指定助理（`antigravity` / `copilot` / `codex` / `claude` / `cursor`）
+
+```bash
+# 匯出（輸出 JSON，含匯入唯一 id）
+cargo run --bin token-usage-insights-cli -- export --agent codex --date 2026-07-09 --out daily-codex-2026-07-09.json
+```
+
+```bash
+# 匯入（以匯入結果中的 date 或 `--date` 為準）
+cargo run --bin token-usage-insights-cli -- import --agent codex --file daily-codex-2026-07-09.json
+```
+
+```bash
+# 取得 CLI usage 說明
+cargo run --bin token-usage-insights-cli -- --help
+cargo run --bin token-usage-insights-cli -- export --help
+cargo run --bin token-usage-insights-cli -- import --help
+```
+
+資料格式使用和前端一致，內含欄位：
+
+- `version`
+- `assistant`
+- `date`
+- `exported_at`
+- `records`（每筆會有 `import_source_id`）
+
+`import_source_id` 會與 `assistant_type` 一起做唯一鍵，重複匯入同一筆會被判為重複並自動跳過，不會重複寫入資料庫。
+
 * * *
 
 ## 環境變數

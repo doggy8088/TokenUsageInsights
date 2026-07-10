@@ -1,6 +1,6 @@
 use axum::{
     http::{header::CONTENT_TYPE, Method},
-    routing::get,
+    routing::{get, post},
     Router,
 };
 use std::path::PathBuf;
@@ -108,6 +108,8 @@ async fn main() {
         .route("/api/:assistant/dates", get(get_available_dates))
         .route("/api/:assistant/setup-info", get(get_setup_info))
         .route("/api/:assistant/usage/:date", get(get_usage_details))
+        .route("/api/:assistant/usage/:date/export", get(export_usage_day))
+        .route("/api/:assistant/usage/:date/import", post(import_usage_day))
         .route(
             "/api/:assistant/session/:session_id",
             get(get_session_details),

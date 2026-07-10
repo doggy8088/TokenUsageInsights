@@ -320,6 +320,15 @@
           </div>
         </div>
         <div class="header-controls" style="display: flex; align-items: center; gap: 10px;">
+          <button id="btn-export-usage-day" class="icon-btn usage-text-btn has-tooltip" data-i18n-title="btn_export_day_title" title="匯出當日資料" aria-label="匯出當日資料">
+            <span class="btn-transfer-icon" aria-hidden="true">↓</span>
+            <span data-i18n="btn_export_day">匯出</span>
+          </button>
+          <button id="btn-import-usage-day" class="icon-btn usage-text-btn has-tooltip" data-i18n-title="btn_import_day_title" title="匯入當日資料" aria-label="匯入當日資料">
+            <span class="btn-transfer-icon" aria-hidden="true">↑</span>
+            <span data-i18n="btn_import_day">匯入</span>
+          </button>
+          <input id="usage-day-import-input" type="file" accept="application/json,.json" style="display: none;" />
           <button id="lang-toggle-btn" class="flag-lang-btn" title="切換語言" aria-label="切換語言">🇹🇼</button>
           <button id="btn-pricing-sheet" class="icon-btn has-tooltip" data-i18n-title="btn_pricing_sheet" title="費用標準" aria-label="費用標準"><span class="icon-glyph icon-currency" aria-hidden="true"></span></button>
           <button id="btn-setup-guide" class="icon-btn has-tooltip" data-i18n-title="setup_guide_title" title="前置作業啟用教學" aria-label="前置作業啟用教學"><span class="icon-glyph icon-help" aria-hidden="true"></span></button>
