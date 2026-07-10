@@ -71,3 +71,11 @@
 - Detection signal: PowerShell reported `Cannot overwrite variable HOME because it is read-only or constant`.
 - Prevention rule: use descriptive response names such as `$homeResponse` instead of identifiers that differ from built-ins only by case.
 - Tripwire: treat PowerShell variable names as case-insensitive when reviewing inline verification scripts.
+
+## 2026-07-10 Optional remote files must not fail release discovery
+
+- Classification: environment-dependent tooling error.
+- Failure mode: a diagnostic batch treated an optional remote `tasks/todo.md` lookup as mandatory, causing the combined command to return failure despite successfully reading the release tag and version.
+- Detection signal: useful v0.1.1 output was present, but the batch exited non-zero only because the remote audit file did not exist.
+- Prevention rule: probe optional paths separately or explicitly normalize their absence to success; only required release artifacts may gate discovery.
+- Tripwire: label every remote read as required or optional before composing parallel release checks.

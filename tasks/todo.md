@@ -129,3 +129,49 @@
 - HTTP smoke passed: `/` and `/static/app.js` returned 200, the dashboard shell/title rendered in source, and the served script contains the cycle and identifier-safety fixes.
 - Browser-plugin validation was blocked by missing sandbox metadata in the browser runtime; no external-browser fallback was used.
 - Pre-migration DB/old binaries and startup logs are retained under `%TEMP%\token-usage-insights-pre-codex-v4-20260710-204706` for rollback.
+
+# 2026-07-10 release_v0.1.2
+
+## Goal and acceptance criteria
+
+- [x] Merge the existing remote v0.1.1, GPT-5.6 pricing, and line-ending commits without rewriting history.
+- [x] Bump crate, lockfile, and README release examples consistently to `0.1.2` / `v0.1.2`.
+- [x] Pass local release-gating tests, including the native Windows collector smoke.
+- [ ] Push `improve` and annotated tag `v0.1.2` without force.
+- [ ] Confirm the tag-triggered Release workflow succeeds for all four targets.
+- [ ] Confirm GitHub Release `v0.1.2` is published with four archives and `SHA256SUMS`.
+
+## Plan
+
+- [x] Inspect workflow triggers, remote branch divergence, existing tags, and v0.1.1 release state.
+- [x] Merge `origin/improve` into local `improve` with an explicit merge commit.
+- [x] Update all authoritative version references to 0.1.2.
+- [x] Run fmt, locked tests, Clippy, Windows collector smoke, and release build.
+- [ ] Commit the release bump and push branch/tag.
+- [ ] Monitor CI and validate the published release assets.
+
+## Risk and rollback
+
+- Risk: medium; pushing the tag creates public release artifacts.
+- Affected components: crate metadata, release packaging, four platform builds, and GitHub Release.
+- Rollback before tag push: revert the version commit locally.
+- Rollback after tag push but before publication: delete the remote tag only if the workflow fails before a release is published.
+- Published releases are immutable history by default; fix forward with a new patch tag instead of moving `v0.1.2`.
+- Monitoring signals: Release workflow job conclusions, artifact count/names, checksum presence, and release draft/prerelease flags.
+
+## Dependencies and environment
+
+- Authenticated GitHub CLI account `doggy8088` with `repo` and `workflow` scopes.
+- `origin` points to `doggy8088/TokenUsageInsights` and release triggers on every pushed tag.
+- No remote `v0.1.2` tag existed at discovery time.
+
+## Working notes
+
+- `v0.1.1` already existed and its Release workflow completed successfully, so the safe next patch is v0.1.2.
+- Local `b5e84a5` and remote commits were merged without conflicts or history rewriting.
+
+## Results
+
+- Local release gates passed: `cargo fmt -- --check`, `cargo test --locked` (12/12), `cargo clippy --locked --all-targets --all-features`, and `scripts/test-windows.ps1`.
+- An isolated `%TEMP%` `cargo build --release --locked` produced the 0.1.2 Windows binary (4,463,616 bytes); the verified temporary build tree was removed afterward.
+- Pending version commit, push, CI completion, and release asset verification.

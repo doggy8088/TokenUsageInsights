@@ -334,8 +334,8 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 建立任意 Git tag 並推送後，GitHub Actions 會自動建立 Release，並產出 Linux、macOS 與 Windows 的平台壓縮包。
 
 ```bash
-git tag v0.1.1
-git push origin v0.1.1
+git tag v0.1.2
+git push origin v0.1.2
 ```
 
 每個 Release 壓縮包都包含：
