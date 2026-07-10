@@ -175,3 +175,23 @@
 - Local release gates passed: `cargo fmt -- --check`, `cargo test --locked` (12/12), `cargo clippy --locked --all-targets --all-features`, and `scripts/test-windows.ps1`.
 - An isolated `%TEMP%` `cargo build --release --locked` produced the 0.1.2 Windows binary (4,463,616 bytes); the verified temporary build tree was removed afterward.
 - Pending version commit, push, CI completion, and release asset verification.
+
+## 2026-07-10 release_v0.1.2 發布結果
+
+- [x] `improve` 已推送至 `3854033b08b2146c133f6c46a431e808fe1fdbba`。
+- [x] annotated tag `v0.1.2` 已推送，且 peeled commit 與版本提交一致。
+- [x] GitHub Actions Release run `29095068751` 全部成功。
+- [x] Linux x64、macOS Intel、macOS Apple Silicon、Windows x64 四個建置 job 全部成功。
+- [x] Windows 原生 collector 測試與安裝後 HTTP smoke test 均通過。
+- [x] GitHub Release `Token 戰情室 v0.1.2` 已正式發布，非草稿且非預覽版。
+- [x] 四個平台封裝與 `SHA256SUMS` 共五個資產均存在。
+- [x] `SHA256SUMS` 共四筆，逐一涵蓋所有平台封裝。
+
+### Results
+
+- 版本提交：`3854033b08b2146c133f6c46a431e808fe1fdbba`（`release: bump version to 0.1.2`）。
+- CI：https://github.com/doggy8088/TokenUsageInsights/actions/runs/29095068751
+- Release：https://github.com/doggy8088/TokenUsageInsights/releases/tag/v0.1.2
+- 發布時間：`2026-07-10T13:13:54Z`。
+- 發布方式：推送 annotated tag `v0.1.2` 觸發既有 CI；未 force push、未改寫既有標籤或歷史。
+- 回滾方式：保留既有 `v0.1.0`、`v0.1.1` Release；如需停止採用本版，可回退下載與部署至前一版，不需改寫 Git 歷史。
