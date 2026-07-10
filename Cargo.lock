@@ -763,7 +763,7 @@ dependencies = [
 
 [[package]]
 name = "token-usage-insights"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "axum",
  "chrono",
@@ -772,6 +772,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tower",
  "tower-http",
 ]
 

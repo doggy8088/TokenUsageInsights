@@ -1,4 +1,5 @@
 use axum::{
+    extract::DefaultBodyLimit,
     http::{header::CONTENT_TYPE, Method},
     routing::{get, post},
     Router,
@@ -14,6 +15,12 @@ mod pricing;
 mod timeline;
 
 use handlers::*;
+
+const MAX_IMPORT_PAYLOAD_BYTES: usize = 200_000_000;
+
+fn import_usage_route() -> axum::routing::MethodRouter {
+    post(import_usage_day).layer(DefaultBodyLimit::max(MAX_IMPORT_PAYLOAD_BYTES))
+}
 
 fn build_cors_layer() -> CorsLayer {
     let default_port = std::env::var("PORT")
@@ -109,7 +116,7 @@ async fn main() {
         .route("/api/:assistant/setup-info", get(get_setup_info))
         .route("/api/:assistant/usage/:date", get(get_usage_details))
         .route("/api/:assistant/usage/:date/export", get(export_usage_day))
-        .route("/api/:assistant/usage/:date/import", post(import_usage_day))
+        .route("/api/:assistant/usage/:date/import", import_usage_route())
         .route(
             "/api/:assistant/session/:session_id",
             get(get_session_details),
@@ -149,4 +156,37 @@ fn get_static_dir() -> PathBuf {
     }
     eprintln!("❌ 無法定位 static 目錄。請在專案根目錄下執行此程式。");
     std::process::exit(1);
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{
+        body::Body,
+        http::{header::CONTENT_TYPE, Method, Request, StatusCode},
+        Router,
+    };
+    use tower::ServiceExt;
+
+    use super::*;
+
+    #[test]
+    fn import_payload_limit_is_200_megabytes() {
+        assert_eq!(MAX_IMPORT_PAYLOAD_BYTES, 200_000_000);
+    }
+
+    #[tokio::test]
+    async fn import_route_allows_json_larger_than_the_default_limit() {
+        let app = Router::new().route("/api/:assistant/usage/:date/import", import_usage_route());
+        let payload = format!(r#"{{"padding":"{}"}}"#, "x".repeat(3 * 1024 * 1024));
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/unsupported/usage/2026-07-10/import")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(payload))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
 }

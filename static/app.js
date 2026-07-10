@@ -1,4 +1,4 @@
-import i18n from './i18n.js?v=15';
+import i18n from './i18n.js?v=16';
 
 // Globals
 let tokenChartInstance = null;

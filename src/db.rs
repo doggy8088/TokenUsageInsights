@@ -2377,7 +2377,7 @@ pub fn import_usage_day_entries(
                     ?, ?, ?, ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?
                 )",
                 rusqlite::params![
                     assistant,
@@ -2950,6 +2950,80 @@ mod tests {
             unique
         ));
         path
+    }
+
+    fn sample_import_record() -> UsageDayExportRecord {
+        UsageDayExportRecord {
+            entry: UsageEntry {
+                timestamp: "2026-07-10T12:34:56Z".to_string(),
+                session_id: "import-session".to_string(),
+                session_name: Some("匯入測試".to_string()),
+                transcript_path: Some("/tmp/import.json".to_string()),
+                cwd: Some("/tmp".to_string()),
+                version: Some("0.1.4".to_string()),
+                turn_no: 1,
+                model: Some("gpt-5".to_string()),
+                model_id: Some("gpt-5".to_string()),
+                tokens: Some(TokenStats {
+                    input: 100,
+                    output: 20,
+                    cache_read: Some(30),
+                    cache_write: Some(10),
+                    reasoning: Some(5),
+                    total: 120,
+                }),
+                delta_tokens: Some(TokenStats {
+                    input: 10,
+                    output: 2,
+                    cache_read: Some(3),
+                    cache_write: Some(1),
+                    reasoning: Some(1),
+                    total: 12,
+                }),
+                context: None,
+                cost: Some(CostStats {
+                    total_api_duration_ms: Some(125.0),
+                    total_duration_ms: None,
+                    total_premium_requests: Some(1.0),
+                }),
+                parent_session_id: Some("parent-session".to_string()),
+                agent_nickname: Some("worker".to_string()),
+                agent_role: Some("analysis".to_string()),
+                reasoning_effort: Some("high".to_string()),
+            },
+            import_source_id: Some("import-test-record".to_string()),
+        }
+    }
+
+    #[test]
+    fn import_usage_day_entries_writes_and_deduplicates_records() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let record = sample_import_record();
+
+        let first = import_usage_day_entries(
+            &mut conn,
+            "codex",
+            "2026-07-10",
+            vec![record.clone()],
+        )
+        .unwrap();
+        assert_eq!(first.imported, 1);
+        assert_eq!(first.skipped_duplicates, 0);
+
+        let second =
+            import_usage_day_entries(&mut conn, "codex", "2026-07-10", vec![record]).unwrap();
+        assert_eq!(second.imported, 0);
+        assert_eq!(second.skipped_duplicates, 1);
+
+        let imported_rows: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries WHERE assistant_type = ? AND import_source_id = ?",
+                params!["codex", "import-test-record"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(imported_rows, 1);
     }
 
     #[test]
