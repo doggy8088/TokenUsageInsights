@@ -276,19 +276,35 @@ function updateBrandLogo() {
 
 function languageMeta(lang) {
   return lang === 'en'
-    ? { flag: '🇺🇸', label: '美國', next: 'zh-TW' }
-    : { flag: '🇹🇼', label: '臺灣', next: 'en' };
+    ? { label: 'United States', next: 'zh-TW' }
+    : { label: '臺灣', next: 'en' };
+}
+
+// Flag artwork sourced from the open-source "flag-icons" project (lipis/flag-icons, MIT license):
+// https://github.com/lipis/flag-icons — local copies live in static/flags/{us,tw}.svg
+function languageFlagIcon(lang) {
+  const code = lang === 'en' ? 'us' : 'tw';
+  const label = lang === 'en' ? 'United States flag' : 'Taiwan flag';
+  return `<img src="/static/flags/${code}.svg" alt="${label}" class="lang-flag-icon" />`;
 }
 
 function updateLanguageToggle() {
   const langToggle = document.getElementById('lang-toggle-btn');
   if (!langToggle) return;
 
+  const langToggleIcon = document.getElementById('lang-toggle-icon');
+  const langToggleText = document.getElementById('lang-toggle-text');
+
   const meta = languageMeta(currentLang);
   const label = currentLang === 'en'
     ? `Switch language, current: United States`
     : `切換語言，目前：${meta.label}`;
-  langToggle.textContent = meta.flag;
+  if (langToggleIcon) {
+    langToggleIcon.innerHTML = languageFlagIcon(currentLang);
+  }
+  if (langToggleText) {
+    langToggleText.textContent = t('btn_language');
+  }
   langToggle.title = label;
   langToggle.setAttribute('aria-label', label);
 }

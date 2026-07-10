@@ -404,14 +404,55 @@ input {
   border-radius: var(--radius-lg);
   background: var(--surface-1);
   color: var(--text-primary);
-  font-size: 1.1rem;
-  line-height: 1;
+  font-size: 0;
   cursor: pointer;
   box-shadow: none;
   transition:
     transform 150ms var(--ease-out-quart),
     background-color 180ms var(--ease-out-quart),
     border-color 180ms var(--ease-out-quart);
+}
+
+.control-svg-icon {
+  width: 20px;
+  height: 20px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.control-svg-icon svg {
+  width: 20px;
+  height: 20px;
+  stroke: currentColor;
+  stroke-width: 2.2;
+  fill: none;
+  display: block;
+}
+
+.flag-lang-btn .control-svg-icon {
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.lang-flag-icon {
+  width: 20px;
+  height: 20px;
+  object-fit: cover;
+  display: block;
+  border-radius: 3px;
+}
+
+.sr-only {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  padding: 0 !important;
+  margin: -1px !important;
+  overflow: hidden !important;
+  clip: rect(0, 0, 0, 0) !important;
+  white-space: nowrap !important;
+  border: 0 !important;
 }
 
 .flag-lang-btn:hover {

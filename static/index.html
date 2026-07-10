@@ -320,16 +320,32 @@
           </div>
         </div>
         <div class="header-controls" style="display: flex; align-items: center; gap: 10px;">
-          <button id="btn-export-usage-day" class="icon-btn usage-text-btn has-tooltip" data-i18n-title="btn_export_day_title" title="匯出當日資料" aria-label="匯出當日資料">
-            <span class="btn-transfer-icon" aria-hidden="true">↓</span>
-            <span data-i18n="btn_export_day">匯出</span>
+          <button id="btn-export-usage-day" class="icon-btn has-tooltip" data-i18n-title="btn_export_day_title" title="匯出當日資料" aria-label="匯出當日資料">
+            <span class="control-svg-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M12 3v11" />
+                <path d="M8 10l4 4 4-4" />
+                <path d="M4 20h16" />
+              </svg>
+            </span>
+            <span class="sr-only" data-i18n="btn_export_day">匯出</span>
           </button>
-          <button id="btn-import-usage-day" class="icon-btn usage-text-btn has-tooltip" data-i18n-title="btn_import_day_title" title="匯入當日資料" aria-label="匯入當日資料">
-            <span class="btn-transfer-icon" aria-hidden="true">↑</span>
-            <span data-i18n="btn_import_day">匯入</span>
+          <button id="btn-import-usage-day" class="icon-btn has-tooltip" data-i18n-title="btn_import_day_title" title="匯入當日資料" aria-label="匯入當日資料">
+            <span class="control-svg-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M12 21V10" />
+                <path d="M8 14l4-4 4 4" />
+                <path d="M4 4h16" />
+              </svg>
+            </span>
+            <span class="sr-only" data-i18n="btn_import_day">匯入</span>
           </button>
           <input id="usage-day-import-input" type="file" accept="application/json,.json" style="display: none;" />
-          <button id="lang-toggle-btn" class="flag-lang-btn" title="切換語言" aria-label="切換語言">🇹🇼</button>
+          <button id="lang-toggle-btn" class="flag-lang-btn has-tooltip" title="切換語言" aria-label="切換語言">
+            <span id="lang-toggle-icon" class="control-svg-icon" aria-hidden="true">
+            </span>
+            <span id="lang-toggle-text" class="sr-only" data-i18n="btn_language">語言</span>
+          </button>
           <button id="btn-pricing-sheet" class="icon-btn has-tooltip" data-i18n-title="btn_pricing_sheet" title="費用標準" aria-label="費用標準"><span class="icon-glyph icon-currency" aria-hidden="true"></span></button>
           <button id="btn-setup-guide" class="icon-btn has-tooltip" data-i18n-title="setup_guide_title" title="前置作業啟用教學" aria-label="前置作業啟用教學"><span class="icon-glyph icon-help" aria-hidden="true"></span></button>
           <button id="btn-sync-db" class="icon-btn has-tooltip" data-i18n-title="sync_db_title" title="立即手動同步日誌檔到 SQLite 資料庫" aria-label="立即手動同步日誌檔到 SQLite 資料庫"><span class="icon-glyph icon-sync" aria-hidden="true"></span></button>
