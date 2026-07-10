@@ -4,7 +4,9 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
+#[path = "../db.rs"]
 mod db;
+#[path = "../paths.rs"]
 mod paths;
 
 const EXPORT_VERSION: u8 = 1;
