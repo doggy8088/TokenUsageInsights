@@ -169,22 +169,34 @@ pub async fn get_setup_info(Path(assistant): Path<String>) -> impl IntoResponse 
         Ok(dir) => dir.to_string_lossy().into_owned(),
         Err(_) => "".to_string(),
     };
-    let home_dir_path = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/home/user"));
+    let home_dir_path = dirs::home_dir().unwrap_or_default();
     let home_dir = home_dir_path.to_string_lossy().into_owned();
 
+    let script_name = if cfg!(windows) {
+        "statusline-token.ps1"
+    } else {
+        "statusline-token.sh"
+    };
+
     let anti_dir = db::get_antigravity_dir();
-    let anti_script = anti_dir
-        .join("statusline-token.sh")
-        .to_string_lossy()
-        .into_owned();
-    let anti_exists = anti_dir.exists();
+    let anti_script = anti_dir.join(script_name);
+    let anti_source_relative = if cfg!(windows) {
+        PathBuf::from("shell").join(script_name)
+    } else {
+        PathBuf::from("shell").join("antigravity").join(script_name)
+    };
+    let anti_source_script =
+        crate::paths::find_resource(&anti_source_relative).unwrap_or(anti_source_relative);
 
     let copilot_dir = db::get_copilot_dir();
-    let copilot_script = copilot_dir
-        .join("statusline-token.sh")
-        .to_string_lossy()
-        .into_owned();
-    let copilot_exists = copilot_dir.exists();
+    let copilot_script = copilot_dir.join(script_name);
+    let copilot_source_relative = if cfg!(windows) {
+        PathBuf::from("shell").join(script_name)
+    } else {
+        PathBuf::from("shell").join("copilot").join(script_name)
+    };
+    let copilot_source_script =
+        crate::paths::find_resource(&copilot_source_relative).unwrap_or(copilot_source_relative);
 
     let codex_dir = db::get_codex_dir();
     let codex_exists = codex_dir.join("sessions").exists();
@@ -196,32 +208,54 @@ pub async fn get_setup_info(Path(assistant): Path<String>) -> impl IntoResponse 
     let cursor_exists = cursor_dir.join("projects").exists();
 
     Json(SetupInfoResponse {
+        platform: std::env::consts::OS.to_string(),
         workspace_dir,
         home_dir,
         antigravity: AssistantSetupStatus {
             dir_path: anti_dir.to_string_lossy().into_owned(),
-            exists: anti_exists,
-            script_path: anti_script,
+            data_path: anti_dir.join("usage").to_string_lossy().into_owned(),
+            exists: anti_script.exists(),
+            script_path: anti_script.to_string_lossy().into_owned(),
+            source_script_path: anti_source_script.to_string_lossy().into_owned(),
+            settings_path: anti_dir
+                .join("settings.json")
+                .to_string_lossy()
+                .into_owned(),
         },
         copilot: AssistantSetupStatus {
             dir_path: copilot_dir.to_string_lossy().into_owned(),
-            exists: copilot_exists,
-            script_path: copilot_script,
+            data_path: copilot_dir.join("usage").to_string_lossy().into_owned(),
+            exists: copilot_script.exists(),
+            script_path: copilot_script.to_string_lossy().into_owned(),
+            source_script_path: copilot_source_script.to_string_lossy().into_owned(),
+            settings_path: copilot_dir
+                .join("settings.json")
+                .to_string_lossy()
+                .into_owned(),
         },
         codex: AssistantSetupStatus {
             dir_path: codex_dir.to_string_lossy().into_owned(),
+            data_path: codex_dir.join("sessions").to_string_lossy().into_owned(),
             exists: codex_exists,
             script_path: "".to_string(),
+            source_script_path: "".to_string(),
+            settings_path: "".to_string(),
         },
         claude: AssistantSetupStatus {
             dir_path: claude_dir.to_string_lossy().into_owned(),
+            data_path: claude_dir.join("projects").to_string_lossy().into_owned(),
             exists: claude_exists,
             script_path: "".to_string(),
+            source_script_path: "".to_string(),
+            settings_path: "".to_string(),
         },
         cursor: AssistantSetupStatus {
             dir_path: cursor_dir.to_string_lossy().into_owned(),
+            data_path: cursor_dir.join("projects").to_string_lossy().into_owned(),
             exists: cursor_exists,
             script_path: "".to_string(),
+            source_script_path: "".to_string(),
+            settings_path: "".to_string(),
         },
     })
     .into_response()

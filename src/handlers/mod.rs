@@ -40,6 +40,7 @@ pub struct MonthListResponse {
 
 #[derive(Serialize)]
 pub struct SetupInfoResponse {
+    pub platform: String,
     pub workspace_dir: String,
     pub home_dir: String,
     pub antigravity: AssistantSetupStatus,
@@ -52,8 +53,11 @@ pub struct SetupInfoResponse {
 #[derive(Serialize)]
 pub struct AssistantSetupStatus {
     pub dir_path: String,
+    pub data_path: String,
     pub exists: bool,
     pub script_path: String,
+    pub source_script_path: String,
+    pub settings_path: String,
 }
 
 #[derive(Serialize, Default, Clone)]

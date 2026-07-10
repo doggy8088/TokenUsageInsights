@@ -9,6 +9,7 @@ use tower_http::services::ServeDir;
 
 mod db;
 mod handlers;
+mod paths;
 mod pricing;
 mod timeline;
 
@@ -141,36 +142,8 @@ async fn main() {
 
 /// 獲取靜態檔案的基準路徑
 fn get_static_dir() -> PathBuf {
-    if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
-        let p = PathBuf::from(manifest_dir).join("static");
-        if p.exists() {
-            return p;
-        }
-    }
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(exe_dir) = exe_path.parent() {
-            let p = exe_dir.join("static");
-            if p.exists() {
-                return p;
-            }
-            if let Some(grandparent) = exe_dir.parent().and_then(|p| p.parent()) {
-                let p = grandparent.join("static");
-                if p.exists() {
-                    return p;
-                }
-            }
-        }
-    }
-    let pwd = PathBuf::from("static");
-    if pwd.exists() {
-        return pwd;
-    }
-
-    if let Ok(cwd) = std::env::current_dir() {
-        let p = cwd.join("static");
-        if p.exists() {
-            return p;
-        }
+    if let Some(path) = paths::find_resource("static") {
+        return path;
     }
     eprintln!("❌ 無法定位 static 目錄。請在專案根目錄下執行此程式。");
     std::process::exit(1);

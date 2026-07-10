@@ -21,7 +21,8 @@ pub async fn get_pricing(Path(assistant): Path<String>) -> impl IntoResponse {
     }
 
     let mut entries = Vec::new();
-    let file_path = PathBuf::from("pricing.csv");
+    let file_path =
+        crate::paths::find_resource("pricing.csv").unwrap_or_else(|| PathBuf::from("pricing.csv"));
     if let Ok(file) = File::open(&file_path) {
         let reader = BufReader::new(file);
         let mut lines = reader.lines();

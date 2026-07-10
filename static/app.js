@@ -1822,16 +1822,17 @@ function initTableSorting() {
 }
 
 function sortAndGetFlatSessions(sessions, sortCol, sortDir) {
-  const map = {};
+  const map = new Map();
   sessions.forEach(s => {
-    map[s.session_id] = { ...s, children: [] };
+    map.set(s.session_id, { ...s, children: [] });
   });
 
+  const nodes = [...map.values()];
   const roots = [];
-  sessions.forEach(s => {
-    const item = map[s.session_id];
-    if (s.parent_session_id && map[s.parent_session_id]) {
-      map[s.parent_session_id].children.push(item);
+  nodes.forEach(item => {
+    const parent = item.parent_session_id ? map.get(item.parent_session_id) : null;
+    if (parent && parent !== item) {
+      parent.children.push(item);
     } else {
       roots.push(item);
     }
@@ -1851,26 +1852,30 @@ function sortAndGetFlatSessions(sessions, sortCol, sortDir) {
 
   // 排序 Root 節點
   roots.sort(compare);
-
-  // 遞迴排序子節點
-  const sortTree = (node) => {
-    node.children.sort(compare);
-    node.children.forEach(sortTree);
-  };
-  roots.forEach(sortTree);
+  nodes.sort(compare);
 
   // 扁平化
   const flat = [];
+  const visited = new Set();
   const traverse = (node, depth, parentName) => {
+    if (visited.has(node.session_id)) return;
+    visited.add(node.session_id);
     flat.push({
       ...node,
       depth,
       isSubagent: depth > 0,
       parentName
     });
-    node.children.forEach(child => traverse(child, depth + 1, node.session_name));
+    node.children
+      .sort(compare)
+      .forEach(child => traverse(child, depth + 1, node.session_name));
   };
   roots.forEach(r => traverse(r, 0, null));
+  nodes.forEach(node => {
+    if (!visited.has(node.session_id)) {
+      traverse(node, 0, null);
+    }
+  });
 
   return flat;
 }
@@ -1932,17 +1937,35 @@ function renderSessionTable(sessions) {
   }
 
   // 建立快速查詢 Map 以供 Hover 高亮與樹狀結構查詢
-  const sessionsMap = {};
+  const sessionsMap = Object.create(null);
   sessions.forEach(s => {
     sessionsMap[s.session_id] = s;
   });
 
   function getRootParentId(session) {
     let curr = session;
-    while (curr && curr.parent_session_id && sessionsMap[curr.parent_session_id]) {
+    const path = [];
+    const positions = new Map();
+
+    while (curr) {
+      const id = curr.session_id;
+      if (positions.has(id)) {
+        return path
+          .slice(positions.get(id))
+          .map(node => String(node.session_id))
+          .sort((a, b) => a.localeCompare(b))[0];
+      }
+
+      positions.set(id, path.length);
+      path.push(curr);
+
+      if (!curr.parent_session_id || !sessionsMap[curr.parent_session_id]) {
+        return id;
+      }
       curr = sessionsMap[curr.parent_session_id];
     }
-    return curr ? curr.session_id : session.session_id;
+
+    return session.session_id;
   }
 
   sessions.forEach(s => {
@@ -1981,14 +2004,14 @@ function renderSessionTable(sessions) {
             ${role ? `<span class="badge agent-role-badge" title="Agent Role: ${escapeHtml(role)}">${escapeHtml(role)}</span>` : ''}
           </div>
           <span class="session-name-text" title="${escapeHtml(s.session_name)}">${escapeHtml(s.session_name)}</span>
-          <span class="session-id-sub">${s.session_id}</span>
+          <span class="session-id-sub">${escapeHtml(String(s.session_id))}</span>
         </div>
       `;
     } else {
       nameCellContent = `
         <div class="session-name-wrapper">
           <span class="session-name-text" title="${escapeHtml(s.session_name)}">${escapeHtml(s.session_name)}</span>
-          <span class="session-id-sub">${s.session_id}</span>
+          <span class="session-id-sub">${escapeHtml(String(s.session_id))}</span>
         </div>
       `;
     }
@@ -2241,7 +2264,7 @@ function renderTimeline(data) {
           attachmentsHTML = `<div class="bubble-attachments">`;
           item.event_data.attachments.forEach(att => {
             const path = att.filePath || att.path || '檔名未知';
-            const basename = path.split('/').pop();
+            const basename = path.split(/[\\/]/).pop();
             const attType = att.type || 'file';
             attachmentsHTML += `
               <div class="attachment-badge" title="${escapeHtml(path)}">
@@ -3964,8 +3987,9 @@ async function loadSetupInfo() {
     const res = await fetch(`/api/${resolvedAssistant}/setup-info`);
     const data = await res.json();
     
-    // Dynamic values based on home_dir
-    const homeDir = data.home_dir || '/home/user';
+    const isWindows = data.platform === 'windows';
+    const quotePowerShell = value => `'${String(value).replace(/'/g, "''")}'`;
+    const quoteShell = value => `'${String(value).replace(/'/g, `'"'"'`)}'`;
 
     // Localize modal title based on selected assistant
     const titleH2 = document.getElementById('setup-modal-title');
@@ -3984,13 +4008,18 @@ async function loadSetupInfo() {
     }
     
     if (currentAssistant === 'antigravity' || currentAssistant === 'copilot') {
-      const folder = currentAssistant === 'copilot' ? '.copilot' : '.gemini/antigravity-cli';
-      const targetScriptPath = `$HOME/${folder}/statusline-token.sh`;
+      const assistantSetup = data[currentAssistant] || {};
+      const targetScriptPath = assistantSetup.script_path || '';
+      const sourceScriptPath = assistantSetup.source_script_path || '';
+      const settingsPath = assistantSetup.settings_path || '';
+      const targetScriptCommand = isWindows
+        ? `powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${targetScriptPath}" -Assistant ${currentAssistant}`
+        : targetScriptPath;
 
       const settingsJson = JSON.stringify({
         "statusLine": {
           "type": "command",
-          "command": targetScriptPath,
+          "command": targetScriptCommand,
           "padding": 1
         }
       }, null, 2);
@@ -4002,7 +4031,7 @@ async function loadSetupInfo() {
         },
         "statusLine": {
           "type": "command",
-          "command": targetScriptPath,
+          "command": targetScriptCommand,
           "padding": 1
         }
       }, null, 2);
@@ -4067,31 +4096,35 @@ async function loadSetupInfo() {
 
       const editCmdEl = document.getElementById('code-edit-settings');
       if (editCmdEl) {
-        editCmdEl.textContent = `vi ~/${folder}/settings.json`;
+        editCmdEl.textContent = isWindows
+          ? `notepad ${quotePowerShell(settingsPath)}`
+          : `vi ${quoteShell(settingsPath)}`;
       }
 
       if (setupCmdEl) {
-        const srcScript = `shell/${currentAssistant === 'copilot' ? 'copilot' : 'antigravity'}/statusline-token.sh`;
-        setupCmdEl.textContent = `mkdir -p ~/${folder} && cp ${srcScript} ~/${folder}/statusline-token.sh && chmod +x ~/${folder}/statusline-token.sh`;
+        setupCmdEl.textContent = isWindows
+          ? `New-Item -ItemType Directory -Force -Path ${quotePowerShell(assistantSetup.dir_path)} | Out-Null; Copy-Item -LiteralPath ${quotePowerShell(sourceScriptPath)} -Destination ${quotePowerShell(targetScriptPath)} -Force`
+          : `mkdir -p ${quoteShell(assistantSetup.dir_path)} && cp ${quoteShell(sourceScriptPath)} ${quoteShell(targetScriptPath)} && chmod +x ${quoteShell(targetScriptPath)}`;
       }
       if (troubleshootAEl) {
-        troubleshootAEl.textContent = `echo '{}' | ~/${folder}/statusline-token.sh`;
+        troubleshootAEl.textContent = isWindows
+          ? `Write-Output '{}' | powershell.exe -NoProfile -ExecutionPolicy Bypass -File ${quotePowerShell(targetScriptPath)} -Assistant ${currentAssistant}`
+          : `echo '{}' | ${quoteShell(targetScriptPath)}`;
       }
       if (troubleshootBEl) {
-        const displaySettingsPath = currentAssistant === 'copilot' 
-          ? `~/.copilot/settings.json`
-          : `~/.gemini/antigravity-cli/settings.json`;
-        troubleshootBEl.textContent = `jq . ${displaySettingsPath}`;
+        troubleshootBEl.textContent = isWindows
+          ? `Get-Content -Raw -LiteralPath ${quotePowerShell(settingsPath)} | ConvertFrom-Json | Out-Null`
+          : `jq . ${quoteShell(settingsPath)}`;
       }
     } else if (currentAssistant === 'codex') {
       const homeLabelCodex = document.getElementById('lbl-detected-home-codex');
-      if (homeLabelCodex) homeLabelCodex.textContent = `${homeDir}/.codex/sessions`;
+      if (homeLabelCodex) homeLabelCodex.textContent = data.codex?.data_path || '';
     } else if (currentAssistant === 'claude') {
       const homeLabelClaude = document.getElementById('lbl-detected-home-claude');
-      if (homeLabelClaude) homeLabelClaude.textContent = `${homeDir}/.claude/projects`;
+      if (homeLabelClaude) homeLabelClaude.textContent = data.claude?.data_path || '';
     } else if (currentAssistant === 'cursor') {
       const homeLabelCursor = document.getElementById('lbl-detected-home-cursor');
-      if (homeLabelCursor) homeLabelCursor.textContent = `${homeDir}/.cursor/projects`;
+      if (homeLabelCursor) homeLabelCursor.textContent = data.cursor?.data_path || '';
     }
 
     // Apply updated language translations

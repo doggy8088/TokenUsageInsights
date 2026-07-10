@@ -42,6 +42,14 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Run Rust tests
+        run: cargo test --locked --target ${{ matrix.target }}
+
+      - name: Test native Windows collectors
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: .\scripts\test-windows.ps1
+
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }}
 
@@ -59,7 +67,7 @@ jobs:
 
           if [[ "${{ runner.os }}" != "Windows" ]] && command -v strip >/dev/null 2>&1; then
             strip "$stage/${{ matrix.executable }}" || true
-          fi
+           fi
 
           cp -R static "$stage/static"
           cp -R shell "$stage/shell"
@@ -80,7 +88,51 @@ jobs:
             powershell -NoProfile -Command "Compress-Archive -Path 'dist/${package}' -DestinationPath 'dist/${package}.zip' -Force"
           else
             tar -czf "dist/${package}.tar.gz" -C dist "$package"
-          fi
+           fi
+
+      - name: Smoke test native Windows release
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $package = "token-usage-insights-${env:GITHUB_REF_NAME}-${{ matrix.target }}"
+          $stage = Join-Path $PWD "dist\$package"
+          $testRoot = Join-Path $env:RUNNER_TEMP "Token Usage Insights 測試"
+          $installDir = Join-Path $testRoot "App Files"
+          $binDir = Join-Path $testRoot "Command Files"
+          $env:INSIGHTS_DIR = Join-Path $testRoot "資料庫"
+          $env:PORT = '39103'
+
+          try {
+            & (Join-Path $stage 'install.ps1') -InstallDir $installDir -BinDir $binDir -Port 39103
+            $process = Start-Process -FilePath (Join-Path $installDir 'token-usage-insights.exe') -WorkingDirectory $env:RUNNER_TEMP -WindowStyle Hidden -PassThru
+            try {
+              $response = $null
+              foreach ($attempt in 1..30) {
+                try {
+                  $response = Invoke-WebRequest 'http://127.0.0.1:39103/api/codex/pricing' -UseBasicParsing
+                  break
+                } catch {
+                  Start-Sleep -Milliseconds 500
+                }
+              }
+              if ($null -eq $response -or $response.StatusCode -ne 200) {
+                throw 'Installed Windows release did not serve the pricing API.'
+              }
+              if (@(($response.Content | ConvertFrom-Json)).Count -le 4) {
+                throw 'Installed Windows release did not load the packaged pricing.csv.'
+              }
+              if (!(Test-Path (Join-Path $env:INSIGHTS_DIR 'token_usage_insights.db'))) {
+                throw 'Installed Windows release did not create a fresh INSIGHTS_DIR.'
+              }
+            } finally {
+              if ($process -and !$process.HasExited) { Stop-Process -Id $process.Id -Force }
+            }
+          } finally {
+            Remove-Item Env:INSIGHTS_DIR -ErrorAction SilentlyContinue
+            Remove-Item Env:PORT -ErrorAction SilentlyContinue
+            if (Test-Path $testRoot) { Remove-Item -LiteralPath $testRoot -Recurse -Force }
+          }
 
       - name: Upload release asset artifact
         uses: actions/upload-artifact@v7

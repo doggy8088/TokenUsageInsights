@@ -4,7 +4,7 @@
 
 本專案不會替你呼叫 AI 供應商 API 查詢資料；核心資料來源是本機日誌、Status Line 收集檔與本機 SQLite。
 
-> 系統環境：目前以 macOS 與 WSL 為主要支援環境。
+> 系統環境：支援 Windows 10/11 原生 PowerShell、macOS、Linux 與 WSL。
 
 * * *
 
@@ -28,12 +28,38 @@ http://localhost:3003
 
 | CLI | 是否需要額外設定 | 預設資料來源 | 說明 |
 | --- | --- | --- | --- |
-| Google Antigravity CLI | 需要 | `~/.gemini/antigravity-cli/usage/usage-YYYY-MM-DD.jsonl` | 透過本專案提供的 `statusline-token.sh` 收集 Token 資料 |
-| GitHub Copilot CLI | 需要 | `~/.copilot/usage/usage-YYYY-MM-DD.jsonl` | 透過本專案提供的 `statusline-token.sh` 收集 Token 資料 |
+| Google Antigravity CLI | 需要 | `~/.gemini/antigravity-cli/usage/usage-YYYY-MM-DD.jsonl` | 透過 `statusline-token.sh` 或 Windows `statusline-token.ps1` 收集 Token 資料 |
+| GitHub Copilot CLI | 需要 | `~/.copilot/usage/usage-YYYY-MM-DD.jsonl` | 透過 `statusline-token.sh` 或 Windows `statusline-token.ps1` 收集 Token 資料 |
 | Codex CLI | 不需要 | `~/.codex/sessions` | 看板會直接掃描 Codex CLI 本機 Session 記錄 |
 | Claude Code | 不需要 | `~/.claude/projects` | 看板會直接掃描 Claude Code 本機專案 Session 記錄 |
 
 **只使用 Codex CLI 或 Claude Code 時，通常只要 `cargo run` 後打開看板即可。**
+
+### Windows 原生執行
+
+Windows 原生建置需要 Rust MSVC toolchain 與 Visual Studio Build Tools 的 C++ workload，不需要 WSL、Git Bash 或 `jq`：
+
+```powershell
+git clone https://github.com/doggy8088/TokenUsageInsights.git
+Set-Location TokenUsageInsights
+cargo run
+Start-Process 'http://localhost:3003'
+```
+
+Windows 預設使用下列原生路徑：
+
+| 用途 | Windows 預設路徑 |
+| --- | --- |
+| SQLite | `%LOCALAPPDATA%\TokenUsageInsights\token_usage_insights.db` |
+| Antigravity | `%USERPROFILE%\.gemini\antigravity-cli` |
+| Copilot | `%USERPROFILE%\.copilot` |
+| Codex | `%USERPROFILE%\.codex` |
+| Claude Code | `%USERPROFILE%\.claude` |
+| Cursor | `%USERPROFILE%\.cursor` |
+
+看板內的設定指南會在 Windows 顯示 PowerShell 複製、設定與診斷命令。PowerShell collector 使用 .NET JSON 與檔案 API，不依賴 Bash、`jq`、`sed` 或 `awk`。
+
+磁碟機代號、含空白或非 ASCII 字元的路徑，以及 UNC 路徑都會交由原生路徑 API 處理。SQLite 資料庫仍建議放在本機磁碟，以避免網路分享的 locking 語意差異。
 
 * * *
 
@@ -232,16 +258,17 @@ GET /api/:assistant/sync
 
 ## 環境變數
 
-環境變數指定的資料夾必須已存在；若不存在，程式會回到預設路徑。
+環境變數指定的路徑會被視為權威設定，不必預先建立；`INSIGHTS_DIR` 會在啟動時自動建立。支援原生絕對/相對路徑，以及開頭為 `~`、`$HOME`、`%USERPROFILE%`、`%LOCALAPPDATA%` 或 `%APPDATA%` 的常見寫法。
 
 | 變數 | 預設值 | 用途 |
 | --- | --- | --- |
 | `PORT` | `3003` | 看板服務埠號 |
-| `INSIGHTS_DIR` | `~/.token-usage-insights` | SQLite 資料庫目錄 |
+| `INSIGHTS_DIR` | Windows: `%LOCALAPPDATA%\TokenUsageInsights`; 其他平台: `~/.token-usage-insights` | SQLite 資料庫目錄 |
 | `ANTIGRAVITY_DIR` | `~/.gemini/antigravity-cli` | Antigravity CLI 資料目錄 |
 | `COPILOT_DIR` | `~/.copilot` | Copilot CLI 資料目錄 |
 | `CODEX_DIR` | `~/.codex` | Codex CLI 資料目錄 |
 | `CLAUDE_DIR` | `~/.claude` | Claude Code 資料目錄 |
+| `CURSOR_DIR` | `~/.cursor` | Cursor 資料目錄 |
 | `CORS_ALLOWED_ORIGINS` | `http://localhost:<PORT>,http://127.0.0.1:<PORT>` | 允許的 CORS 來源，逗號分隔 |
 
 範例：
@@ -250,6 +277,15 @@ GET /api/:assistant/sync
 mkdir -p /tmp/token-usage-insights
 export INSIGHTS_DIR="/tmp/token-usage-insights"
 export PORT="3010"
+cargo run
+```
+
+Windows PowerShell 範例：
+
+```powershell
+$env:INSIGHTS_DIR = 'D:\Token Usage Insights\資料庫'
+$env:CODEX_DIR = "$env:USERPROFILE\.codex"
+$env:PORT = '3010'
 cargo run
 ```
 
@@ -280,6 +316,15 @@ systemctl --user status token-usage-insights.service
 journalctl --user -u token-usage-insights.service -n 50 -f
 systemctl --user restart token-usage-insights.service
 systemctl --user stop token-usage-insights.service
+```
+
+### Windows release 啟動
+
+`install.ps1` 預設安裝至 `%LOCALAPPDATA%\TokenUsageInsights`，並在 `%USERPROFILE%\bin` 建立 `.cmd` shim。安裝路徑可包含空白與非 ASCII 字元；shim 會切換至安裝目錄後啟動：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+& "$HOME\bin\token-usage-insights.cmd"
 ```
 
 * * *
@@ -322,6 +367,12 @@ Windows：
 Expand-Archive token-usage-insights-<tag>-x86_64-pc-windows-msvc.zip
 cd token-usage-insights-<tag>-x86_64-pc-windows-msvc
 powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+自訂 Windows 安裝位置與埠號：
+
+```powershell
+.\install.ps1 -InstallDir 'D:\Apps\Token Usage Insights' -BinDir "$HOME\bin" -Port 3010
 ```
 
 * * *
@@ -371,6 +422,15 @@ ls ~/.claude/projects
 
 Antigravity CLI 與 Copilot CLI 還需要確認 `settings.json` 已設定 `statusLine`，且腳本具備執行權限。
 
+Windows PowerShell 可直接檢查原生資料目錄：
+
+```powershell
+Get-ChildItem "$env:USERPROFILE\.gemini\antigravity-cli\usage"
+Get-ChildItem "$env:USERPROFILE\.copilot\usage"
+Get-ChildItem "$env:USERPROFILE\.codex\sessions"
+Get-ChildItem "$env:USERPROFILE\.claude\projects"
+```
+
 ### Status Line 腳本無法執行
 
 ```bash
@@ -380,6 +440,12 @@ chmod +x ~/.copilot/statusline-token.sh
 ```
 
 Status Line 腳本依賴 `jq` 解析 CLI 傳入的 JSON。
+
+上述 `jq` 需求只適用於 `.sh` collector。Windows `.ps1` collector 可用下列命令測試，並會原生處理反斜線與含空白路徑：
+
+```powershell
+Write-Output '{}' | powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.gemini\antigravity-cli\statusline-token.ps1" -Assistant antigravity
+```
 
 ### 設定檔 JSON 格式錯誤
 
@@ -420,7 +486,8 @@ cargo build --release
 ```text
 src/                 Rust 後端、API、SQLite 同步、價格與時間軸解析
 static/              前端 HTML、JavaScript、CSS 與圖片資產
-shell/               Status Line 腳本與 systemd 服務範本
+shell/               Bash/PowerShell Status Line collector 與 systemd 服務範本
+scripts/             Linux/macOS、Windows 安裝與 Windows smoke test
 pricing.csv          模型價格表，本地估算費用依此檔案載入
 ```
 
