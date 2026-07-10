@@ -364,20 +364,65 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 
 ## GitHub Release 下載安裝
 
-建立任意 Git tag 並推送後，GitHub Actions 會自動建立 Release，並產出 Linux、macOS 與 Windows 的平台壓縮包。
+建立任意 Git tag 並推送後，GitHub Actions 會自動建立 Release，並產出 Linux、macOS 與 Windows 的平台壓縮包，全部都是**已編譯好的可執行檔**，安裝與執行都不需要 Rust 或 Cargo。
 
 ```bash
-git tag v0.1.2
-git push origin v0.1.2
+git tag v0.1.3
+git push origin v0.1.3
 ```
 
-每個 Release 壓縮包都包含：
+### 一行安裝（推薦）
+
+`scripts/get.sh`（Linux / macOS）與 `scripts/get.ps1`（Windows）會自動判斷平台與 CPU 架構、從最新（或指定）Release 下載對應壓縮包、解壓後呼叫套件內的 `install.sh` / `install.ps1`，全程不需要手動下載或解壓：
+
+Linux / macOS：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/improve/scripts/get.sh | bash
+```
+
+Linux 如需同時安裝並啟用 systemd user service：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/improve/scripts/get.sh | bash -s -- --service
+```
+
+Windows PowerShell：
+
+```powershell
+irm https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/improve/scripts/get.ps1 | iex
+```
+
+安裝完成後即可執行（Linux/macOS 需確認 `bin_dir` 已加入 `PATH`；Windows 會建立 `.cmd` shim）：
+
+```bash
+token-usage-insights
+```
+
+環境變數可控制版本與安裝路徑（皆為選用）：
+
+| 變數 | 適用平台 | 說明 |
+| --- | --- | --- |
+| `TOKEN_USAGE_INSIGHTS_VERSION` | Linux / macOS / Windows | 指定要安裝的 Release tag，例如 `v0.1.3`。預設 `latest` |
+| `TOKEN_USAGE_INSIGHTS_INSTALL_DIR` | Linux / macOS | 安裝目錄，會轉交給 `install.sh` |
+| `TOKEN_USAGE_INSIGHTS_BIN_DIR` | Linux / macOS | 執行檔連結目錄，會轉交給 `install.sh` |
+
+Windows 若要自訂安裝位置、bin 目錄與埠號，需先下載腳本再帶參數執行（`iex` 管線不支援傳參數）：
+
+```powershell
+Invoke-WebRequest -Uri https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/improve/scripts/get.ps1 -OutFile get.ps1
+.\get.ps1 -InstallDir 'D:\Apps\Token Usage Insights' -Port 3010
+```
+
+### 手動下載安裝
+
+若不想直接執行遠端腳本，也可以手動下載對應平台壓縮包並執行套件內建的安裝腳本。每個 Release 壓縮包都包含：
 
 - 單一平台可執行檔
 - `static/` 前端資產
 - `pricing.csv` 模型費用表
 - `shell/` 目錄下的 Status Line 與服務腳本
-- `install.sh` 與 `install.ps1` 安裝腳本
+- `scripts/` 目錄（含 `install.sh`、`install.ps1`、`get.sh`、`get.ps1`）
 - README、LICENSE 與 VERSION
 
 Linux 或 macOS：
@@ -407,6 +452,16 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```powershell
 .\install.ps1 -InstallDir 'D:\Apps\Token Usage Insights' -BinDir "$HOME\bin" -Port 3010
 ```
+
+### CI 驗證
+
+`Release` workflow 每次建置都會在 Linux、macOS 與 Windows 上實際執行對應的安裝腳本（`install.sh` / `install.ps1`），安裝後啟動可執行檔並確認：
+
+- 服務會在指定埠號回應 `/api/<assistant>/pricing`
+- 回應內容確實載入了套件內的 `pricing.csv`
+- 全新的 `INSIGHTS_DIR` 會被建立並產生 SQLite 資料庫
+
+`get.sh` 與 `get.ps1` 也會在每次建置時先做語法檢查（`bash -n` 與 PowerShell AST 剖析），確保推送到 Release 的版本可以正常執行。
 
 * * *
 

@@ -4,9 +4,14 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
+// `db` and `paths` are the same source files main.rs uses; only a handful of
+// their exports are needed here, so silence dead-code warnings for the rest
+// instead of forking a trimmed-down copy of shared logic.
 #[path = "../db.rs"]
+#[allow(dead_code)]
 mod db;
 #[path = "../paths.rs"]
+#[allow(dead_code)]
 mod paths;
 
 const EXPORT_VERSION: u8 = 1;
@@ -47,12 +52,16 @@ struct UsageDayExportPayload {
 
 #[derive(Deserialize)]
 struct UsageDayImportPayload {
+    // Kept for schema parity with the exported JSON; not read during import
+    // (import always re-derives these from the current run, not the file).
+    #[allow(dead_code)]
     #[serde(default)]
     version: Option<u8>,
     #[serde(default)]
     assistant: Option<String>,
     #[serde(default)]
     date: Option<String>,
+    #[allow(dead_code)]
     #[serde(default)]
     exported_at: Option<String>,
     #[serde(default)]
@@ -141,7 +150,7 @@ fn run_export(args: &[String]) -> i32 {
         return 2;
     }
 
-    let mut conn = match db::get_db_conn() {
+    let conn = match db::get_db_conn() {
         Ok(conn) => conn,
         Err(err) => {
             eprintln!("開啟資料庫失敗: {err}");

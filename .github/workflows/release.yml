@@ -12,6 +12,9 @@ jobs:
   build:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    env:
+      # Enforce the zero-warnings build policy documented in AGENTS.md.
+      RUSTFLAGS: "-D warnings"
     strategy:
       fail-fast: false
       matrix:
@@ -49,6 +52,26 @@ jobs:
         if: runner.os == 'Windows'
         shell: powershell
         run: .\scripts\test-windows.ps1
+
+      - name: Lint installer scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n scripts/install.sh
+          bash -n scripts/get.sh
+          if command -v pwsh >/dev/null 2>&1; then
+            pwsh -NoProfile -Command '
+              $ErrorActionPreference = "Stop"
+              foreach ($f in @("scripts/install.ps1", "scripts/get.ps1")) {
+                $errors = $null
+                [void][System.Management.Automation.Language.Parser]::ParseFile($f, [ref]$null, [ref]$errors)
+                if ($errors.Count -gt 0) {
+                  $errors | ForEach-Object { Write-Error $_ }
+                  exit 1
+                }
+              }
+            '
+          fi
 
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }}
@@ -89,6 +112,66 @@ jobs:
           else
             tar -czf "dist/${package}.tar.gz" -C dist "$package"
            fi
+
+      - name: Smoke test install.sh (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          package="token-usage-insights-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          stage="dist/${package}"
+
+          test_root="$(mktemp -d)"
+          install_dir="${test_root}/app"
+          bin_dir="${test_root}/bin"
+          insights_dir="${test_root}/insights"
+
+          cleanup() {
+            if [[ -n "${server_pid:-}" ]] && kill -0 "$server_pid" 2>/dev/null; then
+              kill "$server_pid" 2>/dev/null || true
+              wait "$server_pid" 2>/dev/null || true
+            fi
+            rm -rf "$test_root"
+          }
+          trap cleanup EXIT
+
+          TOKEN_USAGE_INSIGHTS_INSTALL_DIR="$install_dir" \
+          TOKEN_USAGE_INSIGHTS_BIN_DIR="$bin_dir" \
+          PORT=39103 \
+            "${stage}/install.sh"
+
+          if [[ ! -x "${bin_dir}/token-usage-insights" ]]; then
+            echo "install.sh did not create the executable symlink at ${bin_dir}/token-usage-insights" >&2
+            exit 1
+          fi
+
+          PORT=39103 INSIGHTS_DIR="$insights_dir" "${bin_dir}/token-usage-insights" &
+          server_pid=$!
+
+          response=""
+          for _ in $(seq 1 30); do
+            if response="$(curl -fsS 'http://127.0.0.1:39103/api/codex/pricing' 2>/dev/null)"; then
+              break
+            fi
+            sleep 0.5
+          done
+
+          if [[ -z "$response" ]]; then
+            echo "Installed release did not serve the pricing API." >&2
+            exit 1
+          fi
+
+          entry_count="$(printf '%s' "$response" | grep -o '"model_name"' | wc -l | tr -d ' ')"
+          if [[ "$entry_count" -le 4 ]]; then
+            echo "Installed release did not load the packaged pricing.csv (got ${entry_count} entries)." >&2
+            exit 1
+          fi
+
+          if [[ ! -f "${insights_dir}/token_usage_insights.db" ]]; then
+            echo "Installed release did not create a fresh INSIGHTS_DIR." >&2
+            exit 1
+          fi
 
       - name: Smoke test native Windows release
         if: runner.os == 'Windows'
