@@ -40,7 +40,7 @@ help:
 	@echo "  make status          查詢 service 狀態（需要 sudo）"
 
 run:
-	PORT=$(PORT) $(CARGO) run
+	PORT=$(PORT) $(CARGO) run --bin $(PROJECT_NAME)
 
 dev: run
 
