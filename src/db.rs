@@ -602,7 +602,7 @@ fn sync_hook_usage_logs(
                             tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_reasoning, tokens_total,
                             delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total,
                             duration_ms, premium_requests
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         params![
                             assistant_type,
                             source_kind,
@@ -3202,6 +3202,38 @@ mod tests {
             },
             import_source_id: Some("import-test-record".to_string()),
         }
+    }
+
+    #[test]
+    fn sync_antigravity_usage_log_writes_all_columns() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let usage_file = temp_jsonl_path("antigravity-sync");
+        let base_dir = usage_file.with_extension("");
+        let usage_dir = base_dir.join("usage");
+        fs::create_dir_all(&usage_dir).unwrap();
+        let log_path = usage_dir.join("usage-2026-07-12.jsonl");
+        let record = sample_import_record().entry;
+        fs::write(
+            &log_path,
+            format!("{}\n", serde_json::to_string(&record).unwrap()),
+        )
+        .unwrap();
+
+        sync_hook_usage_logs(&mut conn, "antigravity", &base_dir).unwrap();
+
+        let inserted: (u64, String, Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT COUNT(*), source_kind, tokens_cache_write, delta_cache_write
+                 FROM usage_entries WHERE assistant_type = 'antigravity'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(inserted, (1, "legacy".to_string(), Some(10), Some(1)));
+
+        fs::remove_dir_all(base_dir).unwrap();
     }
 
     #[test]
