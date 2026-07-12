@@ -53,7 +53,7 @@ const assistantMeta = {
   },
   copilot: {
     logo: '/static/githubcopilot.webp',
-    label: 'GitHub Copilot CLI',
+    label: 'GitHub Copilot',
     shortLabel: 'Copilot',
     alt: 'Copilot',
     badgeStyle: 'background: rgba(185, 43, 39, 0.15); color: #b92b27; border: 1px solid rgba(185, 43, 39, 0.3); display: inline-flex; align-items: center;',
