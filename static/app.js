@@ -2157,6 +2157,11 @@ function renderSessionTable(sessions) {
       const meta = getAssistantMeta(s.assistant_type);
       assistantBadge = `<span class="badge" style="${meta.badgeStyle}">${getAssistantLogoHtml(s.assistant_type)} ${meta.shortLabel}</span>`;
     }
+    const sourceBadge = s.source_kind === 'vscode-chat'
+      ? '<span class="badge source-badge" title="GitHub Copilot in VS Code">VS Code</span>'
+      : (s.assistant_type === 'copilot'
+        ? '<span class="badge source-badge" title="GitHub Copilot CLI">CLI</span>'
+        : '');
 
     const astColumn = (currentAssistant === 'all' || currentAssistant.includes(',')) ? `<td>${assistantBadge}</td>` : '';
 
@@ -2172,10 +2177,12 @@ function renderSessionTable(sessions) {
           <span class="tree-connector" style="left: ${connectorLeft}px;">└─</span>
           <div style="display: flex; flex-wrap: wrap; gap: 4px; align-items: center; margin-bottom: 3px;">
             <span class="badge subagent-badge" title="Subagent of: ${escapeHtml(s.parentName || '')}">Subagent</span>
+            ${sourceBadge}
             ${nickname ? `<span class="badge agent-nickname-badge" title="Agent Nickname: ${escapeHtml(nickname)}">${escapeHtml(nickname)}</span>` : ''}
             ${role ? `<span class="badge agent-role-badge" title="Agent Role: ${escapeHtml(role)}">${escapeHtml(role)}</span>` : ''}
           </div>
           <span class="session-name-text" title="${escapeHtml(s.session_name)}">${escapeHtml(s.session_name)}</span>
+          ${sourceBadge}
           <span class="session-id-sub">${escapeHtml(String(s.session_id))}</span>
         </div>
       `;
@@ -2183,6 +2190,7 @@ function renderSessionTable(sessions) {
       nameCellContent = `
         <div class="session-name-wrapper">
           <span class="session-name-text" title="${escapeHtml(s.session_name)}">${escapeHtml(s.session_name)}</span>
+          ${sourceBadge}
           <span class="session-id-sub">${escapeHtml(String(s.session_id))}</span>
         </div>
       `;

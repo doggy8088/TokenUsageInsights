@@ -605,6 +605,176 @@ pub fn parse_copilot_timeline(
     );
 }
 
+pub fn parse_vscode_timeline(
+    session: &crate::vscode::ChatSession,
+    db_entries: &HashMap<u32, (TokenStats, String)>,
+    timeline: &mut Vec<TimelineItem>,
+    metadata: &mut HashMap<String, serde_json::Value>,
+) {
+    if let Some(cwd) = &session.working_directory {
+        metadata.insert("cwd".to_string(), serde_json::Value::String(cwd.clone()));
+    }
+    if let Some(location) = &session.initial_location {
+        metadata.insert(
+            "initial_location".to_string(),
+            serde_json::Value::String(location.clone()),
+        );
+    }
+    if let Some(username) = &session.responder_username {
+        metadata.insert(
+            "responder_username".to_string(),
+            serde_json::Value::String(username.clone()),
+        );
+    }
+
+    let fallback_timestamp = session
+        .creation_date
+        .map(crate::vscode::timestamp_to_iso)
+        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
+    let mut current_model = "GitHub Copilot".to_string();
+
+    for (index, request) in session.requests.iter().enumerate() {
+        let turn_no = (index + 1) as u32;
+        let timestamp = request
+            .timestamp
+            .map(crate::vscode::timestamp_to_iso)
+            .unwrap_or_else(|| fallback_timestamp.clone());
+        if !request.prompt.trim().is_empty() {
+            timeline.push(TimelineItem::UserPrompt {
+                timestamp: timestamp.clone(),
+                prompt: request.prompt.clone(),
+                context: None,
+                turn_no,
+            });
+        }
+
+        let (tokens, model_from_db) = db_entries
+            .get(&turn_no)
+            .map(|(stats, model)| (Some(stats.clone()), Some(model.clone())))
+            .unwrap_or((None, None));
+        if let Some(model) = model_from_db.or_else(|| request.model_id.clone()) {
+            current_model = model;
+        }
+
+        let mut reasoning = Vec::new();
+        let mut reply_tokens = tokens.clone();
+        for part in &request.response {
+            let kind = part
+                .get("kind")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            match kind {
+                "thinking" => {
+                    if let Some(text) = vscode_part_text(part) {
+                        if !text.trim().is_empty() {
+                            reasoning.push(text);
+                        }
+                    }
+                }
+                "markdownContent" | "markdownVuln" | "text" | "info" | "warning" => {
+                    if let Some(reply) = vscode_part_text(part) {
+                        if !reply.trim().is_empty() {
+                            timeline.push(TimelineItem::AgentReply {
+                                timestamp: timestamp.clone(),
+                                reply,
+                                reasoning: if reasoning.is_empty() {
+                                    None
+                                } else {
+                                    Some(reasoning.join("\n"))
+                                },
+                                turn_no,
+                                model: current_model.clone(),
+                                tokens: reply_tokens.take(),
+                                duration_ms: request.elapsed_ms,
+                                reasoning_effort: None,
+                            });
+                            reasoning.clear();
+                        }
+                    }
+                }
+                "toolInvocationSerialized" | "toolInvocation" => {
+                    let call_id = part
+                        .get("toolCallId")
+                        .or_else(|| part.get("id"))
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string);
+                    let tool_name = part
+                        .get("toolName")
+                        .or_else(|| part.get("name"))
+                        .or_else(|| part.get("toolId"))
+                        .or_else(|| part.get("source").and_then(|source| source.get("label")))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("VS Code Tool")
+                        .to_string();
+                    let arguments = part
+                        .get("parameters")
+                        .or_else(|| part.get("arguments"))
+                        .or_else(|| part.get("input"))
+                        .or_else(|| part.get("invocationMessage"))
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    let result = part
+                        .get("resultDetails")
+                        .or_else(|| part.get("result"))
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    let succeeded = part
+                        .get("isComplete")
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(!result.is_null());
+                    timeline.push(TimelineItem::ToolStep {
+                        timestamp: timestamp.clone(),
+                        tool_name,
+                        arguments,
+                        env: None,
+                        exit_code: Some(if succeeded { 0 } else { 1 }),
+                        stdout: vscode_value_text(&result),
+                        stderr: String::new(),
+                        tool_call_id: call_id,
+                        status: if succeeded {
+                            "success".to_string()
+                        } else {
+                            "running".to_string()
+                        },
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    metadata.insert(
+        "selected_model".to_string(),
+        serde_json::Value::String(current_model),
+    );
+}
+
+fn vscode_part_text(part: &serde_json::Value) -> Option<String> {
+    part.get("content")
+        .or_else(|| part.get("value"))
+        .or_else(|| part.get("text"))
+        .map(vscode_value_text)
+}
+
+fn vscode_value_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(values) => values
+            .iter()
+            .map(vscode_value_text)
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        serde_json::Value::Object(object) => object
+            .get("value")
+            .or_else(|| object.get("text"))
+            .or_else(|| object.get("content"))
+            .map(vscode_value_text)
+            .unwrap_or_else(|| value.to_string()),
+        _ => value.to_string(),
+    }
+}
+
 fn codex_text_from_content(content: &serde_json::Value) -> String {
     if let Some(text) = content.as_str() {
         return text.to_string();

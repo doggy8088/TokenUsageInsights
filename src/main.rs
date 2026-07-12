@@ -13,6 +13,7 @@ mod handlers;
 mod paths;
 mod pricing;
 mod timeline;
+mod vscode;
 
 use handlers::*;
 

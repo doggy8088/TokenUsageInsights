@@ -79,6 +79,7 @@ pub struct SessionSummary {
     pub session_id: String,
     pub session_name: String,
     pub assistant_type: String,
+    pub source_kind: String,
     pub cwd: String,
     pub model: String,
     pub total_tokens: u64,

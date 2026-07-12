@@ -1,11 +1,11 @@
 use axum::{extract::Path, http::StatusCode, response::IntoResponse, Json};
 use chrono::{SecondsFormat, Utc};
+use serde::{Deserialize, Serialize};
 use std::{
     fs::File,
     io::{BufRead, BufReader},
     path::PathBuf,
 };
-use serde::{Deserialize, Serialize};
 
 use super::*;
 use crate::db::{self, UsageDayExportRecord};
@@ -237,7 +237,9 @@ fn normalize_import_payload_date(
     Err("日期格式不正確".to_string())
 }
 
-pub async fn export_usage_day(Path((assistant, date)): Path<(String, String)>) -> impl IntoResponse {
+pub async fn export_usage_day(
+    Path((assistant, date)): Path<(String, String)>,
+) -> impl IntoResponse {
     let assistant = normalize_assistant_name(&assistant);
     if !is_supported_assistant(&assistant) {
         return (
@@ -337,7 +339,8 @@ pub async fn import_usage_day(
     let records = payload.records;
     let import_res = tokio::task::spawn_blocking(move || {
         let mut conn = db::get_db_conn()?;
-        let summary = db::import_usage_day_entries(&mut conn, &assistant_clone, &import_date_clone, records)?;
+        let summary =
+            db::import_usage_day_entries(&mut conn, &assistant_clone, &import_date_clone, records)?;
         Ok::<crate::db::UsageDayImportSummary, String>(summary)
     })
     .await

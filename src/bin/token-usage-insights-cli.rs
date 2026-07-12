@@ -13,6 +13,9 @@ mod db;
 #[path = "../paths.rs"]
 #[allow(dead_code)]
 mod paths;
+#[path = "../vscode.rs"]
+#[allow(dead_code)]
+mod vscode;
 
 const EXPORT_VERSION: u8 = 1;
 const HELP_TEXT: &str = r#"Token 使用量 CLI 匯入 / 匯出工具
@@ -315,7 +318,12 @@ fn run_import(args: &[String]) -> i32 {
         return 1;
     }
 
-    let summary = match db::import_usage_day_entries(&mut conn, &assistant, &imported_from, payload.records) {
+    let summary = match db::import_usage_day_entries(
+        &mut conn,
+        &assistant,
+        &imported_from,
+        payload.records,
+    ) {
         Ok(v) => v,
         Err(err) => {
             eprintln!("匯入失敗: {err}");
@@ -334,7 +342,10 @@ fn run_import(args: &[String]) -> i32 {
     0
 }
 
-fn normalize_import_date(route_date: Option<String>, file_date: Option<String>) -> Result<String, String> {
+fn normalize_import_date(
+    route_date: Option<String>,
+    file_date: Option<String>,
+) -> Result<String, String> {
     if let Some(file_date) = file_date {
         if file_date.trim().is_empty() {
             return Err("匯入檔案日期欄位不能為空".to_string());
@@ -350,7 +361,9 @@ fn normalize_import_date(route_date: Option<String>, file_date: Option<String>) 
             }
 
             if route_date != file_date {
-                return Err(format!("匯入檔案日期 {file_date} 與 --date 指定 {route_date} 不一致"));
+                return Err(format!(
+                    "匯入檔案日期 {file_date} 與 --date 指定 {route_date} 不一致"
+                ));
             }
             return Ok(route_date);
         }

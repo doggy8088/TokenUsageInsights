@@ -1,6 +1,6 @@
 # Token 戰情室
 
-**Token 戰情室是本地優先的 AI CLI Token 使用量與會話還原看板。** 它會讀取本機上的 Google Antigravity CLI、GitHub Copilot CLI、Codex CLI 與 Claude Code 記錄，集中呈現每日、月度、年度的 Token 消耗、快取使用、推理 Token、估算費用、模型分佈、專案目錄分佈與完整 Session 時間軸。
+**Token 戰情室是本地優先的 AI CLI 與 VS Code Copilot Token 使用量與會話還原看板。** 它會讀取本機上的 Google Antigravity CLI、GitHub Copilot CLI、GitHub Copilot Chat（VS Code）、Codex CLI 與 Claude Code 記錄，集中呈現每日、月度、年度的 Token 消耗、快取使用、推理 Token、估算費用、模型分佈、專案目錄分佈與完整 Session 時間軸。
 
 本專案不會替你呼叫 AI 供應商 API 查詢資料；核心資料來源是本機日誌、Status Line 收集檔與本機 SQLite。
 
@@ -38,10 +38,11 @@ http://localhost:3003
 | --- | --- | --- | --- |
 | Google Antigravity CLI | 需要 | `~/.gemini/antigravity-cli/usage/usage-YYYY-MM-DD.jsonl` | 透過 `statusline-token.sh` 或 Windows `statusline-token.ps1` 收集 Token 資料 |
 | GitHub Copilot CLI | 需要 | `~/.copilot/usage/usage-YYYY-MM-DD.jsonl` | 透過 `statusline-token.sh` 或 Windows `statusline-token.ps1` 收集 Token 資料 |
+| GitHub Copilot Chat（VS Code） | 不需要 | VS Code `workspaceStorage/chatSessions` | 看板直接掃描 VS Code Stable 與 Insiders 的本機聊天 Session |
 | Codex CLI | 不需要 | `~/.codex/sessions` | 看板會直接掃描 Codex CLI 本機 Session 記錄 |
 | Claude Code | 不需要 | `~/.claude/projects` | 看板會直接掃描 Claude Code 本機專案 Session 記錄 |
 
-**只使用 Codex CLI 或 Claude Code 時，執行一行安裝指令並開啟看板即可。**
+**只使用 VS Code Copilot、Codex CLI 或 Claude Code 時，執行一行安裝指令並開啟看板即可。**
 
 ### Windows 原生使用
 
@@ -191,6 +192,44 @@ jq . ~/.copilot/settings.json
 
 * * *
 
+## GitHub Copilot Chat（VS Code）設定
+
+**VS Code Copilot Chat 不需要安裝 Status Line、Hook 或額外收集腳本。**看板會直接讀取本機 `workspaceStorage` 內的聊天 Session，並與 Copilot CLI 合併顯示；Session 清單會以 `VS Code` 或 `CLI` 標示來源。
+
+支援 VS Code Stable 與 Insiders：
+
+| 平台 | Stable | Insiders |
+| --- | --- | --- |
+| Windows | `%APPDATA%\Code\User\workspaceStorage` | `%APPDATA%\Code - Insiders\User\workspaceStorage` |
+| macOS | `~/Library/Application Support/Code/User/workspaceStorage` | `~/Library/Application Support/Code - Insiders/User/workspaceStorage` |
+| Linux | `~/.config/Code/User/workspaceStorage` | `~/.config/Code - Insiders/User/workspaceStorage` |
+
+使用方式：
+
+1. 以 VS Code 使用 GitHub Copilot Chat 產生至少一個聊天 Session。
+2. 啟動看板或按右上角同步按鈕。
+3. 在 Copilot 頁面查看合併後的統計與 Session 時間軸。
+
+看板會完整回填現有 `chatSessions` 檔案，也會在檔案大小或修改時間變更時重新同步；沒有 Token 欄位的聊天 Session 仍會顯示，但 Token 數為 0。資料只讀取本機聊天檔案，不包含雲端 Session、Remote SSH 主機或 `state.vscdb`。
+
+若 VS Code 使用 `--user-data-dir` 或 Portable Mode，可指定看板自訂的資料根目錄：
+
+macOS / Linux：
+
+```bash
+VSCODE_USER_DATA_DIR="/path/to/vscode-user-data" token-usage-insights
+```
+
+Windows PowerShell：
+
+```powershell
+$env:VSCODE_USER_DATA_DIR = "C:\path\to\vscode-user-data"; & "$HOME\bin\token-usage-insights.cmd"
+```
+
+`VSCODE_USER_DATA_DIR` 應指向包含 `User/workspaceStorage` 的 VS Code 使用者資料目錄。Portable Mode 若環境變數指向 `data` 目錄，請改用 `VSCODE_PORTABLE_DATA_DIR`；看板會同時檢查 `data/user-data/User/workspaceStorage` 與 `data/User/workspaceStorage`。
+
+* * *
+
 ## Codex CLI 設定
 
 **Codex CLI 不需要安裝 Hook、Status Line 或額外收集腳本。**
@@ -314,6 +353,8 @@ cargo build --release --bin token-usage-insights-cli
 | `INSIGHTS_DIR` | Windows: `%LOCALAPPDATA%\TokenUsageInsights`; 其他平台: `~/.token-usage-insights` | SQLite 資料庫目錄 |
 | `ANTIGRAVITY_DIR` | `~/.gemini/antigravity-cli` | Antigravity CLI 資料目錄 |
 | `COPILOT_DIR` | `~/.copilot` | Copilot CLI 資料目錄 |
+| `VSCODE_USER_DATA_DIR` | 依平台自動偵測 | VS Code 使用者資料目錄，應包含 `User/workspaceStorage` |
+| `VSCODE_PORTABLE_DATA_DIR` | 未設定 | VS Code Portable Mode 的 `data` 目錄 |
 | `CODEX_DIR` | `~/.codex` | Codex CLI 資料目錄 |
 | `CLAUDE_DIR` | `~/.claude` | Claude Code 資料目錄 |
 | `CURSOR_DIR` | `~/.cursor` | Cursor 資料目錄 |

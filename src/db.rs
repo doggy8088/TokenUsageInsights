@@ -45,6 +45,8 @@ pub struct UsageEntry {
     pub delta_tokens: Option<TokenStats>,
     pub context: Option<ContextStats>,
     pub cost: Option<CostStats>,
+    #[serde(default)]
+    pub source_kind: Option<String>,
 
     // Codex-specific / Extended fields
     pub parent_session_id: Option<String>,
@@ -97,6 +99,7 @@ struct CodexTokenUsage {
 }
 
 const CODEX_PARSER_MIGRATION_KEY: &str = "migration:codex_session_identity_v6";
+const COPILOT_SOURCE_KIND_MIGRATION_KEY: &str = "migration:copilot_source_kind_v1";
 
 fn hash_fnv1a_64(input: &str) -> u64 {
     let mut hash: u64 = 0xcbf29ce484222325;
@@ -131,11 +134,7 @@ fn build_import_token_signature(tokens: &Option<TokenStats>) -> String {
     }
 }
 
-fn build_usage_entry_import_source_id(
-    assistant: &str,
-    date: &str,
-    entry: &UsageEntry,
-) -> String {
+fn build_usage_entry_import_source_id(assistant: &str, date: &str, entry: &UsageEntry) -> String {
     let signature = format!(
         "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
         assistant,
@@ -143,14 +142,14 @@ fn build_usage_entry_import_source_id(
         entry.timestamp,
         entry.session_id,
         entry.turn_no,
-        entry.model.clone().unwrap_or_else(|| "".to_string()),
-        entry.model_id.clone().unwrap_or_else(|| "".to_string()),
-        entry.version.clone().unwrap_or_else(|| "".to_string()),
-        entry.cwd.clone().unwrap_or_else(|| "".to_string()),
-        entry.transcript_path.clone().unwrap_or_else(|| "".to_string()),
-        entry.parent_session_id.clone().unwrap_or_else(|| "".to_string()),
-        entry.agent_nickname.clone().unwrap_or_else(|| "".to_string()),
-        entry.agent_role.clone().unwrap_or_else(|| "".to_string()),
+        entry.model.clone().unwrap_or_default(),
+        entry.model_id.clone().unwrap_or_default(),
+        entry.version.clone().unwrap_or_default(),
+        entry.cwd.clone().unwrap_or_default(),
+        entry.transcript_path.clone().unwrap_or_default(),
+        entry.parent_session_id.clone().unwrap_or_default(),
+        entry.agent_nickname.clone().unwrap_or_default(),
+        entry.agent_role.clone().unwrap_or_default(),
         build_import_token_signature(&entry.tokens),
         build_import_token_signature(&entry.delta_tokens)
     );
@@ -323,6 +322,7 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
             -- Duration and Request Count
             duration_ms INTEGER,
             premium_requests INTEGER,
+            source_kind TEXT NOT NULL DEFAULT 'legacy',
 
             -- Codex-specific fields
             parent_session_id TEXT,
@@ -351,14 +351,25 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
         "ALTER TABLE usage_entries ADD COLUMN import_source_id TEXT",
         [],
     );
+    let _ = conn.execute(
+        "ALTER TABLE usage_entries ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'legacy'",
+        [],
+    );
 
-    // Unique index on assistant, session, and turn
+    // Include the original source in the identity so VS Code and Copilot CLI
+    // records can be aggregated without colliding on a reused session id.
+    let _ = conn.execute("DROP INDEX IF EXISTS uidx_assistant_session_turn", []);
     conn.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS uidx_assistant_session_turn 
-         ON usage_entries(assistant_type, session_id, turn_no)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uidx_assistant_source_session_turn
+         ON usage_entries(assistant_type, source_kind, session_id, turn_no)",
         [],
     )
-    .map_err(|e| format!("建立唯一索引 uidx_assistant_session_turn 失敗: {}", e))?;
+    .map_err(|e| {
+        format!(
+            "建立唯一索引 uidx_assistant_source_session_turn 失敗: {}",
+            e
+        )
+    })?;
 
     // Indexes for performance
     conn.execute(
@@ -388,6 +399,30 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
         [],
     )
     .map_err(|e| format!("建立 sync_state 表失敗: {}", e))?;
+
+    // Before source_kind existed, every Copilot record came from the CLI
+    // collector. Classify those historical rows once so the new source-scoped
+    // unique index does not duplicate them on the first synchronization.
+    let source_kind_migration_done: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = ?)",
+            params![COPILOT_SOURCE_KIND_MIGRATION_KEY],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    if !source_kind_migration_done {
+        let _ = conn.execute(
+            "UPDATE usage_entries
+             SET source_kind = 'copilot-cli'
+             WHERE assistant_type = 'copilot' AND source_kind = 'legacy'",
+            [],
+        );
+        let _ = conn.execute(
+            "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES (?, 1, 0)",
+            params![COPILOT_SOURCE_KIND_MIGRATION_KEY],
+        );
+    }
 
     Ok(())
 }
@@ -472,6 +507,11 @@ fn sync_hook_usage_logs(
     }
 
     let entries = fs::read_dir(usage_dir).map_err(|e| format!("無法讀取 usage 目錄: {}", e))?;
+    let source_kind = if assistant_type == "copilot" {
+        "copilot-cli"
+    } else {
+        "legacy"
+    };
 
     for entry in entries.flatten() {
         let file_type = match entry.file_type() {
@@ -558,13 +598,14 @@ fn sync_hook_usage_logs(
 
                     let insert_res = tx.execute(
                         "INSERT OR IGNORE INTO usage_entries (
-                            assistant_type, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
+                            assistant_type, source_kind, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
                             tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_reasoning, tokens_total,
                             delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total,
                             duration_ms, premium_requests
                         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         params![
                             assistant_type,
+                            source_kind,
                             entry.timestamp,
                             date_str,
                             entry.session_id,
@@ -618,6 +659,146 @@ fn sync_hook_usage_logs(
                 }
             }
         }
+    }
+
+    Ok(())
+}
+
+fn insert_vscode_usage_entry(
+    tx: &rusqlite::Transaction<'_>,
+    entry: &UsageEntry,
+) -> rusqlite::Result<usize> {
+    let tokens = entry.tokens.as_ref();
+    let delta = entry.delta_tokens.as_ref();
+    let cost = entry.cost.as_ref();
+    tx.execute(
+        "INSERT OR REPLACE INTO usage_entries (
+            assistant_type, source_kind, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
+            tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_reasoning, tokens_total,
+            delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total,
+            duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, reasoning_effort
+        ) VALUES (
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?
+        )",
+        params![
+            "copilot",
+            entry.source_kind.as_deref().unwrap_or(crate::vscode::SOURCE_KIND),
+            entry.timestamp,
+            entry.timestamp.get(0..10).unwrap_or("unknown"),
+            entry.session_id,
+            entry.session_name.as_deref(),
+            entry.transcript_path.as_deref(),
+            entry.cwd.as_deref(),
+            entry.version.as_deref(),
+            entry.turn_no as i64,
+            entry.model.as_deref(),
+            entry.model_id.as_deref(),
+            tokens.map(|value| value.input as i64),
+            tokens.map(|value| value.output as i64),
+            tokens.and_then(|value| value.cache_read.map(|v| v as i64)),
+            tokens.and_then(|value| value.cache_write.map(|v| v as i64)),
+            tokens.and_then(|value| value.reasoning.map(|v| v as i64)),
+            tokens.map(|value| value.total as i64),
+            delta.map(|value| value.input as i64),
+            delta.map(|value| value.output as i64),
+            delta.and_then(|value| value.cache_read.map(|v| v as i64)),
+            delta.and_then(|value| value.cache_write.map(|v| v as i64)),
+            delta.and_then(|value| value.reasoning.map(|v| v as i64)),
+            delta.map(|value| value.total as i64),
+            cost.and_then(|value| value.total_duration_ms.or(value.total_api_duration_ms))
+                .map(|value| value as i64),
+            cost.and_then(|value| value.total_premium_requests)
+                .map(|value| value as i64),
+            entry.parent_session_id.as_deref(),
+            entry.agent_nickname.as_deref(),
+            entry.agent_role.as_deref(),
+            entry.reasoning_effort.as_deref(),
+        ],
+    )
+}
+
+fn sync_vscode_chat_sessions(conn: &mut Connection) -> Result<(), String> {
+    let mut seen_sessions = HashSet::new();
+
+    for filepath in crate::vscode::discover_session_files() {
+        let metadata = match fs::metadata(&filepath) {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        let current_size = metadata.len();
+        let modified_time = metadata
+            .modified()
+            .ok()
+            .and_then(|value| value.duration_since(SystemTime::UNIX_EPOCH).ok())
+            .map(|value| value.as_nanos() as i64)
+            .unwrap_or(0);
+        let state_key = format!("vscode:{}", filepath.to_string_lossy());
+        let previous_state: Option<(u64, i64)> = conn
+            .query_row(
+                "SELECT last_synced_size, last_synced_time FROM sync_state WHERE filename = ?",
+                params![state_key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .ok();
+
+        if previous_state == Some((current_size, modified_time)) {
+            continue;
+        }
+
+        let session = match crate::vscode::read_session_file(&filepath) {
+            Ok(session) => session,
+            Err(error) => {
+                eprintln!("解析 VS Code Copilot 檔案 {:?} 失敗: {}", filepath, error);
+                continue;
+            }
+        };
+        let session_key = session.session_id.clone();
+        if !crate::vscode::is_github_copilot(&session) || !seen_sessions.insert(session_key.clone())
+        {
+            let tx = conn
+                .transaction()
+                .map_err(|error| format!("建立 VS Code 狀態交易失敗: {error}"))?;
+            tx.execute(
+                "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time)
+                 VALUES (?, ?, ?)",
+                params![state_key, current_size as i64, modified_time],
+            )
+            .map_err(|error| format!("更新 VS Code 狀態失敗: {error}"))?;
+            tx.commit()
+                .map_err(|error| format!("提交 VS Code 狀態交易失敗: {error}"))?;
+            continue;
+        }
+        let entries = crate::vscode::to_usage_entries(&session, &filepath);
+
+        let tx = conn
+            .transaction()
+            .map_err(|error| format!("建立 VS Code 同步交易失敗: {error}"))?;
+        let db_session_id = format!("vscode-{session_key}");
+        tx.execute(
+            "DELETE FROM usage_entries
+             WHERE assistant_type = 'copilot'
+               AND source_kind = ?
+               AND session_id = ?",
+            params![crate::vscode::SOURCE_KIND, db_session_id],
+        )
+        .map_err(|error| format!("清除舊 VS Code 工作階段失敗: {error}"))?;
+
+        for entry in &entries {
+            insert_vscode_usage_entry(&tx, entry)
+                .map_err(|error| format!("寫入 VS Code Copilot 資料失敗: {error}"))?;
+        }
+
+        tx.execute(
+            "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES (?, ?, ?)",
+            params![state_key, current_size as i64, modified_time],
+        )
+        .map_err(|error| format!("更新 VS Code 同步狀態失敗: {error}"))?;
+        tx.commit()
+            .map_err(|error| format!("提交 VS Code 同步交易失敗: {error}"))?;
     }
 
     Ok(())
@@ -929,6 +1110,7 @@ fn parse_codex_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String> 
             delta_tokens: Some(delta_tokens),
             context,
             cost: None,
+            source_kind: None,
             parent_session_id: parent_session_id.clone(),
             agent_nickname: agent_nickname.clone(),
             agent_role: agent_role.clone(),
@@ -1323,6 +1505,7 @@ fn parse_claude_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String>
             delta_tokens: Some(tokens),
             context: None,
             cost: None,
+            source_kind: None,
             parent_session_id: None,
             agent_nickname: None,
             agent_role: None,
@@ -1719,6 +1902,7 @@ fn parse_cursor_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String>
                 delta_tokens: Some(tokens),
                 context: None,
                 cost: None,
+                source_kind: None,
                 parent_session_id: None,
                 agent_nickname: None,
                 agent_role: None,
@@ -1877,6 +2061,11 @@ pub fn sync_usage_logs(conn: &mut Connection) -> Result<(), String> {
     let copilot_dir = get_copilot_dir();
     if let Err(e) = sync_hook_usage_logs(conn, "copilot", &copilot_dir) {
         eprintln!("❌ 同步 Copilot 失敗: {}", e);
+    }
+
+    // 2b. Sync GitHub Copilot sessions created in VS Code
+    if let Err(e) = sync_vscode_chat_sessions(conn) {
+        eprintln!("❌ 同步 VS Code Copilot 失敗: {}", e);
     }
 
     // 3. Sync Codex CLI
@@ -2142,7 +2331,7 @@ pub fn get_usage_entries_by_date(
             timestamp, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
             tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_reasoning, tokens_total,
             delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total,
-            duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, assistant_type, reasoning_effort, import_source_id
+            duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, assistant_type, reasoning_effort, import_source_id, source_kind
          FROM usage_entries WHERE date = ?".to_string();
     let mut params_vec = Vec::new();
     params_vec.push(rusqlite::types::Value::Text(date.to_string()));
@@ -2288,6 +2477,7 @@ pub fn get_usage_entries_by_date(
                 delta_tokens,
                 context: None,
                 cost,
+                source_kind: row.get(29).ok(),
                 parent_session_id: row.get(23).ok(),
                 agent_nickname: row.get(24).ok(),
                 agent_role: row.get(25).ok(),
@@ -2297,8 +2487,11 @@ pub fn get_usage_entries_by_date(
         };
 
         if record.import_source_id.is_none() {
-            record.import_source_id =
-                Some(build_usage_entry_import_source_id(assistant, date, &record.entry));
+            record.import_source_id = Some(build_usage_entry_import_source_id(
+                assistant,
+                date,
+                &record.entry,
+            ));
         }
 
         entries.push((record, ast_type));
@@ -2309,7 +2502,7 @@ pub fn get_usage_entries_by_date(
 fn entry_date_from_timestamp(timestamp: &str) -> Option<&str> {
     let trimmed = timestamp.trim();
     trimmed
-        .split(|c| c == 'T' || c == ' ')
+        .split(['T', ' '])
         .next()
         .filter(|date_part| date_part.len() == 10)
 }
@@ -2324,7 +2517,11 @@ pub fn export_usage_day_entries(
 
     for (mut record, _assistant_type) in rows {
         if record.import_source_id.is_none() {
-            record.import_source_id = Some(build_usage_entry_import_source_id(assistant, date, &record.entry));
+            record.import_source_id = Some(build_usage_entry_import_source_id(
+                assistant,
+                date,
+                &record.entry,
+            ));
         }
         records.push(record);
     }
@@ -2361,26 +2558,30 @@ pub fn import_usage_day_entries(
             ));
         }
 
-        let source_id = normalized_id.unwrap_or_else(|| {
-            build_usage_entry_import_source_id(assistant, date, &entry)
-        });
+        let source_id = normalized_id
+            .unwrap_or_else(|| build_usage_entry_import_source_id(assistant, date, &entry));
+        let source_kind = entry
+            .source_kind
+            .clone()
+            .unwrap_or_else(|| "legacy".to_string());
 
         let imported = tx
             .execute(
                 "INSERT OR IGNORE INTO usage_entries (
-                    assistant_type, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no,
+                    assistant_type, source_kind, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no,
                     model, model_id, tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_reasoning, tokens_total,
                     delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total,
                     duration_ms, premium_requests,
                     parent_session_id, agent_nickname, agent_role, reasoning_effort, import_source_id
                 ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?, ?
                 )",
                 rusqlite::params![
                     assistant,
+                    source_kind,
                     entry.timestamp,
                     date,
                     entry.session_id,
@@ -2391,18 +2592,18 @@ pub fn import_usage_day_entries(
                     entry.turn_no as i64,
                     entry.model,
                     entry.model_id,
-                    entry.tokens.as_ref().and_then(|t| Some(t.input as i64)),
-                    entry.tokens.as_ref().and_then(|t| Some(t.output as i64)),
+                    entry.tokens.as_ref().map(|t| t.input as i64),
+                    entry.tokens.as_ref().map(|t| t.output as i64),
                     entry.tokens.as_ref().and_then(|t| t.cache_read.map(|v| v as i64)),
                     entry.tokens.as_ref().and_then(|t| t.cache_write.map(|v| v as i64)),
                     entry.tokens.as_ref().and_then(|t| t.reasoning.map(|v| v as i64)),
-                    entry.tokens.as_ref().and_then(|t| Some(t.total as i64)),
-                    entry.delta_tokens.as_ref().and_then(|t| Some(t.input as i64)),
-                    entry.delta_tokens.as_ref().and_then(|t| Some(t.output as i64)),
+                    entry.tokens.as_ref().map(|t| t.total as i64),
+                    entry.delta_tokens.as_ref().map(|t| t.input as i64),
+                    entry.delta_tokens.as_ref().map(|t| t.output as i64),
                     entry.delta_tokens.as_ref().and_then(|t| t.cache_read.map(|v| v as i64)),
                     entry.delta_tokens.as_ref().and_then(|t| t.cache_write.map(|v| v as i64)),
                     entry.delta_tokens.as_ref().and_then(|t| t.reasoning.map(|v| v as i64)),
-                    entry.delta_tokens.as_ref().and_then(|t| Some(t.total as i64)),
+                    entry.delta_tokens.as_ref().map(|t| t.total as i64),
                     entry.cost.as_ref().and_then(|c| c.total_api_duration_ms).map(|v| v as i64),
                     entry.cost.as_ref().and_then(|c| c.total_premium_requests).map(|v| v as i64),
                     entry.parent_session_id,
@@ -2436,10 +2637,10 @@ pub fn get_session_assistant_and_transcript(
     conn: &rusqlite::Connection,
     assistant: &str,
     session_id: &str,
-) -> Result<(String, Option<String>), String> {
+) -> Result<(String, Option<String>, String), String> {
     let mut stmt = conn
         .prepare(
-            "SELECT assistant_type, transcript_path FROM usage_entries WHERE session_id = ? AND assistant_type = ? LIMIT 1",
+            "SELECT assistant_type, transcript_path, source_kind FROM usage_entries WHERE session_id = ? AND assistant_type = ? LIMIT 1",
         )
         .map_err(|e| e.to_string())?;
     let mut rows = stmt
@@ -2448,7 +2649,12 @@ pub fn get_session_assistant_and_transcript(
     if let Some(row) = rows.next().map_err(|e| e.to_string())? {
         let ast: String = row.get(0).map_err(|e| e.to_string())?;
         let path: Option<String> = row.get(1).ok();
-        Ok((ast, path))
+        let source_kind = row
+            .get::<_, Option<String>>(2)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "legacy".to_string());
+        Ok((ast, path, source_kind))
     } else {
         Err("Session not found".to_string())
     }
@@ -2579,7 +2785,7 @@ pub fn get_usage_entries_by_month(
             tokens_input, tokens_output, tokens_cache_read, tokens_reasoning, tokens_total,
             delta_input, delta_output, delta_cache_read, delta_reasoning, delta_total,
             duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, assistant_type, reasoning_effort,
-            date
+            date, source_kind
          FROM usage_entries WHERE date LIKE ?".to_string();
     let mut params_vec = Vec::new();
     params_vec.push(rusqlite::types::Value::Text(query_month));
@@ -2714,6 +2920,7 @@ pub fn get_usage_entries_by_month(
                 delta_tokens,
                 context: None,
                 cost,
+                source_kind: row.get(27).ok(),
                 parent_session_id: row.get(21).ok(),
                 agent_nickname: row.get(22).ok(),
                 agent_role: row.get(23).ok(),
@@ -2777,7 +2984,7 @@ pub fn get_usage_entries_by_year(
             tokens_input, tokens_output, tokens_cache_read, tokens_reasoning, tokens_total,
             delta_input, delta_output, delta_cache_read, delta_reasoning, delta_total,
             duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, assistant_type, reasoning_effort,
-            date
+            date, source_kind
          FROM usage_entries WHERE date LIKE ?".to_string();
     let mut params_vec = Vec::new();
     params_vec.push(rusqlite::types::Value::Text(query_year));
@@ -2912,6 +3119,7 @@ pub fn get_usage_entries_by_year(
                 delta_tokens,
                 context: None,
                 cost,
+                source_kind: row.get(27).ok(),
                 parent_session_id: row.get(21).ok(),
                 agent_nickname: row.get(22).ok(),
                 agent_role: row.get(23).ok(),
@@ -2986,6 +3194,7 @@ mod tests {
                     total_duration_ms: None,
                     total_premium_requests: Some(1.0),
                 }),
+                source_kind: None,
                 parent_session_id: Some("parent-session".to_string()),
                 agent_nickname: Some("worker".to_string()),
                 agent_role: Some("analysis".to_string()),
@@ -3001,13 +3210,9 @@ mod tests {
         init_db(&conn).unwrap();
         let record = sample_import_record();
 
-        let first = import_usage_day_entries(
-            &mut conn,
-            "codex",
-            "2026-07-10",
-            vec![record.clone()],
-        )
-        .unwrap();
+        let first =
+            import_usage_day_entries(&mut conn, "codex", "2026-07-10", vec![record.clone()])
+                .unwrap();
         assert_eq!(first.imported, 1);
         assert_eq!(first.skipped_duplicates, 0);
 
@@ -3024,6 +3229,35 @@ mod tests {
             )
             .unwrap();
         assert_eq!(imported_rows, 1);
+    }
+
+    #[test]
+    fn init_db_migrates_legacy_copilot_source_kind() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, turn_no
+             ) VALUES ('copilot', '2026-07-10T00:00:00Z', '2026-07-10', 'legacy-copilot', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM sync_state WHERE filename = ?",
+            params![COPILOT_SOURCE_KIND_MIGRATION_KEY],
+        )
+        .unwrap();
+
+        init_db(&conn).unwrap();
+
+        let source_kind: String = conn
+            .query_row(
+                "SELECT source_kind FROM usage_entries WHERE session_id = 'legacy-copilot'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(source_kind, "copilot-cli");
     }
 
     #[test]

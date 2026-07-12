@@ -11,7 +11,7 @@ use crate::db::{self, TokenStats};
 use crate::pricing::{calculate_cost, load_pricing_rules};
 use crate::timeline::{
     parse_antigravity_timeline, parse_claude_timeline, parse_codex_timeline,
-    parse_copilot_timeline, parse_cursor_timeline, TimelineItem,
+    parse_copilot_timeline, parse_cursor_timeline, parse_vscode_timeline, TimelineItem,
 };
 
 fn is_safe_session_id(session_id: &str) -> bool {
@@ -124,6 +124,37 @@ fn resolve_cursor_transcript_path(
         return Err("會話日誌路徑與 session id 不一致。".to_string());
     }
 
+    Ok(canonical_path)
+}
+
+fn resolve_vscode_transcript_path(transcript_path_db: &str) -> Result<PathBuf, String> {
+    let path = PathBuf::from(transcript_path_db);
+    if !path.exists() {
+        return Err("找不到該 VS Code Copilot 聊天檔案。".to_string());
+    }
+
+    let canonical_path = path
+        .canonicalize()
+        .map_err(|_| "無法解析 VS Code Copilot 聊天檔案路徑。".to_string())?;
+    let is_allowed = crate::vscode::discover_workspace_storage_roots()
+        .into_iter()
+        .filter_map(|root| root.canonicalize().ok())
+        .any(|root| {
+            canonical_path.starts_with(&root)
+                && canonical_path
+                    .parent()
+                    .and_then(|parent| parent.file_name())
+                    .and_then(|name| name.to_str())
+                    == Some("chatSessions")
+        });
+    if !is_allowed {
+        return Err("VS Code Copilot 聊天檔案不在允許的 workspaceStorage 目錄內。".to_string());
+    }
+
+    let extension = canonical_path.extension().and_then(|value| value.to_str());
+    if !matches!(extension, Some("json") | Some("jsonl")) {
+        return Err("VS Code Copilot 聊天檔案格式不受支援。".to_string());
+    }
     Ok(canonical_path)
 }
 
@@ -471,6 +502,10 @@ pub async fn get_usage_details(
                 .session_name
                 .unwrap_or_else(|| "Start Coding Session".to_string()),
             assistant_type: ast_type.clone(),
+            source_kind: last_entry
+                .source_kind
+                .clone()
+                .unwrap_or_else(|| "legacy".to_string()),
             cwd: last_entry.cwd.unwrap_or_default(),
             model: last_entry
                 .model
@@ -563,18 +598,19 @@ pub async fn get_session_details(
             .into_response();
     }
 
-    let session_info: Result<(String, Option<String>), String> = tokio::task::spawn_blocking({
-        let sid = session_id.clone();
-        let assistant_name = assistant.clone();
-        move || {
-            let conn = db::get_db_conn()?;
-            db::get_session_assistant_and_transcript(&conn, &assistant_name, &sid)
-        }
-    })
-    .await
-    .unwrap_or_else(|_| Err("執行緒執行失敗".to_string()));
+    let session_info: Result<(String, Option<String>, String), String> =
+        tokio::task::spawn_blocking({
+            let sid = session_id.clone();
+            let assistant_name = assistant.clone();
+            move || {
+                let conn = db::get_db_conn()?;
+                db::get_session_assistant_and_transcript(&conn, &assistant_name, &sid)
+            }
+        })
+        .await
+        .unwrap_or_else(|_| Err("執行緒執行失敗".to_string()));
 
-    let (resolved_assistant, transcript_path_db) = match session_info {
+    let (resolved_assistant, transcript_path_db, source_kind) = match session_info {
         Ok(info) => info,
         Err(e) => {
             return (
@@ -602,6 +638,27 @@ pub async fn get_session_details(
                 .join(&session_id)
                 .join(".system_generated/logs/transcript_full.jsonl")
         }
+        "copilot" if source_kind == crate::vscode::SOURCE_KIND => match transcript_path_db {
+            Some(ref path) => match resolve_vscode_transcript_path(path) {
+                Ok(path) => path,
+                Err(error) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({ "error": error })),
+                    )
+                        .into_response();
+                }
+            },
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "error": "找不到 VS Code Copilot 聊天檔案路徑。"
+                    })),
+                )
+                    .into_response();
+            }
+        },
         "copilot" => {
             let cop_dir = db::get_copilot_dir();
             let mut path = cop_dir
@@ -717,17 +774,6 @@ pub async fn get_session_details(
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": format!("找不到該會話的本地日誌檔: {:?}", filepath), "reason": reason }))).into_response();
     }
 
-    let file = match File::open(&filepath) {
-        Ok(f) => f,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": format!("開啟日誌檔案失敗: {}", e) })),
-            )
-                .into_response()
-        }
-    };
-
     // 3. 預先載入 SQLite 中的回合 (turn_no) 增量 token 數據
     let sid_clone = session_id.clone();
     let (db_entries, session_cwd): (HashMap<u32, (TokenStats, String)>, Option<String>) =
@@ -743,28 +789,53 @@ pub async fn get_session_details(
         .await
         .unwrap_or_else(|_| (HashMap::new(), None));
 
-    let reader = BufReader::new(file);
     let mut timeline = Vec::new();
     let mut metadata = HashMap::new();
 
     // 依據不同助理格式解析日誌
-    match resolved_assistant.as_str() {
-        "antigravity" => {
-            parse_antigravity_timeline(reader, &db_entries, &mut timeline, &mut metadata);
+    if source_kind == crate::vscode::SOURCE_KIND {
+        match crate::vscode::read_session_file(&filepath) {
+            Ok(session) => {
+                parse_vscode_timeline(&session, &db_entries, &mut timeline, &mut metadata);
+            }
+            Err(error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": error })),
+                )
+                    .into_response();
+            }
         }
-        "copilot" => {
-            parse_copilot_timeline(reader, &db_entries, &mut timeline, &mut metadata);
+    } else {
+        let file = match File::open(&filepath) {
+            Ok(f) => f,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": format!("開啟日誌檔案失敗: {}", e) })),
+                )
+                    .into_response()
+            }
+        };
+        let reader = BufReader::new(file);
+        match resolved_assistant.as_str() {
+            "antigravity" => {
+                parse_antigravity_timeline(reader, &db_entries, &mut timeline, &mut metadata);
+            }
+            "copilot" => {
+                parse_copilot_timeline(reader, &db_entries, &mut timeline, &mut metadata);
+            }
+            "codex" => {
+                parse_codex_timeline(reader, &db_entries, &mut timeline, &mut metadata);
+            }
+            "claude" => {
+                parse_claude_timeline(reader, &db_entries, &mut timeline, &mut metadata);
+            }
+            "cursor" => {
+                parse_cursor_timeline(reader, &db_entries, &mut timeline, &mut metadata);
+            }
+            _ => {}
         }
-        "codex" => {
-            parse_codex_timeline(reader, &db_entries, &mut timeline, &mut metadata);
-        }
-        "claude" => {
-            parse_claude_timeline(reader, &db_entries, &mut timeline, &mut metadata);
-        }
-        "cursor" => {
-            parse_cursor_timeline(reader, &db_entries, &mut timeline, &mut metadata);
-        }
-        _ => {}
     }
 
     // 補充或覆寫 Git 與 CWD 相關資訊（若 metadata 未包含但資料庫中有紀錄）
