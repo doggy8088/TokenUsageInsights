@@ -8,10 +8,10 @@
   install.ps1. Safe to re-run to upgrade to a newer release.
 
 .EXAMPLE
-  irm https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/improve/scripts/get.ps1 | iex
+  irm https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.ps1 | iex
 
 .EXAMPLE
-  $script = irm https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/improve/scripts/get.ps1
+  $script = irm https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.ps1
   Invoke-Expression "& { $script } -InstallDir 'D:\Apps\Token Usage Insights' -Port 3010"
 #>
 [CmdletBinding()]

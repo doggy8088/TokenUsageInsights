@@ -6,7 +6,7 @@
 # install.sh. Safe to re-run to upgrade to a newer release.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/improve/scripts/get.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.sh | bash
 #   curl -fsSL .../get.sh | bash -s -- --service
 #
 # Environment:
