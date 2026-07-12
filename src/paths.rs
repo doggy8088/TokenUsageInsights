@@ -73,7 +73,11 @@ pub fn find_resource(relative: impl AsRef<Path>) -> Option<PathBuf> {
         // ~/.local/bin 內是指向安裝目錄的 symlink；先解析 symlink 才能找到
         // 與真實執行檔同層的資源目錄。
         let resolved = std::fs::canonicalize(&executable).unwrap_or_else(|_| executable.clone());
-        for exe in [&resolved, &executable] {
+        let mut exes = vec![&resolved];
+        if resolved != executable {
+            exes.push(&executable);
+        }
+        for exe in exes {
             if let Some(executable_dir) = exe.parent() {
                 roots.extend(executable_dir.ancestors().take(5).map(Path::to_path_buf));
             }
