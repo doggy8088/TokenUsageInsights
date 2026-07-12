@@ -67,6 +67,31 @@ fn build_cors_layer() -> CorsLayer {
 
 #[tokio::main]
 async fn main() {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        println!(
+            "Usage: token-usage-insights [--backfill-copilot-usage]\n\nOptions:\n  --backfill-copilot-usage  Generate ~/.copilot/usage JSONL entries from Copilot CLI session history, then exit.\n  -h, --help                Show this help."
+        );
+        return;
+    }
+    if args.iter().any(|arg| arg == "--backfill-copilot-usage") {
+        let copilot_dir = db::get_copilot_dir();
+        match db::backfill_copilot_usage_from_history(&copilot_dir) {
+            Ok(count) => {
+                println!(
+                    "✅ Copilot usage backfill completed: {} new entries written to {:?}",
+                    count,
+                    copilot_dir.join("usage")
+                );
+            }
+            Err(e) => {
+                eprintln!("❌ Copilot usage backfill failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     // 初始化 SQLite 資料庫並進行第一次增量同步與遷移
     if let Ok(mut conn) = db::get_db_conn() {
         if let Err(e) = db::init_db(&conn) {

@@ -189,6 +189,18 @@ jq . ~/.copilot/settings.json
 
 完成後重新進入 Copilot CLI Session，狀態列會開始輸出並累積 Token 資料。
 
+### 4. 既有 Copilot CLI 歷史匯入
+
+安裝或更新 Token 戰情室時，安裝程式會自動將既有 Copilot CLI 的 `~/.copilot/session-state/*/events.jsonl` 歷史 Session 匯入為本看板使用的 JSONL。
+
+如需手動重跑，也可以執行：
+
+```bash
+token-usage-insights --backfill-copilot-usage
+```
+
+匯入會寫入 `~/.copilot/usage/usage-YYYY-MM-DD.jsonl`，並略過已經存在於 usage 檔中的 Copilot `session_id`，避免重複匯入。歷史資料是 Session 級彙總；啟用 Status Line 後的新資料才會以即時狀態列記錄方式累積。
+
 * * *
 
 ## Codex CLI 設定

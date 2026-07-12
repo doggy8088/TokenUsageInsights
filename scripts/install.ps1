@@ -67,6 +67,11 @@ set "APP_EXIT_CODE=%ERRORLEVEL%"
 popd
 exit /b %APP_EXIT_CODE%
 "@ | Set-Content -Encoding ASCII $Shim
+
+    & (Join-Path $InstallDir "$AppName.exe") --backfill-copilot-usage
+    if ($LASTEXITCODE -ne 0) {
+        throw "Copilot usage backfill failed with exit code $LASTEXITCODE"
+    }
 }
 
 Write-Host "Token 戰情室 installed."

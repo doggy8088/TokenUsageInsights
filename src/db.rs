@@ -1,8 +1,8 @@
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -131,11 +131,7 @@ fn build_import_token_signature(tokens: &Option<TokenStats>) -> String {
     }
 }
 
-fn build_usage_entry_import_source_id(
-    assistant: &str,
-    date: &str,
-    entry: &UsageEntry,
-) -> String {
+fn build_usage_entry_import_source_id(assistant: &str, date: &str, entry: &UsageEntry) -> String {
     let signature = format!(
         "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
         assistant,
@@ -143,14 +139,14 @@ fn build_usage_entry_import_source_id(
         entry.timestamp,
         entry.session_id,
         entry.turn_no,
-        entry.model.clone().unwrap_or_else(|| "".to_string()),
-        entry.model_id.clone().unwrap_or_else(|| "".to_string()),
-        entry.version.clone().unwrap_or_else(|| "".to_string()),
-        entry.cwd.clone().unwrap_or_else(|| "".to_string()),
-        entry.transcript_path.clone().unwrap_or_else(|| "".to_string()),
-        entry.parent_session_id.clone().unwrap_or_else(|| "".to_string()),
-        entry.agent_nickname.clone().unwrap_or_else(|| "".to_string()),
-        entry.agent_role.clone().unwrap_or_else(|| "".to_string()),
+        entry.model.clone().unwrap_or_default(),
+        entry.model_id.clone().unwrap_or_default(),
+        entry.version.clone().unwrap_or_default(),
+        entry.cwd.clone().unwrap_or_default(),
+        entry.transcript_path.clone().unwrap_or_default(),
+        entry.parent_session_id.clone().unwrap_or_default(),
+        entry.agent_nickname.clone().unwrap_or_default(),
+        entry.agent_role.clone().unwrap_or_default(),
         build_import_token_signature(&entry.tokens),
         build_import_token_signature(&entry.delta_tokens)
     );
@@ -432,6 +428,301 @@ fn get_antigravity_session_name(session_id: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn value_to_u64(value: Option<&serde_json::Value>) -> u64 {
+    value.and_then(|value| value.as_u64()).unwrap_or(0)
+}
+
+fn value_to_f64(value: Option<&serde_json::Value>) -> Option<f64> {
+    value.and_then(|value| value.as_f64()).or_else(|| {
+        value
+            .and_then(|value| value.as_u64())
+            .map(|value| value as f64)
+    })
+}
+
+fn parse_copilot_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String> {
+    let file = File::open(filepath).map_err(|e| format!("無法開啟檔案: {}", e))?;
+    let reader = BufReader::new(file);
+    let fallback_session_id = filepath
+        .parent()
+        .and_then(|path| path.file_name())
+        .and_then(|name| name.to_str())
+        .unwrap_or("unknown-session")
+        .to_string();
+
+    let mut events = Vec::new();
+    for line_res in reader.lines() {
+        let line = match line_res {
+            Ok(line) => line,
+            Err(_) => continue,
+        };
+        if let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) {
+            events.push(event);
+        }
+    }
+
+    let mut session_id = fallback_session_id;
+    let mut session_name: Option<String> = None;
+    let mut session_cwd: Option<String> = None;
+    let mut session_version: Option<String> = None;
+    let mut current_model: Option<String> = None;
+    let mut reasoning_effort: Option<String> = None;
+    let mut shutdown_event: Option<&serde_json::Value> = None;
+
+    for event in &events {
+        let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let data = event.get("data").unwrap_or(&serde_json::Value::Null);
+
+        match event_type {
+            "session.start" => {
+                if let Some(id) = data.get("sessionId").and_then(|id| id.as_str()) {
+                    session_id = id.to_string();
+                }
+                session_version = data
+                    .get("copilotVersion")
+                    .and_then(|version| version.as_str())
+                    .map(|version| version.to_string())
+                    .or(session_version);
+                session_cwd = data
+                    .get("context")
+                    .and_then(|context| context.get("cwd"))
+                    .and_then(|cwd| cwd.as_str())
+                    .map(|cwd| cwd.to_string())
+                    .or(session_cwd);
+            }
+            "session.model_change" => {
+                current_model = data
+                    .get("newModel")
+                    .and_then(|model| model.as_str())
+                    .map(|model| model.to_string())
+                    .or(current_model);
+                reasoning_effort = data
+                    .get("reasoningEffort")
+                    .and_then(|effort| effort.as_str())
+                    .map(|effort| effort.to_string())
+                    .or(reasoning_effort);
+            }
+            "user.message" if session_name.is_none() => {
+                if let Some(content) = data.get("content").and_then(|content| content.as_str()) {
+                    let cleaned = content.trim().replace('\r', "").replace('\n', " ");
+                    if !cleaned.is_empty() {
+                        session_name = Some(cleaned.chars().take(100).collect());
+                    }
+                }
+            }
+            "hook.start" if session_name.is_none() => {
+                if data
+                    .get("hookType")
+                    .and_then(|hook_type| hook_type.as_str())
+                    == Some("userPromptSubmitted")
+                {
+                    if let Some(prompt) = data
+                        .get("input")
+                        .and_then(|input| input.get("prompt"))
+                        .and_then(|prompt| prompt.as_str())
+                    {
+                        let cleaned = prompt.trim().replace('\r', "").replace('\n', " ");
+                        if !cleaned.is_empty() {
+                            session_name = Some(cleaned.chars().take(100).collect());
+                        }
+                    }
+                }
+            }
+            "session.shutdown" => {
+                shutdown_event = Some(event);
+            }
+            _ => {}
+        }
+    }
+
+    let shutdown_event = match shutdown_event {
+        Some(event) => event,
+        None => return Ok(Vec::new()),
+    };
+    let shutdown_data = shutdown_event
+        .get("data")
+        .ok_or_else(|| "Copilot shutdown event missing data".to_string())?;
+    let timestamp = shutdown_event
+        .get("timestamp")
+        .and_then(|timestamp| timestamp.as_str())
+        .unwrap_or("")
+        .to_string();
+    let cost = CostStats {
+        total_api_duration_ms: value_to_f64(shutdown_data.get("totalApiDurationMs")),
+        total_duration_ms: value_to_f64(shutdown_data.get("totalDurationMs")),
+        total_premium_requests: value_to_f64(shutdown_data.get("totalPremiumRequests")),
+    };
+
+    let model_metrics = match shutdown_data
+        .get("modelMetrics")
+        .and_then(|metrics| metrics.as_object())
+    {
+        Some(metrics) => metrics,
+        None => return Ok(Vec::new()),
+    };
+    let mut model_ids = model_metrics.keys().cloned().collect::<Vec<_>>();
+    model_ids.sort();
+    if let Some(current) = current_model.or_else(|| {
+        shutdown_event
+            .get("currentModel")
+            .and_then(|model| model.as_str())
+            .map(|model| model.to_string())
+    }) {
+        model_ids.sort_by_key(|model| if model == &current { 0 } else { 1 });
+    }
+
+    let mut entries = Vec::new();
+    for model_id in model_ids {
+        let usage = match model_metrics
+            .get(&model_id)
+            .and_then(|metrics| metrics.get("usage"))
+        {
+            Some(usage) => usage,
+            None => continue,
+        };
+        let input = value_to_u64(usage.get("inputTokens"));
+        let output = value_to_u64(usage.get("outputTokens"));
+        let cache_read = value_to_u64(usage.get("cacheReadTokens"));
+        let cache_write = value_to_u64(usage.get("cacheWriteTokens"));
+        let reasoning = value_to_u64(usage.get("reasoningTokens"));
+        let total = input
+            .saturating_add(output)
+            .saturating_add(cache_read)
+            .saturating_add(cache_write)
+            .saturating_add(reasoning);
+        if total == 0 {
+            continue;
+        }
+
+        let tokens = TokenStats {
+            input,
+            output,
+            cache_read: Some(cache_read),
+            cache_write: Some(cache_write),
+            reasoning: Some(reasoning),
+            total,
+        };
+
+        entries.push(UsageEntry {
+            timestamp: timestamp.clone(),
+            session_id: session_id.clone(),
+            session_name: session_name.clone(),
+            transcript_path: Some(filepath.to_string_lossy().into_owned()),
+            cwd: session_cwd.clone(),
+            version: session_version.clone(),
+            turn_no: (entries.len() + 1) as u32,
+            model: Some(model_id.clone()),
+            model_id: Some(model_id),
+            tokens: Some(tokens.clone()),
+            delta_tokens: Some(tokens),
+            context: None,
+            cost: Some(cost.clone()),
+            parent_session_id: None,
+            agent_nickname: None,
+            agent_role: None,
+            reasoning_effort: reasoning_effort.clone(),
+        });
+    }
+
+    Ok(entries)
+}
+
+fn find_copilot_session_event_files(copilot_dir: &Path) -> Vec<PathBuf> {
+    let session_state_dir = copilot_dir.join("session-state");
+    let mut files = Vec::new();
+    if let Ok(entries) = fs::read_dir(session_state_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path().join("events.jsonl");
+            if path.is_file() {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+fn existing_copilot_usage_session_ids(usage_dir: &Path) -> HashSet<String> {
+    let mut session_ids = HashSet::new();
+    let entries = match fs::read_dir(usage_dir) {
+        Ok(entries) => entries,
+        Err(_) => return session_ids,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let filename = entry.file_name().to_string_lossy().into_owned();
+        if !filename.starts_with("usage-") || !filename.ends_with(".jsonl") {
+            continue;
+        }
+        let file = match File::open(path) {
+            Ok(file) => file,
+            Err(_) => continue,
+        };
+        for line in BufReader::new(file).lines().map_while(Result::ok) {
+            if let Ok(entry) = serde_json::from_str::<UsageEntry>(&line) {
+                session_ids.insert(entry.session_id);
+            }
+        }
+    }
+
+    session_ids
+}
+
+pub fn backfill_copilot_usage_from_history(copilot_dir: &Path) -> Result<usize, String> {
+    let usage_dir = copilot_dir.join("usage");
+    fs::create_dir_all(&usage_dir)
+        .map_err(|e| format!("無法建立 Copilot usage 目錄 {:?}: {}", usage_dir, e))?;
+
+    let mut existing_session_ids = existing_copilot_usage_session_ids(&usage_dir);
+    let mut entries_by_date: HashMap<String, Vec<UsageEntry>> = HashMap::new();
+
+    for events_path in find_copilot_session_event_files(copilot_dir) {
+        let entries = parse_copilot_session_file(&events_path)?;
+        if entries.is_empty() {
+            continue;
+        }
+        let session_id = entries[0].session_id.clone();
+        if existing_session_ids.contains(&session_id) {
+            continue;
+        }
+        existing_session_ids.insert(session_id);
+
+        for entry in entries {
+            let date = entry
+                .timestamp
+                .get(0..10)
+                .filter(|date| date.len() == 10)
+                .unwrap_or("unknown")
+                .to_string();
+            entries_by_date.entry(date).or_default().push(entry);
+        }
+    }
+
+    let mut written = 0usize;
+    for (date, mut entries) in entries_by_date {
+        entries.sort_by(|left, right| left.timestamp.cmp(&right.timestamp));
+        let usage_path = usage_dir.join(format!("usage-{}.jsonl", date));
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&usage_path)
+            .map_err(|e| format!("無法開啟 Copilot usage 檔 {:?}: {}", usage_path, e))?;
+        for entry in entries {
+            let line = serde_json::to_string(&entry)
+                .map_err(|e| format!("無法序列化 Copilot usage entry: {}", e))?;
+            writeln!(file, "{}", line)
+                .map_err(|e| format!("無法寫入 Copilot usage 檔 {:?}: {}", usage_path, e))?;
+            written += 1;
+        }
+    }
+
+    Ok(written)
 }
 
 /// Sync usage logs for hooks-based assistant (Antigravity or Copilot)
@@ -2297,8 +2588,11 @@ pub fn get_usage_entries_by_date(
         };
 
         if record.import_source_id.is_none() {
-            record.import_source_id =
-                Some(build_usage_entry_import_source_id(assistant, date, &record.entry));
+            record.import_source_id = Some(build_usage_entry_import_source_id(
+                assistant,
+                date,
+                &record.entry,
+            ));
         }
 
         entries.push((record, ast_type));
@@ -2309,7 +2603,7 @@ pub fn get_usage_entries_by_date(
 fn entry_date_from_timestamp(timestamp: &str) -> Option<&str> {
     let trimmed = timestamp.trim();
     trimmed
-        .split(|c| c == 'T' || c == ' ')
+        .split(['T', ' '])
         .next()
         .filter(|date_part| date_part.len() == 10)
 }
@@ -2324,7 +2618,11 @@ pub fn export_usage_day_entries(
 
     for (mut record, _assistant_type) in rows {
         if record.import_source_id.is_none() {
-            record.import_source_id = Some(build_usage_entry_import_source_id(assistant, date, &record.entry));
+            record.import_source_id = Some(build_usage_entry_import_source_id(
+                assistant,
+                date,
+                &record.entry,
+            ));
         }
         records.push(record);
     }
@@ -2361,9 +2659,8 @@ pub fn import_usage_day_entries(
             ));
         }
 
-        let source_id = normalized_id.unwrap_or_else(|| {
-            build_usage_entry_import_source_id(assistant, date, &entry)
-        });
+        let source_id = normalized_id
+            .unwrap_or_else(|| build_usage_entry_import_source_id(assistant, date, &entry));
 
         let imported = tx
             .execute(
@@ -2391,18 +2688,18 @@ pub fn import_usage_day_entries(
                     entry.turn_no as i64,
                     entry.model,
                     entry.model_id,
-                    entry.tokens.as_ref().and_then(|t| Some(t.input as i64)),
-                    entry.tokens.as_ref().and_then(|t| Some(t.output as i64)),
+                    entry.tokens.as_ref().map(|t| t.input as i64),
+                    entry.tokens.as_ref().map(|t| t.output as i64),
                     entry.tokens.as_ref().and_then(|t| t.cache_read.map(|v| v as i64)),
                     entry.tokens.as_ref().and_then(|t| t.cache_write.map(|v| v as i64)),
                     entry.tokens.as_ref().and_then(|t| t.reasoning.map(|v| v as i64)),
-                    entry.tokens.as_ref().and_then(|t| Some(t.total as i64)),
-                    entry.delta_tokens.as_ref().and_then(|t| Some(t.input as i64)),
-                    entry.delta_tokens.as_ref().and_then(|t| Some(t.output as i64)),
+                    entry.tokens.as_ref().map(|t| t.total as i64),
+                    entry.delta_tokens.as_ref().map(|t| t.input as i64),
+                    entry.delta_tokens.as_ref().map(|t| t.output as i64),
                     entry.delta_tokens.as_ref().and_then(|t| t.cache_read.map(|v| v as i64)),
                     entry.delta_tokens.as_ref().and_then(|t| t.cache_write.map(|v| v as i64)),
                     entry.delta_tokens.as_ref().and_then(|t| t.reasoning.map(|v| v as i64)),
-                    entry.delta_tokens.as_ref().and_then(|t| Some(t.total as i64)),
+                    entry.delta_tokens.as_ref().map(|t| t.total as i64),
                     entry.cost.as_ref().and_then(|c| c.total_api_duration_ms).map(|v| v as i64),
                     entry.cost.as_ref().and_then(|c| c.total_premium_requests).map(|v| v as i64),
                     entry.parent_session_id,
@@ -3001,13 +3298,9 @@ mod tests {
         init_db(&conn).unwrap();
         let record = sample_import_record();
 
-        let first = import_usage_day_entries(
-            &mut conn,
-            "codex",
-            "2026-07-10",
-            vec![record.clone()],
-        )
-        .unwrap();
+        let first =
+            import_usage_day_entries(&mut conn, "codex", "2026-07-10", vec![record.clone()])
+                .unwrap();
         assert_eq!(first.imported, 1);
         assert_eq!(first.skipped_duplicates, 0);
 
@@ -3117,6 +3410,97 @@ mod tests {
             Some("parent-session")
         );
         assert_ne!(entries[0].session_id, "parent-session");
+    }
+
+    #[test]
+    fn parse_copilot_session_file_backfills_shutdown_model_metrics() {
+        let path = temp_jsonl_path("copilot-backfill");
+        let content = r#"{"type":"session.start","data":{"sessionId":"copilot-session","copilotVersion":"1.0.57-3","startTime":"2026-05-31T12:04:22.979Z","context":{"cwd":"/tmp/copilot-project"}},"timestamp":"2026-05-31T12:04:23.536Z"}
+{"type":"session.model_change","data":{"newModel":"claude-haiku-4.5","reasoningEffort":"medium"},"timestamp":"2026-05-31T12:07:44.050Z"}
+{"type":"user.message","data":{"content":"Build the report"},"timestamp":"2026-05-31T12:07:47.298Z"}
+{"type":"session.shutdown","data":{"totalPremiumRequests":0.33,"totalApiDurationMs":4270,"totalDurationMs":5000,"modelMetrics":{"claude-haiku-4.5":{"requests":{"count":1,"cost":0.33},"usage":{"inputTokens":29861,"outputTokens":166,"cacheReadTokens":7,"cacheWriteTokens":29851,"reasoningTokens":67}}}},"currentModel":"claude-haiku-4.5","timestamp":"2026-05-31T12:15:22.566Z"}
+"#;
+
+        fs::write(&path, content).unwrap();
+        let entries = parse_copilot_session_file(&path).unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry.timestamp, "2026-05-31T12:15:22.566Z");
+        assert_eq!(entry.session_id, "copilot-session");
+        assert_eq!(entry.session_name.as_deref(), Some("Build the report"));
+        assert_eq!(
+            entry.transcript_path.as_deref(),
+            Some(path.to_string_lossy().as_ref())
+        );
+        assert_eq!(entry.cwd.as_deref(), Some("/tmp/copilot-project"));
+        assert_eq!(entry.version.as_deref(), Some("1.0.57-3"));
+        assert_eq!(entry.turn_no, 1);
+        assert_eq!(entry.model.as_deref(), Some("claude-haiku-4.5"));
+        assert_eq!(entry.model_id.as_deref(), Some("claude-haiku-4.5"));
+        assert_eq!(entry.reasoning_effort.as_deref(), Some("medium"));
+
+        let tokens = entry.tokens.as_ref().unwrap();
+        assert_eq!(tokens.input, 29861);
+        assert_eq!(tokens.output, 166);
+        assert_eq!(tokens.cache_read, Some(7));
+        assert_eq!(tokens.cache_write, Some(29851));
+        assert_eq!(tokens.reasoning, Some(67));
+        assert_eq!(tokens.total, 59952);
+
+        let delta = entry.delta_tokens.as_ref().unwrap();
+        assert_eq!(delta.total, tokens.total);
+
+        let cost = entry.cost.as_ref().unwrap();
+        assert_eq!(cost.total_api_duration_ms, Some(4270.0));
+        assert_eq!(cost.total_duration_ms, Some(5000.0));
+        assert_eq!(cost.total_premium_requests, Some(0.33));
+    }
+
+    #[test]
+    fn backfill_copilot_usage_from_history_writes_usage_jsonl_once() {
+        let mut copilot_dir = std::env::temp_dir();
+        let unique = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        copilot_dir.push(format!(
+            "copilot-backfill-{}-{}",
+            std::process::id(),
+            unique
+        ));
+        let session_dir = copilot_dir.join("session-state").join("copilot-session");
+        fs::create_dir_all(&session_dir).unwrap();
+        let events_path = session_dir.join("events.jsonl");
+        let content = r#"{"type":"session.start","data":{"sessionId":"copilot-session","copilotVersion":"1.0.57-3","context":{"cwd":"/tmp/copilot-project"}},"timestamp":"2026-05-31T12:04:23.536Z"}
+{"type":"user.message","data":{"content":"Build the report"},"timestamp":"2026-05-31T12:07:47.298Z"}
+{"type":"session.shutdown","data":{"totalPremiumRequests":0.33,"totalApiDurationMs":4270,"modelMetrics":{"claude-haiku-4.5":{"usage":{"inputTokens":10,"outputTokens":2,"cacheReadTokens":3,"cacheWriteTokens":4,"reasoningTokens":5}}}},"currentModel":"claude-haiku-4.5","timestamp":"2026-05-31T12:15:22.566Z"}
+"#;
+        fs::write(&events_path, content).unwrap();
+
+        assert_eq!(
+            backfill_copilot_usage_from_history(&copilot_dir).unwrap(),
+            1
+        );
+        assert_eq!(
+            backfill_copilot_usage_from_history(&copilot_dir).unwrap(),
+            0
+        );
+
+        let usage_path = copilot_dir.join("usage").join("usage-2026-05-31.jsonl");
+        let usage_content = fs::read_to_string(&usage_path).unwrap();
+        let lines = usage_content.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 1);
+
+        let entry: UsageEntry = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(entry.session_id, "copilot-session");
+        assert_eq!(entry.session_name.as_deref(), Some("Build the report"));
+        assert_eq!(
+            entry.transcript_path.as_deref(),
+            Some(events_path.to_string_lossy().as_ref())
+        );
+        assert_eq!(entry.tokens.as_ref().unwrap().total, 24);
+        assert_eq!(entry.delta_tokens.as_ref().unwrap().total, 24);
+
+        let _ = fs::remove_dir_all(&copilot_dir);
     }
 
     #[test]

@@ -75,6 +75,8 @@ done
 
 ln -sfn "${install_dir}/${app_name}" "${bin_dir}/${app_name}"
 
+"${install_dir}/${app_name}" --backfill-copilot-usage
+
 if [[ "$install_service" == true ]]; then
   if [[ "$(uname -s)" != "Linux" ]]; then
     echo "--service is only supported on Linux with systemd." >&2
@@ -121,4 +123,3 @@ Executable:
 Run:
   PORT=${port} ${bin_dir}/${app_name}
 DONE
-
