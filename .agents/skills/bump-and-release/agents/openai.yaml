@@ -1,0 +1,4 @@
+interface:
+  display_name: "Bump and Release"
+  short_description: "升級 Rust 套件版本並完成 GitHub Release 發佈驗證"
+  default_prompt: "使用 $bump-and-release 升級 patch 版本並完成正式發佈。"
