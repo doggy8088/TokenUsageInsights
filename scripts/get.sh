@@ -55,10 +55,14 @@ fi
 
 if [[ "$version" == "latest" ]]; then
   echo "Resolving latest release tag for ${repo} ..."
-  tag="$(curl -fsSL "https://api.github.com/repos/${repo}/releases/latest" \
-    | grep -m1 '"tag_name"' \
-    | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')"
-  if [[ -z "$tag" ]]; then
+  # Follow the /releases/latest redirect to /releases/tag/<tag> and take the
+  # final path component. This avoids piping curl into grep/sed, which races
+  # with `set -o pipefail` and intermittently fails with curl: (23) SIGPIPE
+  # when grep -m1 exits before curl has finished writing the API response.
+  latest_url="$(curl -fsSL -o /dev/null -w '%{url_effective}' \
+    "https://github.com/${repo}/releases/latest")"
+  tag="${latest_url##*/}"
+  if [[ -z "$tag" || "$tag" == "latest" ]]; then
     echo "Failed to resolve the latest release tag." >&2
     exit 1
   fi
