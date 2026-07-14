@@ -1,9 +1,13 @@
-import i18n from './i18n.js?v=21';
+import i18n from './i18n.js?v=25';
 import {
   aggregateDailyTokenCandles,
+  calculateCandleViewport,
+  calculateCandleViewportYRange,
   calculateMovingAverageTrend,
+  calculateMovingAverageViewportTrend,
   getChartDataPointX,
-} from './chart-utils.js?v=3';
+  parseUsageTimestamp,
+} from './chart-utils.js?v=7';
 
 // Globals
 let tokenChartInstance = null;
@@ -31,6 +35,7 @@ const DAILY_CHART_MODE_STORAGE_KEY = 'daily_chart_mode';
 const DAILY_CHART_INTERVAL_STORAGE_KEY = 'daily_chart_interval_minutes';
 const DAILY_CHART_INTERVALS = [5, 15, 30, 60, 120, 240];
 const DAILY_CHART_MA_WINDOW = 5;
+const DAILY_CHART_MAX_VISIBLE_CANDLES = 24;
 const utf8TextEncoder = new TextEncoder();
 
 const savedDailyChartMode = localStorage.getItem(DAILY_CHART_MODE_STORAGE_KEY);
@@ -39,6 +44,9 @@ const savedDailyChartInterval = Number(localStorage.getItem(DAILY_CHART_INTERVAL
 let dailyChartIntervalMinutes = DAILY_CHART_INTERVALS.includes(savedDailyChartInterval)
   ? savedDailyChartInterval
   : 60;
+let dailyChartViewportStart = 0;
+let dailyChartViewportPinnedToLatest = true;
+let dailyChartViewportContext = '';
 
 // Cookie helper functions
 function setCookie(name, value, days = 365) {
@@ -203,10 +211,10 @@ let currentSessionAssistantType = '';
 let availableDates = [];
 let pricingRules = [];
 
-function getLocalDateString(date = new Date()) {
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, '0');
-  const day = String(date.getDate()).padStart(2, '0');
+function getUtcDateString(date = new Date()) {
+  const year = date.getUTCFullYear();
+  const month = String(date.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(date.getUTCDate()).padStart(2, '0');
   return `${year}-${month}-${day}`;
 }
 
@@ -643,11 +651,11 @@ function initApp() {
     const currentDateVal = dateSelect.value;
     if (!currentDateVal) return;
     
-    const currentDate = new Date(currentDateVal);
+    const currentDate = new Date(`${currentDateVal}T00:00:00Z`);
     if (isNaN(currentDate.getTime())) return;
     
-    currentDate.setDate(currentDate.getDate() + offset);
-    const newDateStr = getLocalDateString(currentDate);
+    currentDate.setUTCDate(currentDate.getUTCDate() + offset);
+    const newDateStr = getUtcDateString(currentDate);
     dateSelect.value = newDateStr;
     await loadUsageData(newDateStr);
   };
@@ -666,7 +674,7 @@ function initApp() {
   const btnToday = document.getElementById('btn-today');
   if (btnToday) {
     btnToday.addEventListener('click', async () => {
-      const todayStr = getLocalDateString();
+      const todayStr = getUtcDateString();
       if (dateSelect) {
         dateSelect.value = todayStr;
       }
@@ -1208,7 +1216,7 @@ function toggleLiveRefresh(enabled, showToast = true) {
     if (btnNextDay) btnNextDay.disabled = true;
 
     // 自動切換到當天的日期 (以今天日期進行即時監控)
-    const todayStr = getLocalDateString();
+    const todayStr = getUtcDateString();
     dateSelect.value = todayStr;
     loadUsageData(todayStr);
 
@@ -1279,12 +1287,12 @@ function stopLiveRefresh() {
 
 async function refreshLiveData() {
   try {
+    const todayStr = getUtcDateString();
     const res = await fetch(`/api/${currentAssistant}/dates`);
     const data = await res.json();
     availableDates = data.dates || [];
     
     const dateSelect = document.getElementById('date-select');
-    const todayStr = getLocalDateString();
     
     // 更新日曆的最小與最大限制
     if (availableDates.length > 0) {
@@ -1327,7 +1335,7 @@ async function fetchDates(selectedDate = null, keepDate = false) {
     // 設定日曆最小與最大值
     const oldestDate = availableDates.length > 0 ? availableDates[availableDates.length - 1] : null;
     const newestDate = availableDates.length > 0 ? availableDates[0] : null;
-    const todayStr = getLocalDateString();
+    const todayStr = getUtcDateString();
     
     if (oldestDate) dateSelect.min = oldestDate;
     dateSelect.max = todayStr;
@@ -1403,7 +1411,7 @@ async function loadUsageData(date) {
 
 function getCurrentUsageDayDate() {
   const dateSelect = document.getElementById('date-select');
-  return dateSelect && dateSelect.value ? dateSelect.value : getLocalDateString();
+  return dateSelect && dateSelect.value ? dateSelect.value : getUtcDateString();
 }
 
 function getUsageExportFilename(payload) {
@@ -1792,6 +1800,168 @@ function renderDashboard(data) {
 // =========================================================================
 // 單日 Token 圖表控制與 K 線資料聚合
 // =========================================================================
+function resetDailyChartViewport() {
+  dailyChartViewportStart = 0;
+  dailyChartViewportPinnedToLatest = true;
+  dailyChartViewportContext = '';
+}
+
+function resolveDailyChartViewport(candles, utcDate) {
+  const context = `${utcDate || ''}:${dailyChartIntervalMinutes}`;
+  if (dailyChartViewportContext !== context) {
+    dailyChartViewportContext = context;
+    dailyChartViewportPinnedToLatest = true;
+    dailyChartViewportStart = 0;
+  }
+
+  const requestedStart = dailyChartViewportPinnedToLatest
+    ? null
+    : dailyChartViewportStart;
+  const viewport = calculateCandleViewport(
+    candles,
+    DAILY_CHART_MAX_VISIBLE_CANDLES,
+    requestedStart
+  );
+  dailyChartViewportStart = viewport.start;
+  return viewport;
+}
+
+function applyDailyChartViewport(chart, viewport, candles, movingAverageValues) {
+  if (!chart?.options?.scales?.x || !viewport) return;
+  const yRange = calculateCandleViewportYRange(candles, movingAverageValues, viewport);
+  chart.$dailyViewport = viewport;
+  chart.options.scales.x.min = viewport.start;
+  chart.options.scales.x.max = viewport.end;
+  chart.options.scales.y.min = yRange.min;
+  chart.options.scales.y.max = yRange.max;
+  chart.options.scales.y.beginAtZero = yRange.min === 0;
+}
+
+function updateDailyChartNavigator(candles, viewport) {
+  const navigator = document.getElementById('daily-chart-navigator');
+  const range = document.getElementById('daily-chart-range');
+  const previous = document.getElementById('daily-chart-pan-previous');
+  const next = document.getElementById('daily-chart-pan-next');
+  const status = document.getElementById('daily-chart-window-status');
+  const canvas = document.getElementById('tokenChart');
+  const isVisible = dailyChartMode === 'kline' && Boolean(viewport?.canPan);
+
+  if (navigator) navigator.classList.toggle('hidden', !isVisible);
+  if (canvas) canvas.classList.toggle('is-pannable', isVisible);
+  if (!viewport) return;
+
+  if (range) {
+    range.min = '0';
+    range.max = String(viewport.maxStart);
+    range.value = String(viewport.start);
+    range.disabled = !viewport.canPan;
+    range.setAttribute('aria-label', t('chart_pan_slider_label'));
+  }
+  if (previous) {
+    previous.disabled = viewport.start <= 0;
+    previous.title = t('chart_pan_earlier');
+    previous.setAttribute('aria-label', t('chart_pan_earlier'));
+  }
+  if (next) {
+    next.disabled = viewport.start >= viewport.maxStart;
+    next.title = t('chart_pan_later');
+    next.setAttribute('aria-label', t('chart_pan_later'));
+  }
+  if (status && candles.length > 0) {
+    const startLabel = candles[viewport.start]?.startLabel || candles[viewport.start]?.label || '';
+    const endLabel = candles[viewport.end]?.endLabel || candles[viewport.end]?.label || '';
+    status.textContent = t('chart_pan_status')
+      .replace('{start}', startLabel)
+      .replace('{end}', endLabel)
+      .replace('{visible}', String(viewport.visibleCount))
+      .replace('{total}', String(viewport.candleCount));
+  }
+}
+
+function setDailyChartViewportStart(requestedStart) {
+  if (!tokenChartInstance || tokenChartInstance.$dailyChartMode !== 'kline') return;
+  const candles = tokenChartInstance.$dailyCandles;
+  if (!Array.isArray(candles)) return;
+
+  const viewport = calculateCandleViewport(
+    candles,
+    DAILY_CHART_MAX_VISIBLE_CANDLES,
+    requestedStart
+  );
+  dailyChartViewportStart = viewport.start;
+  dailyChartViewportPinnedToLatest = viewport.start >= viewport.maxStart;
+  const fullTrendMetrics = tokenChartInstance.$dailyFullTrendMetrics;
+  tokenChartInstance.$dailyTrendMetrics = calculateMovingAverageViewportTrend(
+    fullTrendMetrics?.values || [],
+    dailyChartIntervalMinutes,
+    viewport,
+    DAILY_CHART_MA_WINDOW
+  );
+  applyDailyChartViewport(
+    tokenChartInstance,
+    viewport,
+    candles,
+    fullTrendMetrics?.values
+  );
+  updateDailyChartNavigator(candles, viewport);
+  tokenChartInstance.update('none');
+}
+
+function initializeDailyChartPanInteractions(canvas) {
+  if (!canvas || canvas.dataset.panInitialized === 'true') return;
+  canvas.dataset.panInitialized = 'true';
+  let panState = null;
+
+  const finishPan = event => {
+    if (!panState) return;
+    if (canvas.hasPointerCapture?.(event.pointerId)) {
+      canvas.releasePointerCapture(event.pointerId);
+    }
+    panState = null;
+    canvas.classList.remove('is-dragging');
+  };
+
+  canvas.addEventListener('pointerdown', event => {
+    const viewport = tokenChartInstance?.$dailyViewport;
+    if (!viewport?.canPan || (event.pointerType === 'mouse' && event.button !== 0)) return;
+    panState = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      viewportStart: viewport.start,
+    };
+    canvas.setPointerCapture?.(event.pointerId);
+    canvas.classList.add('is-dragging');
+  });
+
+  canvas.addEventListener('pointermove', event => {
+    if (!panState || event.pointerId !== panState.pointerId) return;
+    const viewport = tokenChartInstance?.$dailyViewport;
+    const chartWidth = tokenChartInstance?.chartArea?.width || canvas.clientWidth;
+    if (!viewport || chartWidth <= 0) return;
+    const slotWidth = chartWidth / Math.max(1, viewport.visibleCount);
+    const candleOffset = Math.round((panState.startX - event.clientX) / slotWidth);
+    if (Math.abs(event.clientX - panState.startX) >= 3) event.preventDefault();
+    setDailyChartViewportStart(panState.viewportStart + candleOffset);
+  });
+
+  canvas.addEventListener('pointerup', finishPan);
+  canvas.addEventListener('pointercancel', finishPan);
+  canvas.addEventListener('lostpointercapture', () => {
+    panState = null;
+    canvas.classList.remove('is-dragging');
+  });
+
+  canvas.addEventListener('wheel', event => {
+    const viewport = tokenChartInstance?.$dailyViewport;
+    const horizontalDelta = Math.abs(event.deltaX) > Math.abs(event.deltaY)
+      ? event.deltaX
+      : event.shiftKey ? event.deltaY : 0;
+    if (!viewport?.canPan || horizontalDelta === 0) return;
+    event.preventDefault();
+    setDailyChartViewportStart(viewport.start + Math.sign(horizontalDelta));
+  }, { passive: false });
+}
+
 function initDailyChartControls() {
   const modeToggle = document.getElementById('daily-chart-mode-toggle');
   if (modeToggle) {
@@ -1812,6 +1982,7 @@ function initDailyChartControls() {
         return;
       }
       dailyChartIntervalMinutes = interval;
+      resetDailyChartViewport();
       localStorage.setItem(DAILY_CHART_INTERVAL_STORAGE_KEY, String(interval));
       updateDailyChartControls();
       if (currentUsageData && dailyChartMode === 'kline') {
@@ -1819,6 +1990,26 @@ function initDailyChartControls() {
       }
     });
   });
+
+  const range = document.getElementById('daily-chart-range');
+  if (range) {
+    range.addEventListener('input', event => {
+      setDailyChartViewportStart(Number(event.target.value));
+    });
+  }
+  const previous = document.getElementById('daily-chart-pan-previous');
+  if (previous) {
+    previous.addEventListener('click', () => {
+      setDailyChartViewportStart(dailyChartViewportStart - 1);
+    });
+  }
+  const next = document.getElementById('daily-chart-pan-next');
+  if (next) {
+    next.addEventListener('click', () => {
+      setDailyChartViewportStart(dailyChartViewportStart + 1);
+    });
+  }
+  initializeDailyChartPanInteractions(document.getElementById('tokenChart'));
 
   updateDailyChartControls();
 }
@@ -1835,6 +2026,7 @@ function updateDailyChartControls() {
   const caption = document.getElementById('daily-chart-caption');
   const experimentBadge = document.getElementById('daily-chart-experiment-badge');
   const intervalSelector = document.getElementById('daily-chart-intervals');
+  const navigator = document.getElementById('daily-chart-navigator');
   const marketSummary = document.getElementById('daily-chart-market-summary');
   const canvas = document.getElementById('tokenChart');
 
@@ -1858,11 +2050,15 @@ function updateDailyChartControls() {
     intervalSelector.classList.toggle('hidden', !isKline);
     intervalSelector.setAttribute('aria-label', t('chart_interval_label'));
   }
+  if (navigator && !isKline) {
+    navigator.classList.add('hidden');
+  }
   if (marketSummary) {
     marketSummary.classList.toggle('hidden', !isKline);
   }
   if (canvas && !isKline) {
     canvas.setAttribute('aria-label', t('chart_trend_aria'));
+    canvas.classList.remove('is-pannable', 'is-dragging');
   }
 
   document.querySelectorAll('.chart-interval-button').forEach(button => {
@@ -1886,9 +2082,17 @@ function getCandlestickThemeColors() {
 }
 
 function getCandlestickBodyWidth(chart) {
-  const candleCount = Math.max(1, chart.$dailyCandles?.length || 1);
+  const candleCount = Math.max(
+    1,
+    chart.$dailyViewport?.visibleCount || chart.$dailyCandles?.length || 1
+  );
   const slotWidth = chart.chartArea.width / candleCount;
   return Math.max(2, Math.min(18, slotWidth * 0.68));
+}
+
+function isCandleInDailyViewport(chart, index) {
+  const viewport = chart.$dailyViewport;
+  return !viewport || (index >= viewport.start && index <= viewport.end);
 }
 
 const dailyTokenCandlestickPlugin = {
@@ -1902,6 +2106,7 @@ const dailyTokenCandlestickPlugin = {
     ctx.rect(chartArea.left, chartArea.top, chartArea.width, chartArea.height);
     ctx.clip();
     chart.$dailyCandles.forEach((candle, index) => {
+      if (candle.isFuture || !isCandleInDailyViewport(chart, index)) return;
       const x = getChartDataPointX(chart, index);
       const top = scales.y.getPixelForValue(candle.close);
       const bottom = scales.y.getPixelForValue(candle.open);
@@ -1929,12 +2134,16 @@ const dailyTokenCandlestickPlugin = {
     const { ctx, chartArea, scales } = chart;
     const colors = getCandlestickThemeColors();
     const width = getCandlestickBodyWidth(chart);
-    const slotWidth = chartArea.width / Math.max(1, chart.$dailyCandles.length);
+    const slotWidth = chartArea.width / Math.max(
+      1,
+      chart.$dailyViewport?.visibleCount || chart.$dailyCandles.length
+    );
     ctx.save();
     ctx.beginPath();
     ctx.rect(chartArea.left, chartArea.top, chartArea.width, chartArea.height);
     ctx.clip();
     chart.$dailyCandles.forEach((candle, index) => {
+      if (candle.isFuture || !isCandleInDailyViewport(chart, index)) return;
       const x = getChartDataPointX(chart, index);
       const top = scales.y.getPixelForValue(candle.close);
       const bottom = scales.y.getPixelForValue(candle.open);
@@ -2001,6 +2210,7 @@ function formatShortTokenRate(rate) {
 function drawMovingAverageSlopeTag(chart, colors) {
   const metrics = chart.$dailyTrendMetrics;
   if (!metrics || metrics.lastIndex < 0 || !Number.isFinite(metrics.slopeTokensPerHour)) return;
+  if (!isCandleInDailyViewport(chart, metrics.lastIndex)) return;
   const value = metrics.values[metrics.lastIndex];
   if (!Number.isFinite(value)) return;
 
@@ -2073,10 +2283,27 @@ function updateDailyChartMarketSummary(candles, trendMetrics) {
 
 function renderTokenCandlestickChart(data) {
   const canvas = document.getElementById('tokenChart');
-  const candles = aggregateDailyTokenCandles(data.raw_entries, data.sessions, dailyChartIntervalMinutes);
+  const candles = aggregateDailyTokenCandles(
+    data.raw_entries,
+    data.sessions,
+    dailyChartIntervalMinutes,
+    data.date
+  );
+  const viewport = resolveDailyChartViewport(candles, data.date);
   const trendMetrics = calculateMovingAverageTrend(
     candles,
     dailyChartIntervalMinutes,
+    DAILY_CHART_MA_WINDOW
+  );
+  const viewportYRange = calculateCandleViewportYRange(
+    candles,
+    trendMetrics.values,
+    viewport
+  );
+  const viewportTrendMetrics = calculateMovingAverageViewportTrend(
+    trendMetrics.values,
+    dailyChartIntervalMinutes,
+    viewport,
     DAILY_CHART_MA_WINDOW
   );
   const labels = candles.map(candle => candle.label);
@@ -2149,7 +2376,10 @@ function renderTokenCandlestickChart(data) {
     tokenChartInstance.data.labels = labels;
     tokenChartInstance.data.datasets = datasets;
     tokenChartInstance.$dailyCandles = candles;
-    tokenChartInstance.$dailyTrendMetrics = trendMetrics;
+    tokenChartInstance.$dailyFullTrendMetrics = trendMetrics;
+    tokenChartInstance.$dailyTrendMetrics = viewportTrendMetrics;
+    applyDailyChartViewport(tokenChartInstance, viewport, candles, trendMetrics.values);
+    updateDailyChartNavigator(candles, viewport);
     tokenChartInstance.options.scales.y.title.text = t('chart_day_total');
     tokenChartInstance.update();
     return;
@@ -2172,7 +2402,10 @@ function renderTokenCandlestickChart(data) {
         intersect: false,
       },
       onHover: (event, activeElements) => {
-        canvas.style.cursor = activeElements.length ? 'crosshair' : 'default';
+        if (canvas.classList.contains('is-dragging')) return;
+        canvas.style.cursor = tokenChartInstance?.$dailyViewport?.canPan
+          ? 'grab'
+          : activeElements.length ? 'crosshair' : 'default';
       },
       plugins: {
         legend: {
@@ -2197,6 +2430,7 @@ function renderTokenCandlestickChart(data) {
           bodyColor: '#f4f7fb',
           borderColor: 'rgba(255, 255, 255, 0.1)',
           borderWidth: 1,
+          filter: context => !context.chart.$dailyCandles?.[context.dataIndex]?.isFuture,
           callbacks: {
             title: contexts => contexts[0]?.chart.$dailyCandles?.[contexts[0].dataIndex]?.rangeLabel || '',
             label: context => {
@@ -2226,6 +2460,8 @@ function renderTokenCandlestickChart(data) {
       scales: {
         x: {
           stacked: false,
+          min: viewport.start,
+          max: viewport.end,
           grid: {
             display: false,
           },
@@ -2242,7 +2478,9 @@ function renderTokenCandlestickChart(data) {
         },
         y: {
           stacked: false,
-          beginAtZero: true,
+          beginAtZero: viewportYRange.min === 0,
+          min: viewportYRange.min,
+          max: viewportYRange.max,
           grace: '18%',
           grid: {
             color: 'rgba(255, 255, 255, 0.05)',
@@ -2262,7 +2500,10 @@ function renderTokenCandlestickChart(data) {
   });
   tokenChartInstance.$dailyChartMode = 'kline';
   tokenChartInstance.$dailyCandles = candles;
-  tokenChartInstance.$dailyTrendMetrics = trendMetrics;
+  tokenChartInstance.$dailyFullTrendMetrics = trendMetrics;
+  tokenChartInstance.$dailyTrendMetrics = viewportTrendMetrics;
+  applyDailyChartViewport(tokenChartInstance, viewport, candles, trendMetrics.values);
+  updateDailyChartNavigator(candles, viewport);
 
   const currentTheme = document.documentElement.getAttribute('data-theme') || 'dark';
   updateChartsTheme(currentTheme);
@@ -2289,7 +2530,11 @@ function renderSessionTrendChart(sessions) {
   const canvas = document.getElementById('tokenChart');
 
   // 只取前 15 個 Session 來畫，避免過於擁擠
-  const sortedSessions = [...sessions].sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+  const sortedSessions = [...sessions].sort((a, b) => {
+    const timeA = parseUsageTimestamp(a.timestamp)?.getTime() ?? 0;
+    const timeB = parseUsageTimestamp(b.timestamp)?.getTime() ?? 0;
+    return timeA - timeB;
+  });
   const displaySessions = sortedSessions.slice(-15);
 
   currentChartSessions = displaySessions;
@@ -3386,8 +3631,8 @@ function formatDuration(ms) {
 function formatLocalTime(isoString, includeSeconds = true) {
   if (!isoString) return '';
   try {
-    const date = new Date(isoString);
-    if (isNaN(date.getTime())) return '';
+    const date = parseUsageTimestamp(isoString);
+    if (!date) return '';
     const pad = (num) => String(num).padStart(2, '0');
     const hours = pad(date.getHours());
     const minutes = pad(date.getMinutes());

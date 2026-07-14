@@ -20,7 +20,7 @@
     document.documentElement.setAttribute('data-theme', savedTheme);
   </script>
   <!-- CSS Stylesheet -->
-  <link rel="stylesheet" href="/static/styles.css?v=16">
+  <link rel="stylesheet" href="/static/styles.css?v=17">
   <!-- Chart.js for beautiful charts -->
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <!-- Marked.js for rendering markdown response -->
@@ -429,6 +429,12 @@
             <div class="daily-chart-market-summary" id="daily-chart-market-summary" aria-live="polite"></div>
             <div class="canvas-wrapper">
               <canvas id="tokenChart" role="img"></canvas>
+            </div>
+            <div class="chart-pan-navigator hidden" id="daily-chart-navigator">
+              <button class="chart-pan-button" id="daily-chart-pan-previous" type="button" aria-label="向較早時間移動">←</button>
+              <input class="chart-pan-range" id="daily-chart-range" type="range" min="0" max="0" value="0" step="1" aria-label="K 線可視時間範圍">
+              <button class="chart-pan-button" id="daily-chart-pan-next" type="button" aria-label="向較晚時間移動">→</button>
+              <span class="chart-pan-status" id="daily-chart-window-status" aria-live="polite"></span>
             </div>
             <div class="chart-interval-selector" id="daily-chart-intervals" role="group" aria-label="K 線時間刻度">
               <button class="chart-interval-button" type="button" data-minutes="5">5min</button>
@@ -1064,6 +1070,6 @@
   <div class="sidebar-overlay" id="sidebar-overlay"></div>
 
   <!-- Frontend Javascript logic -->
-  <script type="module" src="/static/app.js?v=31"></script>
+  <script type="module" src="/static/app.js?v=35"></script>
 </body>
 </html>

@@ -2091,6 +2091,71 @@ body {
   min-height: 340px;
 }
 
+#tokenChart.is-pannable {
+  cursor: grab;
+  touch-action: pan-y;
+}
+
+#tokenChart.is-pannable.is-dragging {
+  cursor: grabbing;
+}
+
+.chart-pan-navigator {
+  display: grid;
+  grid-template-columns: 32px minmax(160px, 1fr) 32px auto;
+  align-items: center;
+  gap: var(--space-2);
+  max-width: 760px;
+  margin: var(--space-2) auto 0;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.chart-pan-button {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-md);
+  background: var(--surface-2);
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.chart-pan-button:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--accent-cyan) 38%, transparent);
+  color: var(--accent-cyan);
+}
+
+.chart-pan-button:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.chart-pan-button:focus-visible,
+.chart-pan-range:focus-visible {
+  outline: 2px solid var(--accent-cyan);
+  outline-offset: 2px;
+}
+
+.chart-pan-range {
+  width: 100%;
+  height: 20px;
+  margin: 0;
+  accent-color: var(--accent-cyan);
+  cursor: ew-resize;
+}
+
+.chart-pan-status {
+  min-width: 190px;
+  text-align: right;
+  white-space: nowrap;
+}
+
 .chart-interval-selector {
   display: flex;
   align-items: center;
@@ -2150,6 +2215,16 @@ body {
   .daily-chart-container .canvas-wrapper {
     height: 310px;
     min-height: 310px;
+  }
+
+  .chart-pan-navigator {
+    grid-template-columns: 32px minmax(120px, 1fr) 32px;
+  }
+
+  .chart-pan-status {
+    grid-column: 1 / -1;
+    min-width: 0;
+    text-align: center;
   }
 
   .chart-interval-selector {

@@ -17,10 +17,23 @@ export function normalizeEntryTokenParts(entry) {
   return { input, output, cache, total };
 }
 
-export function getUsageEntryMinute(timestamp) {
-  const parsed = new Date(timestamp);
-  if (!Number.isNaN(parsed.getTime())) {
-    return parsed.getHours() * 60 + parsed.getMinutes();
+export function parseUsageTimestamp(timestamp) {
+  const value = String(timestamp || '').trim();
+  if (!value) return null;
+
+  const hasExplicitTimezone = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(value);
+  const isSqlOrIsoTimestamp = /^\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}/.test(value);
+  const normalized = isSqlOrIsoTimestamp && !hasExplicitTimezone
+    ? `${value.replace(' ', 'T')}Z`
+    : value;
+  const parsed = new Date(normalized);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+export function getUsageEntryUtcMinute(timestamp) {
+  const parsed = parseUsageTimestamp(timestamp);
+  if (parsed) {
+    return parsed.getUTCHours() * 60 + parsed.getUTCMinutes();
   }
 
   const timeMatch = String(timestamp || '').match(/(?:T|\s|^)(\d{1,2}):(\d{2})/);
@@ -36,6 +49,88 @@ export function formatMinuteOfDay(totalMinutes) {
   const hours = Math.floor(totalMinutes / 60);
   const minutes = totalMinutes % 60;
   return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}`;
+}
+
+export function formatUtcMinuteInBrowserTime(utcDate, totalMinutes, includeDate = false) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(utcDate || ''))) {
+    return formatMinuteOfDay(totalMinutes);
+  }
+
+  const localDate = new Date(`${utcDate}T00:00:00Z`);
+  localDate.setUTCMinutes(totalMinutes);
+  if (Number.isNaN(localDate.getTime())) return formatMinuteOfDay(totalMinutes);
+
+  const pad = value => String(value).padStart(2, '0');
+  const time = `${pad(localDate.getHours())}:${pad(localDate.getMinutes())}`;
+  if (!includeDate) return time;
+  return `${pad(localDate.getMonth() + 1)}/${pad(localDate.getDate())} ${time}`;
+}
+
+export function isUtcBucketFuture(utcDate, startMinute, now = new Date()) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(utcDate || ''))) return false;
+  const dayStart = Date.parse(`${utcDate}T00:00:00Z`);
+  const nowValue = now instanceof Date ? now.getTime() : new Date(now).getTime();
+  if (!Number.isFinite(dayStart) || !Number.isFinite(nowValue)) return false;
+  return dayStart + startMinute * 60_000 > nowValue;
+}
+
+export function calculateCandleViewport(candles, maxVisible = 24, requestedStart = null) {
+  const candleCount = Array.isArray(candles) ? candles.length : 0;
+  const visibleCount = Math.min(Math.max(1, maxVisible), Math.max(1, candleCount));
+  let lastAvailableIndex = -1;
+  for (let index = candleCount - 1; index >= 0; index -= 1) {
+    if (!candles[index].isFuture) {
+      lastAvailableIndex = index;
+      break;
+    }
+  }
+
+  const latestWindowEnd = lastAvailableIndex >= 0
+    ? lastAvailableIndex
+    : Math.min(candleCount - 1, visibleCount - 1);
+  const maxStart = Math.max(0, latestWindowEnd - visibleCount + 1);
+  const requested = requestedStart !== null && Number.isFinite(Number(requestedStart))
+    ? Math.round(Number(requestedStart))
+    : maxStart;
+  const start = Math.max(0, Math.min(maxStart, requested));
+  const end = candleCount > 0
+    ? Math.min(candleCount - 1, start + visibleCount - 1)
+    : 0;
+
+  return {
+    start,
+    end,
+    visibleCount: candleCount > 0 ? end - start + 1 : 0,
+    candleCount,
+    lastAvailableIndex,
+    maxStart,
+    canPan: maxStart > 0,
+  };
+}
+
+export function calculateCandleViewportYRange(candles, movingAverageValues, viewport) {
+  if (!Array.isArray(candles) || candles.length === 0 || !viewport) {
+    return { min: 0, max: 1 };
+  }
+
+  const values = [];
+  for (let index = viewport.start; index <= viewport.end; index += 1) {
+    const candle = candles[index];
+    if (!candle || candle.isFuture) continue;
+    values.push(candle.open, candle.close);
+    const movingAverage = movingAverageValues?.[index];
+    if (Number.isFinite(movingAverage)) values.push(movingAverage);
+  }
+  if (values.length === 0) return { min: 0, max: 1 };
+
+  const dataMin = Math.min(...values);
+  const dataMax = Math.max(...values);
+  const spread = Math.max(0, dataMax - dataMin);
+  const padding = Math.max(1, spread * 0.12, dataMax * 0.015);
+  return {
+    min: dataMin <= padding ? 0 : Math.max(0, dataMin - padding),
+    max: Math.max(1, dataMax + padding),
+  };
 }
 
 export function getChartDataPointX(chart, dataIndex) {
@@ -94,10 +189,15 @@ function calculateRegressionSlope(values, endIndex, intervalMinutes, windowSize)
   return denominator > 0 ? numerator / denominator : null;
 }
 
-export function calculateMovingAverageTrend(candles, intervalMinutes, windowSize = 5) {
-  const values = calculateCumulativeMovingAverage(candles, windowSize);
+function summarizeMovingAverageTrend(
+  values,
+  intervalMinutes,
+  windowSize,
+  startIndex = 0,
+  endIndex = values.length - 1
+) {
   let lastIndex = -1;
-  for (let index = values.length - 1; index >= 0; index -= 1) {
+  for (let index = Math.min(values.length - 1, endIndex); index >= startIndex; index -= 1) {
     if (Number.isFinite(values[index])) {
       lastIndex = index;
       break;
@@ -134,14 +234,44 @@ export function calculateMovingAverageTrend(candles, intervalMinutes, windowSize
   };
 }
 
-export function aggregateDailyTokenCandles(rawEntries, sessions, intervalMinutes) {
+export function calculateMovingAverageTrend(candles, intervalMinutes, windowSize = 5) {
+  const values = calculateCumulativeMovingAverage(candles, windowSize);
+  return summarizeMovingAverageTrend(values, intervalMinutes, windowSize);
+}
+
+export function calculateMovingAverageViewportTrend(
+  values,
+  intervalMinutes,
+  viewport,
+  windowSize = 5
+) {
+  return summarizeMovingAverageTrend(
+    values,
+    intervalMinutes,
+    windowSize,
+    viewport?.start || 0,
+    viewport?.end ?? values.length - 1
+  );
+}
+
+export function aggregateDailyTokenCandles(
+  rawEntries,
+  sessions,
+  intervalMinutes,
+  utcDate,
+  now = new Date()
+) {
   const bucketCount = Math.ceil(1440 / intervalMinutes);
   const buckets = Array.from({ length: bucketCount }, (_, index) => {
     const startMinute = index * intervalMinutes;
     const endMinute = Math.min(1440, startMinute + intervalMinutes);
+    const rangeStart = formatUtcMinuteInBrowserTime(utcDate, startMinute, true);
+    const rangeEnd = formatUtcMinuteInBrowserTime(utcDate, endMinute, true);
     return {
-      label: formatMinuteOfDay(startMinute),
-      rangeLabel: `${formatMinuteOfDay(startMinute)}–${formatMinuteOfDay(endMinute)}`,
+      label: formatUtcMinuteInBrowserTime(utcDate, startMinute),
+      rangeLabel: `${rangeStart}–${rangeEnd}`,
+      startLabel: rangeStart,
+      endLabel: rangeEnd,
       input: 0,
       output: 0,
       cache: 0,
@@ -152,6 +282,7 @@ export function aggregateDailyTokenCandles(rawEntries, sessions, intervalMinutes
       direction: 0,
       changePercent: null,
       labelRow: 0,
+      isFuture: isUtcBucketFuture(utcDate, startMinute, now),
     };
   });
 
@@ -175,9 +306,10 @@ export function aggregateDailyTokenCandles(rawEntries, sessions, intervalMinutes
   entries.forEach(entry => {
     const parts = normalizeEntryTokenParts(entry);
     if (parts.total <= 0) return;
-    const minute = getUsageEntryMinute(entry.timestamp);
+    const minute = getUsageEntryUtcMinute(entry.timestamp);
     if (minute === null) return;
     const bucket = buckets[Math.min(bucketCount - 1, Math.floor(minute / intervalMinutes))];
+    if (bucket.isFuture) return;
     bucket.input += parts.input;
     bucket.output += parts.output;
     bucket.cache += parts.cache;
