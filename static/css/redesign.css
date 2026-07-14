@@ -1926,3 +1926,234 @@ body {
   color: var(--text-primary);
   border-color: var(--accent-cyan);
 }
+
+/* Daily Token candlestick experiment */
+.daily-chart-container {
+  overflow: hidden;
+}
+
+.daily-chart-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-4);
+  margin-bottom: var(--space-3);
+}
+
+.daily-chart-heading {
+  min-width: 0;
+}
+
+.daily-chart-title-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.daily-chart-title-row h3 {
+  margin: 0;
+}
+
+.chart-experiment-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 20px;
+  padding: 2px 7px;
+  border: 1px solid color-mix(in srgb, var(--neon-gold) 38%, transparent);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--neon-gold) 10%, transparent);
+  color: var(--neon-gold);
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.daily-chart-caption {
+  max-width: 72ch;
+  margin-top: 6px;
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  line-height: 1.45;
+  text-wrap: pretty;
+}
+
+.chart-mode-toggle {
+  flex: 0 0 auto;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(48px, 1fr));
+  gap: 2px;
+  min-height: 34px;
+  padding: 3px;
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-lg);
+  background: var(--surface-2);
+  color: var(--text-muted);
+  font: inherit;
+  cursor: pointer;
+  transition: border-color 180ms var(--ease-out-quart), background 180ms var(--ease-out-quart);
+}
+
+.chart-mode-toggle:hover {
+  border-color: var(--glass-border-strong);
+}
+
+.chart-mode-toggle:focus-visible,
+.chart-interval-button:focus-visible {
+  outline: 2px solid var(--accent-cyan);
+  outline-offset: 2px;
+}
+
+.chart-mode-option {
+  display: grid;
+  place-items: center;
+  min-height: 26px;
+  padding: 0 8px;
+  border-radius: var(--radius-md);
+  font-size: 0.72rem;
+  font-weight: 700;
+  line-height: 1;
+  transition: color 180ms var(--ease-out-quart), background 180ms var(--ease-out-quart);
+}
+
+.chart-mode-option.is-active {
+  background: var(--surface-selected);
+  color: var(--accent-cyan);
+}
+
+.daily-chart-market-summary {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: 28px;
+  margin-bottom: var(--space-2);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.daily-chart-market-summary::-webkit-scrollbar {
+  display: none;
+}
+
+.daily-chart-market-summary .market-divider {
+  width: 1px;
+  height: 14px;
+  background: var(--glass-border-strong);
+}
+
+.daily-chart-market-summary .market-value {
+  color: var(--text-primary);
+  font-weight: 700;
+}
+
+.daily-chart-market-summary .market-cost {
+  color: var(--neon-gold);
+}
+
+.daily-chart-market-summary .market-slope {
+  color: #2d8cff;
+}
+
+.market-momentum {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 2px 7px;
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-sm);
+  font-weight: 700;
+}
+
+.market-momentum.is-accelerating {
+  border-color: color-mix(in srgb, var(--neon-green) 34%, transparent);
+  background: color-mix(in srgb, var(--neon-green) 9%, transparent);
+  color: var(--neon-green);
+}
+
+.market-momentum.is-cooling {
+  border-color: color-mix(in srgb, var(--accent-purple) 42%, transparent);
+  background: color-mix(in srgb, var(--accent-purple) 11%, transparent);
+  color: var(--text-secondary);
+}
+
+.market-momentum.is-steady {
+  background: var(--surface-2);
+  color: var(--text-muted);
+}
+
+.daily-chart-container .canvas-wrapper {
+  height: 340px;
+  min-height: 340px;
+}
+
+.chart-interval-selector {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  margin-top: var(--space-3);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--glass-border);
+  overflow-x: auto;
+}
+
+.chart-interval-button {
+  min-width: 52px;
+  min-height: 32px;
+  padding: 0 10px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: color 180ms var(--ease-out-quart), border-color 180ms var(--ease-out-quart), background 180ms var(--ease-out-quart);
+}
+
+.chart-interval-button:hover {
+  color: var(--text-primary);
+  background: var(--surface-2);
+}
+
+.chart-interval-button.is-active {
+  border-color: color-mix(in srgb, var(--accent-cyan) 38%, transparent);
+  background: var(--surface-selected);
+  color: var(--accent-cyan);
+}
+
+@media (max-width: 640px) {
+  .daily-chart-header {
+    align-items: center;
+  }
+
+  .daily-chart-title-row {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 5px;
+  }
+
+  .daily-chart-caption {
+    max-width: 46ch;
+  }
+
+  .chart-mode-toggle {
+    grid-template-columns: repeat(2, minmax(42px, 1fr));
+  }
+
+  .daily-chart-container .canvas-wrapper {
+    height: 310px;
+    min-height: 310px;
+  }
+
+  .chart-interval-selector {
+    justify-content: flex-start;
+    padding-bottom: 2px;
+  }
+}

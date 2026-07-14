@@ -20,7 +20,7 @@
     document.documentElement.setAttribute('data-theme', savedTheme);
   </script>
   <!-- CSS Stylesheet -->
-  <link rel="stylesheet" href="/static/styles.css?v=14">
+  <link rel="stylesheet" href="/static/styles.css?v=16">
   <!-- Chart.js for beautiful charts -->
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <!-- Marked.js for rendering markdown response -->
@@ -412,10 +412,31 @@
 
         <!-- Charts Section -->
         <section class="charts-section">
-          <div class="chart-container glass-card">
-            <h3 data-i18n="chart_daily_title">Token 消耗趨勢與快取狀況</h3>
+          <div class="chart-container daily-chart-container glass-card">
+            <div class="daily-chart-header">
+              <div class="daily-chart-heading">
+                <div class="daily-chart-title-row">
+                  <h3 id="daily-chart-title">單日 Token K 線</h3>
+                  <span class="chart-experiment-badge" id="daily-chart-experiment-badge" data-i18n="chart_experimental">實驗性</span>
+                </div>
+                <p class="daily-chart-caption" id="daily-chart-caption">K 棒由輸入、輸出與快取組成；空心棒代表無新增，藍色 MA5 線與坡度呈現平均燃燒速率。</p>
+              </div>
+              <button class="chart-mode-toggle" id="daily-chart-mode-toggle" type="button" role="switch" aria-checked="true">
+                <span class="chart-mode-option" data-chart-mode="trend" data-i18n="chart_mode_trend">趨勢</span>
+                <span class="chart-mode-option is-active" data-chart-mode="kline" data-i18n="chart_mode_kline">K 線</span>
+              </button>
+            </div>
+            <div class="daily-chart-market-summary" id="daily-chart-market-summary" aria-live="polite"></div>
             <div class="canvas-wrapper">
-              <canvas id="tokenChart"></canvas>
+              <canvas id="tokenChart" role="img"></canvas>
+            </div>
+            <div class="chart-interval-selector" id="daily-chart-intervals" role="group" aria-label="K 線時間刻度">
+              <button class="chart-interval-button" type="button" data-minutes="5">5min</button>
+              <button class="chart-interval-button" type="button" data-minutes="15">15min</button>
+              <button class="chart-interval-button" type="button" data-minutes="30">30min</button>
+              <button class="chart-interval-button is-active" type="button" data-minutes="60">1hr</button>
+              <button class="chart-interval-button" type="button" data-minutes="120">2hr</button>
+              <button class="chart-interval-button" type="button" data-minutes="240">4hr</button>
             </div>
           </div>
         </section>
@@ -1043,6 +1064,6 @@
   <div class="sidebar-overlay" id="sidebar-overlay"></div>
 
   <!-- Frontend Javascript logic -->
-  <script type="module" src="/static/app.js?v=25"></script>
+  <script type="module" src="/static/app.js?v=31"></script>
 </body>
 </html>

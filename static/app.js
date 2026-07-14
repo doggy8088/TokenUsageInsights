@@ -1,4 +1,9 @@
-import i18n from './i18n.js?v=17';
+import i18n from './i18n.js?v=21';
+import {
+  aggregateDailyTokenCandles,
+  calculateMovingAverageTrend,
+  getChartDataPointX,
+} from './chart-utils.js?v=3';
 
 // Globals
 let tokenChartInstance = null;
@@ -11,11 +16,29 @@ const chartPalette = {
   cacheStroke: '#8997ac',
   trendFill: 'rgba(246, 190, 79, 0.14)',
   trendStroke: '#f6be4f',
+  candleInputFill: 'rgba(47, 184, 197, 0.82)',
+  candleOutputFill: 'rgba(167, 139, 250, 0.82)',
+  candleCacheFill: 'rgba(246, 190, 79, 0.84)',
+  candleUp: '#31d0aa',
+  candleDown: '#ff5c8a',
+  candleFlat: '#94a3b8',
+  candleAverage: '#2d8cff',
 };
 
 const chartFontFamily = 'IBM Plex Sans';
 const SIDEBAR_STATE_STORAGE_KEY = 'sidebar_state';
+const DAILY_CHART_MODE_STORAGE_KEY = 'daily_chart_mode';
+const DAILY_CHART_INTERVAL_STORAGE_KEY = 'daily_chart_interval_minutes';
+const DAILY_CHART_INTERVALS = [5, 15, 30, 60, 120, 240];
+const DAILY_CHART_MA_WINDOW = 5;
 const utf8TextEncoder = new TextEncoder();
+
+const savedDailyChartMode = localStorage.getItem(DAILY_CHART_MODE_STORAGE_KEY);
+let dailyChartMode = savedDailyChartMode === 'trend' ? 'trend' : 'kline';
+const savedDailyChartInterval = Number(localStorage.getItem(DAILY_CHART_INTERVAL_STORAGE_KEY));
+let dailyChartIntervalMinutes = DAILY_CHART_INTERVALS.includes(savedDailyChartInterval)
+  ? savedDailyChartInterval
+  : 60;
 
 // Cookie helper functions
 function setCookie(name, value, days = 365) {
@@ -407,6 +430,7 @@ function updateLanguageUI() {
   // Update dynamic brand logo in sidebar
   updateBrandLogo();
   syncSidebarToggleButton();
+  updateDailyChartControls();
   updateCodexRateLimit();
 }
 
@@ -1025,6 +1049,9 @@ function initApp() {
 
   // 初始化表格欄位排序
   initTableSorting();
+
+  // 初始化單日圖表類型與 K 線時間刻度
+  initDailyChartControls();
 
   // 初始化前置設定教學 Modal 與事件
   initSetupGuide();
@@ -1755,7 +1782,7 @@ function renderDashboard(data) {
   }
 
   // 4. 繪製 Token 圖表
-  renderChart(sessions);
+  renderChart(data);
 
   // 5. 渲染 Session 列表
   currentSessions = [...sessions];
@@ -1763,9 +1790,502 @@ function renderDashboard(data) {
 }
 
 // =========================================================================
-// 渲染 Chart.js Token 使用趨勢圖
+// 單日 Token 圖表控制與 K 線資料聚合
 // =========================================================================
-function renderChart(sessions) {
+function initDailyChartControls() {
+  const modeToggle = document.getElementById('daily-chart-mode-toggle');
+  if (modeToggle) {
+    modeToggle.addEventListener('click', () => {
+      dailyChartMode = dailyChartMode === 'kline' ? 'trend' : 'kline';
+      localStorage.setItem(DAILY_CHART_MODE_STORAGE_KEY, dailyChartMode);
+      updateDailyChartControls();
+      if (currentUsageData) {
+        renderChart(currentUsageData);
+      }
+    });
+  }
+
+  document.querySelectorAll('.chart-interval-button').forEach(button => {
+    button.addEventListener('click', () => {
+      const interval = Number(button.dataset.minutes);
+      if (!DAILY_CHART_INTERVALS.includes(interval) || interval === dailyChartIntervalMinutes) {
+        return;
+      }
+      dailyChartIntervalMinutes = interval;
+      localStorage.setItem(DAILY_CHART_INTERVAL_STORAGE_KEY, String(interval));
+      updateDailyChartControls();
+      if (currentUsageData && dailyChartMode === 'kline') {
+        renderChart(currentUsageData);
+      }
+    });
+  });
+
+  updateDailyChartControls();
+}
+
+function getDailyChartIntervalLabel(minutes) {
+  if (minutes < 60) return `${minutes}min`;
+  return `${minutes / 60}hr`;
+}
+
+function updateDailyChartControls() {
+  const isKline = dailyChartMode === 'kline';
+  const modeToggle = document.getElementById('daily-chart-mode-toggle');
+  const title = document.getElementById('daily-chart-title');
+  const caption = document.getElementById('daily-chart-caption');
+  const experimentBadge = document.getElementById('daily-chart-experiment-badge');
+  const intervalSelector = document.getElementById('daily-chart-intervals');
+  const marketSummary = document.getElementById('daily-chart-market-summary');
+  const canvas = document.getElementById('tokenChart');
+
+  if (modeToggle) {
+    modeToggle.setAttribute('aria-checked', String(isKline));
+    modeToggle.setAttribute('aria-label', t('chart_mode_toggle_label'));
+    modeToggle.querySelectorAll('.chart-mode-option').forEach(option => {
+      option.classList.toggle('is-active', option.dataset.chartMode === dailyChartMode);
+    });
+  }
+  if (title) {
+    title.textContent = t(isKline ? 'chart_daily_kline_title' : 'chart_daily_title');
+  }
+  if (caption) {
+    caption.textContent = t(isKline ? 'chart_kline_caption' : 'chart_trend_caption');
+  }
+  if (experimentBadge) {
+    experimentBadge.classList.toggle('hidden', !isKline);
+  }
+  if (intervalSelector) {
+    intervalSelector.classList.toggle('hidden', !isKline);
+    intervalSelector.setAttribute('aria-label', t('chart_interval_label'));
+  }
+  if (marketSummary) {
+    marketSummary.classList.toggle('hidden', !isKline);
+  }
+  if (canvas && !isKline) {
+    canvas.setAttribute('aria-label', t('chart_trend_aria'));
+  }
+
+  document.querySelectorAll('.chart-interval-button').forEach(button => {
+    const isActive = Number(button.dataset.minutes) === dailyChartIntervalMinutes;
+    button.classList.toggle('is-active', isActive);
+    button.setAttribute('aria-pressed', String(isActive));
+  });
+}
+
+function getCandlestickThemeColors() {
+  const isLight = document.documentElement.getAttribute('data-theme') === 'light';
+  return {
+    up: isLight ? '#07845f' : chartPalette.candleUp,
+    down: isLight ? '#d93666' : chartPalette.candleDown,
+    flat: isLight ? '#64748b' : chartPalette.candleFlat,
+    empty: isLight ? 'rgba(71, 85, 105, 0.58)' : 'rgba(148, 163, 184, 0.52)',
+    average: chartPalette.candleAverage,
+    tagBackground: isLight ? 'rgba(255, 255, 255, 0.94)' : 'rgba(13, 17, 24, 0.94)',
+    cost: isLight ? '#a75808' : chartPalette.trendStroke,
+  };
+}
+
+function getCandlestickBodyWidth(chart) {
+  const candleCount = Math.max(1, chart.$dailyCandles?.length || 1);
+  const slotWidth = chart.chartArea.width / candleCount;
+  return Math.max(2, Math.min(18, slotWidth * 0.68));
+}
+
+const dailyTokenCandlestickPlugin = {
+  id: 'dailyTokenCandlesticks',
+  beforeDatasetsDraw(chart) {
+    if (chart.$dailyChartMode !== 'kline' || !Array.isArray(chart.$dailyCandles)) return;
+    const { ctx, chartArea, scales } = chart;
+    const colors = getCandlestickThemeColors();
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(chartArea.left, chartArea.top, chartArea.width, chartArea.height);
+    ctx.clip();
+    chart.$dailyCandles.forEach((candle, index) => {
+      const x = getChartDataPointX(chart, index);
+      const top = scales.y.getPixelForValue(candle.close);
+      const bottom = scales.y.getPixelForValue(candle.open);
+      if (candle.total <= 0) {
+        ctx.strokeStyle = colors.empty;
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(x, Math.max(chartArea.top, top - 7));
+        ctx.lineTo(x, Math.min(chartArea.bottom, top + 7));
+        ctx.stroke();
+        return;
+      }
+      const stroke = candle.direction > 0 ? colors.up : candle.direction < 0 ? colors.down : colors.flat;
+      ctx.strokeStyle = stroke;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(x, Math.max(chartArea.top, top - 4));
+      ctx.lineTo(x, Math.min(chartArea.bottom, bottom + 4));
+      ctx.stroke();
+    });
+    ctx.restore();
+  },
+  afterDatasetsDraw(chart) {
+    if (chart.$dailyChartMode !== 'kline' || !Array.isArray(chart.$dailyCandles)) return;
+    const { ctx, chartArea, scales } = chart;
+    const colors = getCandlestickThemeColors();
+    const width = getCandlestickBodyWidth(chart);
+    const slotWidth = chartArea.width / Math.max(1, chart.$dailyCandles.length);
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(chartArea.left, chartArea.top, chartArea.width, chartArea.height);
+    ctx.clip();
+    chart.$dailyCandles.forEach((candle, index) => {
+      const x = getChartDataPointX(chart, index);
+      const top = scales.y.getPixelForValue(candle.close);
+      const bottom = scales.y.getPixelForValue(candle.open);
+      const isEmpty = candle.total <= 0;
+      const emptyHeight = Math.max(8, Math.min(12, width * 0.7));
+      const bodyTop = isEmpty
+        ? Math.min(chartArea.bottom - emptyHeight, Math.max(chartArea.top, top - emptyHeight / 2))
+        : top;
+      const height = isEmpty ? emptyHeight : Math.max(2, bottom - top);
+      if (isEmpty) {
+        ctx.strokeStyle = colors.empty;
+        ctx.lineWidth = 1.25;
+        ctx.strokeRect(x - width / 2, bodyTop, width, height);
+        return;
+      }
+      const stroke = candle.direction > 0 ? colors.up : candle.direction < 0 ? colors.down : colors.flat;
+      ctx.strokeStyle = stroke;
+      ctx.lineWidth = 1.5;
+      ctx.strokeRect(x - width / 2, bodyTop, width, height);
+
+      const costLabel = formatCandlestickCost(candle.cost);
+      const labelY = Math.max(chartArea.top + 8, top - 7 - candle.labelRow * 9);
+      ctx.fillStyle = colors.cost;
+      ctx.font = `600 ${slotWidth < 10 ? 8 : 9}px "IBM Plex Mono", monospace`;
+      if (slotWidth < 12) {
+        ctx.save();
+        ctx.translate(x, labelY);
+        ctx.rotate(-Math.PI / 2);
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(costLabel, 0, 0);
+        ctx.restore();
+      } else {
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'bottom';
+        ctx.fillText(costLabel, x, labelY);
+      }
+    });
+    drawMovingAverageSlopeTag(chart, colors);
+    ctx.restore();
+  },
+};
+
+function formatCandlestickCost(cost) {
+  const value = Math.max(0, Number(cost) || 0);
+  if (value === 0) return '$0';
+  if (value < 0.0001) return '<$0.0001';
+  if (value < 0.01) return `$${value.toFixed(4)}`;
+  return `$${value.toFixed(2)}`;
+}
+
+function formatTokenRate(rate) {
+  if (!Number.isFinite(rate)) return '—';
+  const sign = rate > 0 ? '+' : rate < 0 ? '−' : '';
+  return `${sign}${formatToken(Math.abs(rate))} Token/hr`;
+}
+
+function formatShortTokenRate(rate) {
+  if (!Number.isFinite(rate)) return '—';
+  const sign = rate > 0 ? '+' : rate < 0 ? '−' : '';
+  return `${sign}${formatToken(Math.abs(rate))}/hr`;
+}
+
+function drawMovingAverageSlopeTag(chart, colors) {
+  const metrics = chart.$dailyTrendMetrics;
+  if (!metrics || metrics.lastIndex < 0 || !Number.isFinite(metrics.slopeTokensPerHour)) return;
+  const value = metrics.values[metrics.lastIndex];
+  if (!Number.isFinite(value)) return;
+
+  const { ctx, chartArea, scales } = chart;
+  const x = getChartDataPointX(chart, metrics.lastIndex);
+  const y = scales.y.getPixelForValue(value);
+  const arrow = metrics.slopeTokensPerHour > 0 ? '↗' : metrics.slopeTokensPerHour < 0 ? '↘' : '→';
+  const label = `MA${metrics.windowSize} ${arrow} ${formatShortTokenRate(metrics.slopeTokensPerHour)}`;
+  ctx.font = '600 10px "IBM Plex Mono", monospace';
+  const horizontalPadding = 7;
+  const labelWidth = ctx.measureText(label).width + horizontalPadding * 2;
+  const labelHeight = 22;
+  const left = Math.min(
+    chartArea.right - labelWidth - 2,
+    Math.max(chartArea.left + 2, x + 9)
+  );
+  const top = Math.min(
+    chartArea.bottom - labelHeight - 2,
+    Math.max(chartArea.top + 2, y - labelHeight - 9)
+  );
+
+  ctx.fillStyle = colors.tagBackground;
+  ctx.strokeStyle = colors.average;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  if (typeof ctx.roundRect === 'function') {
+    ctx.roundRect(left, top, labelWidth, labelHeight, 5);
+  } else {
+    ctx.rect(left, top, labelWidth, labelHeight);
+  }
+  ctx.fill();
+  ctx.stroke();
+  ctx.fillStyle = colors.average;
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(label, left + horizontalPadding, top + labelHeight / 2);
+}
+
+function updateDailyChartMarketSummary(candles, trendMetrics) {
+  const summary = document.getElementById('daily-chart-market-summary');
+  if (!summary) return;
+  const activeCount = candles.filter(candle => candle.total > 0).length;
+  const totalTokens = candles.length > 0 ? candles[candles.length - 1].close : 0;
+  const totalCost = candles.reduce((sum, candle) => sum + candle.cost, 0);
+  const hasSlope = Number.isFinite(trendMetrics?.slopeTokensPerHour);
+  const momentumLabel = hasSlope
+    ? t(`chart_momentum_${trendMetrics.momentum}`)
+    : '';
+  const momentumSymbol = trendMetrics?.momentum === 'accelerating'
+    ? '↑'
+    : trendMetrics?.momentum === 'cooling' ? '↓' : '→';
+  const momentumPercent = Number.isFinite(trendMetrics?.momentumChangePercent)
+    ? ` ${Math.min(999, Math.abs(trendMetrics.momentumChangePercent)).toFixed(1)}%`
+    : '';
+  summary.innerHTML = `
+    <span>${getDailyChartIntervalLabel(dailyChartIntervalMinutes)} K</span>
+    <span class="market-divider" aria-hidden="true"></span>
+    <span><span class="market-value">${formatNumber(activeCount)}</span> ${t('chart_active_candles')}</span>
+    <span class="market-divider" aria-hidden="true"></span>
+    <span>${t('chart_day_total')} <span class="market-value">${formatToken(totalTokens)}</span></span>
+    <span class="market-divider" aria-hidden="true"></span>
+    <span>${t('estimated_cost_label')} <span class="market-value market-cost">${formatCost(totalCost)}</span></span>
+    ${hasSlope ? `
+      <span class="market-divider" aria-hidden="true"></span>
+      <span>MA${trendMetrics.windowSize} ${t('chart_slope_label')} <span class="market-value market-slope">${formatTokenRate(trendMetrics.slopeTokensPerHour)}</span></span>
+      <span class="market-momentum is-${trendMetrics.momentum}">${momentumSymbol} ${momentumLabel}${momentumPercent}</span>
+    ` : ''}
+  `;
+}
+
+function renderTokenCandlestickChart(data) {
+  const canvas = document.getElementById('tokenChart');
+  const candles = aggregateDailyTokenCandles(data.raw_entries, data.sessions, dailyChartIntervalMinutes);
+  const trendMetrics = calculateMovingAverageTrend(
+    candles,
+    dailyChartIntervalMinutes,
+    DAILY_CHART_MA_WINDOW
+  );
+  const labels = candles.map(candle => candle.label);
+  const inputData = candles.map(candle => candle.input > 0
+    ? [candle.open, candle.open + candle.input]
+    : null);
+  const outputData = candles.map(candle => candle.output > 0
+    ? [candle.open + candle.input, candle.open + candle.input + candle.output]
+    : null);
+  const cacheData = candles.map(candle => candle.cache > 0
+    ? [candle.open + candle.input + candle.output, candle.close]
+    : null);
+  const candleDatasets = [
+    {
+      label: t('chart_input_label'),
+      data: inputData,
+      backgroundColor: chartPalette.candleInputFill,
+    },
+    {
+      label: t('chart_output_label'),
+      data: outputData,
+      backgroundColor: chartPalette.candleOutputFill,
+    },
+    {
+      label: t('chart_cache_combined_label'),
+      data: cacheData,
+      backgroundColor: chartPalette.candleCacheFill,
+    },
+  ].map(dataset => ({
+    ...dataset,
+    borderWidth: 0,
+    borderSkipped: false,
+    borderRadius: 0,
+    grouped: false,
+    barPercentage: 0.72,
+    categoryPercentage: 0.9,
+  }));
+  const datasets = [
+    ...candleDatasets,
+    {
+      label: t('chart_ma_label').replace('{window}', String(trendMetrics.windowSize)),
+      data: trendMetrics.values,
+      type: 'line',
+      dailyRole: 'movingAverage',
+      borderColor: chartPalette.candleAverage,
+      backgroundColor: 'rgba(45, 140, 255, 0.1)',
+      borderWidth: 2,
+      pointRadius: 0,
+      pointHoverRadius: 3,
+      pointHitRadius: 8,
+      pointStyle: 'line',
+      tension: 0.24,
+      fill: false,
+      spanGaps: false,
+      order: -10,
+    },
+  ];
+
+  updateDailyChartMarketSummary(candles, trendMetrics);
+  const totalTokens = candles.length > 0 ? candles[candles.length - 1].close : 0;
+  canvas.setAttribute(
+    'aria-label',
+    t('chart_kline_aria')
+      .replace('{interval}', getDailyChartIntervalLabel(dailyChartIntervalMinutes))
+      .replace('{total}', formatNumber(totalTokens))
+  );
+  currentChartSessions = [];
+
+  if (tokenChartInstance) {
+    tokenChartInstance.data.labels = labels;
+    tokenChartInstance.data.datasets = datasets;
+    tokenChartInstance.$dailyCandles = candles;
+    tokenChartInstance.$dailyTrendMetrics = trendMetrics;
+    tokenChartInstance.options.scales.y.title.text = t('chart_day_total');
+    tokenChartInstance.update();
+    return;
+  }
+
+  const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  tokenChartInstance = new Chart(canvas, {
+    type: 'bar',
+    data: { labels, datasets },
+    plugins: [dailyTokenCandlestickPlugin],
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: prefersReducedMotion ? false : { duration: 180 },
+      layout: {
+        padding: { top: 16, right: 8 },
+      },
+      interaction: {
+        mode: 'index',
+        intersect: false,
+      },
+      onHover: (event, activeElements) => {
+        canvas.style.cursor = activeElements.length ? 'crosshair' : 'default';
+      },
+      plugins: {
+        legend: {
+          position: 'top',
+          align: 'start',
+          onClick: () => {},
+          labels: {
+            color: '#f4f7fb',
+            boxWidth: 10,
+            boxHeight: 10,
+            padding: 14,
+            font: {
+              family: chartFontFamily,
+              size: 11,
+            },
+          },
+        },
+        tooltip: {
+          padding: 12,
+          backgroundColor: 'rgba(15, 18, 29, 0.96)',
+          titleColor: chartPalette.tokenStroke,
+          bodyColor: '#f4f7fb',
+          borderColor: 'rgba(255, 255, 255, 0.1)',
+          borderWidth: 1,
+          callbacks: {
+            title: contexts => contexts[0]?.chart.$dailyCandles?.[contexts[0].dataIndex]?.rangeLabel || '',
+            label: context => {
+              if (context.dataset.dailyRole === 'movingAverage') {
+                return `${context.dataset.label}: ${formatToken(context.parsed.y)} Token`;
+              }
+              const candle = context.chart.$dailyCandles[context.dataIndex];
+              const values = [candle.input, candle.output, candle.cache];
+              return `${context.dataset.label}: ${formatToken(values[context.datasetIndex])} (${formatNumber(values[context.datasetIndex])})`;
+            },
+            afterBody: contexts => {
+              const candle = contexts[0]?.chart.$dailyCandles?.[contexts[0].dataIndex];
+              if (!candle) return [];
+              const changeLabel = candle.changePercent === null
+                ? t('chart_usage_flat')
+                : `${candle.direction > 0 ? t('chart_usage_up') : candle.direction < 0 ? t('chart_usage_down') : t('chart_usage_flat')} ${Math.abs(candle.changePercent).toFixed(1)}%`;
+              return [
+                `${t('chart_interval_total')}: ${formatToken(candle.total)} (${formatNumber(candle.total)})`,
+                `${t('chart_accumulated_label')}: ${formatToken(candle.open)} → ${formatToken(candle.close)}`,
+                `${t('chart_interval_cost')}: ${formatCandlestickCost(candle.cost)}`,
+                `${t('chart_usage_change')}: ${changeLabel}`,
+              ];
+            },
+          },
+        },
+      },
+      scales: {
+        x: {
+          stacked: false,
+          grid: {
+            display: false,
+          },
+          ticks: {
+            color: '#94a3b8',
+            autoSkip: true,
+            maxRotation: 0,
+            maxTicksLimit: 12,
+            font: {
+              family: 'IBM Plex Mono',
+              size: 10,
+            },
+          },
+        },
+        y: {
+          stacked: false,
+          beginAtZero: true,
+          grace: '18%',
+          grid: {
+            color: 'rgba(255, 255, 255, 0.05)',
+          },
+          ticks: {
+            color: '#94a3b8',
+            callback: value => formatToken(value),
+          },
+          title: {
+            display: true,
+            text: t('chart_day_total'),
+            color: '#f4f7fb',
+          },
+        },
+      },
+    },
+  });
+  tokenChartInstance.$dailyChartMode = 'kline';
+  tokenChartInstance.$dailyCandles = candles;
+  tokenChartInstance.$dailyTrendMetrics = trendMetrics;
+
+  const currentTheme = document.documentElement.getAttribute('data-theme') || 'dark';
+  updateChartsTheme(currentTheme);
+}
+
+function renderChart(data) {
+  updateDailyChartControls();
+  if (tokenChartInstance && tokenChartInstance.$dailyChartMode !== dailyChartMode) {
+    tokenChartInstance.destroy();
+    tokenChartInstance = null;
+  }
+
+  if (dailyChartMode === 'kline') {
+    renderTokenCandlestickChart(data);
+  } else {
+    renderSessionTrendChart(Array.isArray(data.sessions) ? data.sessions : []);
+  }
+}
+
+// =========================================================================
+// 渲染 Chart.js Session Token 使用趨勢圖
+// =========================================================================
+function renderSessionTrendChart(sessions) {
   const canvas = document.getElementById('tokenChart');
 
   // 只取前 15 個 Session 來畫，避免過於擁擠
@@ -1935,6 +2455,7 @@ function renderChart(sessions) {
       }
     }
   });
+  tokenChartInstance.$dailyChartMode = 'trend';
 
   // 根據當前主題更新圖表樣式
   const currentTheme = document.documentElement.getAttribute('data-theme') || 'dark';
