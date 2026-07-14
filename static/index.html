@@ -20,7 +20,7 @@
     document.documentElement.setAttribute('data-theme', savedTheme);
   </script>
   <!-- CSS Stylesheet -->
-  <link rel="stylesheet" href="/static/styles.css?v=13">
+  <link rel="stylesheet" href="/static/styles.css?v=14">
   <!-- Chart.js for beautiful charts -->
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <!-- Marked.js for rendering markdown response -->
@@ -813,6 +813,10 @@
             <span class="lbl" data-i18n="drawer_total">總計</span>
             <span class="val" id="meta-tokens">-</span>
           </div>
+          <div class="meta-item stat-item cost-item">
+            <span class="lbl" data-i18n="drawer_cost">估算費用</span>
+            <span class="val" id="meta-cost">-</span>
+          </div>
         </div>
 
         <!-- Reconstructed Timeline -->
@@ -1039,6 +1043,6 @@
   <div class="sidebar-overlay" id="sidebar-overlay"></div>
 
   <!-- Frontend Javascript logic -->
-  <script type="module" src="/static/app.js?v=23"></script>
+  <script type="module" src="/static/app.js?v=25"></script>
 </body>
 </html>

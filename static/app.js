@@ -1,4 +1,4 @@
-import i18n from './i18n.js?v=16';
+import i18n from './i18n.js?v=17';
 
 // Globals
 let tokenChartInstance = null;
@@ -1851,7 +1851,7 @@ function renderChart(sessions) {
           const index = elements[0].index;
           const session = currentChartSessions[index];
           if (session) {
-            openSessionTimeline(session.session_id, session.session_name, session.total_tokens, session.total_cache_read_tokens);
+            openSessionTimeline(session);
           }
         }
       },
@@ -2220,21 +2220,7 @@ function renderSessionTable(sessions) {
 
     // 當點擊 Session 時，開啟對話詳細還原
     tr.addEventListener('click', () => {
-      openSessionTimeline(
-        s.session_id,
-        s.session_name,
-        s.total_tokens,
-        s.total_cache_read_tokens,
-        s.total_input_tokens,
-        s.total_output_tokens,
-        s.total_reasoning_tokens,
-        s.cwd,
-        s.model,
-        s.assistant_type,
-        s.agent_nickname,
-        s.agent_role,
-        s.reasoning_effort
-      );
+      openSessionTimeline(s);
     });
 
     // 群組 Hover 高亮
@@ -2264,7 +2250,22 @@ function renderSessionTable(sessions) {
 // =========================================================================
 // API 呼叫: 載入並渲染特定 Session 對話時間軸 (Timeline)
 // =========================================================================
-async function openSessionTimeline(sessionId, sessionName, totalTokens, cacheReadTokens, inputTokens, outputTokens, reasoningTokens, cwd, model, assistantType, agentNickname, agentRole) {
+async function openSessionTimeline(session) {
+  const {
+    session_id: sessionId,
+    session_name: sessionName,
+    total_tokens: totalTokens,
+    total_cache_read_tokens: cacheReadTokens,
+    total_input_tokens: inputTokens,
+    total_output_tokens: outputTokens,
+    total_reasoning_tokens: reasoningTokens,
+    cwd,
+    model,
+    assistant_type: assistantType,
+    agent_nickname: agentNickname,
+    agent_role: agentRole,
+    cost_usd: estimatedCost,
+  } = session;
   const drawerOverlay = document.getElementById('timeline-drawer');
   const timelineContainer = document.getElementById('timeline-items');
 
@@ -2303,6 +2304,7 @@ async function openSessionTimeline(sessionId, sessionName, totalTokens, cacheRea
   document.getElementById('meta-input').textContent = formatToken(inputTokens || 0);
   document.getElementById('meta-output').textContent = formatToken(outputTokens || 0);
   document.getElementById('meta-reasoning').textContent = formatToken(reasoningTokens || 0);
+  document.getElementById('meta-cost').textContent = formatCost(estimatedCost);
 
   const nicknameContainer = document.getElementById('drawer-meta-nickname-container');
   const roleContainer = document.getElementById('drawer-meta-role-container');

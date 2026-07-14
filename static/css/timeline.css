@@ -121,7 +121,7 @@
 }
 
 .session-stats-grid {
-  grid-template-columns: repeat(6, 1fr);
+  grid-template-columns: repeat(7, minmax(0, 1fr));
   margin-top: 12px;
 }
 
@@ -152,7 +152,7 @@
   grid-column: span 2;
 }
 
-@media (max-width: 768px) {
+@media (max-width: 900px) {
   .session-meta-grid {
     grid-template-columns: repeat(2, 1fr);
     gap: 10px;
@@ -167,6 +167,9 @@
   }
   .session-stats-grid .meta-item.stat-item.highlight {
     grid-column: span 1;
+  }
+  .session-stats-grid .meta-item.stat-item.cost-item {
+    grid-column: 1 / -1;
   }
 }
 
@@ -184,6 +187,9 @@
   }
   .session-stats-grid .meta-item.stat-item.highlight {
     grid-column: span 1;
+  }
+  .session-stats-grid .meta-item.stat-item.cost-item {
+    grid-column: 1 / -1;
   }
 }
 
@@ -229,6 +235,10 @@
 
 #meta-tokens {
   color: #fbbf24;
+}
+
+#meta-cost {
+  color: var(--neon-gold);
 }
 
 #meta-cache {
