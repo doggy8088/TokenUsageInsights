@@ -101,6 +101,7 @@ struct CodexTokenUsage {
 const CODEX_PARSER_MIGRATION_KEY: &str = "migration:codex_session_identity_v6";
 const COPILOT_SOURCE_KIND_MIGRATION_KEY: &str = "migration:copilot_source_kind_v1";
 const VSCODE_EMPTY_SESSION_MIGRATION_KEY: &str = "migration:vscode_empty_sessions_v1";
+const COPILOT_CACHED_INPUT_MIGRATION_KEY: &str = "migration:copilot_cached_input_v1";
 
 fn hash_fnv1a_64(input: &str) -> u64 {
     let mut hash: u64 = 0xcbf29ce484222325;
@@ -464,6 +465,47 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
         .map_err(|error| format!("記錄空白 VS Code Copilot 工作階段遷移失敗: {error}"))?;
     }
 
+    let copilot_cached_input_migration_done: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = ?)",
+            params![COPILOT_CACHED_INPUT_MIGRATION_KEY],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    if !copilot_cached_input_migration_done {
+        conn.execute(
+            "UPDATE usage_entries
+             SET tokens_input = CASE
+                    WHEN tokens_input IS NOT NULL
+                     AND tokens_output IS NOT NULL
+                     AND tokens_cache_read > 0
+                     AND tokens_input >= tokens_cache_read
+                     AND tokens_total = tokens_input + tokens_output
+                    THEN tokens_input - tokens_cache_read
+                    ELSE tokens_input
+                 END,
+                 delta_input = CASE
+                    WHEN delta_input IS NOT NULL
+                     AND delta_output IS NOT NULL
+                     AND delta_cache_read > 0
+                     AND delta_input >= delta_cache_read
+                     AND delta_total = delta_input + delta_output
+                    THEN delta_input - delta_cache_read
+                    ELSE delta_input
+                 END
+             WHERE assistant_type = 'copilot'
+               AND source_kind = 'copilot-cli'",
+            [],
+        )
+        .map_err(|error| format!("正規化 Copilot CLI 快取輸入失敗: {error}"))?;
+        conn.execute(
+            "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES (?, 1, 0)",
+            params![COPILOT_CACHED_INPUT_MIGRATION_KEY],
+        )
+        .map_err(|error| format!("記錄 Copilot CLI 快取輸入遷移失敗: {error}"))?;
+    }
+
     Ok(())
 }
 
@@ -471,6 +513,28 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
 fn parse_usage_entries(content: &str) -> Vec<UsageEntry> {
     let stream = serde_json::Deserializer::from_str(content).into_iter::<UsageEntry>();
     stream.filter_map(Result::ok).collect()
+}
+
+fn separate_copilot_cli_cached_input(input: u64, output: u64, cache_read: u64, total: u64) -> u64 {
+    if cache_read > 0 && input >= cache_read && total == input.saturating_add(output) {
+        input - cache_read
+    } else {
+        input
+    }
+}
+
+fn normalize_copilot_cli_token_stats(tokens: &mut Option<TokenStats>) {
+    let Some(tokens) = tokens else {
+        return;
+    };
+    let cache_read = tokens.cache_read.unwrap_or(0);
+    tokens.input =
+        separate_copilot_cli_cached_input(tokens.input, tokens.output, cache_read, tokens.total);
+}
+
+fn normalize_copilot_cli_usage_entry(entry: &mut UsageEntry) {
+    normalize_copilot_cli_token_stats(&mut entry.tokens);
+    normalize_copilot_cli_token_stats(&mut entry.delta_tokens);
 }
 
 fn get_antigravity_session_name(session_id: &str) -> Option<String> {
@@ -613,7 +677,13 @@ fn sync_hook_usage_logs(
 
             if read_len > 0 {
                 let new_content = String::from_utf8_lossy(&buffer[..read_len]);
-                let parsed_entries = parse_usage_entries(&new_content);
+                let mut parsed_entries = parse_usage_entries(&new_content);
+
+                if assistant_type == "copilot" {
+                    for entry in &mut parsed_entries {
+                        normalize_copilot_cli_usage_entry(entry);
+                    }
+                }
 
                 if parsed_entries.is_empty() {
                     continue;
@@ -2217,6 +2287,50 @@ fn migrate_records(
     while let Ok(Some(row)) = rows.next() {
         let session_id = row.get::<_, String>(2)?;
         let turn_no = row.get::<_, i64>(7)?;
+        let mut tokens_input = row.get::<_, Option<i64>>(10)?;
+        let tokens_output = row.get::<_, Option<i64>>(11)?;
+        let tokens_cache_read = row.get::<_, Option<i64>>(12)?;
+        let tokens_reasoning = row.get::<_, Option<i64>>(13)?;
+        let tokens_total = row.get::<_, Option<i64>>(14)?;
+        let mut delta_input = row.get::<_, Option<i64>>(15)?;
+        let delta_output = row.get::<_, Option<i64>>(16)?;
+        let delta_cache_read = row.get::<_, Option<i64>>(17)?;
+        let delta_reasoning = row.get::<_, Option<i64>>(18)?;
+        let delta_total = row.get::<_, Option<i64>>(19)?;
+
+        if assistant == "copilot" {
+            let normalize_input = |input: Option<i64>,
+                                   output: Option<i64>,
+                                   cache_read: Option<i64>,
+                                   total: Option<i64>| {
+                let (Some(input), Some(output), Some(cache_read), Some(total)) =
+                    (input, output, cache_read, total)
+                else {
+                    return input;
+                };
+                let Ok(input_unsigned) = u64::try_from(input) else {
+                    return Some(input);
+                };
+                let Ok(output_unsigned) = u64::try_from(output) else {
+                    return Some(input);
+                };
+                let Ok(cache_read_unsigned) = u64::try_from(cache_read) else {
+                    return Some(input);
+                };
+                let Ok(total_unsigned) = u64::try_from(total) else {
+                    return Some(input);
+                };
+                Some(separate_copilot_cli_cached_input(
+                    input_unsigned,
+                    output_unsigned,
+                    cache_read_unsigned,
+                    total_unsigned,
+                ) as i64)
+            };
+            tokens_input =
+                normalize_input(tokens_input, tokens_output, tokens_cache_read, tokens_total);
+            delta_input = normalize_input(delta_input, delta_output, delta_cache_read, delta_total);
+        }
 
         let mut parent_sid: Option<String> = None;
         let mut nickname: Option<String> = None;
@@ -2238,13 +2352,18 @@ fn migrate_records(
 
         let insert_res = tx.execute(
             "INSERT OR IGNORE INTO usage_entries (
-                assistant_type, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
+                assistant_type, source_kind, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
                 tokens_input, tokens_output, tokens_cache_read, tokens_reasoning, tokens_total,
                 delta_input, delta_output, delta_cache_read, delta_reasoning, delta_total,
                 duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 assistant,
+                if assistant == "copilot" {
+                    "copilot-cli"
+                } else {
+                    "legacy"
+                },
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 session_id,
@@ -2255,16 +2374,16 @@ fn migrate_records(
                 turn_no,
                 row.get::<_, Option<String>>(8)?,
                 row.get::<_, Option<String>>(9)?,
-                row.get::<_, Option<i64>>(10)?,
-                row.get::<_, Option<i64>>(11)?,
-                row.get::<_, Option<i64>>(12)?,
-                row.get::<_, Option<i64>>(13)?,
-                row.get::<_, Option<i64>>(14)?,
-                row.get::<_, Option<i64>>(15)?,
-                row.get::<_, Option<i64>>(16)?,
-                row.get::<_, Option<i64>>(17)?,
-                row.get::<_, Option<i64>>(18)?,
-                row.get::<_, Option<i64>>(19)?,
+                tokens_input,
+                tokens_output,
+                tokens_cache_read,
+                tokens_reasoning,
+                tokens_total,
+                delta_input,
+                delta_output,
+                delta_cache_read,
+                delta_reasoning,
+                delta_total,
                 row.get::<_, Option<i64>>(20)?,
                 row.get::<_, Option<i64>>(21)?,
                 parent_sid,
@@ -2588,7 +2707,7 @@ pub fn import_usage_day_entries(
         .map_err(|e| format!("建立匯入交易失敗: {}", e))?;
 
     for record in records {
-        let entry = record.entry;
+        let mut entry = record.entry;
         let normalized_id = normalize_import_source_id(record.import_source_id.as_deref());
         let file_date = entry_date_from_timestamp(&entry.timestamp)
             .ok_or_else(|| "無效的 timestamp 格式，無法取得日期".to_string())?;
@@ -2598,12 +2717,15 @@ pub fn import_usage_day_entries(
             ));
         }
 
-        let source_id = normalized_id
-            .unwrap_or_else(|| build_usage_entry_import_source_id(assistant, date, &entry));
         let source_kind = entry
             .source_kind
             .clone()
             .unwrap_or_else(|| "legacy".to_string());
+        if assistant == "copilot" && matches!(source_kind.as_str(), "copilot-cli" | "legacy") {
+            normalize_copilot_cli_usage_entry(&mut entry);
+        }
+        let source_id = normalized_id
+            .unwrap_or_else(|| build_usage_entry_import_source_id(assistant, date, &entry));
 
         let imported = tx
             .execute(
@@ -3245,6 +3367,61 @@ mod tests {
     }
 
     #[test]
+    fn normalize_copilot_cli_usage_entry_separates_cached_input() {
+        let mut entry = sample_import_record().entry;
+        entry.model = Some("mai-code-1-flash-picker · medium".to_string());
+        entry.tokens = Some(TokenStats {
+            input: 443_554,
+            output: 1_370,
+            cache_read: Some(401_024),
+            cache_write: Some(0),
+            reasoning: Some(384),
+            total: 444_924,
+        });
+        entry.delta_tokens = entry.tokens.clone();
+
+        normalize_copilot_cli_usage_entry(&mut entry);
+
+        assert_eq!(
+            entry.tokens.as_ref().map(|tokens| tokens.input),
+            Some(42_530)
+        );
+        assert_eq!(
+            entry.delta_tokens.as_ref().map(|tokens| tokens.input),
+            Some(42_530)
+        );
+        assert_eq!(
+            entry.tokens.as_ref().map(|tokens| tokens.total),
+            Some(444_924)
+        );
+    }
+
+    #[test]
+    fn normalize_copilot_cli_usage_entry_preserves_net_input() {
+        let mut entry = sample_import_record().entry;
+        entry.tokens = Some(TokenStats {
+            input: 42_530,
+            output: 1_370,
+            cache_read: Some(401_024),
+            cache_write: Some(0),
+            reasoning: Some(384),
+            total: 444_924,
+        });
+        entry.delta_tokens = entry.tokens.clone();
+
+        normalize_copilot_cli_usage_entry(&mut entry);
+
+        assert_eq!(
+            entry.tokens.as_ref().map(|tokens| tokens.input),
+            Some(42_530)
+        );
+        assert_eq!(
+            entry.delta_tokens.as_ref().map(|tokens| tokens.input),
+            Some(42_530)
+        );
+    }
+
+    #[test]
     fn sync_antigravity_usage_log_writes_all_columns() {
         let mut conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
@@ -3277,6 +3454,49 @@ mod tests {
     }
 
     #[test]
+    fn sync_copilot_usage_log_separates_cached_input() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let usage_file = temp_jsonl_path("copilot-sync");
+        let base_dir = usage_file.with_extension("");
+        let usage_dir = base_dir.join("usage");
+        fs::create_dir_all(&usage_dir).unwrap();
+        let log_path = usage_dir.join("usage-2026-07-15.jsonl");
+        let mut record = sample_import_record().entry;
+        record.session_id = "copilot-cache-session".to_string();
+        record.tokens = Some(TokenStats {
+            input: 443_554,
+            output: 1_370,
+            cache_read: Some(401_024),
+            cache_write: Some(0),
+            reasoning: Some(384),
+            total: 444_924,
+        });
+        record.delta_tokens = record.tokens.clone();
+        fs::write(
+            &log_path,
+            format!("{}\n", serde_json::to_string(&record).unwrap()),
+        )
+        .unwrap();
+
+        sync_hook_usage_logs(&mut conn, "copilot", &base_dir).unwrap();
+
+        let inserted: (u64, u64) = conn
+            .query_row(
+                "SELECT tokens_input, delta_input
+                 FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND session_id = 'copilot-cache-session'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(inserted, (42_530, 42_530));
+
+        fs::remove_dir_all(base_dir).unwrap();
+    }
+
+    #[test]
     fn import_usage_day_entries_writes_and_deduplicates_records() {
         let mut conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
@@ -3301,6 +3521,38 @@ mod tests {
             )
             .unwrap();
         assert_eq!(imported_rows, 1);
+    }
+
+    #[test]
+    fn import_usage_day_entries_normalizes_copilot_cached_input() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut record = sample_import_record();
+        record.entry.session_id = "imported-copilot-cache".to_string();
+        record.entry.source_kind = Some("copilot-cli".to_string());
+        record.entry.tokens = Some(TokenStats {
+            input: 443_554,
+            output: 1_370,
+            cache_read: Some(401_024),
+            cache_write: Some(0),
+            reasoning: Some(384),
+            total: 444_924,
+        });
+        record.entry.delta_tokens = record.entry.tokens.clone();
+        record.import_source_id = Some("imported-copilot-cache".to_string());
+
+        import_usage_day_entries(&mut conn, "copilot", "2026-07-10", vec![record]).unwrap();
+
+        let inserted: (u64, u64) = conn
+            .query_row(
+                "SELECT tokens_input, delta_input
+                 FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND session_id = 'imported-copilot-cache'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(inserted, (42_530, 42_530));
     }
 
     #[test]
@@ -3370,6 +3622,118 @@ mod tests {
             .unwrap();
         assert_eq!(empty_count, 0);
         assert_eq!(unresolved_count, 1);
+    }
+
+    #[test]
+    fn init_db_normalizes_legacy_copilot_cached_input() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, timestamp, date, session_id, turn_no,
+                tokens_input, tokens_output, tokens_cache_read, tokens_total,
+                delta_input, delta_output, delta_cache_read, delta_total
+             ) VALUES
+                ('copilot', 'copilot-cli', '2026-07-15T20:40:35Z', '2026-07-15', 'raw-copilot', 1,
+                 443554, 1370, 401024, 444924, 443554, 1370, 401024, 444924),
+                ('copilot', 'copilot-cli', '2026-07-15T20:40:36Z', '2026-07-15', 'net-copilot', 1,
+                 42530, 1370, 401024, 444924, 42530, 1370, 401024, 444924),
+                ('antigravity', 'legacy', '2026-07-15T20:40:37Z', '2026-07-15', 'other-assistant', 1,
+                 443554, 1370, 401024, 444924, 443554, 1370, 401024, 444924)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM sync_state WHERE filename = 'migration:copilot_cached_input_v1'",
+            [],
+        )
+        .unwrap();
+
+        init_db(&conn).unwrap();
+
+        let raw_copilot: (u64, u64) = conn
+            .query_row(
+                "SELECT tokens_input, delta_input FROM usage_entries WHERE session_id = 'raw-copilot'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let net_copilot: (u64, u64) = conn
+            .query_row(
+                "SELECT tokens_input, delta_input FROM usage_entries WHERE session_id = 'net-copilot'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let other_assistant: (u64, u64) = conn
+            .query_row(
+                "SELECT tokens_input, delta_input FROM usage_entries WHERE session_id = 'other-assistant'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        assert_eq!(raw_copilot, (42_530, 42_530));
+        assert_eq!(net_copilot, (42_530, 42_530));
+        assert_eq!(other_assistant, (443_554, 443_554));
+    }
+
+    #[test]
+    fn migrate_records_normalizes_copilot_cached_input() {
+        let src_conn = Connection::open_in_memory().unwrap();
+        src_conn
+            .execute_batch(
+                "CREATE TABLE usage_entries (
+                    timestamp TEXT NOT NULL,
+                    date TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    session_name TEXT,
+                    transcript_path TEXT,
+                    cwd TEXT,
+                    version TEXT,
+                    turn_no INTEGER NOT NULL,
+                    model TEXT,
+                    model_id TEXT,
+                    tokens_input INTEGER,
+                    tokens_output INTEGER,
+                    tokens_cache_read INTEGER,
+                    tokens_reasoning INTEGER,
+                    tokens_total INTEGER,
+                    delta_input INTEGER,
+                    delta_output INTEGER,
+                    delta_cache_read INTEGER,
+                    delta_reasoning INTEGER,
+                    delta_total INTEGER,
+                    duration_ms INTEGER,
+                    premium_requests INTEGER
+                );
+                INSERT INTO usage_entries (
+                    timestamp, date, session_id, turn_no, model,
+                    tokens_input, tokens_output, tokens_cache_read, tokens_total,
+                    delta_input, delta_output, delta_cache_read, delta_total
+                ) VALUES (
+                    '2026-07-15T20:40:35Z', '2026-07-15', 'legacy-copilot-cache', 1,
+                    'mai-code-1-flash-picker · medium',
+                    443554, 1370, 401024, 444924,
+                    443554, 1370, 401024, 444924
+                );",
+            )
+            .unwrap();
+        let mut dest_conn = Connection::open_in_memory().unwrap();
+        init_db(&dest_conn).unwrap();
+
+        migrate_records(&src_conn, &mut dest_conn, "copilot").unwrap();
+
+        let inserted: (String, u64, u64) = dest_conn
+            .query_row(
+                "SELECT source_kind, tokens_input, delta_input
+                 FROM usage_entries
+                 WHERE session_id = 'legacy-copilot-cache'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(inserted, ("copilot-cli".to_string(), 42_530, 42_530));
     }
 
     #[test]

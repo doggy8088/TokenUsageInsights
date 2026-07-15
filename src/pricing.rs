@@ -214,4 +214,25 @@ mod tests {
         let error = calculate_usage_cost(&[], None, 10, 2, 3).unwrap_err();
         assert_eq!(error, "缺少模型名稱，無法估算成本");
     }
+
+    #[test]
+    fn copilot_cli_cost_uses_non_cached_input() {
+        let rules = [PricingRule {
+            model_name: "MAI-Code-1-Flash".to_string(),
+            input_price: 0.75,
+            cache_input_price: 0.075,
+            output_price: 4.50,
+        }];
+
+        let cost = calculate_usage_cost(
+            &rules,
+            Some("mai-code-1-flash-picker · medium"),
+            42_530,
+            1_370,
+            401_024,
+        )
+        .unwrap();
+
+        assert!((cost - 0.068_139_3).abs() < f64::EPSILON);
+    }
 }

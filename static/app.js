@@ -1698,21 +1698,19 @@ function renderDashboard(data) {
   // 3. 更新主看板 Metric Cards
   const activeAgents = getActiveAgents();
   const isMulti = activeAgents.length > 1;
-  const rawInputTokens = summary.total_input_tokens || 0;
+  const inputTokens = summary.total_input_tokens || 0;
   const cacheReadTokens = summary.total_cache_read_tokens || 0;
   const reasoningTokens = summary.total_reasoning_tokens || 0;
-  const netInputTokens = getNetInputTokens(rawInputTokens, cacheReadTokens);
-  const combinedInputTokens = netInputTokens + reasoningTokens;
 
   if (!isMulti) {
     document.getElementById('stat-total-tokens').textContent = formatToken(summary.total_tokens);
-    document.getElementById('stat-input-tokens').textContent = formatToken(combinedInputTokens);
+    document.getElementById('stat-input-tokens').textContent = formatToken(inputTokens);
     document.getElementById('stat-cache-read-tokens').textContent = formatToken(cacheReadTokens);
     document.getElementById('stat-output-tokens').textContent = formatToken(summary.total_output_tokens);
     document.getElementById('stat-total-cost').textContent = formatCost(summary.total_cost_usd || 0);
   } else {
     renderMetricValue('stat-total-tokens', s => s.total_tokens, formatToken, sessions, activeAgents);
-    renderMetricValue('stat-input-tokens', getDisplayedInputTokens, formatToken, sessions, activeAgents);
+    renderMetricValue('stat-input-tokens', s => s.total_input_tokens || 0, formatToken, sessions, activeAgents);
     renderMetricValue('stat-cache-read-tokens', s => s.total_cache_read_tokens || 0, formatToken, sessions, activeAgents);
     renderMetricValue('stat-output-tokens', s => s.total_output_tokens, formatToken, sessions, activeAgents);
     renderMetricValue('stat-total-cost', s => s.cost_usd || 0, formatCost, sessions, activeAgents);
@@ -1724,18 +1722,14 @@ function renderDashboard(data) {
   const statCacheReadLabel = document.getElementById('stat-cache-read-label');
   const statCacheWrite = document.getElementById('stat-cache-write');
   const statOutputLabel = document.getElementById('stat-output-label');
-  const inputPercent = calculatePercentage(combinedInputTokens, summary.total_tokens);
+  const inputPercent = calculatePercentage(inputTokens, summary.total_tokens);
   const cacheReadPercent = calculatePercentage(cacheReadTokens, summary.total_tokens);
   const outputPercent = calculatePercentage(summary.total_output_tokens || 0, summary.total_tokens);
   const reasoningPercent = calculatePercentage(reasoningTokens, summary.total_tokens);
 
   if (statInputLabel) {
     const inputTooltip = t('input_tokens_percentage_formula')
-      .replace('{input}', formatNumber(rawInputTokens))
-      .replace('{cacheRead}', formatNumber(cacheReadTokens))
-      .replace('{netInput}', formatNumber(netInputTokens))
-      .replace('{reasoning}', formatNumber(reasoningTokens))
-      .replace('{combined}', formatNumber(combinedInputTokens))
+      .replace('{input}', formatNumber(inputTokens))
       .replace('{total}', formatNumber(summary.total_tokens || 0))
       .replace('{percent}', inputPercent);
     statInputLabel.textContent = `${t('input_tokens_label')} (${inputPercent})`;
@@ -1744,11 +1738,11 @@ function renderDashboard(data) {
   }
   if (statInputTokens) {
     const inputValueTooltip = t('reasoning_tokens_value_tooltip')
-      .replace('{netInput}', formatToken(netInputTokens))
+      .replace('{input}', formatToken(inputTokens))
       .replace('{reasoning}', formatToken(reasoningTokens))
       .replace('{percent}', reasoningPercent);
     statInputTokens.title = inputValueTooltip;
-    statInputTokens.setAttribute('aria-label', `${formatToken(combinedInputTokens)}; ${inputValueTooltip}`);
+    statInputTokens.setAttribute('aria-label', `${formatToken(inputTokens)}; ${inputValueTooltip}`);
   }
   if (statCacheReadLabel) {
     const cacheReadTooltip = t('cache_read_percentage_formula')
@@ -3594,17 +3588,6 @@ function calculatePercentage(part, total) {
   return `${Math.round(percent)}%`;
 }
 
-function getNetInputTokens(inputTokens, cacheReadTokens) {
-  const input = Number(inputTokens) || 0;
-  const cacheRead = Number(cacheReadTokens) || 0;
-  return input >= cacheRead ? input - cacheRead : input;
-}
-
-function getDisplayedInputTokens(stats) {
-  return getNetInputTokens(stats?.total_input_tokens, stats?.total_cache_read_tokens)
-    + (Number(stats?.total_reasoning_tokens) || 0);
-}
-
 function formatDuration(ms) {
   if (ms === null || ms === undefined || ms === 0) return '-';
   if (ms < 1000) return `${ms}ms`;
@@ -3811,7 +3794,7 @@ function renderYearlyDashboard(data) {
   // 2. 更新指標卡片
   const activeAgents = getActiveAgents();
   const isMulti = activeAgents.length > 1;
-  const yearlyInputTokens = getNetInputTokens(summary.total_input_tokens, summary.total_cache_read_tokens);
+  const yearlyInputTokens = summary.total_input_tokens || 0;
 
   if (!isMulti) {
     const totalTokensEl = document.getElementById('yearly-stat-total-tokens');
@@ -3827,7 +3810,7 @@ function renderYearlyDashboard(data) {
     if (totalCostEl) totalCostEl.textContent = formatCost(summary.total_cost_usd || 0);
   } else {
     renderYearlyMetricValue('yearly-stat-total-tokens', a => a.total_tokens, formatToken, agent_breakdown, activeAgents);
-    renderYearlyMetricValue('yearly-stat-input-tokens', a => getNetInputTokens(a.total_input_tokens, a.total_cache_read_tokens), formatToken, agent_breakdown, activeAgents);
+    renderYearlyMetricValue('yearly-stat-input-tokens', a => a.total_input_tokens || 0, formatToken, agent_breakdown, activeAgents);
     renderYearlyMetricValue('yearly-stat-output-tokens', a => a.total_output_tokens, formatToken, agent_breakdown, activeAgents);
     renderYearlyMetricValue('yearly-stat-total-cost', a => a.total_cost_usd, formatCost, agent_breakdown, activeAgents);
     
@@ -4324,7 +4307,7 @@ function renderMonthlyDashboard(data) {
   // 2. 更新指標卡片
   const activeAgents = getActiveAgents();
   const isMulti = activeAgents.length > 1;
-  const monthlyInputTokens = getNetInputTokens(summary.total_input_tokens, summary.total_cache_read_tokens);
+  const monthlyInputTokens = summary.total_input_tokens || 0;
 
   if (!isMulti) {
     document.getElementById('monthly-stat-total-tokens').textContent = formatToken(summary.total_tokens);
@@ -4334,7 +4317,7 @@ function renderMonthlyDashboard(data) {
     document.getElementById('monthly-stat-total-cost').textContent = formatCost(summary.total_cost_usd || 0);
   } else {
     renderMonthlyMetricValue('monthly-stat-total-tokens', a => a.total_tokens, formatToken, agent_breakdown, activeAgents);
-    renderMonthlyMetricValue('monthly-stat-input-tokens', a => getNetInputTokens(a.total_input_tokens, a.total_cache_read_tokens), formatToken, agent_breakdown, activeAgents);
+    renderMonthlyMetricValue('monthly-stat-input-tokens', a => a.total_input_tokens || 0, formatToken, agent_breakdown, activeAgents);
     renderMonthlyMetricValue('monthly-stat-cache-input-tokens', a => a.total_cache_read_tokens || 0, formatToken, agent_breakdown, activeAgents);
     renderMonthlyMetricValue('monthly-stat-output-tokens', a => a.total_output_tokens, formatToken, agent_breakdown, activeAgents);
     renderMonthlyMetricValue('monthly-stat-total-cost', a => a.total_cost_usd, formatCost, agent_breakdown, activeAgents);
