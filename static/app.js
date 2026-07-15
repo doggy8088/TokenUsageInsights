@@ -390,6 +390,14 @@ function isEditableShortcutTarget(target) {
     || target.isContentEditable;
 }
 
+function isSidebarToggleShortcut(event) {
+  const hasExactlyOnePrimaryModifier = event.metaKey !== event.ctrlKey;
+  return hasExactlyOnePrimaryModifier
+    && !event.altKey
+    && !event.shiftKey
+    && event.key.toLowerCase() === 'b';
+}
+
 function toggleSidebar() {
   const appContainer = document.querySelector('.app-container');
   if (!appContainer) return;
@@ -1006,7 +1014,7 @@ function initApp() {
 
   // 支援 ESC 鍵關閉抽屜與關閉行動端側欄
   window.addEventListener('keydown', (e) => {
-    if ((e.ctrlKey || e.metaKey) && !e.altKey && e.key.toLowerCase() === 'b' && !isEditableShortcutTarget(e.target)) {
+    if (isSidebarToggleShortcut(e) && !isEditableShortcutTarget(e.target)) {
       e.preventDefault();
       toggleSidebar();
       return;
