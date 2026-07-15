@@ -100,6 +100,7 @@ struct CodexTokenUsage {
 
 const CODEX_PARSER_MIGRATION_KEY: &str = "migration:codex_session_identity_v6";
 const COPILOT_SOURCE_KIND_MIGRATION_KEY: &str = "migration:copilot_source_kind_v1";
+const VSCODE_EMPTY_SESSION_MIGRATION_KEY: &str = "migration:vscode_empty_sessions_v1";
 
 fn hash_fnv1a_64(input: &str) -> u64 {
     let mut hash: u64 = 0xcbf29ce484222325;
@@ -422,6 +423,45 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
              VALUES (?, 1, 0)",
             params![COPILOT_SOURCE_KIND_MIGRATION_KEY],
         );
+    }
+
+    let empty_vscode_migration_done: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = ?)",
+            params![VSCODE_EMPTY_SESSION_MIGRATION_KEY],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    if !empty_vscode_migration_done {
+        conn.execute(
+            "DELETE FROM usage_entries
+             WHERE assistant_type = 'copilot'
+               AND source_kind = 'vscode-chat'
+               AND model IS NULL
+               AND model_id IS NULL
+               AND tokens_input IS NULL
+               AND tokens_output IS NULL
+               AND tokens_cache_read IS NULL
+               AND tokens_cache_write IS NULL
+               AND tokens_reasoning IS NULL
+               AND tokens_total IS NULL
+               AND delta_input IS NULL
+               AND delta_output IS NULL
+               AND delta_cache_read IS NULL
+               AND delta_cache_write IS NULL
+               AND delta_reasoning IS NULL
+               AND delta_total IS NULL
+               AND duration_ms IS NULL
+               AND premium_requests IS NULL",
+            [],
+        )
+        .map_err(|error| format!("清除空白 VS Code Copilot 工作階段失敗: {error}"))?;
+        conn.execute(
+            "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES (?, 1, 0)",
+            params![VSCODE_EMPTY_SESSION_MIGRATION_KEY],
+        )
+        .map_err(|error| format!("記錄空白 VS Code Copilot 工作階段遷移失敗: {error}"))?;
     }
 
     Ok(())
@@ -3290,6 +3330,46 @@ mod tests {
             )
             .unwrap();
         assert_eq!(source_kind, "copilot-cli");
+    }
+
+    #[test]
+    fn init_db_removes_empty_vscode_session_placeholders() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, timestamp, date, session_id, turn_no,
+                tokens_input, tokens_output, tokens_total
+             ) VALUES
+                ('copilot', 'vscode-chat', '2026-07-10T00:00:00Z', '2026-07-10', 'empty-vscode', 1, NULL, NULL, NULL),
+                ('copilot', 'vscode-chat', '2026-07-10T00:01:00Z', '2026-07-10', 'unresolved-vscode', 1, 8, 2, 10)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM sync_state WHERE filename = 'migration:vscode_empty_sessions_v1'",
+            [],
+        )
+        .unwrap();
+
+        init_db(&conn).unwrap();
+
+        let empty_count: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries WHERE session_id = 'empty-vscode'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let unresolved_count: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries WHERE session_id = 'unresolved-vscode'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(empty_count, 0);
+        assert_eq!(unresolved_count, 1);
     }
 
     #[test]

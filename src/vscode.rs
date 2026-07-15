@@ -267,7 +267,7 @@ pub fn to_usage_entries(session: &ChatSession, path: &Path) -> Vec<UsageEntry> {
         .or_else(|| Some(session.session_id.clone()));
     let fallback_timestamp = session.creation_date.map(timestamp_to_iso);
 
-    let mut entries = session
+    session
         .requests
         .iter()
         .enumerate()
@@ -309,32 +309,7 @@ pub fn to_usage_entries(session: &ChatSession, path: &Path) -> Vec<UsageEntry> {
                 reasoning_effort: None,
             }
         })
-        .collect::<Vec<_>>();
-
-    if entries.is_empty() {
-        entries.push(UsageEntry {
-            timestamp: fallback_timestamp.unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string()),
-            session_id,
-            session_name,
-            transcript_path: Some(path.to_string_lossy().into_owned()),
-            cwd: session.working_directory.clone(),
-            version: None,
-            turn_no: 1,
-            model: None,
-            model_id: None,
-            tokens: None,
-            delta_tokens: None,
-            context: None,
-            cost: None,
-            source_kind: Some(SOURCE_KIND.to_string()),
-            parent_session_id: None,
-            agent_nickname: None,
-            agent_role: None,
-            reasoning_effort: None,
-        });
-    }
-
-    entries
+        .collect()
 }
 
 fn replay_operation_log(content: &str) -> Result<Value, String> {
@@ -624,5 +599,20 @@ mod tests {
             Some(15)
         );
         assert_eq!(entries[0].source_kind.as_deref(), Some(SOURCE_KIND));
+    }
+
+    #[test]
+    fn empty_copilot_session_produces_no_usage_entries() {
+        let session = ChatSession {
+            session_id: "empty-session".to_string(),
+            creation_date: Some(1_735_689_600_000),
+            initial_location: None,
+            working_directory: Some("/tmp/project".to_string()),
+            responder_username: Some("GitHub Copilot".to_string()),
+            requests: Vec::new(),
+        };
+
+        assert!(is_github_copilot(&session));
+        assert!(to_usage_entries(&session, Path::new("empty-session.jsonl")).is_empty());
     }
 }

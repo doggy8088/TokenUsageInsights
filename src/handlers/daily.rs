@@ -8,7 +8,7 @@ use std::{
 
 use super::*;
 use crate::db::{self, TokenStats};
-use crate::pricing::{calculate_cost, load_pricing_rules};
+use crate::pricing::{calculate_usage_cost, load_pricing_rules};
 use crate::timeline::{
     parse_antigravity_timeline, parse_claude_timeline, parse_codex_timeline,
     parse_copilot_timeline, parse_cursor_timeline, parse_vscode_timeline, TimelineItem,
@@ -478,12 +478,9 @@ pub async fn get_usage_details(
             last_entry.tokens.as_ref().map(|t| t.output).unwrap_or(0)
         };
 
-        let cost_usd = match calculate_cost(
+        let cost_usd = match calculate_usage_cost(
             &pricing_rules,
-            &last_entry
-                .model
-                .clone()
-                .unwrap_or_else(|| "Unknown Model".to_string()),
+            last_entry.model.as_deref(),
             total_input_tokens,
             total_output_tokens,
             total_cache_read_tokens,

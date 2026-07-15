@@ -180,3 +180,38 @@ pub fn calculate_cost(
         Err(format!("找不到可用的模型價格規則：{}", model_name))
     }
 }
+
+pub fn calculate_usage_cost(
+    rules: &[PricingRule],
+    model_name: Option<&str>,
+    input: u64,
+    output: u64,
+    cache_read: u64,
+) -> Result<f64, String> {
+    if input == 0 && output == 0 && cache_read == 0 {
+        return Ok(0.0);
+    }
+
+    let model_name = model_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| "缺少模型名稱，無法估算成本".to_string())?;
+    calculate_cost(rules, model_name, input, output, cache_read)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_token_usage_without_model_costs_zero() {
+        let cost = calculate_usage_cost(&[], None, 0, 0, 0).unwrap();
+        assert_eq!(cost, 0.0);
+    }
+
+    #[test]
+    fn token_usage_without_model_reports_missing_metadata() {
+        let error = calculate_usage_cost(&[], None, 10, 2, 3).unwrap_err();
+        assert_eq!(error, "缺少模型名稱，無法估算成本");
+    }
+}

@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::*;
 use crate::db;
-use crate::pricing::{calculate_cost, load_pricing_rules};
+use crate::pricing::{calculate_usage_cost, load_pricing_rules};
 
 /// API 12: 獲取可用的有使用記錄年份
 pub async fn get_available_years(Path(assistant): Path<String>) -> impl IntoResponse {
@@ -204,12 +204,9 @@ pub async fn get_yearly_details(
                 last_entry.tokens.as_ref().map(|t| t.total).unwrap_or(0)
             };
 
-            let cost_usd = match calculate_cost(
+            let cost_usd = match calculate_usage_cost(
                 &pricing_rules,
-                &last_entry
-                    .model
-                    .clone()
-                    .unwrap_or_else(|| "Unknown Model".to_string()),
+                last_entry.model.as_deref(),
                 final_input,
                 final_output,
                 final_cache,
@@ -326,12 +323,9 @@ pub async fn get_yearly_details(
             last_entry.tokens.as_ref().map(|t| t.total).unwrap_or(0)
         };
 
-        let cost_usd = match calculate_cost(
+        let cost_usd = match calculate_usage_cost(
             &pricing_rules,
-            &last_entry
-                .model
-                .clone()
-                .unwrap_or_else(|| "Unknown Model".to_string()),
+            last_entry.model.as_deref(),
             final_input,
             final_output,
             final_cache,
