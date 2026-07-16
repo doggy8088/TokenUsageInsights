@@ -1,4 +1,4 @@
-import i18n from './i18n.js?v=25';
+import i18n from './i18n.js?v=26';
 import {
   aggregateDailyTokenCandles,
   calculateCandleViewport,
@@ -235,6 +235,14 @@ function renderSafeMarkdown(markdownText) {
 let currentSessions = [];
 let currentSortColumn = 'timestamp'; // Default sorted by starting time
 let currentSortDirection = 'desc';  // Default chronological order
+let currentSessionSearchContext = '';
+let currentSessionSearchDataFingerprint = '';
+let currentSessionSearchQuery = '';
+let currentSessionSearchMatches = null;
+let currentSessionSearchUnavailable = 0;
+let currentSessionSearchState = 'idle';
+let sessionSearchDebounceTimer = null;
+let sessionSearchAbortController = null;
 
 // Monthly daily summary sorting state
 let monthlyDailySortColumn = 'date';
@@ -461,6 +469,7 @@ function initApp() {
   const dateSelect = document.getElementById('date-select');
   const monthSelect = document.getElementById('month-select');
   const yearSelect = document.getElementById('year-select');
+  const sessionSearchInput = document.getElementById('session-search-input');
   const closeDrawerBtn = document.getElementById('close-drawer-btn');
   const drawerOverlay = document.getElementById('timeline-drawer');
 
@@ -472,6 +481,12 @@ function initApp() {
   // Live Controls
   const liveToggle = document.getElementById('live-toggle');
   const liveInterval = document.getElementById('live-interval');
+
+  if (sessionSearchInput) {
+    sessionSearchInput.addEventListener('input', () => {
+      scheduleSessionPromptSearch(sessionSearchInput.value);
+    });
+  }
 
   // Apply initial tab visibility based on restored activeTab
   const dailySelector = document.getElementById('daily-selector-section');
@@ -1691,6 +1706,19 @@ function renderMonthlyMetricValue(elementId, getValFn, formatFn, agentBreakdown,
 function renderDashboard(data) {
   currentUsageData = data;
   const { date, summary, sessions } = data;
+  const nextSearchContext = `${currentAssistant}:${date}`;
+  if (nextSearchContext !== currentSessionSearchContext) {
+    resetSessionPromptSearch();
+    currentSessionSearchContext = nextSearchContext;
+  }
+  const nextSearchFingerprint = JSON.stringify(
+    sessions
+      .map(session => [session.assistant_type, session.session_id, session.max_turn_no])
+      .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)))
+  );
+  const shouldRefreshSearch = currentSessionSearchQuery
+    && nextSearchFingerprint !== currentSessionSearchDataFingerprint;
+  currentSessionSearchDataFingerprint = nextSearchFingerprint;
 
   // 1. 更新標題
   setTitleMarkup('calendar', date);
@@ -1796,7 +1824,11 @@ function renderDashboard(data) {
 
   // 5. 渲染 Session 列表
   currentSessions = [...sessions];
-  sortAndRenderSessionTable();
+  if (shouldRefreshSearch) {
+    scheduleSessionPromptSearch(currentSessionSearchQuery, { immediate: true });
+  } else {
+    sortAndRenderSessionTable();
+  }
 }
 
 // =========================================================================
@@ -2761,6 +2793,134 @@ function initTableSorting() {
   });
 }
 
+function resetSessionPromptSearch() {
+  if (sessionSearchDebounceTimer) {
+    clearTimeout(sessionSearchDebounceTimer);
+    sessionSearchDebounceTimer = null;
+  }
+  if (sessionSearchAbortController) {
+    sessionSearchAbortController.abort();
+    sessionSearchAbortController = null;
+  }
+
+  currentSessionSearchQuery = '';
+  currentSessionSearchMatches = null;
+  currentSessionSearchUnavailable = 0;
+  currentSessionSearchState = 'idle';
+  currentSessionSearchDataFingerprint = '';
+
+  const input = document.getElementById('session-search-input');
+  if (input) input.value = '';
+}
+
+function sessionSearchMatchKey(assistantType, sessionId) {
+  return JSON.stringify([assistantType || '', sessionId || '']);
+}
+
+function getSearchFilteredSessions() {
+  if (
+    !currentSessionSearchQuery
+    || currentSessionSearchState !== 'complete'
+    || !(currentSessionSearchMatches instanceof Set)
+  ) {
+    return currentSessions;
+  }
+
+  return currentSessions.filter(session => currentSessionSearchMatches.has(
+    sessionSearchMatchKey(session.assistant_type, session.session_id)
+  ));
+}
+
+function scheduleSessionPromptSearch(value, { immediate = false } = {}) {
+  const query = String(value || '').trim();
+
+  if (sessionSearchDebounceTimer) {
+    clearTimeout(sessionSearchDebounceTimer);
+    sessionSearchDebounceTimer = null;
+  }
+  if (sessionSearchAbortController) {
+    sessionSearchAbortController.abort();
+    sessionSearchAbortController = null;
+  }
+
+  currentSessionSearchQuery = query;
+  currentSessionSearchMatches = null;
+  currentSessionSearchUnavailable = 0;
+
+  if (!query) {
+    currentSessionSearchState = 'idle';
+    sortAndRenderSessionTable();
+    return;
+  }
+
+  if (!currentUsageData?.date) {
+    currentSessionSearchState = 'idle';
+    return;
+  }
+
+  currentSessionSearchState = 'loading';
+  sortAndRenderSessionTable();
+  const delay = immediate ? 0 : 250;
+  sessionSearchDebounceTimer = setTimeout(() => {
+    sessionSearchDebounceTimer = null;
+    executeSessionPromptSearch(query, currentSessionSearchContext);
+  }, delay);
+}
+
+async function executeSessionPromptSearch(query, searchContext) {
+  const controller = new AbortController();
+  sessionSearchAbortController = controller;
+  const date = currentUsageData?.date;
+  const params = new URLSearchParams({ q: query });
+
+  try {
+    const response = await fetch(
+      `/api/${encodeURIComponent(currentAssistant)}/usage/${encodeURIComponent(date)}/session-search?${params}`,
+      { signal: controller.signal }
+    );
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    const result = await response.json();
+
+    if (
+      searchContext !== currentSessionSearchContext
+      || query !== currentSessionSearchQuery
+    ) {
+      return;
+    }
+
+    currentSessionSearchMatches = new Set(
+      (result.matches || []).map(match => sessionSearchMatchKey(
+        match.assistant_type,
+        match.session_id
+      ))
+    );
+    currentSessionSearchUnavailable = Number(result.unavailable_sessions) || 0;
+    currentSessionSearchState = 'complete';
+    sortAndRenderSessionTable();
+  } catch (error) {
+    if (error.name === 'AbortError') return;
+    if (
+      searchContext !== currentSessionSearchContext
+      || query !== currentSessionSearchQuery
+    ) {
+      return;
+    }
+
+    console.error('搜尋 USER 提示詞失敗:', error);
+    currentSessionSearchMatches = null;
+    currentSessionSearchUnavailable = 0;
+    currentSessionSearchState = 'error';
+    sortAndRenderSessionTable();
+    showNotification(t('session_search_failed'), 'error');
+  } finally {
+    if (sessionSearchAbortController === controller) {
+      sessionSearchAbortController = null;
+    }
+  }
+}
+
 function sortAndGetFlatSessions(sessions, sortCol, sortDir) {
   const map = new Map();
   sessions.forEach(s => {
@@ -2826,7 +2986,8 @@ function sortAndRenderSessionTable() {
     return;
   }
 
-  const flatSessions = sortAndGetFlatSessions(currentSessions, currentSortColumn, currentSortDirection);
+  const filteredSessions = getSearchFilteredSessions();
+  const flatSessions = sortAndGetFlatSessions(filteredSessions, currentSortColumn, currentSortDirection);
   renderSessionTable(flatSessions);
   updateSortHeadersUI();
 }
@@ -2859,7 +3020,20 @@ function updateSortHeadersUI() {
 // =========================================================================
 function renderSessionTable(sessions) {
   const tbody = document.getElementById('session-list-body');
-  document.getElementById('session-count').textContent = `${sessions.length} Sessions`;
+  const sessionCount = document.getElementById('session-count');
+  if (currentSessionSearchQuery && currentSessionSearchState === 'loading') {
+    sessionCount.textContent = t('session_search_loading');
+  } else if (currentSessionSearchQuery && currentSessionSearchState === 'complete') {
+    const countKey = currentSessionSearchUnavailable > 0
+      ? 'session_search_count_partial'
+      : 'session_search_count';
+    sessionCount.textContent = t(countKey)
+      .replace('{matched}', sessions.length)
+      .replace('{total}', currentSessions.length)
+      .replace('{unavailable}', currentSessionSearchUnavailable);
+  } else {
+    sessionCount.textContent = `${sessions.length} Sessions`;
+  }
   tbody.innerHTML = '';
 
   const colHeader = document.getElementById('col-assistant-header');
@@ -2872,7 +3046,10 @@ function renderSessionTable(sessions) {
   }
 
   if (sessions.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="12" class="placeholder-text">${t('placeholder_no_sessions')}</td></tr>`;
+    const placeholderKey = currentSessionSearchQuery && currentSessionSearchState === 'complete'
+      ? 'placeholder_no_session_search_results'
+      : 'placeholder_no_sessions';
+    tbody.innerHTML = `<tr><td colspan="13" class="placeholder-text">${t(placeholderKey)}</td></tr>`;
     return;
   }
 
@@ -2984,6 +3161,9 @@ function renderSessionTable(sessions) {
       <td style="font-weight: 700; color: var(--accent-cyan);">${formatCost(s.cost_usd || 0)}</td>
       <td>${formatDuration(s.duration_ms)}</td>
       <td style="color: var(--text-secondary);">${timeFormatted}</td>
+      <td class="session-cwd-column">
+        <span class="session-cwd-value" title="${escapeHtml(s.cwd || '')}">${escapeHtml(s.cwd || '-')}</span>
+      </td>
     `;
 
     // 當點擊 Session 時，開啟對話詳細還原

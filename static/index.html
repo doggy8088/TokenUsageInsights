@@ -20,7 +20,7 @@
     document.documentElement.setAttribute('data-theme', savedTheme);
   </script>
   <!-- CSS Stylesheet -->
-  <link rel="stylesheet" href="/static/styles.css?v=17">
+  <link rel="stylesheet" href="/static/styles.css?v=19">
   <!-- Chart.js for beautiful charts -->
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <!-- Marked.js for rendering markdown response -->
@@ -449,9 +449,25 @@
 
         <!-- Session List Section -->
         <section class="sessions-section glass-card">
-          <div class="section-header">
-            <h3 data-i18n="sessions_table_title">今日會話列表 (Sessions)</h3>
-            <span class="session-count-badge" id="session-count">0 Sessions</span>
+          <div class="section-header sessions-section-header">
+            <div class="sessions-title-group">
+              <h3 data-i18n="sessions_table_title">今日會話列表 (Sessions)</h3>
+              <span class="session-count-badge" id="session-count" aria-live="polite">0 Sessions</span>
+            </div>
+            <label class="session-search-field" for="session-search-input">
+              <span class="icon-glyph icon-search" aria-hidden="true"></span>
+              <input
+                id="session-search-input"
+                type="search"
+                maxlength="256"
+                autocomplete="off"
+                spellcheck="false"
+                data-i18n-placeholder="session_search_placeholder"
+                data-i18n-title="session_search_label"
+                aria-label="搜尋所有 USER 提示詞"
+                placeholder="搜尋所有 USER 提示詞"
+              >
+            </label>
           </div>
           <div class="table-wrapper">
             <table class="premium-table">
@@ -469,11 +485,12 @@
                   <th class="sortable" data-sort="cost_usd"><span data-i18n="col_cost">估算費用 (美金)</span> <span class="sort-icon"></span></th>
                   <th class="sortable" data-sort="duration_ms"><span data-i18n="col_duration">耗時</span> <span class="sort-icon"></span></th>
                   <th class="sortable" data-sort="timestamp"><span data-i18n="col_time">時間</span> <span class="sort-icon"></span></th>
+                  <th class="sortable session-cwd-column" data-sort="cwd"><span data-i18n="col_project_cwd">工作路徑 (CWD)</span> <span class="sort-icon"></span></th>
                 </tr>
               </thead>
               <tbody id="session-list-body">
                 <tr>
-                  <td colspan="12" class="placeholder-text" data-i18n="placeholder_select_date">請先在左側選擇一個日期</td>
+                  <td colspan="13" class="placeholder-text" data-i18n="placeholder_select_date">請先在左側選擇一個日期</td>
                 </tr>
               </tbody>
             </table>
@@ -1070,6 +1087,6 @@
   <div class="sidebar-overlay" id="sidebar-overlay"></div>
 
   <!-- Frontend Javascript logic -->
-  <script type="module" src="/static/app.js?v=35"></script>
+  <script type="module" src="/static/app.js?v=38"></script>
 </body>
 </html>

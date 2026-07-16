@@ -116,6 +116,10 @@ async fn main() {
         .route("/api/:assistant/dates", get(get_available_dates))
         .route("/api/:assistant/setup-info", get(get_setup_info))
         .route("/api/:assistant/usage/:date", get(get_usage_details))
+        .route(
+            "/api/:assistant/usage/:date/session-search",
+            get(search_sessions_by_user_prompt),
+        )
         .route("/api/:assistant/usage/:date/export", get(export_usage_day))
         .route("/api/:assistant/usage/:date/import", import_usage_route())
         .route(

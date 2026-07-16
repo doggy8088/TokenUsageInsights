@@ -1,4 +1,4 @@
-use crate::db::{CostStats, TokenStats, UsageEntry};
+use crate::db::{CostStats, InitialUserPromptSelector, TokenStats, UsageEntry};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::Value;
@@ -258,12 +258,15 @@ pub fn is_github_copilot(session: &ChatSession) -> bool {
 
 pub fn to_usage_entries(session: &ChatSession, path: &Path) -> Vec<UsageEntry> {
     let session_id = format!("{SESSION_ID_PREFIX}{}", session.session_id);
-    let session_name = session
-        .requests
-        .iter()
-        .map(|request| request.prompt.trim())
-        .find(|prompt| !prompt.is_empty())
-        .map(|prompt| prompt.chars().take(100).collect::<String>())
+    let mut session_name_selector = InitialUserPromptSelector::default();
+    for request in &session.requests {
+        session_name_selector.observe_user_prompt(&request.prompt);
+        if !request.response.is_empty() {
+            session_name_selector.observe_non_user_message();
+        }
+    }
+    let session_name = session_name_selector
+        .into_name()
         .or_else(|| Some(session.session_id.clone()));
     let fallback_timestamp = session.creation_date.map(timestamp_to_iso);
 
@@ -599,6 +602,61 @@ mod tests {
             Some(15)
         );
         assert_eq!(entries[0].source_kind.as_deref(), Some(SOURCE_KIND));
+    }
+
+    #[test]
+    fn session_name_uses_last_prompt_before_first_response() {
+        let session = ChatSession {
+            session_id: "consecutive-prompts".to_string(),
+            creation_date: Some(1_735_689_600_000),
+            initial_location: None,
+            working_directory: Some("/tmp/project".to_string()),
+            responder_username: Some("GitHub Copilot".to_string()),
+            requests: vec![
+                ChatRequest {
+                    timestamp: Some(1_735_689_601_000),
+                    prompt: "First prompt".to_string(),
+                    agent_id: Some("github.copilot".to_string()),
+                    model_id: Some("gpt-4o".to_string()),
+                    completion_tokens: None,
+                    prompt_tokens: None,
+                    elapsed_ms: None,
+                    response: Vec::new(),
+                },
+                ChatRequest {
+                    timestamp: Some(1_735_689_602_000),
+                    prompt: "Second prompt".to_string(),
+                    agent_id: Some("github.copilot".to_string()),
+                    model_id: Some("gpt-4o".to_string()),
+                    completion_tokens: Some(5),
+                    prompt_tokens: Some(10),
+                    elapsed_ms: Some(250),
+                    response: vec![serde_json::json!({
+                        "kind": "markdownContent",
+                        "content": "Reply"
+                    })],
+                },
+                ChatRequest {
+                    timestamp: Some(1_735_689_603_000),
+                    prompt: "Later prompt".to_string(),
+                    agent_id: Some("github.copilot".to_string()),
+                    model_id: Some("gpt-4o".to_string()),
+                    completion_tokens: Some(5),
+                    prompt_tokens: Some(10),
+                    elapsed_ms: Some(250),
+                    response: vec![serde_json::json!({
+                        "kind": "markdownContent",
+                        "content": "Later reply"
+                    })],
+                },
+            ],
+        };
+
+        let entries = to_usage_entries(&session, Path::new("session.json"));
+
+        assert!(entries
+            .iter()
+            .all(|entry| entry.session_name.as_deref() == Some("Second prompt")));
     }
 
     #[test]

@@ -102,6 +102,70 @@ const CODEX_PARSER_MIGRATION_KEY: &str = "migration:codex_session_identity_v6";
 const COPILOT_SOURCE_KIND_MIGRATION_KEY: &str = "migration:copilot_source_kind_v1";
 const VSCODE_EMPTY_SESSION_MIGRATION_KEY: &str = "migration:vscode_empty_sessions_v1";
 const COPILOT_CACHED_INPUT_MIGRATION_KEY: &str = "migration:copilot_cached_input_v1";
+const SESSION_NAME_SELECTION_MIGRATION_KEY: &str = "migration:session_name_selection_v1";
+
+#[derive(Default)]
+enum InitialUserPromptState {
+    #[default]
+    Waiting,
+    Collecting,
+    WaitingForFallback,
+    Complete,
+}
+
+#[derive(Default)]
+pub(crate) struct InitialUserPromptSelector {
+    state: InitialUserPromptState,
+    name: Option<String>,
+}
+
+impl InitialUserPromptSelector {
+    pub(crate) fn observe_user_prompt(&mut self, prompt: &str) {
+        let normalized = prompt.trim().replace('\r', "").replace('\n', " ");
+        if normalized.is_empty() || matches!(self.state, InitialUserPromptState::Complete) {
+            return;
+        }
+
+        let name = normalized.chars().take(100).collect();
+        match self.state {
+            InitialUserPromptState::Waiting => {
+                self.name = Some(name);
+                self.state = InitialUserPromptState::Collecting;
+            }
+            InitialUserPromptState::Collecting => {
+                self.name = Some(name);
+            }
+            InitialUserPromptState::WaitingForFallback => {
+                self.name = Some(name);
+                self.state = InitialUserPromptState::Complete;
+            }
+            InitialUserPromptState::Complete => {}
+        }
+    }
+
+    pub(crate) fn observe_non_user_message(&mut self) {
+        self.state = match self.state {
+            InitialUserPromptState::Waiting => InitialUserPromptState::WaitingForFallback,
+            InitialUserPromptState::Collecting => InitialUserPromptState::Complete,
+            InitialUserPromptState::WaitingForFallback => {
+                InitialUserPromptState::WaitingForFallback
+            }
+            InitialUserPromptState::Complete => InitialUserPromptState::Complete,
+        };
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(self.state, InitialUserPromptState::Complete)
+    }
+
+    fn selected_name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    pub(crate) fn into_name(self) -> Option<String> {
+        self.name
+    }
+}
 
 fn hash_fnv1a_64(input: &str) -> u64 {
     let mut hash: u64 = 0xcbf29ce484222325;
@@ -506,6 +570,34 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
         .map_err(|error| format!("記錄 Copilot CLI 快取輸入遷移失敗: {error}"))?;
     }
 
+    let session_name_migration_done: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = ?)",
+            params![SESSION_NAME_SELECTION_MIGRATION_KEY],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    if !session_name_migration_done {
+        conn.execute(
+            "DELETE FROM sync_state
+             WHERE filename LIKE 'antigravity:%'
+                OR filename LIKE 'copilot:%'
+                OR filename LIKE 'vscode:%'
+                OR filename LIKE 'codex:sessions/%'
+                OR filename LIKE 'codex:sessions\\%'
+                OR filename LIKE 'claude:%'
+                OR filename LIKE 'cursor:%'",
+            [],
+        )
+        .map_err(|error| format!("清除會話名稱同步狀態失敗: {error}"))?;
+        conn.execute(
+            "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES (?, 1, 0)",
+            params![SESSION_NAME_SELECTION_MIGRATION_KEY],
+        )
+        .map_err(|error| format!("記錄會話名稱遷移失敗: {error}"))?;
+    }
+
     Ok(())
 }
 
@@ -547,30 +639,97 @@ fn get_antigravity_session_name(session_id: &str) -> Option<String> {
     }
     let file = File::open(path).ok()?;
     let reader = BufReader::new(file);
+    let mut selector = InitialUserPromptSelector::default();
     for line_res in reader.lines() {
-        let line = line_res.ok()?;
-        let event: serde_json::Value = serde_json::from_str(&line).ok()?;
-        if event.get("type").and_then(|t| t.as_str()) == Some("USER_INPUT") {
-            if let Some(content) = event.get("content").and_then(|c| c.as_str()) {
-                let request_text = if let Some(start_idx) = content.find("<USER_REQUEST>") {
-                    let actual_start = start_idx + "<USER_REQUEST>".len();
-                    if let Some(end_idx) = content[actual_start..].find("</USER_REQUEST>") {
-                        &content[actual_start..(actual_start + end_idx)]
+        let Ok(line) = line_res else {
+            continue;
+        };
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        match event.get("type").and_then(|event_type| event_type.as_str()) {
+            Some("USER_INPUT") => {
+                if let Some(content) = event.get("content").and_then(|content| content.as_str()) {
+                    let request_text = if let Some(start_idx) = content.find("<USER_REQUEST>") {
+                        let actual_start = start_idx + "<USER_REQUEST>".len();
+                        if let Some(end_idx) = content[actual_start..].find("</USER_REQUEST>") {
+                            &content[actual_start..(actual_start + end_idx)]
+                        } else {
+                            content
+                        }
                     } else {
                         content
-                    }
-                } else {
-                    content
-                };
-                let trimmed = request_text.trim();
-                let cleaned = trimmed.replace('\r', "").replace('\n', " ");
-                let truncated = cleaned.chars().take(100).collect::<String>();
-                return Some(truncated);
+                    };
+                    selector.observe_user_prompt(request_text);
+                }
             }
+            Some("PLANNER_RESPONSE" | "RUN_COMMAND" | "GREP_SEARCH" | "LIST_DIRECTORY")
+            | Some("VIEW_FILE" | "CODE_ACTION" | "GENERIC" | "ERROR_MESSAGE" | "TOOL_CALL") => {
+                selector.observe_non_user_message();
+            }
+            _ => {}
+        }
+        if selector.is_complete() {
             break;
         }
     }
-    None
+    selector.into_name()
+}
+
+fn get_copilot_session_name(session_id: &str) -> Option<String> {
+    let copilot_dir = get_copilot_dir();
+    let events_path = copilot_dir
+        .join("session-state")
+        .join(session_id)
+        .join("events.jsonl");
+    let path = if events_path.exists() {
+        events_path
+    } else {
+        copilot_dir
+            .join("session-state")
+            .join(format!("{session_id}.jsonl"))
+    };
+    let file = File::open(path).ok()?;
+    let reader = BufReader::new(file);
+    let mut selector = InitialUserPromptSelector::default();
+
+    for line_res in reader.lines() {
+        let Ok(line) = line_res else {
+            continue;
+        };
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let event_type = event
+            .get("type")
+            .and_then(|event_type| event_type.as_str())
+            .unwrap_or("");
+        match event_type {
+            "user.message" | "USER_PROMPT" => {
+                let payload = event.get("payload").or_else(|| event.get("data"));
+                if let Some(content) = payload
+                    .and_then(|payload| payload.get("content"))
+                    .and_then(|content| content.as_str())
+                {
+                    selector.observe_user_prompt(content);
+                }
+            }
+            "assistant.message"
+            | "ASSISTANT_REPLY"
+            | "tool.call"
+            | "TOOL_CALL"
+            | "tool.response"
+            | "TOOL_RESPONSE"
+            | "tool.execution_start"
+            | "tool.execution_complete" => selector.observe_non_user_message(),
+            _ => {}
+        }
+        if selector.is_complete() {
+            break;
+        }
+    }
+
+    selector.into_name()
 }
 
 /// Sync usage logs for hooks-based assistant (Antigravity or Copilot)
@@ -694,17 +853,21 @@ fn sync_hook_usage_logs(
                     .map_err(|e| format!("Transaction BEGIN 失敗: {}", e))?;
 
                 let mut success = true;
+                let mut resolved_names = HashMap::<String, Option<String>>::new();
                 for entry in &parsed_entries {
                     let tokens = entry.tokens.as_ref();
                     let delta = entry.delta_tokens.as_ref();
                     let cost = entry.cost.as_ref();
 
-                    let mut resolved_name = entry.session_name.clone();
-                    if assistant_type == "antigravity" {
-                        if let Some(name) = get_antigravity_session_name(&entry.session_id) {
-                            resolved_name = Some(name);
-                        }
-                    }
+                    let resolved_name = resolved_names
+                        .entry(entry.session_id.clone())
+                        .or_insert_with(|| match assistant_type {
+                            "antigravity" => get_antigravity_session_name(&entry.session_id),
+                            "copilot" => get_copilot_session_name(&entry.session_id),
+                            _ => None,
+                        })
+                        .clone()
+                        .or_else(|| entry.session_name.clone());
 
                     let insert_res = tx.execute(
                         "INSERT OR IGNORE INTO usage_entries (
@@ -747,6 +910,21 @@ fn sync_hook_usage_logs(
                         eprintln!("[{}] 寫入資料庫失敗: {}", assistant_type, e);
                         success = false;
                         break;
+                    }
+
+                    if let Some(name) = resolved_name.as_deref() {
+                        if let Err(error) = tx.execute(
+                            "UPDATE usage_entries
+                             SET session_name = ?
+                             WHERE assistant_type = ?
+                               AND source_kind = ?
+                               AND session_id = ?",
+                            params![name, assistant_type, source_kind, entry.session_id],
+                        ) {
+                            eprintln!("[{}] 更新會話名稱失敗: {}", assistant_type, error);
+                            success = false;
+                            break;
+                        }
                     }
                 }
 
@@ -1039,7 +1217,7 @@ fn parse_codex_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String> 
     }
 
     let mut session_id = fallback_session_id.clone();
-    let mut session_name: Option<String> = None;
+    let mut session_name_selector = InitialUserPromptSelector::default();
     let mut session_cwd: Option<String> = None;
     let mut session_version: Option<String> = None;
     let mut parent_session_id: Option<String> = None;
@@ -1117,29 +1295,35 @@ fn parse_codex_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String> 
                 .and_then(|effort| effort.as_str())
                 .map(|effort| effort.to_string())
                 .or(reasoning_effort);
-        } else if session_name.is_none()
-            && event_type == "event_msg"
-            && payload_type == "user_message"
-        {
-            if let Some(message) = payload.get("message").and_then(|message| message.as_str()) {
-                let cleaned = message.trim().replace('\r', "").replace('\n', " ");
-                if !cleaned.is_empty() {
-                    session_name = Some(cleaned.chars().take(100).collect());
+        }
+
+        match (event_type, payload_type) {
+            ("event_msg", "user_message") => {
+                if let Some(message) = payload.get("message").and_then(|message| message.as_str()) {
+                    session_name_selector.observe_user_prompt(message);
                 }
             }
-        } else if session_name.is_none()
-            && event_type == "response_item"
-            && payload_type == "message"
-            && payload.get("role").and_then(|role| role.as_str()) == Some("user")
-        {
-            if let Some(content) = payload.get("content") {
-                let cleaned = codex_content_to_text(content);
-                if !cleaned.trim().is_empty() {
-                    session_name = Some(cleaned.trim().chars().take(100).collect());
+            ("response_item", "message")
+                if payload.get("role").and_then(|role| role.as_str()) == Some("user") =>
+            {
+                if let Some(content) = payload.get("content") {
+                    session_name_selector.observe_user_prompt(&codex_content_to_text(content));
                 }
             }
+            ("event_msg", "agent_message")
+            | ("response_item", "function_call" | "function_call_output") => {
+                session_name_selector.observe_non_user_message();
+            }
+            ("response_item", "message")
+                if payload.get("role").and_then(|role| role.as_str()) == Some("assistant") =>
+            {
+                session_name_selector.observe_non_user_message();
+            }
+            _ => {}
         }
     }
+
+    let session_name = session_name_selector.into_name();
 
     if parent_session_id.as_deref() == Some(session_id.as_str()) {
         parent_session_id = None;
@@ -1489,7 +1673,7 @@ fn parse_claude_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String>
         .unwrap_or("unknown-session")
         .to_string();
 
-    let mut session_name: Option<String> = None;
+    let mut session_name_selector = InitialUserPromptSelector::default();
     let mut session_cwd: Option<String> = None;
     let mut session_version: Option<String> = None;
     let mut seen_response_keys = HashSet::new();
@@ -1527,18 +1711,27 @@ fn parse_claude_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String>
             .and_then(|role| role.as_str())
             .unwrap_or("");
 
-        if role == "user" && session_name.is_none() {
+        if role == "user" {
             if let Some(content) = message.get("content") {
-                let first_message = claude_content_to_text(content);
-                if !first_message.trim().is_empty() {
-                    session_name = Some(first_message.chars().take(100).collect());
+                let has_tool_result = content.as_array().is_some_and(|items| {
+                    items.iter().any(|item| {
+                        item.get("type").and_then(|item_type| item_type.as_str())
+                            == Some("tool_result")
+                    })
+                });
+                if has_tool_result {
+                    session_name_selector.observe_non_user_message();
+                } else {
+                    session_name_selector.observe_user_prompt(&claude_content_to_text(content));
                 }
             }
+            continue;
         }
 
         if role != "assistant" {
             continue;
         }
+        session_name_selector.observe_non_user_message();
 
         let usage_value = match message.get("usage") {
             Some(usage) => usage.clone(),
@@ -1602,8 +1795,9 @@ fn parse_claude_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String>
         results.push(UsageEntry {
             timestamp,
             session_id,
-            session_name: session_name
-                .clone()
+            session_name: session_name_selector
+                .selected_name()
+                .map(str::to_string)
                 .or_else(|| Some(fallback_session_id.clone())),
             transcript_path: Some(filepath.to_string_lossy().into_owned()),
             cwd,
@@ -1920,7 +2114,7 @@ fn parse_cursor_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String>
         .unwrap_or("unknown-session")
         .to_string();
 
-    let mut session_name: Option<String> = None;
+    let mut session_name_selector = InitialUserPromptSelector::default();
     let mut results = Vec::new();
 
     let mut current_timestamp = String::new();
@@ -1963,10 +2157,9 @@ fn parse_cursor_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String>
             }
 
             current_prompt = clean_prompt.trim().to_string();
-            if session_name.is_none() && !current_prompt.is_empty() {
-                session_name = Some(current_prompt.chars().take(100).collect());
-            }
+            session_name_selector.observe_user_prompt(&current_prompt);
         } else if role == "assistant" {
+            session_name_selector.observe_non_user_message();
             let content_val = event.get("message").and_then(|m| m.get("content"));
             let reply_text =
                 cursor_content_to_text(content_val.unwrap_or(&serde_json::Value::Null));
@@ -1999,8 +2192,9 @@ fn parse_cursor_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String>
             results.push(UsageEntry {
                 timestamp: current_timestamp.clone(),
                 session_id: fallback_session_id.clone(),
-                session_name: session_name
-                    .clone()
+                session_name: session_name_selector
+                    .selected_name()
+                    .map(str::to_string)
                     .or_else(|| Some(fallback_session_id.clone())),
                 transcript_path: Some(filepath.to_string_lossy().into_owned()),
                 cwd: None,
@@ -3367,6 +3561,99 @@ mod tests {
     }
 
     #[test]
+    fn session_name_uses_last_prompt_from_initial_consecutive_run() {
+        let mut selector = InitialUserPromptSelector::default();
+        selector.observe_user_prompt("第一條提示");
+        selector.observe_user_prompt("第二條提示");
+        selector.observe_non_user_message();
+        selector.observe_user_prompt("後續提示");
+
+        assert_eq!(selector.into_name().as_deref(), Some("第二條提示"));
+    }
+
+    #[test]
+    fn session_name_uses_first_prompt_when_initial_run_has_one_prompt() {
+        let mut selector = InitialUserPromptSelector::default();
+        selector.observe_user_prompt("第一條提示");
+        selector.observe_non_user_message();
+        selector.observe_user_prompt("後續提示");
+
+        assert_eq!(selector.into_name().as_deref(), Some("第一條提示"));
+    }
+
+    #[test]
+    fn session_name_falls_back_to_first_user_prompt_after_non_user_message() {
+        let mut selector = InitialUserPromptSelector::default();
+        selector.observe_non_user_message();
+        selector.observe_user_prompt("第一條使用者提示");
+        selector.observe_user_prompt("不應取代名稱");
+
+        assert_eq!(selector.into_name().as_deref(), Some("第一條使用者提示"));
+    }
+
+    #[test]
+    fn hook_session_name_readers_use_last_initial_consecutive_prompt() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_antigravity_dir = std::env::var("ANTIGRAVITY_DIR").ok();
+        let old_copilot_dir = std::env::var("COPILOT_DIR").ok();
+        let base_dir = temp_jsonl_path("hook-session-names").with_extension("");
+        let antigravity_dir = base_dir.join("antigravity");
+        let copilot_dir = base_dir.join("copilot");
+        let antigravity_log = antigravity_dir
+            .join("brain")
+            .join("antigravity-session")
+            .join(".system_generated/logs/transcript_full.jsonl");
+        let copilot_log = copilot_dir
+            .join("session-state")
+            .join("copilot-session")
+            .join("events.jsonl");
+        fs::create_dir_all(antigravity_log.parent().unwrap()).unwrap();
+        fs::create_dir_all(copilot_log.parent().unwrap()).unwrap();
+        fs::write(
+            &antigravity_log,
+            r#"{"type":"USER_INPUT","content":"第一條提示"}
+{"type":"USER_INPUT","content":"<USER_REQUEST>第二條提示</USER_REQUEST>"}
+{"type":"PLANNER_RESPONSE","content":"收到"}
+{"type":"USER_INPUT","content":"後續提示"}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            &copilot_log,
+            r#"{"type":"session.start","data":{}}
+{"type":"user.message","data":{"content":"First prompt"}}
+{"type":"user.message","data":{"content":"Second prompt"}}
+{"type":"assistant.message","data":{"content":"Reply"}}
+{"type":"user.message","data":{"content":"Later prompt"}}
+"#,
+        )
+        .unwrap();
+        std::env::set_var("ANTIGRAVITY_DIR", &antigravity_dir);
+        std::env::set_var("COPILOT_DIR", &copilot_dir);
+
+        assert_eq!(
+            get_antigravity_session_name("antigravity-session").as_deref(),
+            Some("第二條提示")
+        );
+        assert_eq!(
+            get_copilot_session_name("copilot-session").as_deref(),
+            Some("Second prompt")
+        );
+
+        if let Some(value) = old_antigravity_dir {
+            std::env::set_var("ANTIGRAVITY_DIR", value);
+        } else {
+            std::env::remove_var("ANTIGRAVITY_DIR");
+        }
+        if let Some(value) = old_copilot_dir {
+            std::env::set_var("COPILOT_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
     fn normalize_copilot_cli_usage_entry_separates_cached_input() {
         let mut entry = sample_import_record().entry;
         entry.model = Some("mai-code-1-flash-picker · medium".to_string());
@@ -3679,6 +3966,82 @@ mod tests {
     }
 
     #[test]
+    fn session_name_migration_resets_source_sync_state_without_deleting_usage() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, session_name, turn_no
+             ) VALUES (
+                'codex', '2026-07-16T00:00:00Z', '2026-07-16',
+                'preserved-session', '舊名稱', 1
+             )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM sync_state WHERE filename = ?",
+            params![SESSION_NAME_SELECTION_MIGRATION_KEY],
+        )
+        .unwrap();
+        for state_key in [
+            "antigravity:usage-2026-07-16.jsonl",
+            "copilot:usage-2026-07-16.jsonl",
+            "vscode:session.jsonl",
+            "codex:sessions/2026/07/session.jsonl",
+            "claude:projects/session.jsonl",
+            "cursor:projects/session.jsonl",
+        ] {
+            conn.execute(
+                "INSERT INTO sync_state (filename, last_synced_size, last_synced_time)
+                 VALUES (?, 10, 0)",
+                params![state_key],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES ('migration:unrelated', 1, 0)",
+            [],
+        )
+        .unwrap();
+
+        init_db(&conn).unwrap();
+
+        let source_state_count: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state
+                 WHERE filename LIKE 'antigravity:%'
+                    OR filename LIKE 'copilot:%'
+                    OR filename LIKE 'vscode:%'
+                    OR filename LIKE 'codex:sessions/%'
+                    OR filename LIKE 'claude:%'
+                    OR filename LIKE 'cursor:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let preserved_usage_count: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries WHERE session_id = 'preserved-session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let unrelated_state_count: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state WHERE filename = 'migration:unrelated'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(source_state_count, 0);
+        assert_eq!(preserved_usage_count, 1);
+        assert_eq!(unrelated_state_count, 1);
+    }
+
+    #[test]
     fn migrate_records_normalizes_copilot_cached_input() {
         let src_conn = Connection::open_in_memory().unwrap();
         src_conn
@@ -3778,6 +4141,25 @@ mod tests {
             .map(|entry| entry.delta_tokens.as_ref().unwrap().total)
             .sum::<u64>();
         assert_eq!(total, 145);
+    }
+
+    #[test]
+    fn parse_codex_session_file_uses_last_initial_consecutive_user_prompt_as_name() {
+        let path = temp_jsonl_path("codex-session-name");
+        let content = r#"{"timestamp":"2026-07-16T00:00:00Z","type":"session_meta","payload":{"session_id":"session-name","model":"gpt-5.5"}}
+{"timestamp":"2026-07-16T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"第一條提示"}}
+{"timestamp":"2026-07-16T00:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"第二條提示"}}
+{"timestamp":"2026-07-16T00:00:03Z","type":"event_msg","payload":{"type":"agent_message","message":"收到"}}
+{"timestamp":"2026-07-16T00:00:04Z","type":"event_msg","payload":{"type":"user_message","message":"後續提示"}}
+{"timestamp":"2026-07-16T00:00:05Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110},"model_context_window":258400}}}
+"#;
+
+        fs::write(&path, content).unwrap();
+        let entries = parse_codex_session_file(&path).unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].session_name.as_deref(), Some("第二條提示"));
     }
 
     #[test]
@@ -4073,6 +4455,7 @@ mod tests {
         let path = temp_jsonl_path("claude-parser");
 
         let content = r#"{"type":"user","sessionId":"session-1","cwd":"/tmp/project","version":"2.1.201","timestamp":"2026-07-04T19:28:48.190Z","uuid":"u1","message":{"role":"user","content":"Build the report"}}
+{"type":"user","sessionId":"session-1","cwd":"/tmp/project","version":"2.1.201","timestamp":"2026-07-04T19:28:49.190Z","uuid":"u2","message":{"role":"user","content":"Use monthly grouping"}}
 {"type":"assistant","sessionId":"session-1","cwd":"/tmp/project","version":"2.1.201","timestamp":"2026-07-04T19:28:51.753Z","uuid":"a1","requestId":"req_1","message":{"id":"msg_1","role":"assistant","model":"claude-haiku-4-5-20251001","content":[{"type":"thinking","thinking":"working"}],"usage":{"input_tokens":10,"cache_creation_input_tokens":3,"cache_read_input_tokens":7,"output_tokens":5}}}
 {"type":"assistant","sessionId":"session-1","cwd":"/tmp/project","version":"2.1.201","timestamp":"2026-07-04T19:28:51.948Z","uuid":"a2","requestId":"req_1","message":{"id":"msg_1","role":"assistant","model":"claude-haiku-4-5-20251001","content":[{"type":"text","text":"Done"}],"usage":{"input_tokens":10,"cache_creation_input_tokens":3,"cache_read_input_tokens":7,"output_tokens":5}}}
 "#;
@@ -4084,7 +4467,7 @@ mod tests {
         assert_eq!(entries.len(), 1);
         let entry = &entries[0];
         assert_eq!(entry.session_id, "session-1");
-        assert_eq!(entry.session_name.as_deref(), Some("Build the report"));
+        assert_eq!(entry.session_name.as_deref(), Some("Use monthly grouping"));
         assert_eq!(entry.cwd.as_deref(), Some("/tmp/project"));
         assert_eq!(entry.version.as_deref(), Some("2.1.201"));
         assert_eq!(entry.model.as_deref(), Some("claude-haiku-4-5-20251001"));
@@ -4095,6 +4478,26 @@ mod tests {
         assert_eq!(tokens.cache_read, Some(7));
         assert_eq!(tokens.output, 5);
         assert_eq!(tokens.total, 25);
+    }
+
+    #[test]
+    fn parse_cursor_session_file_uses_last_initial_consecutive_user_prompt_as_name() {
+        let path = temp_jsonl_path("cursor-session-name");
+        let content = r#"{"role":"user","message":{"content":"第一條提示"}}
+{"role":"user","message":{"content":"第二條提示"}}
+{"role":"assistant","message":{"content":"收到"}}
+{"role":"user","message":{"content":"後續提示"}}
+{"role":"assistant","message":{"content":"完成"}}
+"#;
+
+        fs::write(&path, content).unwrap();
+        let entries = parse_cursor_session_file(&path).unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(entries.len(), 2);
+        assert!(entries
+            .iter()
+            .all(|entry| entry.session_name.as_deref() == Some("第二條提示")));
     }
 
     #[test]

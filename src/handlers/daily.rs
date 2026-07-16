@@ -1,4 +1,10 @@
-use axum::{extract::Path, http::StatusCode, response::IntoResponse, Json};
+use axum::{
+    extract::{Path, Query},
+    http::StatusCode,
+    response::IntoResponse,
+    Json,
+};
+use serde::Deserialize;
 use std::{
     collections::HashMap,
     fs::File,
@@ -156,6 +162,147 @@ fn resolve_vscode_transcript_path(transcript_path_db: &str) -> Result<PathBuf, S
         return Err("VS Code Copilot 聊天檔案格式不受支援。".to_string());
     }
     Ok(canonical_path)
+}
+
+type SessionFileError = (StatusCode, String);
+
+fn resolve_session_file_path(
+    assistant: &str,
+    session_id: &str,
+    transcript_path_db: Option<&str>,
+    source_kind: &str,
+) -> Result<PathBuf, SessionFileError> {
+    match assistant {
+        "antigravity" => Ok(db::get_antigravity_dir()
+            .join("brain")
+            .join(session_id)
+            .join(".system_generated/logs/transcript_full.jsonl")),
+        "copilot" if source_kind == crate::vscode::SOURCE_KIND => {
+            let path = transcript_path_db.ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    "找不到 VS Code Copilot 聊天檔案路徑。".to_string(),
+                )
+            })?;
+            resolve_vscode_transcript_path(path).map_err(|error| (StatusCode::BAD_REQUEST, error))
+        }
+        "copilot" => {
+            let copilot_dir = db::get_copilot_dir();
+            let events_path = copilot_dir
+                .join("session-state")
+                .join(session_id)
+                .join("events.jsonl");
+            if events_path.exists() {
+                Ok(events_path)
+            } else {
+                Ok(copilot_dir
+                    .join("session-state")
+                    .join(format!("{session_id}.jsonl")))
+            }
+        }
+        "codex" => {
+            let path = transcript_path_db.ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    "找不到 Codex CLI 會話日誌檔案路徑。".to_string(),
+                )
+            })?;
+            resolve_codex_transcript_path(&db::get_codex_dir(), path)
+                .map_err(|error| (StatusCode::BAD_REQUEST, error))
+        }
+        "claude" => {
+            let path = transcript_path_db.ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    "找不到 Claude Code 會話日誌檔案路徑。".to_string(),
+                )
+            })?;
+            resolve_claude_transcript_path(&db::get_claude_dir(), session_id, path)
+                .map_err(|error| (StatusCode::BAD_REQUEST, error))
+        }
+        "cursor" => {
+            let path = transcript_path_db.ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    "找不到 Cursor 會話日誌檔案路徑。".to_string(),
+                )
+            })?;
+            resolve_cursor_transcript_path(&db::get_cursor_dir(), session_id, path)
+                .map_err(|error| (StatusCode::BAD_REQUEST, error))
+        }
+        _ => Err((StatusCode::BAD_REQUEST, "不支援的助理類型".to_string())),
+    }
+}
+
+fn parse_session_timeline_file(
+    assistant: &str,
+    source_kind: &str,
+    filepath: &StdPath,
+    db_entries: &HashMap<u32, (TokenStats, String)>,
+) -> Result<(Vec<TimelineItem>, HashMap<String, serde_json::Value>), SessionFileError> {
+    let mut timeline = Vec::new();
+    let mut metadata = HashMap::new();
+
+    if source_kind == crate::vscode::SOURCE_KIND {
+        let session = crate::vscode::read_session_file(filepath)
+            .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+        parse_vscode_timeline(&session, db_entries, &mut timeline, &mut metadata);
+        return Ok((timeline, metadata));
+    }
+
+    let file = File::open(filepath).map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("開啟日誌檔案失敗: {error}"),
+        )
+    })?;
+    let reader = BufReader::new(file);
+    match assistant {
+        "antigravity" => {
+            parse_antigravity_timeline(reader, db_entries, &mut timeline, &mut metadata)
+        }
+        "copilot" => parse_copilot_timeline(reader, db_entries, &mut timeline, &mut metadata),
+        "codex" => parse_codex_timeline(reader, db_entries, &mut timeline, &mut metadata),
+        "claude" => parse_claude_timeline(reader, db_entries, &mut timeline, &mut metadata),
+        "cursor" => parse_cursor_timeline(reader, db_entries, &mut timeline, &mut metadata),
+        _ => return Err((StatusCode::BAD_REQUEST, "不支援的助理類型".to_string())),
+    }
+
+    Ok((timeline, metadata))
+}
+
+fn timeline_matches_user_prompt(timeline: &[TimelineItem], normalized_query: &str) -> bool {
+    timeline.iter().any(|item| {
+        matches!(
+            item,
+            TimelineItem::UserPrompt { prompt, .. }
+                if prompt.to_lowercase().contains(normalized_query)
+        )
+    })
+}
+
+#[derive(Deserialize)]
+pub struct SessionSearchQuery {
+    q: String,
+}
+
+#[derive(Serialize)]
+struct SessionSearchMatch {
+    session_id: String,
+    assistant_type: String,
+}
+
+#[derive(Serialize)]
+struct SessionSearchResponse {
+    matches: Vec<SessionSearchMatch>,
+    unavailable_sessions: usize,
+}
+
+struct SearchableSession {
+    session_id: String,
+    assistant_type: String,
+    transcript_path: Option<String>,
+    source_kind: String,
 }
 
 pub async fn get_available_dates(Path(assistant): Path<String>) -> impl IntoResponse {
@@ -539,6 +686,127 @@ pub async fn get_usage_details(
     .into_response()
 }
 
+/// 搜尋指定日期各會話中的所有 USER 提示詞
+pub async fn search_sessions_by_user_prompt(
+    Path((assistant, date)): Path<(String, String)>,
+    Query(params): Query<SessionSearchQuery>,
+) -> impl IntoResponse {
+    let assistant = normalize_assistant_name(&assistant);
+    if !is_supported_assistant(&assistant) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "不支援的助理類型" })),
+        )
+            .into_response();
+    }
+
+    let query = params.q.trim();
+    if query.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "搜尋關鍵字不可為空。" })),
+        )
+            .into_response();
+    }
+    if query.chars().count() > 256 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "搜尋關鍵字不可超過 256 個字元。" })),
+        )
+            .into_response();
+    }
+
+    let normalized_query = query.to_lowercase();
+    let search_result: Result<SessionSearchResponse, String> = tokio::task::spawn_blocking({
+        let assistant = assistant.clone();
+        move || {
+            let conn = db::get_db_conn()?;
+            let entries = db::get_usage_entries_by_date(&conn, &date, &assistant)?;
+            let mut sessions = HashMap::<(String, String), SearchableSession>::new();
+
+            for (record, assistant_type) in entries {
+                let entry = record.entry;
+                let key = (assistant_type.clone(), entry.session_id.clone());
+                let session = sessions.entry(key).or_insert_with(|| SearchableSession {
+                    session_id: entry.session_id.clone(),
+                    assistant_type,
+                    transcript_path: entry.transcript_path.clone(),
+                    source_kind: entry
+                        .source_kind
+                        .clone()
+                        .unwrap_or_else(|| "legacy".to_string()),
+                });
+                if session.transcript_path.is_none() {
+                    session.transcript_path = entry.transcript_path;
+                }
+            }
+
+            let mut matches = Vec::new();
+            let mut unavailable_sessions = 0;
+            for session in sessions.into_values() {
+                if !is_safe_session_id(&session.session_id) {
+                    unavailable_sessions += 1;
+                    continue;
+                }
+
+                let filepath = match resolve_session_file_path(
+                    &session.assistant_type,
+                    &session.session_id,
+                    session.transcript_path.as_deref(),
+                    &session.source_kind,
+                ) {
+                    Ok(path) if path.exists() => path,
+                    _ => {
+                        unavailable_sessions += 1;
+                        continue;
+                    }
+                };
+                let db_entries = HashMap::new();
+                let (timeline, _) = match parse_session_timeline_file(
+                    &session.assistant_type,
+                    &session.source_kind,
+                    &filepath,
+                    &db_entries,
+                ) {
+                    Ok(result) => result,
+                    Err(_) => {
+                        unavailable_sessions += 1;
+                        continue;
+                    }
+                };
+
+                if timeline_matches_user_prompt(&timeline, &normalized_query) {
+                    matches.push(SessionSearchMatch {
+                        session_id: session.session_id,
+                        assistant_type: session.assistant_type,
+                    });
+                }
+            }
+
+            matches.sort_by(|a, b| {
+                a.assistant_type
+                    .cmp(&b.assistant_type)
+                    .then_with(|| a.session_id.cmp(&b.session_id))
+            });
+            Ok(SessionSearchResponse {
+                matches,
+                unavailable_sessions,
+            })
+        }
+    })
+    .await
+    .unwrap_or_else(|_| Err("執行緒執行失敗".to_string()));
+
+    match search_result {
+        Ok(result) => Json(result).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": error })),
+        )
+            .into_response(),
+    }
+}
+
 /// API 4: 獲取特定會話的詳細對話歷史還原時間軸
 fn get_git_info(cwd_str: &str) -> (Option<String>, Option<String>) {
     let path = std::path::Path::new(cwd_str);
@@ -627,130 +895,15 @@ pub async fn get_session_details(
     }
 
     // 2. 準備讀取檔案的完整路徑
-    let filepath = match resolved_assistant.as_str() {
-        "antigravity" => {
-            let anti_dir = db::get_antigravity_dir();
-            anti_dir
-                .join("brain")
-                .join(&session_id)
-                .join(".system_generated/logs/transcript_full.jsonl")
-        }
-        "copilot" if source_kind == crate::vscode::SOURCE_KIND => match transcript_path_db {
-            Some(ref path) => match resolve_vscode_transcript_path(path) {
-                Ok(path) => path,
-                Err(error) => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({ "error": error })),
-                    )
-                        .into_response();
-                }
-            },
-            None => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({
-                        "error": "找不到 VS Code Copilot 聊天檔案路徑。"
-                    })),
-                )
-                    .into_response();
-            }
-        },
-        "copilot" => {
-            let cop_dir = db::get_copilot_dir();
-            let mut path = cop_dir
-                .join("session-state")
-                .join(&session_id)
-                .join("events.jsonl");
-            if !path.exists() {
-                path = cop_dir
-                    .join("session-state")
-                    .join(format!("{}.jsonl", session_id));
-            }
-            path
-        }
-        "codex" => {
-            let codex_dir = db::get_codex_dir();
-            match transcript_path_db {
-                Some(ref p_str) => match resolve_codex_transcript_path(&codex_dir, p_str) {
-                    Ok(path) => path,
-                    Err(err) => {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            Json(serde_json::json!({ "error": err })),
-                        )
-                            .into_response();
-                    }
-                },
-                None => {
-                    return (
-                        StatusCode::NOT_FOUND,
-                        Json(serde_json::json!({
-                            "error": "找不到 Codex CLI 會話日誌檔案路徑。"
-                        })),
-                    )
-                        .into_response();
-                }
-            }
-        }
-        "claude" => {
-            let claude_dir = db::get_claude_dir();
-            match transcript_path_db {
-                Some(ref p_str) => {
-                    match resolve_claude_transcript_path(&claude_dir, &session_id, p_str) {
-                        Ok(path) => path,
-                        Err(err) => {
-                            return (
-                                StatusCode::BAD_REQUEST,
-                                Json(serde_json::json!({ "error": err })),
-                            )
-                                .into_response();
-                        }
-                    }
-                }
-                None => {
-                    return (
-                        StatusCode::NOT_FOUND,
-                        Json(serde_json::json!({
-                            "error": "找不到 Claude Code 會話日誌檔案路徑。"
-                        })),
-                    )
-                        .into_response();
-                }
-            }
-        }
-        "cursor" => {
-            let cursor_dir = db::get_cursor_dir();
-            match transcript_path_db {
-                Some(ref p_str) => {
-                    match resolve_cursor_transcript_path(&cursor_dir, &session_id, p_str) {
-                        Ok(path) => path,
-                        Err(err) => {
-                            return (
-                                StatusCode::BAD_REQUEST,
-                                Json(serde_json::json!({ "error": err })),
-                            )
-                                .into_response();
-                        }
-                    }
-                }
-                None => {
-                    return (
-                        StatusCode::NOT_FOUND,
-                        Json(serde_json::json!({
-                            "error": "找不到 Cursor 會話日誌檔案路徑。"
-                        })),
-                    )
-                        .into_response();
-                }
-            }
-        }
-        _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": "不支援的助理類型" })),
-            )
-                .into_response()
+    let filepath = match resolve_session_file_path(
+        &resolved_assistant,
+        &session_id,
+        transcript_path_db.as_deref(),
+        &source_kind,
+    ) {
+        Ok(path) => path,
+        Err((status, error)) => {
+            return (status, Json(serde_json::json!({ "error": error }))).into_response();
         }
     };
 
@@ -786,54 +939,18 @@ pub async fn get_session_details(
         .await
         .unwrap_or_else(|_| (HashMap::new(), None));
 
-    let mut timeline = Vec::new();
-    let mut metadata = HashMap::new();
-
     // 依據不同助理格式解析日誌
-    if source_kind == crate::vscode::SOURCE_KIND {
-        match crate::vscode::read_session_file(&filepath) {
-            Ok(session) => {
-                parse_vscode_timeline(&session, &db_entries, &mut timeline, &mut metadata);
-            }
-            Err(error) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({ "error": error })),
-                )
-                    .into_response();
-            }
+    let (timeline, mut metadata) = match parse_session_timeline_file(
+        &resolved_assistant,
+        &source_kind,
+        &filepath,
+        &db_entries,
+    ) {
+        Ok(result) => result,
+        Err((status, error)) => {
+            return (status, Json(serde_json::json!({ "error": error }))).into_response();
         }
-    } else {
-        let file = match File::open(&filepath) {
-            Ok(f) => f,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({ "error": format!("開啟日誌檔案失敗: {}", e) })),
-                )
-                    .into_response()
-            }
-        };
-        let reader = BufReader::new(file);
-        match resolved_assistant.as_str() {
-            "antigravity" => {
-                parse_antigravity_timeline(reader, &db_entries, &mut timeline, &mut metadata);
-            }
-            "copilot" => {
-                parse_copilot_timeline(reader, &db_entries, &mut timeline, &mut metadata);
-            }
-            "codex" => {
-                parse_codex_timeline(reader, &db_entries, &mut timeline, &mut metadata);
-            }
-            "claude" => {
-                parse_claude_timeline(reader, &db_entries, &mut timeline, &mut metadata);
-            }
-            "cursor" => {
-                parse_cursor_timeline(reader, &db_entries, &mut timeline, &mut metadata);
-            }
-            _ => {}
-        }
-    }
+    };
 
     // 補充或覆寫 Git 與 CWD 相關資訊（若 metadata 未包含但資料庫中有紀錄）
     if let Some(ref cwd) = session_cwd {
@@ -983,4 +1100,42 @@ pub async fn get_session_details(
         "timeline": legacy_timeline,
     }))
     .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn user_prompt(prompt: &str, turn_no: u32) -> TimelineItem {
+        TimelineItem::UserPrompt {
+            timestamp: "2026-07-16T00:00:00Z".to_string(),
+            prompt: prompt.to_string(),
+            context: None,
+            turn_no,
+        }
+    }
+
+    #[test]
+    fn user_prompt_search_checks_every_turn_case_insensitively() {
+        let timeline = vec![
+            user_prompt("先建立專案", 1),
+            user_prompt("Please FIX the payment callback", 2),
+        ];
+
+        assert!(timeline_matches_user_prompt(&timeline, "fix the payment"));
+    }
+
+    #[test]
+    fn user_prompt_search_ignores_non_user_timeline_content() {
+        let timeline = vec![
+            user_prompt("整理今日工作", 1),
+            TimelineItem::SystemStatus {
+                timestamp: "2026-07-16T00:00:01Z".to_string(),
+                status_type: "session_start".to_string(),
+                message: "secret keyword".to_string(),
+            },
+        ];
+
+        assert!(!timeline_matches_user_prompt(&timeline, "secret keyword"));
+    }
 }
