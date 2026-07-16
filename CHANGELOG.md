@@ -6,6 +6,17 @@
 
 目前沒有尚未發行的變更。
 
+## [0.4.1] - 2026-07-16
+
+### 修正
+
+- 修正透過一行安裝腳本安裝後，從 `~/.local/bin/token-usage-insights` symlink 在任意工作目錄啟動時，無法定位套件內 `static/` 資源而結束的問題。
+- 資源定位會先解析執行檔的真實路徑，並在解析失敗或原始路徑不同時保留既有搜尋路徑作為備援。
+
+### 相容性
+
+- 既有 API、資料庫結構、環境變數與安裝流程維持相容。
+
 ## [0.4.0] - 2026-07-16
 
 ### 新增
@@ -219,7 +230,8 @@
 - 修正行動版側邊欄遮擋、黑畫面、標題擠壓、圖表導覽索引與年度版面問題。
 - 修正並補齊多個 Gemini、Claude、GPT 與 GPT-OSS 模型的定價規則。
 
-[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.4.0...HEAD
+[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.3.0...v0.3.1
