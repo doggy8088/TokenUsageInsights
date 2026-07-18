@@ -101,6 +101,8 @@ struct CodexTokenUsage {
 const CODEX_PARSER_MIGRATION_KEY: &str = "migration:codex_session_identity_v6";
 const COPILOT_SOURCE_KIND_MIGRATION_KEY: &str = "migration:copilot_source_kind_v1";
 const VSCODE_EMPTY_SESSION_MIGRATION_KEY: &str = "migration:vscode_empty_sessions_v1";
+const VSCODE_SUMMARY_USAGE_MIGRATION_KEY: &str = "migration:vscode_summary_usage_v1";
+const VSCODE_AGENT_DEBUG_USAGE_MIGRATION_KEY: &str = "migration:vscode_agent_debug_usage_v1";
 const COPILOT_CACHED_INPUT_MIGRATION_KEY: &str = "migration:copilot_cached_input_v1";
 const SESSION_NAME_SELECTION_MIGRATION_KEY: &str = "migration:session_name_selection_v1";
 
@@ -598,6 +600,42 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
         .map_err(|error| format!("記錄會話名稱遷移失敗: {error}"))?;
     }
 
+    let vscode_summary_usage_migration_done: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = ?)",
+            params![VSCODE_SUMMARY_USAGE_MIGRATION_KEY],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    if !vscode_summary_usage_migration_done {
+        conn.execute("DELETE FROM sync_state WHERE filename LIKE 'vscode:%'", [])
+            .map_err(|error| format!("清除 VS Code 摘要 Token 同步狀態失敗: {error}"))?;
+        conn.execute(
+            "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES (?, 1, 0)",
+            params![VSCODE_SUMMARY_USAGE_MIGRATION_KEY],
+        )
+        .map_err(|error| format!("記錄 VS Code 摘要 Token 遷移失敗: {error}"))?;
+    }
+
+    let vscode_agent_debug_usage_migration_done: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = ?)",
+            params![VSCODE_AGENT_DEBUG_USAGE_MIGRATION_KEY],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    if !vscode_agent_debug_usage_migration_done {
+        conn.execute("DELETE FROM sync_state WHERE filename LIKE 'vscode:%'", [])
+            .map_err(|error| format!("清除 VS Code Agent Debug Log 同步狀態失敗: {error}"))?;
+        conn.execute(
+            "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES (?, 1, 0)",
+            params![VSCODE_AGENT_DEBUG_USAGE_MIGRATION_KEY],
+        )
+        .map_err(|error| format!("記錄 VS Code Agent Debug Log 遷移失敗: {error}"))?;
+    }
+
     Ok(())
 }
 
@@ -1012,17 +1050,15 @@ fn sync_vscode_chat_sessions(conn: &mut Connection) -> Result<(), String> {
     let mut seen_sessions = HashSet::new();
 
     for filepath in crate::vscode::discover_session_files() {
-        let metadata = match fs::metadata(&filepath) {
-            Ok(metadata) => metadata,
-            Err(_) => continue,
-        };
-        let current_size = metadata.len();
-        let modified_time = metadata
-            .modified()
-            .ok()
-            .and_then(|value| value.duration_since(SystemTime::UNIX_EPOCH).ok())
-            .map(|value| value.as_nanos() as i64)
-            .unwrap_or(0);
+        let source_session_id = filepath
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("unknown");
+        let (current_size, modified_time) =
+            match crate::vscode::session_source_metadata(&filepath, source_session_id) {
+                Ok(metadata) => metadata,
+                Err(_) => continue,
+            };
         let state_key = format!("vscode:{}", filepath.to_string_lossy());
         let previous_state: Option<(u64, i64)> = conn
             .query_row(
@@ -4039,6 +4075,107 @@ mod tests {
         assert_eq!(source_state_count, 0);
         assert_eq!(preserved_usage_count, 1);
         assert_eq!(unrelated_state_count, 1);
+    }
+
+    #[test]
+    fn vscode_summary_usage_migration_resets_vscode_sync_state_without_deleting_usage() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, timestamp, date, session_id, turn_no,
+                tokens_input, tokens_output, tokens_total
+             ) VALUES (
+                'copilot', 'vscode-chat', '2026-07-18T00:00:00Z', '2026-07-18',
+                'preserved-vscode-session', 1, 8, 2, 10
+             )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM sync_state WHERE filename = ?",
+            params![VSCODE_SUMMARY_USAGE_MIGRATION_KEY],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES ('vscode:session.jsonl', 10, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES ('migration:unrelated-vscode-summary-test', 1, 0)",
+            [],
+        )
+        .unwrap();
+
+        init_db(&conn).unwrap();
+
+        let vscode_state_count: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state WHERE filename LIKE 'vscode:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let preserved_usage_count: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE session_id = 'preserved-vscode-session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let unrelated_state_count: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state
+                 WHERE filename = 'migration:unrelated-vscode-summary-test'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(vscode_state_count, 0);
+        assert_eq!(preserved_usage_count, 1);
+        assert_eq!(unrelated_state_count, 1);
+    }
+
+    #[test]
+    fn vscode_agent_debug_usage_migration_resets_vscode_sync_state_once() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "DELETE FROM sync_state WHERE filename = ?",
+            params![VSCODE_AGENT_DEBUG_USAGE_MIGRATION_KEY],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES ('vscode:debug-session.jsonl', 10, 0)",
+            [],
+        )
+        .unwrap();
+
+        init_db(&conn).unwrap();
+
+        let vscode_state_count: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state WHERE filename LIKE 'vscode:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let migration_count: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state WHERE filename = ?",
+                params![VSCODE_AGENT_DEBUG_USAGE_MIGRATION_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(vscode_state_count, 0);
+        assert_eq!(migration_count, 1);
     }
 
     #[test]

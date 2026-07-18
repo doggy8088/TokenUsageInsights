@@ -4,6 +4,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 pub const SOURCE_KIND: &str = "vscode-chat";
@@ -29,6 +30,45 @@ pub struct ChatRequest {
     pub prompt_tokens: Option<u64>,
     pub elapsed_ms: Option<u64>,
     pub response: Vec<Value>,
+    summary_usages: Vec<ChatUsage>,
+    debug_usages: Vec<ChatUsage>,
+}
+
+#[derive(Debug, Clone)]
+struct ChatUsage {
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    cached_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct TimedChatUsage {
+    timestamp: i64,
+    usage: ChatUsage,
+}
+
+#[derive(Debug, Deserialize)]
+struct SerializedAgentDebugEntry {
+    #[serde(default)]
+    ts: Option<i64>,
+    #[serde(default)]
+    #[serde(rename = "type")]
+    entry_type: Option<String>,
+    #[serde(default)]
+    attrs: Option<SerializedAgentDebugAttrs>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SerializedAgentDebugAttrs {
+    #[serde(default)]
+    #[serde(rename = "inputTokens")]
+    input_tokens: Option<u64>,
+    #[serde(default)]
+    #[serde(rename = "outputTokens")]
+    output_tokens: Option<u64>,
+    #[serde(default)]
+    #[serde(rename = "cachedTokens")]
+    cached_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -65,6 +105,8 @@ struct SerializedChatRequest {
     model_id: Option<String>,
     #[serde(default)]
     response: Option<Value>,
+    #[serde(default)]
+    result: Option<Value>,
     #[serde(default)]
     #[serde(rename = "completionTokens")]
     completion_tokens: Option<u64>,
@@ -207,23 +249,12 @@ pub fn read_session_file(path: &Path) -> Result<ChatSession, String> {
         .to_string();
     let session_id = serialized.session_id.unwrap_or(fallback_id);
 
-    let requests = serialized
+    let mut requests: Vec<ChatRequest> = serialized
         .requests
         .into_iter()
-        .map(|request| ChatRequest {
-            timestamp: request.timestamp,
-            prompt: request
-                .message
-                .map(|message| message.text)
-                .unwrap_or_default(),
-            agent_id: request.agent.as_ref().and_then(agent_id),
-            model_id: request.model_id,
-            completion_tokens: request.completion_tokens,
-            prompt_tokens: request.prompt_tokens,
-            elapsed_ms: request.elapsed_ms,
-            response: response_parts(request.response),
-        })
+        .map(deserialize_request)
         .collect();
+    attach_agent_debug_usages(path, &session_id, &mut requests);
 
     Ok(ChatSession {
         session_id,
@@ -232,6 +263,106 @@ pub fn read_session_file(path: &Path) -> Result<ChatSession, String> {
         working_directory: serialized.working_directory,
         responder_username: serialized.responder_username,
         requests,
+    })
+}
+
+pub fn agent_debug_log_path(session_path: &Path, session_id: &str) -> Option<PathBuf> {
+    let chat_sessions_dir = session_path.parent()?;
+    if chat_sessions_dir.file_name()?.to_str()? != "chatSessions" {
+        return None;
+    }
+    let workspace_dir = chat_sessions_dir.parent()?;
+    Some(
+        workspace_dir
+            .join("GitHub.copilot-chat")
+            .join("debug-logs")
+            .join(session_id)
+            .join("main.jsonl"),
+    )
+}
+
+pub fn session_source_metadata(path: &Path, session_id: &str) -> Result<(u64, i64), String> {
+    let chat_metadata = fs::metadata(path)
+        .map_err(|error| format!("無法讀取 VS Code 聊天檔案資訊 {:?}: {error}", path))?;
+    let mut total_size = chat_metadata.len();
+    let mut latest_modified = modified_time_nanos(&chat_metadata);
+
+    if let Some(debug_path) = agent_debug_log_path(path, session_id) {
+        if let Ok(debug_metadata) = fs::metadata(debug_path) {
+            total_size = total_size.saturating_add(debug_metadata.len());
+            latest_modified = latest_modified.max(modified_time_nanos(&debug_metadata));
+        }
+    }
+
+    Ok((total_size, latest_modified))
+}
+
+fn modified_time_nanos(metadata: &fs::Metadata) -> i64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|value| value.as_nanos() as i64)
+        .unwrap_or(0)
+}
+
+fn attach_agent_debug_usages(path: &Path, session_id: &str, requests: &mut [ChatRequest]) {
+    let Some(debug_path) = agent_debug_log_path(path, session_id) else {
+        return;
+    };
+    let Ok(file) = fs::File::open(debug_path) else {
+        return;
+    };
+
+    let mut usages = BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .filter_map(|line| parse_agent_debug_usage(&line))
+        .collect::<Vec<_>>();
+    usages.sort_by_key(|usage| usage.timestamp);
+
+    for timed_usage in usages {
+        let request_index = requests
+            .iter()
+            .enumerate()
+            .filter_map(|(index, request)| {
+                request
+                    .timestamp
+                    .filter(|timestamp| *timestamp <= timed_usage.timestamp)
+                    .map(|timestamp| (index, timestamp))
+            })
+            .max_by_key(|(_, timestamp)| *timestamp)
+            .map(|(index, _)| index)
+            // Session 建立後、第一筆聊天請求寫入前也可能已有 Agent 呼叫。
+            .or_else(|| (!requests.is_empty()).then_some(0));
+
+        if let Some(index) = request_index {
+            requests[index].debug_usages.push(timed_usage.usage);
+        }
+    }
+}
+
+fn parse_agent_debug_usage(line: &str) -> Option<TimedChatUsage> {
+    let entry: SerializedAgentDebugEntry = serde_json::from_str(line).ok()?;
+    if entry.entry_type.as_deref() != Some("llm_request") {
+        return None;
+    }
+    let timestamp = entry.ts?;
+    let attrs = entry.attrs?;
+    let prompt_tokens = attrs.input_tokens;
+    let completion_tokens = attrs.output_tokens;
+    let cached_tokens = attrs.cached_tokens;
+    if prompt_tokens.is_none() && completion_tokens.is_none() && cached_tokens.is_none() {
+        return None;
+    }
+
+    Some(TimedChatUsage {
+        timestamp,
+        usage: ChatUsage {
+            prompt_tokens: prompt_tokens.unwrap_or(0),
+            completion_tokens: completion_tokens.unwrap_or(0),
+            cached_tokens,
+        },
     })
 }
 
@@ -490,19 +621,116 @@ fn contains_copilot_marker(value: &str) -> bool {
     value.contains("copilot")
 }
 
+fn deserialize_request(request: SerializedChatRequest) -> ChatRequest {
+    let summary_usages = summary_usages(request.result.as_ref());
+    ChatRequest {
+        timestamp: request.timestamp,
+        prompt: request
+            .message
+            .map(|message| message.text)
+            .unwrap_or_default(),
+        agent_id: request.agent.as_ref().and_then(agent_id),
+        model_id: request.model_id,
+        completion_tokens: request.completion_tokens,
+        prompt_tokens: request.prompt_tokens,
+        elapsed_ms: request.elapsed_ms,
+        response: response_parts(request.response),
+        summary_usages,
+        debug_usages: Vec::new(),
+    }
+}
+
+fn summary_usages(result: Option<&Value>) -> Vec<ChatUsage> {
+    result
+        .and_then(|value| value.get("metadata"))
+        .and_then(|metadata| metadata.get("summaries"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|summary| summary.get("usage"))
+        .filter_map(Value::as_object)
+        .map(|usage| ChatUsage {
+            prompt_tokens: usage
+                .get("prompt_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            completion_tokens: usage
+                .get("completion_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            cached_tokens: usage
+                .get("prompt_tokens_details")
+                .and_then(|details| details.get("cached_tokens"))
+                .and_then(Value::as_u64),
+        })
+        .collect()
+}
+
 fn token_stats(request: &ChatRequest) -> Option<TokenStats> {
-    if request.prompt_tokens.is_none() && request.completion_tokens.is_none() {
+    if !request.debug_usages.is_empty() {
+        return aggregate_usages(&request.debug_usages);
+    }
+
+    if request.prompt_tokens.is_none()
+        && request.completion_tokens.is_none()
+        && request.summary_usages.is_empty()
+    {
         return None;
     }
-    let input = request.prompt_tokens.unwrap_or(0);
-    let output = request.completion_tokens.unwrap_or(0);
+
+    let (input, output, cache_read, has_cache_read) = accumulate_usages(
+        &request.summary_usages,
+        request.prompt_tokens.unwrap_or(0),
+        request.completion_tokens.unwrap_or(0),
+    );
+
+    let total = input.saturating_add(output).saturating_add(cache_read);
     Some(TokenStats {
         input,
         output,
-        cache_read: None,
+        cache_read: has_cache_read.then_some(cache_read),
         cache_write: None,
         reasoning: None,
-        total: input.saturating_add(output),
+        total,
+    })
+}
+
+fn accumulate_usages(
+    usages: &[ChatUsage],
+    mut input: u64,
+    mut output: u64,
+) -> (u64, u64, u64, bool) {
+    let mut cache_read = 0u64;
+    let mut has_cache_read = false;
+    for usage in usages {
+        let cached = usage
+            .cached_tokens
+            .map(|value| value.min(usage.prompt_tokens));
+        if let Some(cached) = cached {
+            has_cache_read = true;
+            cache_read = cache_read.saturating_add(cached);
+        }
+        input = input.saturating_add(usage.prompt_tokens.saturating_sub(cached.unwrap_or(0)));
+        output = output.saturating_add(usage.completion_tokens);
+    }
+
+    (input, output, cache_read, has_cache_read)
+}
+
+fn aggregate_usages(usages: &[ChatUsage]) -> Option<TokenStats> {
+    if usages.is_empty() {
+        return None;
+    }
+
+    let (input, output, cache_read, has_cache_read) = accumulate_usages(usages, 0, 0);
+
+    Some(TokenStats {
+        input,
+        output,
+        cache_read: has_cache_read.then_some(cache_read),
+        cache_write: None,
+        reasoning: None,
+        total: input.saturating_add(output).saturating_add(cache_read),
     })
 }
 
@@ -530,6 +758,17 @@ pub fn timestamp_to_iso(timestamp: i64) -> String {
 mod tests {
     use super::*;
 
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "token-usage-insights-{name}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
     #[test]
     fn replays_vscode_operation_log() {
         let content = concat!(
@@ -539,12 +778,19 @@ mod tests {
             "\n",
             r#"{"kind":1,"k":["requests",0,"promptTokens"],"v":12}"#,
             "\n",
+            r#"{"kind":1,"k":["requests",0,"result"],"v":{"metadata":{"summaries":[{"usage":{"prompt_tokens":10,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":8}}}]}}}"#,
+            "\n",
             r#"{"kind":3,"k":["requests",0,"requestId"]}"#,
             "\n"
         );
         let value = replay_operation_log(content).expect("operation log should replay");
         assert_eq!(value["sessionId"], "abc");
         assert_eq!(value["requests"][0]["promptTokens"], 12);
+        assert_eq!(
+            value["requests"][0]["result"]["metadata"]["summaries"][0]["usage"]
+                ["prompt_tokens_details"]["cached_tokens"],
+            8
+        );
         assert!(value["requests"][0].get("requestId").is_none());
     }
 
@@ -573,23 +819,7 @@ mod tests {
             initial_location: raw.initial_location,
             working_directory: raw.working_directory,
             responder_username: raw.responder_username,
-            requests: raw
-                .requests
-                .into_iter()
-                .map(|request| ChatRequest {
-                    timestamp: request.timestamp,
-                    prompt: request
-                        .message
-                        .map(|message| message.text)
-                        .unwrap_or_default(),
-                    agent_id: request.agent.as_ref().and_then(agent_id),
-                    model_id: request.model_id,
-                    completion_tokens: request.completion_tokens,
-                    prompt_tokens: request.prompt_tokens,
-                    elapsed_ms: request.elapsed_ms,
-                    response: response_parts(request.response),
-                })
-                .collect(),
+            requests: raw.requests.into_iter().map(deserialize_request).collect(),
         })
         .expect("flat session should parse");
 
@@ -602,6 +832,141 @@ mod tests {
             Some(15)
         );
         assert_eq!(entries[0].source_kind.as_deref(), Some(SOURCE_KIND));
+    }
+
+    #[test]
+    fn maps_summarization_usage_and_cached_tokens() {
+        let request: SerializedChatRequest = serde_json::from_value(serde_json::json!({
+            "promptTokens": 68_331,
+            "completionTokens": 29_589,
+            "result": {
+                "metadata": {
+                    "summaries": [{
+                        "usage": {
+                            "prompt_tokens": 201_558,
+                            "completion_tokens": 9_945,
+                            "total_tokens": 211_503,
+                            "prompt_tokens_details": {
+                                "cached_tokens": 200_192
+                            }
+                        }
+                    }]
+                }
+            }
+        }))
+        .expect("request with summarization usage should parse");
+
+        let stats = token_stats(&deserialize_request(request))
+            .expect("summarization usage should produce token stats");
+
+        assert_eq!(stats.input, 69_697);
+        assert_eq!(stats.output, 39_534);
+        assert_eq!(stats.cache_read, Some(200_192));
+        assert_eq!(stats.total, 309_423);
+    }
+
+    #[test]
+    fn maps_agent_debug_usage_to_requests_and_prefers_it_over_chat_totals() {
+        let workspace = unique_temp_dir("vscode-debug-usage");
+        let session_id = "debug-session";
+        let chat_dir = workspace.join("chatSessions");
+        let debug_dir = workspace
+            .join("GitHub.copilot-chat")
+            .join("debug-logs")
+            .join(session_id);
+        fs::create_dir_all(&chat_dir).unwrap();
+        fs::create_dir_all(&debug_dir).unwrap();
+
+        let session_path = chat_dir.join(format!("{session_id}.json"));
+        fs::write(
+            &session_path,
+            serde_json::json!({
+                "sessionId": session_id,
+                "responderUsername": "GitHub Copilot",
+                "requests": [
+                    {
+                        "timestamp": 1_000,
+                        "message": {"text": "first"},
+                        "promptTokens": 999,
+                        "completionTokens": 999,
+                        "result": {
+                            "metadata": {
+                                "summaries": [{
+                                    "usage": {
+                                        "prompt_tokens": 999,
+                                        "completion_tokens": 999,
+                                        "prompt_tokens_details": {"cached_tokens": 999}
+                                    }
+                                }]
+                            }
+                        }
+                    },
+                    {
+                        "timestamp": 2_000,
+                        "message": {"text": "second"},
+                        "promptTokens": 999,
+                        "completionTokens": 999
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            debug_dir.join("main.jsonl"),
+            concat!(
+                r#"{"ts":900,"type":"llm_request","attrs":{"inputTokens":20,"outputTokens":2,"cachedTokens":10}}"#,
+                "\n",
+                r#"{"ts":1100,"type":"llm_request","attrs":{"inputTokens":100,"outputTokens":10,"cachedTokens":80}}"#,
+                "\n",
+                r#"{"ts":1200,"type":"llm_request","attrs":{"inputTokens":150,"outputTokens":20,"cachedTokens":100}}"#,
+                "\n",
+                r#"{"ts":2100,"type":"llm_request","attrs":{"inputTokens":200,"outputTokens":30,"cachedTokens":0}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+
+        let session = read_session_file(&session_path).expect("session should parse");
+        let entries = to_usage_entries(&session, &session_path);
+
+        assert_eq!(entries.len(), 2);
+        let first = entries[0].tokens.as_ref().unwrap();
+        assert_eq!(first.input, 80);
+        assert_eq!(first.output, 32);
+        assert_eq!(first.cache_read, Some(190));
+        assert_eq!(first.total, 302);
+        let second = entries[1].tokens.as_ref().unwrap();
+        assert_eq!(second.input, 200);
+        assert_eq!(second.output, 30);
+        assert_eq!(second.cache_read, Some(0));
+        assert_eq!(second.total, 230);
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn session_source_metadata_includes_agent_debug_log() {
+        let workspace = unique_temp_dir("vscode-debug-metadata");
+        let session_id = "metadata-session";
+        let chat_dir = workspace.join("chatSessions");
+        let debug_dir = workspace
+            .join("GitHub.copilot-chat")
+            .join("debug-logs")
+            .join(session_id);
+        fs::create_dir_all(&chat_dir).unwrap();
+        fs::create_dir_all(&debug_dir).unwrap();
+        let session_path = chat_dir.join(format!("{session_id}.json"));
+        fs::write(&session_path, "12345").unwrap();
+
+        let without_debug = session_source_metadata(&session_path, session_id).unwrap();
+        fs::write(debug_dir.join("main.jsonl"), "1234567").unwrap();
+        let with_debug = session_source_metadata(&session_path, session_id).unwrap();
+
+        assert_eq!(without_debug.0, 5);
+        assert_eq!(with_debug.0, 12);
+
+        let _ = fs::remove_dir_all(workspace);
     }
 
     #[test]
@@ -622,6 +987,8 @@ mod tests {
                     prompt_tokens: None,
                     elapsed_ms: None,
                     response: Vec::new(),
+                    summary_usages: Vec::new(),
+                    debug_usages: Vec::new(),
                 },
                 ChatRequest {
                     timestamp: Some(1_735_689_602_000),
@@ -635,6 +1002,8 @@ mod tests {
                         "kind": "markdownContent",
                         "content": "Reply"
                     })],
+                    summary_usages: Vec::new(),
+                    debug_usages: Vec::new(),
                 },
                 ChatRequest {
                     timestamp: Some(1_735_689_603_000),
@@ -648,6 +1017,8 @@ mod tests {
                         "kind": "markdownContent",
                         "content": "Later reply"
                     })],
+                    summary_usages: Vec::new(),
+                    debug_usages: Vec::new(),
                 },
             ],
         };

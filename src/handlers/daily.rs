@@ -20,6 +20,48 @@ use crate::timeline::{
     parse_copilot_timeline, parse_cursor_timeline, parse_vscode_timeline, TimelineItem,
 };
 
+fn aggregate_cache_read<'a>(stats: impl Iterator<Item = &'a TokenStats>) -> (u64, bool) {
+    stats.fold((0u64, false), |(total, available), tokens| {
+        (
+            total.saturating_add(tokens.cache_read.unwrap_or(0)),
+            available || tokens.cache_read.is_some(),
+        )
+    })
+}
+
+async fn cache_read_source(entry: &UsageEntry, available: bool) -> String {
+    if !available {
+        return "unavailable".to_string();
+    }
+    if entry.source_kind.as_deref() != Some(crate::vscode::SOURCE_KIND) {
+        return "usage-log".to_string();
+    }
+
+    let debug_log_path = entry
+        .transcript_path
+        .as_deref()
+        .map(StdPath::new)
+        .and_then(|path| {
+            let session_id = entry
+                .session_id
+                .strip_prefix("vscode-")
+                .unwrap_or(&entry.session_id);
+            crate::vscode::agent_debug_log_path(path, session_id)
+        });
+    let has_debug_log = if let Some(path) = debug_log_path {
+        tokio::fs::metadata(path)
+            .await
+            .is_ok_and(|metadata| metadata.is_file())
+    } else {
+        false
+    };
+    if has_debug_log {
+        "agent-debug-log".to_string()
+    } else {
+        "chat-session".to_string()
+    }
+}
+
 fn is_safe_session_id(session_id: &str) -> bool {
     if session_id.is_empty() || session_id.len() > 128 {
         return false;
@@ -537,6 +579,7 @@ pub async fn get_usage_details(
             .iter()
             .map(|e| e.delta_tokens.as_ref().map(|t| t.total).unwrap_or(0))
             .sum::<u64>();
+        let has_delta_token_stats = s_entries.iter().any(|entry| entry.delta_tokens.is_some());
         let session_input_tokens = s_entries
             .iter()
             .map(|e| e.delta_tokens.as_ref().map(|t| t.input).unwrap_or(0))
@@ -545,15 +588,11 @@ pub async fn get_usage_details(
             .iter()
             .map(|e| e.delta_tokens.as_ref().map(|t| t.output).unwrap_or(0))
             .sum::<u64>();
-        let session_cache_read = s_entries
-            .iter()
-            .map(|e| {
-                e.delta_tokens
-                    .as_ref()
-                    .and_then(|t| t.cache_read)
-                    .unwrap_or(0)
-            })
-            .sum::<u64>();
+        let (session_cache_read, session_cache_read_available) = aggregate_cache_read(
+            s_entries
+                .iter()
+                .filter_map(|entry| entry.delta_tokens.as_ref()),
+        );
         let session_cache_write = s_entries
             .iter()
             .map(|e| {
@@ -587,14 +626,14 @@ pub async fn get_usage_details(
         summary.total_duration_ms += session_duration;
         summary.total_requests += session_requests;
 
-        let total_cache_read_tokens = if session_tokens > 0 {
-            session_cache_read
+        let (total_cache_read_tokens, cache_read_available) = if has_delta_token_stats {
+            (session_cache_read, session_cache_read_available)
         } else {
             last_entry
                 .tokens
                 .as_ref()
-                .and_then(|t| t.cache_read)
-                .unwrap_or(0)
+                .map(|tokens| aggregate_cache_read(std::iter::once(tokens)))
+                .unwrap_or((0, false))
         };
         let total_cache_write_tokens = if session_tokens > 0 {
             session_cache_write
@@ -639,6 +678,7 @@ pub async fn get_usage_details(
             }
         };
         summary.total_cost_usd += cost_usd;
+        let cache_read_source = cache_read_source(&last_entry, cache_read_available).await;
 
         sessions_summary.push(SessionSummary {
             session_id: session_id.clone(),
@@ -662,6 +702,8 @@ pub async fn get_usage_details(
             total_input_tokens,
             total_output_tokens,
             total_cache_read_tokens,
+            cache_read_available,
+            cache_read_source,
             total_cache_write_tokens,
             total_reasoning_tokens,
             max_turn_no: s_entries.iter().map(|e| e.turn_no).max().unwrap_or(1),
@@ -1105,6 +1147,85 @@ pub async fn get_session_details(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn usage_entry(session_id: &str, transcript_path: Option<String>) -> UsageEntry {
+        UsageEntry {
+            timestamp: "2026-07-18T00:00:00Z".to_string(),
+            session_id: session_id.to_string(),
+            session_name: None,
+            transcript_path,
+            cwd: None,
+            version: None,
+            turn_no: 1,
+            model: None,
+            model_id: None,
+            tokens: None,
+            delta_tokens: None,
+            context: None,
+            cost: None,
+            source_kind: Some(crate::vscode::SOURCE_KIND.to_string()),
+            parent_session_id: None,
+            agent_nickname: None,
+            agent_role: None,
+            reasoning_effort: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn cache_read_source_detects_agent_debug_log_asynchronously() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!(
+            "token-usage-insights-cache-source-{}-{nonce}",
+            std::process::id()
+        ));
+        let session_id = "async-metadata-session";
+        let transcript_path = workspace
+            .join("chatSessions")
+            .join(format!("{session_id}.json"));
+        let debug_log_path = workspace
+            .join("GitHub.copilot-chat")
+            .join("debug-logs")
+            .join(session_id)
+            .join("main.jsonl");
+        tokio::fs::create_dir_all(debug_log_path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&debug_log_path, "{}\n").await.unwrap();
+
+        let entry = usage_entry(
+            &format!("vscode-{session_id}"),
+            Some(transcript_path.to_string_lossy().into_owned()),
+        );
+
+        assert_eq!(cache_read_source(&entry, true).await, "agent-debug-log");
+
+        let _ = tokio::fs::remove_dir_all(workspace).await;
+    }
+
+    #[test]
+    fn cache_read_observation_distinguishes_zero_from_unavailable() {
+        let unavailable = TokenStats {
+            input: 10,
+            output: 1,
+            cache_read: None,
+            cache_write: None,
+            reasoning: None,
+            total: 11,
+        };
+        let observed_zero = TokenStats {
+            cache_read: Some(0),
+            ..unavailable.clone()
+        };
+
+        assert_eq!(aggregate_cache_read([&unavailable].into_iter()), (0, false));
+        assert_eq!(
+            aggregate_cache_read([&observed_zero].into_iter()),
+            (0, true)
+        );
+    }
 
     fn user_prompt(prompt: &str, turn_no: u32) -> TimelineItem {
         TimelineItem::UserPrompt {

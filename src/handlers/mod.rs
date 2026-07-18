@@ -86,6 +86,8 @@ pub struct SessionSummary {
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
     pub total_cache_read_tokens: u64,
+    pub cache_read_available: bool,
+    pub cache_read_source: String,
     pub total_cache_write_tokens: u64,
     pub total_reasoning_tokens: u64,
     pub max_turn_no: u32,
