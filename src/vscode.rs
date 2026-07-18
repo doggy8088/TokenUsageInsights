@@ -678,22 +678,11 @@ fn token_stats(request: &ChatRequest) -> Option<TokenStats> {
         return None;
     }
 
-    let mut input = request.prompt_tokens.unwrap_or(0);
-    let mut output = request.completion_tokens.unwrap_or(0);
-    let mut cache_read = 0u64;
-    let mut has_cache_read = false;
-
-    for usage in &request.summary_usages {
-        let cached = usage
-            .cached_tokens
-            .map(|value| value.min(usage.prompt_tokens));
-        if let Some(cached) = cached {
-            has_cache_read = true;
-            cache_read = cache_read.saturating_add(cached);
-        }
-        input = input.saturating_add(usage.prompt_tokens.saturating_sub(cached.unwrap_or(0)));
-        output = output.saturating_add(usage.completion_tokens);
-    }
+    let (input, output, cache_read, has_cache_read) = accumulate_usages(
+        &request.summary_usages,
+        request.prompt_tokens.unwrap_or(0),
+        request.completion_tokens.unwrap_or(0),
+    );
 
     let total = input.saturating_add(output).saturating_add(cache_read);
     Some(TokenStats {
@@ -706,13 +695,11 @@ fn token_stats(request: &ChatRequest) -> Option<TokenStats> {
     })
 }
 
-fn aggregate_usages(usages: &[ChatUsage]) -> Option<TokenStats> {
-    if usages.is_empty() {
-        return None;
-    }
-
-    let mut input = 0u64;
-    let mut output = 0u64;
+fn accumulate_usages(
+    usages: &[ChatUsage],
+    mut input: u64,
+    mut output: u64,
+) -> (u64, u64, u64, bool) {
     let mut cache_read = 0u64;
     let mut has_cache_read = false;
     for usage in usages {
@@ -726,6 +713,16 @@ fn aggregate_usages(usages: &[ChatUsage]) -> Option<TokenStats> {
         input = input.saturating_add(usage.prompt_tokens.saturating_sub(cached.unwrap_or(0)));
         output = output.saturating_add(usage.completion_tokens);
     }
+
+    (input, output, cache_read, has_cache_read)
+}
+
+fn aggregate_usages(usages: &[ChatUsage]) -> Option<TokenStats> {
+    if usages.is_empty() {
+        return None;
+    }
+
+    let (input, output, cache_read, has_cache_read) = accumulate_usages(usages, 0, 0);
 
     Some(TokenStats {
         input,

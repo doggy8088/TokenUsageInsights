@@ -29,7 +29,7 @@ fn aggregate_cache_read<'a>(stats: impl Iterator<Item = &'a TokenStats>) -> (u64
     })
 }
 
-fn cache_read_source(entry: &UsageEntry, available: bool) -> String {
+async fn cache_read_source(entry: &UsageEntry, available: bool) -> String {
     if !available {
         return "unavailable".to_string();
     }
@@ -37,7 +37,7 @@ fn cache_read_source(entry: &UsageEntry, available: bool) -> String {
         return "usage-log".to_string();
     }
 
-    let has_debug_log = entry
+    let debug_log_path = entry
         .transcript_path
         .as_deref()
         .map(StdPath::new)
@@ -47,8 +47,14 @@ fn cache_read_source(entry: &UsageEntry, available: bool) -> String {
                 .strip_prefix("vscode-")
                 .unwrap_or(&entry.session_id);
             crate::vscode::agent_debug_log_path(path, session_id)
-        })
-        .is_some_and(|path| path.is_file());
+        });
+    let has_debug_log = if let Some(path) = debug_log_path {
+        tokio::fs::metadata(path)
+            .await
+            .is_ok_and(|metadata| metadata.is_file())
+    } else {
+        false
+    };
     if has_debug_log {
         "agent-debug-log".to_string()
     } else {
@@ -672,7 +678,7 @@ pub async fn get_usage_details(
             }
         };
         summary.total_cost_usd += cost_usd;
-        let cache_read_source = cache_read_source(&last_entry, cache_read_available);
+        let cache_read_source = cache_read_source(&last_entry, cache_read_available).await;
 
         sessions_summary.push(SessionSummary {
             session_id: session_id.clone(),
@@ -1141,6 +1147,63 @@ pub async fn get_session_details(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn usage_entry(session_id: &str, transcript_path: Option<String>) -> UsageEntry {
+        UsageEntry {
+            timestamp: "2026-07-18T00:00:00Z".to_string(),
+            session_id: session_id.to_string(),
+            session_name: None,
+            transcript_path,
+            cwd: None,
+            version: None,
+            turn_no: 1,
+            model: None,
+            model_id: None,
+            tokens: None,
+            delta_tokens: None,
+            context: None,
+            cost: None,
+            source_kind: Some(crate::vscode::SOURCE_KIND.to_string()),
+            parent_session_id: None,
+            agent_nickname: None,
+            agent_role: None,
+            reasoning_effort: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn cache_read_source_detects_agent_debug_log_asynchronously() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!(
+            "token-usage-insights-cache-source-{}-{nonce}",
+            std::process::id()
+        ));
+        let session_id = "async-metadata-session";
+        let transcript_path = workspace
+            .join("chatSessions")
+            .join(format!("{session_id}.json"));
+        let debug_log_path = workspace
+            .join("GitHub.copilot-chat")
+            .join("debug-logs")
+            .join(session_id)
+            .join("main.jsonl");
+        tokio::fs::create_dir_all(debug_log_path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&debug_log_path, "{}\n").await.unwrap();
+
+        let entry = usage_entry(
+            &format!("vscode-{session_id}"),
+            Some(transcript_path.to_string_lossy().into_owned()),
+        );
+
+        assert_eq!(cache_read_source(&entry, true).await, "agent-debug-log");
+
+        let _ = tokio::fs::remove_dir_all(workspace).await;
+    }
 
     #[test]
     fn cache_read_observation_distinguishes_zero_from_unavailable() {
