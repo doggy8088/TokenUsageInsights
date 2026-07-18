@@ -20,6 +20,42 @@ use crate::timeline::{
     parse_copilot_timeline, parse_cursor_timeline, parse_vscode_timeline, TimelineItem,
 };
 
+fn aggregate_cache_read<'a>(stats: impl Iterator<Item = &'a TokenStats>) -> (u64, bool) {
+    stats.fold((0u64, false), |(total, available), tokens| {
+        (
+            total.saturating_add(tokens.cache_read.unwrap_or(0)),
+            available || tokens.cache_read.is_some(),
+        )
+    })
+}
+
+fn cache_read_source(entry: &UsageEntry, available: bool) -> String {
+    if !available {
+        return "unavailable".to_string();
+    }
+    if entry.source_kind.as_deref() != Some(crate::vscode::SOURCE_KIND) {
+        return "usage-log".to_string();
+    }
+
+    let has_debug_log = entry
+        .transcript_path
+        .as_deref()
+        .map(StdPath::new)
+        .and_then(|path| {
+            let session_id = entry
+                .session_id
+                .strip_prefix("vscode-")
+                .unwrap_or(&entry.session_id);
+            crate::vscode::agent_debug_log_path(path, session_id)
+        })
+        .is_some_and(|path| path.is_file());
+    if has_debug_log {
+        "agent-debug-log".to_string()
+    } else {
+        "chat-session".to_string()
+    }
+}
+
 fn is_safe_session_id(session_id: &str) -> bool {
     if session_id.is_empty() || session_id.len() > 128 {
         return false;
@@ -537,6 +573,7 @@ pub async fn get_usage_details(
             .iter()
             .map(|e| e.delta_tokens.as_ref().map(|t| t.total).unwrap_or(0))
             .sum::<u64>();
+        let has_delta_token_stats = s_entries.iter().any(|entry| entry.delta_tokens.is_some());
         let session_input_tokens = s_entries
             .iter()
             .map(|e| e.delta_tokens.as_ref().map(|t| t.input).unwrap_or(0))
@@ -545,15 +582,11 @@ pub async fn get_usage_details(
             .iter()
             .map(|e| e.delta_tokens.as_ref().map(|t| t.output).unwrap_or(0))
             .sum::<u64>();
-        let session_cache_read = s_entries
-            .iter()
-            .map(|e| {
-                e.delta_tokens
-                    .as_ref()
-                    .and_then(|t| t.cache_read)
-                    .unwrap_or(0)
-            })
-            .sum::<u64>();
+        let (session_cache_read, session_cache_read_available) = aggregate_cache_read(
+            s_entries
+                .iter()
+                .filter_map(|entry| entry.delta_tokens.as_ref()),
+        );
         let session_cache_write = s_entries
             .iter()
             .map(|e| {
@@ -587,14 +620,14 @@ pub async fn get_usage_details(
         summary.total_duration_ms += session_duration;
         summary.total_requests += session_requests;
 
-        let total_cache_read_tokens = if session_tokens > 0 {
-            session_cache_read
+        let (total_cache_read_tokens, cache_read_available) = if has_delta_token_stats {
+            (session_cache_read, session_cache_read_available)
         } else {
             last_entry
                 .tokens
                 .as_ref()
-                .and_then(|t| t.cache_read)
-                .unwrap_or(0)
+                .map(|tokens| aggregate_cache_read(std::iter::once(tokens)))
+                .unwrap_or((0, false))
         };
         let total_cache_write_tokens = if session_tokens > 0 {
             session_cache_write
@@ -639,6 +672,7 @@ pub async fn get_usage_details(
             }
         };
         summary.total_cost_usd += cost_usd;
+        let cache_read_source = cache_read_source(&last_entry, cache_read_available);
 
         sessions_summary.push(SessionSummary {
             session_id: session_id.clone(),
@@ -662,6 +696,8 @@ pub async fn get_usage_details(
             total_input_tokens,
             total_output_tokens,
             total_cache_read_tokens,
+            cache_read_available,
+            cache_read_source,
             total_cache_write_tokens,
             total_reasoning_tokens,
             max_turn_no: s_entries.iter().map(|e| e.turn_no).max().unwrap_or(1),
@@ -1105,6 +1141,28 @@ pub async fn get_session_details(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_read_observation_distinguishes_zero_from_unavailable() {
+        let unavailable = TokenStats {
+            input: 10,
+            output: 1,
+            cache_read: None,
+            cache_write: None,
+            reasoning: None,
+            total: 11,
+        };
+        let observed_zero = TokenStats {
+            cache_read: Some(0),
+            ..unavailable.clone()
+        };
+
+        assert_eq!(aggregate_cache_read([&unavailable].into_iter()), (0, false));
+        assert_eq!(
+            aggregate_cache_read([&observed_zero].into_iter()),
+            (0, true)
+        );
+    }
 
     fn user_prompt(prompt: &str, turn_no: u32) -> TimelineItem {
         TimelineItem::UserPrompt {

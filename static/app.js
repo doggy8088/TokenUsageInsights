@@ -1672,6 +1672,57 @@ function renderMetricValue(elementId, getValFn, formatFn, sessions, activeAgents
   }
 }
 
+function getCacheReadCoverage(sessions) {
+  const observedSessions = sessions.filter(session => session.cache_read_available !== false);
+  return {
+    available: observedSessions.length,
+    total: sessions.length,
+    tokens: observedSessions.reduce(
+      (sum, session) => sum + (session.total_cache_read_tokens || 0),
+      0
+    ),
+  };
+}
+
+function getCacheReadCoverageTitle(coverage) {
+  if (coverage.available === 0) {
+    return t('cache_data_unavailable');
+  }
+  return t('cache_data_coverage')
+    .replace('{available}', coverage.available)
+    .replace('{total}', coverage.total);
+}
+
+function renderCacheMetricValue(elementId, sessions, activeAgents) {
+  const el = document.getElementById(elementId);
+  if (!el) return;
+
+  const renderValue = scopedSessions => {
+    const coverage = getCacheReadCoverage(scopedSessions);
+    const value = coverage.available > 0 ? formatToken(coverage.tokens) : t('not_available');
+    return `<span title="${escapeHtml(getCacheReadCoverageTitle(coverage))}">${value}</span>`;
+  };
+
+  if (activeAgents.length <= 1) {
+    el.innerHTML = renderValue(sessions);
+    return;
+  }
+
+  let html = '<div class="stat-value-list">';
+  activeAgents.forEach(agent => {
+    const meta = getAssistantMeta(agent);
+    const scopedSessions = sessions.filter(session => session.assistant_type === agent);
+    html += `
+      <div class="stat-value-item">
+        <span class="agent-name" title="${meta.label}"><img class="badge-logo" src="${meta.logo}" alt="${meta.label}" /></span>
+        <span class="val">${renderValue(scopedSessions)}</span>
+      </div>
+    `;
+  });
+  html += '</div>';
+  el.innerHTML = html;
+}
+
 function renderMonthlyMetricValue(elementId, getValFn, formatFn, agentBreakdown, activeAgents) {
   const el = document.getElementById(elementId);
   if (!el) return;
@@ -1719,6 +1770,11 @@ function renderDashboard(data) {
   const shouldRefreshSearch = currentSessionSearchQuery
     && nextSearchFingerprint !== currentSessionSearchDataFingerprint;
   currentSessionSearchDataFingerprint = nextSearchFingerprint;
+  const cacheCoverage = getCacheReadCoverage(sessions);
+  const cacheCoverageTitle = getCacheReadCoverageTitle(cacheCoverage);
+  const cacheReadDisplay = cacheCoverage.available > 0
+    ? formatToken(cacheCoverage.tokens)
+    : t('not_available');
 
   // 1. 更新標題
   setTitleMarkup('calendar', date);
@@ -1726,7 +1782,8 @@ function renderDashboard(data) {
   // 2. 更新側邊欄指標卡片
   document.getElementById('mini-sessions').textContent = summary.total_sessions;
   document.getElementById('mini-tokens').textContent = formatToken(summary.total_tokens);
-  document.getElementById('mini-cache').textContent = `${t('cache_read_label')}: ${formatToken(summary.total_cache_read_tokens)}`;
+  document.getElementById('mini-cache').textContent = `${t('cache_read_label')}: ${cacheReadDisplay}`;
+  document.getElementById('mini-cache').title = cacheCoverageTitle;
   document.getElementById('mini-cost').textContent = formatCost(summary.total_cost_usd || 0);
   document.getElementById('mini-duration').textContent = formatDuration(summary.total_duration_ms);
   document.getElementById('mini-requests').textContent = summary.total_requests;
@@ -1735,19 +1792,19 @@ function renderDashboard(data) {
   const activeAgents = getActiveAgents();
   const isMulti = activeAgents.length > 1;
   const inputTokens = summary.total_input_tokens || 0;
-  const cacheReadTokens = summary.total_cache_read_tokens || 0;
+  const cacheReadTokens = cacheCoverage.tokens;
   const reasoningTokens = summary.total_reasoning_tokens || 0;
 
   if (!isMulti) {
     document.getElementById('stat-total-tokens').textContent = formatToken(summary.total_tokens);
     document.getElementById('stat-input-tokens').textContent = formatToken(inputTokens);
-    document.getElementById('stat-cache-read-tokens').textContent = formatToken(cacheReadTokens);
+    renderCacheMetricValue('stat-cache-read-tokens', sessions, activeAgents);
     document.getElementById('stat-output-tokens').textContent = formatToken(summary.total_output_tokens);
     document.getElementById('stat-total-cost').textContent = formatCost(summary.total_cost_usd || 0);
   } else {
     renderMetricValue('stat-total-tokens', s => s.total_tokens, formatToken, sessions, activeAgents);
     renderMetricValue('stat-input-tokens', s => s.total_input_tokens || 0, formatToken, sessions, activeAgents);
-    renderMetricValue('stat-cache-read-tokens', s => s.total_cache_read_tokens || 0, formatToken, sessions, activeAgents);
+    renderCacheMetricValue('stat-cache-read-tokens', sessions, activeAgents);
     renderMetricValue('stat-output-tokens', s => s.total_output_tokens, formatToken, sessions, activeAgents);
     renderMetricValue('stat-total-cost', s => s.cost_usd || 0, formatCost, sessions, activeAgents);
   }
@@ -1781,11 +1838,20 @@ function renderDashboard(data) {
     statInputTokens.setAttribute('aria-label', `${formatToken(inputTokens)}; ${inputValueTooltip}`);
   }
   if (statCacheReadLabel) {
-    const cacheReadTooltip = t('cache_read_percentage_formula')
-      .replace('{cacheRead}', formatNumber(cacheReadTokens))
-      .replace('{total}', formatNumber(summary.total_tokens || 0))
-      .replace('{percent}', cacheReadPercent);
-    statCacheReadLabel.textContent = `${t('chart_cache_label')} (${cacheReadPercent})`;
+    const cacheReadComplete = cacheCoverage.total > 0
+      && cacheCoverage.available === cacheCoverage.total;
+    const cacheReadTooltip = cacheReadComplete
+      ? t('cache_read_percentage_formula')
+        .replace('{cacheRead}', formatNumber(cacheReadTokens))
+        .replace('{total}', formatNumber(summary.total_tokens || 0))
+        .replace('{percent}', cacheReadPercent)
+      : cacheCoverageTitle;
+    const cacheReadStatus = cacheCoverage.available === 0
+      ? t('not_available')
+      : (cacheReadComplete
+        ? cacheReadPercent
+        : `${cacheCoverage.available}/${cacheCoverage.total}`);
+    statCacheReadLabel.textContent = `${t('chart_cache_label')} (${cacheReadStatus})`;
     statCacheReadLabel.title = cacheReadTooltip;
     statCacheReadLabel.setAttribute('aria-label', cacheReadTooltip);
   }
@@ -2579,7 +2645,9 @@ function renderSessionTrendChart(sessions) {
   });
 
   const tokenData = displaySessions.map(s => s.total_tokens);
-  const cacheData = displaySessions.map(s => s.total_cache_read_tokens || 0);
+  const cacheData = displaySessions.map(s => (
+    s.cache_read_available === false ? null : (s.total_cache_read_tokens || 0)
+  ));
   const maxTurnData = displaySessions.map(s => s.max_turn_no);
 
   // 若圖表已存在，則動態更新數據以達到平滑變動效果
@@ -2676,6 +2744,9 @@ function renderSessionTrendChart(sessions) {
           callbacks: {
             label: (context) => {
               const label = context.dataset.label || '';
+              if (context.raw === null) {
+                return `${label}: ${t('not_available')}`;
+              }
               const value = context.parsed.y;
               if (label.includes('Token')) {
                 return `${label}: ${formatToken(value)} (${formatNumber(value)})`;
@@ -3107,6 +3178,20 @@ function renderSessionTable(sessions) {
       : (s.assistant_type === 'copilot'
         ? '<span class="badge source-badge" title="GitHub Copilot CLI">CLI</span>'
         : '');
+    const cacheReadAvailable = s.cache_read_available !== false;
+    const cacheSourceLabel = s.cache_read_source === 'agent-debug-log'
+      ? t('cache_source_agent_debug')
+      : (s.cache_read_source === 'chat-session'
+        ? t('cache_source_chat_session')
+        : (s.cache_read_source === 'usage-log'
+          ? t('cache_source_usage_log')
+          : t('not_available')));
+    const cacheReadValue = cacheReadAvailable
+      ? formatToken(s.total_cache_read_tokens || 0)
+      : t('not_available');
+    const cacheSourceBadge = s.source_kind === 'vscode-chat'
+      ? `<span class="badge source-badge" title="${escapeHtml(cacheSourceLabel)}">${escapeHtml(cacheSourceLabel)}</span>`
+      : '';
 
     const astColumn = (currentAssistant === 'all' || currentAssistant.includes(',')) ? `<td>${assistantBadge}</td>` : '';
 
@@ -3156,7 +3241,7 @@ function renderSessionTable(sessions) {
       <td style="color: var(--text-secondary);">${formatToken(s.total_input_tokens || 0)}</td>
       <td style="color: var(--text-secondary);">${formatToken(s.total_output_tokens || 0)}</td>
       <td style="color: #aeb9c8;">${formatToken(s.total_reasoning_tokens || 0)}</td>
-      <td style="color: #34d399;">${formatToken(s.total_cache_read_tokens || 0)}</td>
+      <td style="color: #34d399;">${cacheReadValue} ${cacheSourceBadge}</td>
       <td style="font-weight: 700; color: #fbbf24;">${formatToken(s.total_tokens)}</td>
       <td style="font-weight: 700; color: var(--accent-cyan);">${formatCost(s.cost_usd || 0)}</td>
       <td>${formatDuration(s.duration_ms)}</td>
