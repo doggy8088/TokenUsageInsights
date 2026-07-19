@@ -667,6 +667,7 @@ pub async fn get_usage_details(
             max_turn_no: s_entries.iter().map(|e| e.turn_no).max().unwrap_or(1),
             timestamp: s_entries[0].timestamp.clone(),
             duration_ms: session_duration,
+            total_requests: session_requests,
             cost_usd,
             parent_session_id: last_entry.parent_session_id.clone(),
             agent_nickname: last_entry.agent_nickname.clone(),
@@ -679,6 +680,10 @@ pub async fn get_usage_details(
 
     Json(UsageDetailsResponse {
         date,
+        home_dir: dirs::home_dir()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned(),
         summary,
         sessions: sessions_summary,
         raw_entries: entries,

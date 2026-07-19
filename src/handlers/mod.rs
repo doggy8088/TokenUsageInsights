@@ -91,6 +91,7 @@ pub struct SessionSummary {
     pub max_turn_no: u32,
     pub timestamp: String,
     pub duration_ms: u64,
+    pub total_requests: u64,
     pub cost_usd: f64,
     pub parent_session_id: Option<String>,
     pub agent_nickname: Option<String>,
@@ -101,6 +102,7 @@ pub struct SessionSummary {
 #[derive(Serialize)]
 pub struct UsageDetailsResponse {
     pub date: String,
+    pub home_dir: String,
     pub summary: DaySummary,
     pub sessions: Vec<SessionSummary>,
     pub raw_entries: Vec<UsageEntry>,

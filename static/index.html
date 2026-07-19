@@ -20,7 +20,7 @@
     document.documentElement.setAttribute('data-theme', savedTheme);
   </script>
   <!-- CSS Stylesheet -->
-  <link rel="stylesheet" href="/static/styles.css?v=19">
+  <link rel="stylesheet" href="/static/styles.css?v=20">
   <!-- Chart.js for beautiful charts -->
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <!-- Marked.js for rendering markdown response -->
@@ -454,20 +454,34 @@
               <h3 data-i18n="sessions_table_title">今日會話列表 (Sessions)</h3>
               <span class="session-count-badge" id="session-count" aria-live="polite">0 Sessions</span>
             </div>
-            <label class="session-search-field" for="session-search-input">
-              <span class="icon-glyph icon-search" aria-hidden="true"></span>
-              <input
-                id="session-search-input"
-                type="search"
-                maxlength="256"
-                autocomplete="off"
-                spellcheck="false"
-                data-i18n-placeholder="session_search_placeholder"
-                data-i18n-title="session_search_label"
-                aria-label="搜尋所有 USER 提示詞"
-                placeholder="搜尋所有 USER 提示詞"
-              >
-            </label>
+            <div class="sessions-controls">
+              <label class="session-cwd-filter-field" for="session-cwd-filter">
+                <span class="session-cwd-filter-label" data-i18n="session_cwd_filter_label">工作目錄</span>
+                <select
+                  id="session-cwd-filter"
+                  class="premium-select-mini session-cwd-filter-select"
+                  autocomplete="off"
+                  data-i18n-title="session_cwd_filter_aria_label"
+                  aria-label="依工作目錄篩選 Sessions"
+                >
+                  <option value="" data-i18n="session_cwd_filter_all">所有工作目錄</option>
+                </select>
+              </label>
+              <label class="session-search-field" for="session-search-input">
+                <span class="icon-glyph icon-search" aria-hidden="true"></span>
+                <input
+                  id="session-search-input"
+                  type="search"
+                  maxlength="256"
+                  autocomplete="off"
+                  spellcheck="false"
+                  data-i18n-placeholder="session_search_placeholder"
+                  data-i18n-title="session_search_label"
+                  aria-label="搜尋所有 USER 提示詞"
+                  placeholder="搜尋所有 USER 提示詞"
+                >
+              </label>
+            </div>
           </div>
           <div class="table-wrapper">
             <table class="premium-table">
@@ -1087,6 +1101,6 @@
   <div class="sidebar-overlay" id="sidebar-overlay"></div>
 
   <!-- Frontend Javascript logic -->
-  <script type="module" src="/static/app.js?v=38"></script>
+  <script type="module" src="/static/app.js?v=40"></script>
 </body>
 </html>

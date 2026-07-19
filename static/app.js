@@ -1,4 +1,4 @@
-import i18n from './i18n.js?v=26';
+import i18n from './i18n.js?v=27';
 import {
   aggregateDailyTokenCandles,
   calculateCandleViewport,
@@ -243,6 +243,8 @@ let currentSessionSearchUnavailable = 0;
 let currentSessionSearchState = 'idle';
 let sessionSearchDebounceTimer = null;
 let sessionSearchAbortController = null;
+let currentSessionCwdFilter = '';
+let currentSessionHomeDir = '';
 
 // Monthly daily summary sorting state
 let monthlyDailySortColumn = 'date';
@@ -470,6 +472,7 @@ function initApp() {
   const monthSelect = document.getElementById('month-select');
   const yearSelect = document.getElementById('year-select');
   const sessionSearchInput = document.getElementById('session-search-input');
+  const sessionCwdFilter = document.getElementById('session-cwd-filter');
   const closeDrawerBtn = document.getElementById('close-drawer-btn');
   const drawerOverlay = document.getElementById('timeline-drawer');
 
@@ -485,6 +488,20 @@ function initApp() {
   if (sessionSearchInput) {
     sessionSearchInput.addEventListener('input', () => {
       scheduleSessionPromptSearch(sessionSearchInput.value);
+    });
+  }
+
+  if (sessionCwdFilter) {
+    sessionCwdFilter.addEventListener('change', () => {
+      currentSessionCwdFilter = sessionCwdFilter.value;
+      sessionCwdFilter.title = sessionCwdFilter.selectedOptions[0]?.textContent
+        || t('session_cwd_filter_aria_label');
+      resetDailyChartViewport();
+      if (currentUsageData) {
+        renderDashboard(currentUsageData);
+      } else {
+        sortAndRenderSessionTable();
+      }
     });
   }
 
@@ -1398,6 +1415,9 @@ async function fetchDates(selectedDate = null, keepDate = false) {
 async function reloadDailyData() {
   const dateSelect = document.getElementById('date-select');
   const selectedDate = dateSelect.value;
+  resetSessionCwdFilter();
+  resetDailyChartViewport();
+  if (currentUsageData) renderDashboard(currentUsageData);
   await fetchDates(selectedDate);
 }
 
@@ -1705,20 +1725,28 @@ function renderMonthlyMetricValue(elementId, getValFn, formatFn, agentBreakdown,
 // =========================================================================
 function renderDashboard(data) {
   currentUsageData = data;
-  const { date, summary, sessions } = data;
+  const { date, home_dir: homeDir } = data;
+  const allSessions = Array.isArray(data.sessions) ? data.sessions : [];
+  currentSessionHomeDir = typeof homeDir === 'string' ? homeDir : currentSessionHomeDir;
   const nextSearchContext = `${currentAssistant}:${date}`;
   if (nextSearchContext !== currentSessionSearchContext) {
     resetSessionPromptSearch();
+    resetSessionCwdFilter();
     currentSessionSearchContext = nextSearchContext;
   }
   const nextSearchFingerprint = JSON.stringify(
-    sessions
+    allSessions
       .map(session => [session.assistant_type, session.session_id, session.max_turn_no])
       .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)))
   );
   const shouldRefreshSearch = currentSessionSearchQuery
     && nextSearchFingerprint !== currentSessionSearchDataFingerprint;
   currentSessionSearchDataFingerprint = nextSearchFingerprint;
+  currentSessions = [...allSessions];
+  updateSessionCwdFilterOptions(currentSessions);
+
+  const dailyViewData = buildDailyViewData(data);
+  const { summary, sessions } = dailyViewData;
 
   // 1. 更新標題
   setTitleMarkup('calendar', date);
@@ -1820,10 +1848,9 @@ function renderDashboard(data) {
   }
 
   // 4. 繪製 Token 圖表
-  renderChart(data);
+  renderChart(dailyViewData);
 
   // 5. 渲染 Session 列表
-  currentSessions = [...sessions];
   if (shouldRefreshSearch) {
     scheduleSessionPromptSearch(currentSessionSearchQuery, { immediate: true });
   } else {
@@ -2004,7 +2031,7 @@ function initDailyChartControls() {
       localStorage.setItem(DAILY_CHART_MODE_STORAGE_KEY, dailyChartMode);
       updateDailyChartControls();
       if (currentUsageData) {
-        renderChart(currentUsageData);
+        renderChart(buildDailyViewData(currentUsageData));
       }
     });
   }
@@ -2020,7 +2047,7 @@ function initDailyChartControls() {
       localStorage.setItem(DAILY_CHART_INTERVAL_STORAGE_KEY, String(interval));
       updateDailyChartControls();
       if (currentUsageData && dailyChartMode === 'kline') {
-        renderChart(currentUsageData);
+        renderChart(buildDailyViewData(currentUsageData));
       }
     });
   });
@@ -2813,20 +2840,156 @@ function resetSessionPromptSearch() {
   if (input) input.value = '';
 }
 
+function normalizeSessionCwd(value) {
+  let path = String(value || '').trim();
+  if (!path) return '';
+
+  const usesWindowsSeparators = /^[a-zA-Z]:[\\/]/.test(path) || path.includes('\\');
+  if (usesWindowsSeparators) {
+    path = path.replace(/[\\/]+/g, '\\');
+    if (!/^[a-zA-Z]:\\$/.test(path) && !/^\\\\[^\\]+\\[^\\]+\\?$/.test(path)) {
+      path = path.replace(/\\+$/, '');
+    }
+  } else {
+    path = path.replace(/\/{2,}/g, '/');
+    if (path !== '/') path = path.replace(/\/+$/, '');
+  }
+
+  return path;
+}
+
+function sessionCwdMatchKey(value) {
+  const path = normalizeSessionCwd(value);
+  return /^[a-zA-Z]:\\/.test(path) ? path.toLocaleLowerCase('en-US') : path;
+}
+
+function abbreviateHomePath(value) {
+  const path = normalizeSessionCwd(value);
+  const homeDir = normalizeSessionCwd(currentSessionHomeDir);
+  if (!path || !homeDir) return path;
+
+  const pathKey = sessionCwdMatchKey(path);
+  const homeKey = sessionCwdMatchKey(homeDir);
+  if (pathKey === homeKey) return '~';
+  if (!pathKey.startsWith(homeKey)) return path;
+
+  const suffix = path.slice(homeDir.length);
+  return suffix.startsWith('/') || suffix.startsWith('\\') ? `~${suffix}` : path;
+}
+
+function resetSessionCwdFilter() {
+  currentSessionCwdFilter = '';
+  const select = document.getElementById('session-cwd-filter');
+  if (select) select.value = '';
+}
+
+function getCwdFilteredSessions(sessions = currentSessions) {
+  if (!currentSessionCwdFilter) return sessions;
+  return sessions.filter(session => (
+    sessionCwdMatchKey(session.cwd) === currentSessionCwdFilter
+  ));
+}
+
+function summarizeDailySessions(sessions) {
+  const sum = key => sessions.reduce(
+    (total, session) => total + (Number(session[key]) || 0),
+    0
+  );
+
+  return {
+    total_sessions: sessions.length,
+    total_tokens: sum('total_tokens'),
+    total_input_tokens: sum('total_input_tokens'),
+    total_output_tokens: sum('total_output_tokens'),
+    total_cache_read_tokens: sum('total_cache_read_tokens'),
+    total_cache_write_tokens: sum('total_cache_write_tokens'),
+    total_reasoning_tokens: sum('total_reasoning_tokens'),
+    total_duration_ms: sum('duration_ms'),
+    total_requests: sum('total_requests'),
+    total_cost_usd: sum('cost_usd'),
+  };
+}
+
+function buildDailyViewData(data) {
+  if (!currentSessionCwdFilter) return data;
+
+  const sessions = getCwdFilteredSessions(Array.isArray(data.sessions) ? data.sessions : []);
+  const sessionIds = new Set(sessions.map(session => String(session.session_id || '')));
+  const rawEntries = (Array.isArray(data.raw_entries) ? data.raw_entries : []).filter(entry => (
+    sessionIds.has(String(entry.session_id || ''))
+  ));
+
+  return {
+    ...data,
+    summary: summarizeDailySessions(sessions),
+    sessions,
+    raw_entries: rawEntries,
+  };
+}
+
+function updateSessionCwdFilterOptions(sessions) {
+  const select = document.getElementById('session-cwd-filter');
+  if (!select) return;
+
+  const uniqueDirectories = new Map();
+  sessions.forEach(session => {
+    const normalizedPath = normalizeSessionCwd(session.cwd);
+    const matchKey = sessionCwdMatchKey(normalizedPath);
+    if (matchKey && !uniqueDirectories.has(matchKey)) {
+      uniqueDirectories.set(matchKey, {
+        matchKey,
+        displayPath: abbreviateHomePath(normalizedPath),
+      });
+    }
+  });
+
+  const directories = [...uniqueDirectories.values()].sort((a, b) => (
+    a.displayPath.localeCompare(b.displayPath, currentLang, {
+      numeric: true,
+      sensitivity: 'base',
+    })
+  ));
+  if (currentSessionCwdFilter && !uniqueDirectories.has(currentSessionCwdFilter)) {
+    currentSessionCwdFilter = '';
+  }
+
+  select.replaceChildren();
+  const allOption = document.createElement('option');
+  allOption.value = '';
+  allOption.textContent = t('session_cwd_filter_all');
+  select.appendChild(allOption);
+
+  directories.forEach(directory => {
+    const option = document.createElement('option');
+    option.value = directory.matchKey;
+    option.textContent = directory.displayPath;
+    option.title = directory.displayPath;
+    select.appendChild(option);
+  });
+
+  select.disabled = directories.length === 0;
+  select.value = currentSessionCwdFilter;
+  select.title = currentSessionCwdFilter
+    ? (select.selectedOptions[0]?.textContent || t('session_cwd_filter_aria_label'))
+    : t('session_cwd_filter_aria_label');
+}
+
 function sessionSearchMatchKey(assistantType, sessionId) {
   return JSON.stringify([assistantType || '', sessionId || '']);
 }
 
 function getSearchFilteredSessions() {
+  const cwdFilteredSessions = getCwdFilteredSessions();
+
   if (
     !currentSessionSearchQuery
     || currentSessionSearchState !== 'complete'
     || !(currentSessionSearchMatches instanceof Set)
   ) {
-    return currentSessions;
+    return cwdFilteredSessions;
   }
 
-  return currentSessions.filter(session => currentSessionSearchMatches.has(
+  return cwdFilteredSessions.filter(session => currentSessionSearchMatches.has(
     sessionSearchMatchKey(session.assistant_type, session.session_id)
   ));
 }
@@ -3021,16 +3184,23 @@ function updateSortHeadersUI() {
 function renderSessionTable(sessions) {
   const tbody = document.getElementById('session-list-body');
   const sessionCount = document.getElementById('session-count');
+  const cwdFilteredTotal = currentSessionCwdFilter
+    ? currentSessions.filter(session => sessionCwdMatchKey(session.cwd) === currentSessionCwdFilter).length
+    : currentSessions.length;
   if (currentSessionSearchQuery && currentSessionSearchState === 'loading') {
     sessionCount.textContent = t('session_search_loading');
   } else if (currentSessionSearchQuery && currentSessionSearchState === 'complete') {
-    const countKey = currentSessionSearchUnavailable > 0
+    const countKey = currentSessionSearchUnavailable > 0 && !currentSessionCwdFilter
       ? 'session_search_count_partial'
       : 'session_search_count';
     sessionCount.textContent = t(countKey)
       .replace('{matched}', sessions.length)
-      .replace('{total}', currentSessions.length)
+      .replace('{total}', cwdFilteredTotal)
       .replace('{unavailable}', currentSessionSearchUnavailable);
+  } else if (currentSessionCwdFilter) {
+    sessionCount.textContent = t('session_cwd_filter_count')
+      .replace('{matched}', sessions.length)
+      .replace('{total}', currentSessions.length);
   } else {
     sessionCount.textContent = `${sessions.length} Sessions`;
   }
@@ -3046,9 +3216,14 @@ function renderSessionTable(sessions) {
   }
 
   if (sessions.length === 0) {
-    const placeholderKey = currentSessionSearchQuery && currentSessionSearchState === 'complete'
-      ? 'placeholder_no_session_search_results'
-      : 'placeholder_no_sessions';
+    let placeholderKey = 'placeholder_no_sessions';
+    if (currentSessionSearchQuery && currentSessionSearchState === 'complete') {
+      placeholderKey = currentSessionCwdFilter
+        ? 'placeholder_no_session_cwd_search_results'
+        : 'placeholder_no_session_search_results';
+    } else if (currentSessionCwdFilter) {
+      placeholderKey = 'placeholder_no_session_cwd_results';
+    }
     tbody.innerHTML = `<tr><td colspan="13" class="placeholder-text">${t(placeholderKey)}</td></tr>`;
     return;
   }
@@ -3096,6 +3271,7 @@ function renderSessionTable(sessions) {
     
     // 格式化時間
     const timeFormatted = s.timestamp ? formatLocalTime(s.timestamp, true) : '-';
+    const displayCwd = abbreviateHomePath(s.cwd) || '-';
 
     let assistantBadge = "";
     if (isSupportedAssistant(s.assistant_type)) {
@@ -3162,7 +3338,7 @@ function renderSessionTable(sessions) {
       <td>${formatDuration(s.duration_ms)}</td>
       <td style="color: var(--text-secondary);">${timeFormatted}</td>
       <td class="session-cwd-column">
-        <span class="session-cwd-value" title="${escapeHtml(s.cwd || '')}">${escapeHtml(s.cwd || '-')}</span>
+        <span class="session-cwd-value" title="${escapeHtml(displayCwd)}">${escapeHtml(displayCwd)}</span>
       </td>
     `;
 
@@ -3238,8 +3414,9 @@ async function openSessionTimeline(session) {
   document.getElementById('drawer-session-id').textContent = sessionId;
 
   // 更新會話 Token & 基礎資訊（立即呈現在畫面上）
-  document.getElementById('meta-cwd').textContent = cwd || '-';
-  document.getElementById('meta-cwd').title = cwd || '';
+  const displayCwd = abbreviateHomePath(cwd) || '-';
+  document.getElementById('meta-cwd').textContent = displayCwd;
+  document.getElementById('meta-cwd').title = displayCwd;
   document.getElementById('meta-model').textContent = model || '-';
   const metaEffort = document.getElementById('meta-effort');
   if (metaEffort) {
@@ -3314,11 +3491,12 @@ function renderTimeline(data) {
 
   // 取得最終使用的基礎資訊（API 回傳優先，沒有則 fallback 到列表正確欄位）
   const finalCwd = metadata.cwd || currentSessionCwd || '-';
+  const displayCwd = abbreviateHomePath(finalCwd) || '-';
   const finalModel = metadata.selected_model || currentSessionModel || '-';
 
   // 更新 Metadata 區塊
-  document.getElementById('meta-cwd').textContent = finalCwd;
-  document.getElementById('meta-cwd').title = finalCwd;
+  document.getElementById('meta-cwd').textContent = displayCwd;
+  document.getElementById('meta-cwd').title = displayCwd;
   document.getElementById('meta-branch').textContent = metadata.git_branch || '-';
   document.getElementById('meta-model').textContent = finalModel;
   document.getElementById('meta-repo').textContent = metadata.repository || '-';
@@ -5105,6 +5283,7 @@ async function loadSetupInfo() {
     const resolvedAssistant = isSupportedAssistant(currentAssistant) ? currentAssistant : 'antigravity';
     const res = await fetch(`/api/${resolvedAssistant}/setup-info`);
     const data = await res.json();
+    currentSessionHomeDir = typeof data.home_dir === 'string' ? data.home_dir : currentSessionHomeDir;
     
     const isWindows = data.platform === 'windows';
     const quotePowerShell = value => `'${String(value).replace(/'/g, "''")}'`;
@@ -5237,13 +5416,13 @@ async function loadSetupInfo() {
       }
     } else if (currentAssistant === 'codex') {
       const homeLabelCodex = document.getElementById('lbl-detected-home-codex');
-      if (homeLabelCodex) homeLabelCodex.textContent = data.codex?.data_path || '';
+      if (homeLabelCodex) homeLabelCodex.textContent = abbreviateHomePath(data.codex?.data_path || '');
     } else if (currentAssistant === 'claude') {
       const homeLabelClaude = document.getElementById('lbl-detected-home-claude');
-      if (homeLabelClaude) homeLabelClaude.textContent = data.claude?.data_path || '';
+      if (homeLabelClaude) homeLabelClaude.textContent = abbreviateHomePath(data.claude?.data_path || '');
     } else if (currentAssistant === 'cursor') {
       const homeLabelCursor = document.getElementById('lbl-detected-home-cursor');
-      if (homeLabelCursor) homeLabelCursor.textContent = data.cursor?.data_path || '';
+      if (homeLabelCursor) homeLabelCursor.textContent = abbreviateHomePath(data.cursor?.data_path || '');
     }
 
     // Apply updated language translations
