@@ -6,6 +6,25 @@
 
 目前沒有尚未發行的變更。
 
+## [0.5.0] - 2026-07-20
+
+### 新增與改善
+
+- 在「今日會話列表」加入工作目錄下拉選單，自動彙整當日所有 Session 的工作目錄、正規化路徑並去除重複。
+- 選取工作目錄後，同步篩選每日摘要、側欄快速統計、Token 與成本指標卡、K 線圖、趨勢圖及 Sessions 清單。
+- 將使用者家目錄前綴縮寫為 `~`，並支援 Unix 與 Windows 路徑格式，縮短選單、列表、時間軸與設定資訊中的路徑顯示。
+- 調整 Sessions 標題、工作目錄選單與提示詞搜尋欄的響應式排版，避免長路徑或窄螢幕造成控制項擠壓。
+
+### 變更
+
+- 工作目錄篩選不寫入瀏覽器持久化儲存空間；重新整理頁面、切換日期或手動重新載入每日資料時，會恢復顯示整天資料。
+- 即時資料更新與圖表模式切換會保留當下工作目錄篩選，避免操作過程中突然重設。
+
+### 相容性
+
+- 每日明細 API 新增 `home_dir`，Session 摘要新增 `total_requests`；既有欄位與端點維持相容。
+- 資料庫結構、環境變數與安裝流程沒有變更，不需要資料遷移或設定調整。
+
 ## [0.4.1] - 2026-07-16
 
 ### 修正
@@ -230,7 +249,8 @@
 - 修正行動版側邊欄遮擋、黑畫面、標題擠壓、圖表導覽索引與年度版面問題。
 - 修正並補齊多個 Gemini、Claude、GPT 與 GPT-OSS 模型的定價規則。
 
-[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.4.1...HEAD
+[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.3.1...v0.3.2
