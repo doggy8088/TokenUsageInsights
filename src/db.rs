@@ -434,13 +434,24 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
         "ALTER TABLE usage_entries ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'legacy'",
         [],
     );
+    // source_dir_key isolates Copilot App rows by source directory so that
+    // identical (session_id, turn_no) from different COPILOT_APP_DIR values
+    // do not REPLACE each other via the unique index. NULL for all other
+    // collectors; SQLite treats NULLs as distinct in unique indexes, so
+    // existing behavior is unchanged.
+    let _ = conn.execute(
+        "ALTER TABLE usage_entries ADD COLUMN source_dir_key TEXT",
+        [],
+    );
 
     // Include the original source in the identity so VS Code and Copilot CLI
     // records can be aggregated without colliding on a reused session id.
+    // For copilot-app, source_dir_key further isolates rows by source directory.
     let _ = conn.execute("DROP INDEX IF EXISTS uidx_assistant_session_turn", []);
+    let _ = conn.execute("DROP INDEX IF EXISTS uidx_assistant_source_session_turn", []);
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS uidx_assistant_source_session_turn
-         ON usage_entries(assistant_type, source_kind, session_id, turn_no)",
+         ON usage_entries(assistant_type, source_kind, source_dir_key, session_id, turn_no)",
         [],
     )
     .map_err(|e| {
@@ -1756,16 +1767,18 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
         // Use INSERT OR REPLACE so turns that received additional API calls
         // after the first sync are updated with the complete re-aggregated
         // totals instead of being silently dropped by INSERT OR IGNORE.
+        // source_dir_key isolates rows by source directory in the unique index.
         let insert_res = tx.execute(
             "INSERT OR REPLACE INTO usage_entries (
-                assistant_type, source_kind, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
+                assistant_type, source_kind, source_dir_key, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
                 tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_reasoning, tokens_total,
                 delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total,
                 duration_ms, premium_requests, import_source_id, reasoning_effort
-            ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)",
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)",
             params![
                 "copilot",
                 COPILOT_APP_SOURCE_KIND,
+                source_key,
                 timestamp,
                 date_str,
                 row.session_id,
@@ -5924,6 +5937,123 @@ mod tests {
             "import_source_id must end with :sess-x:0, got: {}",
             import_source_id
         );
+
+        if let Some(value) = old_app_dir {
+            std::env::set_var("COPILOT_APP_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_APP_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    /// Verify that two different COPILOT_APP_DIR with the same (session_id,
+    /// turn_index) do not overwrite each other. The unique index now includes
+    /// source_dir_key, so each directory keeps its own row.
+    #[test]
+    fn sync_copilot_app_usage_logs_isolates_rows_by_source_dir() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_app_dir = std::env::var("COPILOT_APP_DIR").ok();
+
+        let base_dir = temp_jsonl_path("copilot-app-isolate").with_extension("");
+        let app_dir_a = base_dir.join("app-a");
+        let app_dir_b = base_dir.join("app-b");
+        fs::create_dir_all(&app_dir_a).unwrap();
+        fs::create_dir_all(&app_dir_b).unwrap();
+
+        let build_store = |dir: &Path| {
+            let store = Connection::open(dir.join("session-store.db")).unwrap();
+            store
+                .execute(
+                    "CREATE TABLE assistant_usage_events (
+                        id TEXT PRIMARY KEY,
+                        session_id TEXT,
+                        turn_index INTEGER,
+                        model TEXT,
+                        input_tokens INTEGER,
+                        output_tokens INTEGER,
+                        cache_read_tokens INTEGER,
+                        cache_write_tokens INTEGER,
+                        reasoning_tokens INTEGER,
+                        duration_ms INTEGER,
+                        reasoning_effort TEXT,
+                        created_at TEXT
+                     )",
+                    [],
+                )
+                .unwrap();
+            store
+        };
+
+        let store_a = build_store(&app_dir_a);
+        let store_b = build_store(&app_dir_b);
+
+        // Both directories have the SAME session_id and turn_index, but
+        // different token counts so we can tell them apart.
+        store_a
+            .execute(
+                "INSERT INTO assistant_usage_events
+                    (id, session_id, turn_index, model,
+                     input_tokens, output_tokens,
+                     cache_read_tokens, cache_write_tokens,
+                     reasoning_tokens, duration_ms,
+                     reasoning_effort, created_at)
+                 VALUES ('a-0', 'shared-sess', 0, 'gpt-5', 100, 10, 0, 0, 0, 100, 'medium', '2026-07-20 10:00:00')",
+                [],
+            )
+            .unwrap();
+        store_b
+            .execute(
+                "INSERT INTO assistant_usage_events
+                    (id, session_id, turn_index, model,
+                     input_tokens, output_tokens,
+                     cache_read_tokens, cache_write_tokens,
+                     reasoning_tokens, duration_ms,
+                     reasoning_effort, created_at)
+                 VALUES ('b-0', 'shared-sess', 0, 'gpt-5', 200, 20, 0, 0, 0, 100, 'medium', '2026-07-20 09:00:00')",
+                [],
+            )
+            .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // Sync A first.
+        std::env::set_var("COPILOT_APP_DIR", &app_dir_a);
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+
+        // Sync B (same session_id, same turn). Must NOT overwrite A's row.
+        std::env::set_var("COPILOT_APP_DIR", &app_dir_b);
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+
+        // Both rows must coexist.
+        let row_count: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'
+                   AND session_id = 'shared-sess' AND turn_no = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            row_count, 2,
+            "two source dirs with same session/turn must each keep their own row"
+        );
+
+        // Verify token totals are distinct (A=100, B=200) and not overwritten.
+        let totals: Vec<i64> = conn
+            .prepare(
+                "SELECT tokens_input FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'
+                   AND session_id = 'shared-sess' AND turn_no = 1
+                 ORDER BY tokens_input",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(totals, vec![100, 200], "both directories' rows must be present with their own totals");
 
         if let Some(value) = old_app_dir {
             std::env::set_var("COPILOT_APP_DIR", value);
