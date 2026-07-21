@@ -485,8 +485,14 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
     // directory. A single nullable-column index would treat NULLs as distinct,
     // breaking uniqueness for codex/claude/cursor/copilot-cli/vscode.
     let _ = conn.execute("DROP INDEX IF EXISTS uidx_assistant_session_turn", []);
-    let _ = conn.execute("DROP INDEX IF EXISTS uidx_assistant_source_session_turn", []);
-    let _ = conn.execute("DROP INDEX IF EXISTS uidx_assistant_source_dir_session_turn", []);
+    let _ = conn.execute(
+        "DROP INDEX IF EXISTS uidx_assistant_source_session_turn",
+        [],
+    );
+    let _ = conn.execute(
+        "DROP INDEX IF EXISTS uidx_assistant_source_dir_session_turn",
+        [],
+    );
 
     // Partial index for collectors without source_dir_key (NULL): preserves
     // the original (assistant_type, source_kind, session_id, turn_no) uniqueness.
@@ -1576,9 +1582,7 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
     // injective (no two distinct paths map to the same key) and free of LIKE
     // wildcard characters (`%`, `_`). Encoding raw bytes (not lossy UTF-8) avoids
     // collisions from Unicode replacement chars and from `\\` vs `/` normalization.
-    let canonical_app_dir = app_dir
-        .canonicalize()
-        .unwrap_or_else(|_| app_dir.clone());
+    let canonical_app_dir = app_dir.canonicalize().unwrap_or_else(|_| app_dir.clone());
     let source_key = encode_hex(canonical_app_dir.as_os_str().as_encoded_bytes());
     let cursor_key_prefix = format!("{}{}::", COPILOT_APP_CURSOR_PREFIX, source_key);
 
@@ -1718,8 +1722,7 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
     // (`separate_copilot_cli_cached_input`). `tokens_cache_read` keeps the
     // raw cache-read total; `tokens_total` sums net input + output +
     // cache_read + cache_write + reasoning, so cache read is counted once.
-    let aggregate_query =
-        "SELECT MIN(created_at) AS ts,
+    let aggregate_query = "SELECT MIN(created_at) AS ts,
                 SUM(input_tokens), SUM(output_tokens),
                 SUM(cache_read_tokens), SUM(cache_write_tokens),
                 SUM(reasoning_tokens), SUM(duration_ms),
@@ -1735,28 +1738,25 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
     let mut turn_rows: Vec<CopilotAppTurnRow> = Vec::new();
     let mut failed = 0usize;
     for (session_id, turn_index) in &touched_turns {
-        let row_res = agg_stmt.query_row(
-            params![session_id, turn_index],
-            |row| {
-                let raw_input: i64 = row.get::<_, Option<i64>>(1)?.unwrap_or(0).max(0);
-                let cache_read: i64 = row.get::<_, Option<i64>>(3)?.unwrap_or(0).max(0);
-                // Net non-cached input; clamp at 0 in case of schema drift.
-                let net_input = (raw_input - cache_read).max(0) as u64;
-                Ok(CopilotAppTurnRow {
-                    session_id: session_id.clone(),
-                    turn_index: *turn_index,
-                    ts: row.get::<_, String>(0)?,
-                    input_tokens: net_input,
-                    output_tokens: row.get::<_, Option<i64>>(2)?.unwrap_or(0).max(0) as u64,
-                    cache_read: cache_read as u64,
-                    cache_write: row.get::<_, Option<i64>>(4)?.unwrap_or(0).max(0) as u64,
-                    reasoning: row.get::<_, Option<i64>>(5)?.unwrap_or(0).max(0) as u64,
-                    duration_ms: row.get::<_, Option<i64>>(6)?.unwrap_or(0).max(0) as u64,
-                    model: row.get::<_, Option<String>>(7)?,
-                    reasoning_effort: row.get::<_, Option<String>>(8)?,
-                })
-            },
-        );
+        let row_res = agg_stmt.query_row(params![session_id, turn_index], |row| {
+            let raw_input: i64 = row.get::<_, Option<i64>>(1)?.unwrap_or(0).max(0);
+            let cache_read: i64 = row.get::<_, Option<i64>>(3)?.unwrap_or(0).max(0);
+            // Net non-cached input; clamp at 0 in case of schema drift.
+            let net_input = (raw_input - cache_read).max(0) as u64;
+            Ok(CopilotAppTurnRow {
+                session_id: session_id.clone(),
+                turn_index: *turn_index,
+                ts: row.get::<_, String>(0)?,
+                input_tokens: net_input,
+                output_tokens: row.get::<_, Option<i64>>(2)?.unwrap_or(0).max(0) as u64,
+                cache_read: cache_read as u64,
+                cache_write: row.get::<_, Option<i64>>(4)?.unwrap_or(0).max(0) as u64,
+                reasoning: row.get::<_, Option<i64>>(5)?.unwrap_or(0).max(0) as u64,
+                duration_ms: row.get::<_, Option<i64>>(6)?.unwrap_or(0).max(0) as u64,
+                model: row.get::<_, Option<String>>(7)?,
+                reasoning_effort: row.get::<_, Option<String>>(8)?,
+            })
+        });
         match row_res {
             Ok(r) => turn_rows.push(r),
             Err(e) => {
@@ -1797,11 +1797,8 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
 
         // tokens_total counts cache_read once (as its own component), since
         // tokens_input has already been normalized to the non-cached portion.
-        let total = row.input_tokens
-            + row.output_tokens
-            + row.cache_read
-            + row.cache_write
-            + row.reasoning;
+        let total =
+            row.input_tokens + row.output_tokens + row.cache_read + row.cache_write + row.reasoning;
 
         // Delta tokens: the source records per-API-call usage (not cumulative
         // session totals), so the per-turn SUM already represents the delta for
@@ -1963,11 +1960,7 @@ fn resolve_copilot_app_session_meta(
 fn normalize_copilot_app_timestamp(raw: &str) -> String {
     // Already ISO-ish; ensure `T` separator and `Z` suffix.
     if raw.len() >= 19 {
-        format!(
-            "{}T{}Z",
-            &raw[..10],
-            &raw[11..19]
-        )
+        format!("{}T{}Z", &raw[..10], &raw[11..19])
     } else {
         raw.to_string()
     }
@@ -5240,14 +5233,7 @@ mod tests {
                              reasoning_tokens, duration_ms,
                              reasoning_effort, created_at)
                          VALUES (?, ?, ?, 'gpt-5', ?, ?, 0, 0, 0, 100, 'medium', ?)",
-                        params![
-                            id,
-                            session_id,
-                            turn,
-                            (turn + 1) * 100,
-                            (turn + 1) * 10,
-                            ts,
-                        ],
+                        params![id, session_id, turn, (turn + 1) * 100, (turn + 1) * 10, ts,],
                     )
                     .unwrap();
             }
@@ -5300,7 +5286,11 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(turn0, (100, 100), "turn 0 delta should equal per-turn total");
+        assert_eq!(
+            turn0,
+            (100, 100),
+            "turn 0 delta should equal per-turn total"
+        );
 
         let turn1: (i64, i64) = conn
             .query_row(
@@ -5312,7 +5302,11 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(turn1, (200, 200), "turn 1 delta should equal per-turn total");
+        assert_eq!(
+            turn1,
+            (200, 200),
+            "turn 1 delta should equal per-turn total"
+        );
 
         let turn2: (i64, i64) = conn
             .query_row(
@@ -5324,7 +5318,11 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(turn2, (300, 300), "turn 2 delta should equal per-turn total");
+        assert_eq!(
+            turn2,
+            (300, 300),
+            "turn 2 delta should equal per-turn total"
+        );
 
         // Verify session title resolved from data.db.
         let title: Option<String> = conn
@@ -5584,7 +5582,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(cursor_count, 2, "each source directory must have its own cursor");
+        assert_eq!(
+            cursor_count, 2,
+            "each source directory must have its own cursor"
+        );
 
         if let Some(value) = old_app_dir {
             std::env::set_var("COPILOT_APP_DIR", value);
@@ -5674,7 +5675,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(row.0, 42_530, "tokens_input must exclude cache_read");
-        assert_eq!(row.1, 401_024, "tokens_cache_read keeps the raw cache total");
+        assert_eq!(
+            row.1, 401_024,
+            "tokens_cache_read keeps the raw cache total"
+        );
         assert_eq!(row.2, 1_370, "tokens_output");
         assert_eq!(row.3, 384, "tokens_reasoning");
         // total = net_input + cache_read + output + reasoning = 42_530 + 401_024 + 1_370 + 384
@@ -5795,7 +5799,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(total_input, 300, "turn 0 total should remain 300 after idempotent re-sync");
+        assert_eq!(
+            total_input, 300,
+            "turn 0 total should remain 300 after idempotent re-sync"
+        );
 
         if let Some(value) = old_app_dir {
             std::env::set_var("COPILOT_APP_DIR", value);
@@ -6127,7 +6134,11 @@ mod tests {
             .unwrap()
             .map(|r| r.unwrap())
             .collect();
-        assert_eq!(totals, vec![100, 200], "both directories' rows must be present with their own totals");
+        assert_eq!(
+            totals,
+            vec![100, 200],
+            "both directories' rows must be present with their own totals"
+        );
 
         if let Some(value) = old_app_dir {
             std::env::set_var("COPILOT_APP_DIR", value);
@@ -6340,7 +6351,11 @@ mod tests {
         // Verify the token totals are distinct (100 and 200, not 300 merged).
         let mut all_totals: Vec<i64> = sessions.values().map(|v| v[0]).collect();
         all_totals.sort();
-        assert_eq!(all_totals, vec![100, 200], "each session keeps its own tokens");
+        assert_eq!(
+            all_totals,
+            vec![100, 200],
+            "each session keeps its own tokens"
+        );
 
         // Verify source_kind is "copilot-app" for all entries so the frontend
         // renders the App badge, not the CLI fallback.

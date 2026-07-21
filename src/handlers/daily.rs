@@ -500,16 +500,22 @@ pub async fn get_usage_details(
     }
 
     let mut summary = DaySummary::default();
-    // Session identity = (session_id, source_dir_key) so that rows from
-    // different COPILOT_APP_DIR with the same session_id are not merged.
-    let mut sessions_map: HashMap<(String, Option<String>), (Vec<UsageEntry>, String)> =
-        HashMap::new();
+    // Session identity = (source_kind, session_id, source_dir_key) so that
+    // rows from different sources (copilot-cli, copilot-app, vscode-chat) with
+    // the same session_id are not merged, and different COPILOT_APP_DIR values
+    // remain isolated.
+    type SessionKey = (String, String, Option<String>);
+    let mut sessions_map: HashMap<SessionKey, (Vec<UsageEntry>, String)> = HashMap::new();
     let mut entries = Vec::new();
 
     for (record, ast_type) in &entries_with_type {
         let e = &record.entry;
         entries.push(e.clone());
-        let key = (e.session_id.clone(), e.source_dir_key.clone());
+        let source_kind = e
+            .source_kind
+            .clone()
+            .unwrap_or_else(|| "legacy".to_string());
+        let key = (source_kind, e.session_id.clone(), e.source_dir_key.clone());
         let (list, _) = sessions_map
             .entry(key)
             .or_insert_with(|| (Vec::new(), ast_type.clone()));
@@ -517,7 +523,7 @@ pub async fn get_usage_details(
     }
 
     summary.total_sessions = sessions_map.len();
-    let mut session_last_entries: HashMap<(String, Option<String>), UsageEntry> = HashMap::new();
+    let mut session_last_entries: HashMap<SessionKey, UsageEntry> = HashMap::new();
 
     for e in &entries {
         if let Some(ref tokens) = e.delta_tokens {
@@ -538,7 +544,11 @@ pub async fn get_usage_details(
             }
         }
 
-        let key = (e.session_id.clone(), e.source_dir_key.clone());
+        let source_kind = e
+            .source_kind
+            .clone()
+            .unwrap_or_else(|| "legacy".to_string());
+        let key = (source_kind, e.session_id.clone(), e.source_dir_key.clone());
         let last_e = session_last_entries.entry(key).or_insert_with(|| e.clone());
         if e.turn_no > last_e.turn_no {
             *last_e = e.clone();
@@ -548,8 +558,12 @@ pub async fn get_usage_details(
     let pricing_rules = load_pricing_rules();
     let mut sessions_summary = Vec::new();
 
-    for ((session_id, _source_dir_key), (s_entries, ast_type)) in &sessions_map {
-        let key = (session_id.clone(), _source_dir_key.clone());
+    for ((source_kind, session_id, _source_dir_key), (s_entries, ast_type)) in &sessions_map {
+        let key = (
+            source_kind.clone(),
+            session_id.clone(),
+            _source_dir_key.clone(),
+        );
         let last_entry = session_last_entries
             .get(&key)
             .cloned()
@@ -668,10 +682,7 @@ pub async fn get_usage_details(
                 .session_name
                 .unwrap_or_else(|| "Start Coding Session".to_string()),
             assistant_type: ast_type.clone(),
-            source_kind: last_entry
-                .source_kind
-                .clone()
-                .unwrap_or_else(|| "legacy".to_string()),
+            source_kind: source_kind.clone(),
             cwd: last_entry.cwd.unwrap_or_default(),
             model: last_entry
                 .model
@@ -959,8 +970,9 @@ pub async fn get_session_details(
             if let Ok(conn) = db::get_db_conn() {
                 let session_cwd =
                     db::get_session_cwd(&conn, &sid_clone, sdk_clone.as_deref()).unwrap_or(None);
-                let map = db::get_session_turns_token_stats(&conn, &sid_clone, sdk_clone.as_deref())
-                    .unwrap_or_default();
+                let map =
+                    db::get_session_turns_token_stats(&conn, &sid_clone, sdk_clone.as_deref())
+                        .unwrap_or_default();
                 (map, session_cwd)
             } else {
                 (HashMap::new(), None)
@@ -1135,6 +1147,8 @@ pub async fn get_session_details(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::Connection;
+    use std::collections::HashMap;
 
     fn user_prompt(prompt: &str, turn_no: u32) -> TimelineItem {
         TimelineItem::UserPrompt {
@@ -1167,5 +1181,105 @@ mod tests {
         ];
 
         assert!(!timeline_matches_user_prompt(&timeline, "secret keyword"));
+    }
+
+    /// Regression test: same session_id with copilot-cli and copilot-app rows
+    /// must produce two separate session summaries with correct source_kind,
+    /// not one merged session. This mirrors the aggregation logic in
+    /// get_usage_details using get_usage_entries_by_date.
+    #[test]
+    fn daily_summary_separates_copilot_cli_and_app_with_same_session_id() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        // Insert a copilot-cli row for session "shared-sess".
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, session_name,
+                tokens_input, tokens_output, tokens_total,
+                delta_input, delta_output, delta_total
+             ) VALUES (
+                'copilot', 'copilot-cli', NULL, '2026-07-20T10:00:00Z', '2026-07-20',
+                'shared-sess', 1, 'CLI Session',
+                50, 5, 55,
+                50, 5, 55
+             )",
+            [],
+        )
+        .unwrap();
+
+        // Insert a copilot-app row for the SAME session_id (simulating what
+        // sync_copilot_app_usage_logs would produce).
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, session_name,
+                tokens_input, tokens_output, tokens_total,
+                delta_input, delta_output, delta_total,
+                model
+             ) VALUES (
+                'copilot', 'copilot-app', 'abcdef00', '2026-07-20T10:00:00Z', '2026-07-20',
+                'shared-sess', 1, 'App Session',
+                100, 10, 110,
+                100, 10, 110,
+                'GLM5.2'
+             )",
+            [],
+        )
+        .unwrap();
+
+        // Fetch entries for the date — should have copilot-cli and copilot-app.
+        let entries = crate::db::get_usage_entries_by_date(&conn, "2026-07-20", "copilot").unwrap();
+
+        // Group by (source_kind, session_id, source_dir_key) mirroring the handler.
+        let mut sessions: HashMap<(String, String, Option<String>), Vec<&crate::db::UsageEntry>> =
+            HashMap::new();
+        for (record, _ast) in &entries {
+            let e = &record.entry;
+            let sk = e
+                .source_kind
+                .clone()
+                .unwrap_or_else(|| "legacy".to_string());
+            let key = (sk, e.session_id.clone(), e.source_dir_key.clone());
+            sessions.entry(key).or_default().push(e);
+        }
+
+        // Must be 2 separate sessions.
+        assert_eq!(
+            sessions.len(),
+            2,
+            "copilot-cli and copilot-app with same session_id must be 2 separate sessions"
+        );
+
+        // Verify each session has the correct source_kind.
+        let source_kinds: Vec<String> = sessions.keys().map(|(sk, _, _)| sk.clone()).collect();
+        assert!(
+            source_kinds.contains(&"copilot-cli".to_string()),
+            "must have a copilot-cli session, got: {:?}",
+            source_kinds
+        );
+        assert!(
+            source_kinds.contains(&"copilot-app".to_string()),
+            "must have a copilot-app session, got: {:?}",
+            source_kinds
+        );
+
+        // Verify the copilot-app session has model GLM5.2 and source_kind copilot-app.
+        let app_session = sessions
+            .iter()
+            .find(|(key, _)| key.0 == "copilot-app")
+            .map(|(_, entries)| entries)
+            .unwrap();
+        assert_eq!(
+            app_session[0].model.as_deref(),
+            Some("GLM5.2"),
+            "copilot-app session model should be GLM5.2"
+        );
+        assert_eq!(
+            app_session[0].source_kind.as_deref(),
+            Some("copilot-app"),
+            "copilot-app session source_kind must be copilot-app"
+        );
     }
 }
