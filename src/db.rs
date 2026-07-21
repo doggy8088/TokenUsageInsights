@@ -1572,9 +1572,6 @@ fn portable_relative_path(root: &Path, path: &Path) -> String {
 fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
     let app_dir = crate::paths::copilot_app_dir();
     let session_store_path = app_dir.join("session-store.db");
-    if !session_store_path.exists() {
-        return Ok(());
-    }
 
     // Canonicalize the source directory so the cursor is stable across trailing
     // slashes / symlinks and isolated per COPILOT_APP_DIR / COPILOT_DIR value.
@@ -1585,6 +1582,80 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
     let canonical_app_dir = app_dir.canonicalize().unwrap_or_else(|_| app_dir.clone());
     let source_key = encode_hex(canonical_app_dir.as_os_str().as_encoded_bytes());
     let cursor_key_prefix = format!("{}{}::", COPILOT_APP_CURSOR_PREFIX, source_key);
+
+    // `data.db.sessions` is the authoritative registry for Copilot App
+    // sessions. The session-store is shared with Copilot CLI, so without a
+    // validated registry it is unsafe to classify any usage event as App.
+    let data_db_path = app_dir.join("data.db");
+    if !data_db_path.exists() {
+        eprintln!(
+            "⚠️ Copilot App 同步跳過：找不到 data.db ({})",
+            data_db_path.display()
+        );
+        return Ok(());
+    }
+    let data_db = match Connection::open_with_flags(
+        &data_db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "⚠️ Copilot App 同步跳過：無法開啟 data.db ({}): {}",
+                data_db_path.display(),
+                e
+            );
+            return Ok(());
+        }
+    };
+    let _ = data_db.busy_timeout(std::time::Duration::from_secs(2));
+
+    let sessions_table_exists: bool = data_db
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if !sessions_table_exists {
+        eprintln!(
+            "⚠️ Copilot App 同步跳過：data.db 缺少 sessions table ({})",
+            data_db_path.display()
+        );
+        return Ok(());
+    }
+
+    let app_session_ids_result: rusqlite::Result<HashSet<String>> = (|| {
+        let mut stmt = data_db.prepare("SELECT id FROM sessions")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect()
+    })();
+    let app_session_ids: HashSet<String> = match app_session_ids_result {
+        Ok(ids) => ids,
+        Err(e) => {
+            eprintln!(
+                "⚠️ Copilot App 同步跳過：讀取 data.db.sessions 失敗 ({}): {}",
+                data_db_path.display(),
+                e
+            );
+            return Ok(());
+        }
+    };
+
+    let existing_app_session_ids = query_copilot_app_session_ids(conn, &source_key)?;
+    let reconciliation_session_ids: Vec<String> = app_session_ids
+        .difference(&existing_app_session_ids)
+        .cloned()
+        .collect();
+    let stale_app_session_ids: Vec<String> = existing_app_session_ids
+        .difference(&app_session_ids)
+        .cloned()
+        .collect();
+
+    if !session_store_path.exists() {
+        cleanup_stale_copilot_app_rows(conn, &source_key, &stale_app_session_ids)?;
+        return Ok(());
+    }
 
     // Open the Copilot App session-store in read-only mode with a busy timeout
     // so concurrent writes from the app do not block us.
@@ -1599,6 +1670,7 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
                 session_store_path.display(),
                 e
             );
+            cleanup_stale_copilot_app_rows(conn, &source_key, &stale_app_session_ids)?;
             return Ok(());
         }
     };
@@ -1613,22 +1685,8 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
         )
         .unwrap_or(false);
     if !table_exists {
+        cleanup_stale_copilot_app_rows(conn, &source_key, &stale_app_session_ids)?;
         return Ok(());
-    }
-
-    // Optional join source for session title / workspace.
-    let data_db_path = app_dir.join("data.db");
-    let data_db = if data_db_path.exists() {
-        Connection::open_with_flags(
-            &data_db_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .ok()
-    } else {
-        None
-    };
-    if let Some(ref c) = data_db {
-        let _ = c.busy_timeout(std::time::Duration::from_secs(2));
     }
 
     // Load last sync cursor (scoped by canonical source path). New cursors
@@ -1696,7 +1754,11 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
         match row_res {
             Ok((session_id, turn_index, created_at, id)) => {
                 max_event_cursor = Some((created_at, id));
-                if touched_set.insert((session_id.clone(), turn_index)) {
+                if matches!(
+                    classify_copilot_app_session(&app_dir, &app_session_ids, &session_id),
+                    CopilotAppSessionKind::App
+                ) && touched_set.insert((session_id.clone(), turn_index))
+                {
                     touched_turns.push((session_id, turn_index));
                 }
             }
@@ -1714,7 +1776,35 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
     // Upgrade a legacy timestamp-only cursor even when there are no events
     // after it. The maximum id at the legacy timestamp is the safest tuple
     // boundary and prevents the old timestamp from causing repeated scans.
-    if touched_turns.is_empty() {
+    // Add all turns for registry sessions which do not yet have an App row.
+    // This is the history-based reconciliation path for events whose cursor
+    // was already advanced before data.db.sessions contained the session.
+    if !reconciliation_session_ids.is_empty() {
+        let mut reconciliation_stmt = session_store
+            .prepare(
+                "SELECT DISTINCT session_id, turn_index
+                 FROM assistant_usage_events
+                 WHERE session_id = ?
+                 ORDER BY turn_index ASC",
+            )
+            .map_err(|e| format!("準備 Copilot App reconciliation 查詢失敗: {}", e))?;
+        for session_id in &reconciliation_session_ids {
+            let rows = reconciliation_stmt
+                .query_map(params![session_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .map_err(|e| format!("執行 Copilot App reconciliation 查詢失敗: {}", e))?;
+            for row in rows {
+                let turn =
+                    row.map_err(|e| format!("讀取 Copilot App reconciliation turn 失敗: {}", e))?;
+                if touched_set.insert(turn.clone()) {
+                    touched_turns.push(turn);
+                }
+            }
+        }
+    }
+
+    if touched_turns.is_empty() && stale_app_session_ids.is_empty() {
         if legacy_cursor {
             let legacy_timestamp = last_cursor
                 .as_ref()
@@ -1739,7 +1829,9 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
             tx.commit()
                 .map_err(|e| format!("Copilot App cursor migration COMMIT 失敗: {}", e))?;
         }
-        return Ok(());
+        if max_event_cursor.is_none() {
+            return Ok(());
+        }
     }
 
     // Re-aggregate each touched turn from the FULL event history for that
@@ -1802,7 +1894,7 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
         }
     }
 
-    if turn_rows.is_empty() {
+    if turn_rows.is_empty() && stale_app_session_ids.is_empty() && max_event_cursor.is_none() {
         return Ok(());
     }
 
@@ -1814,6 +1906,7 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
     let mut session_meta_cache: HashMap<String, CopilotAppSessionMeta> = HashMap::new();
 
     let mut upserted = 0usize;
+    let deleted = delete_stale_copilot_app_rows(&tx, &source_key, &stale_app_session_ids)?;
 
     for row in turn_rows {
         // Resolve session metadata (title + cwd).
@@ -1929,6 +2022,99 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
     if upserted > 0 {
         println!("✅ 同步 Copilot App：{} 筆 turn（upsert）", upserted);
     }
+    if deleted > 0 {
+        println!("✅ Copilot App reconciliation：清除 {} 筆錯誤資料", deleted);
+    }
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CopilotAppSessionKind {
+    App,
+    Cli,
+    Unknown,
+}
+
+fn classify_copilot_app_session(
+    app_dir: &Path,
+    app_session_ids: &HashSet<String>,
+    session_id: &str,
+) -> CopilotAppSessionKind {
+    if app_session_ids.contains(session_id) {
+        return CopilotAppSessionKind::App;
+    }
+
+    let cli_transcript = app_dir
+        .join("session-state")
+        .join(session_id)
+        .join("events.jsonl");
+    if cli_transcript.is_file() {
+        CopilotAppSessionKind::Cli
+    } else {
+        CopilotAppSessionKind::Unknown
+    }
+}
+
+fn query_copilot_app_session_ids(
+    conn: &Connection,
+    source_key: &str,
+) -> Result<HashSet<String>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT DISTINCT session_id
+             FROM usage_entries
+             WHERE assistant_type = 'copilot'
+               AND source_kind = ?
+               AND source_dir_key = ?",
+        )
+        .map_err(|e| format!("查詢 Copilot App session 失敗: {}", e))?;
+    let rows = stmt
+        .query_map(params![COPILOT_APP_SOURCE_KIND, source_key], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|e| format!("讀取 Copilot App session 失敗: {}", e))?;
+    rows.map(|row| row.map_err(|e| format!("讀取 Copilot App session 失敗: {}", e)))
+        .collect()
+}
+
+fn delete_stale_copilot_app_rows(
+    tx: &rusqlite::Transaction<'_>,
+    source_key: &str,
+    session_ids: &[String],
+) -> Result<usize, String> {
+    let mut deleted = 0usize;
+    for session_id in session_ids {
+        deleted += tx
+            .execute(
+                "DELETE FROM usage_entries
+                 WHERE assistant_type = 'copilot'
+                   AND source_kind = ?
+                   AND source_dir_key = ?
+                   AND session_id = ?",
+                params![COPILOT_APP_SOURCE_KIND, source_key, session_id],
+            )
+            .map_err(|e| format!("刪除錯誤 Copilot App 資料失敗: {}", e))?;
+    }
+    Ok(deleted)
+}
+
+fn cleanup_stale_copilot_app_rows(
+    conn: &mut Connection,
+    source_key: &str,
+    session_ids: &[String],
+) -> Result<(), String> {
+    if session_ids.is_empty() {
+        return Ok(());
+    }
+    let tx = conn
+        .transaction()
+        .map_err(|e| format!("開啟 Copilot App cleanup transaction 失敗: {}", e))?;
+    let deleted = delete_stale_copilot_app_rows(&tx, source_key, session_ids)?;
+    tx.commit()
+        .map_err(|e| format!("Copilot App cleanup COMMIT 失敗: {}", e))?;
+    if deleted > 0 {
+        println!("✅ Copilot App reconciliation：清除 {} 筆錯誤資料", deleted);
+    }
     Ok(())
 }
 
@@ -1993,14 +2179,10 @@ struct CopilotAppSessionMeta {
 }
 
 fn resolve_copilot_app_session_meta(
-    data_db: &Option<Connection>,
+    data_db: &Connection,
     session_id: &str,
 ) -> CopilotAppSessionMeta {
-    let Some(db) = data_db else {
-        return CopilotAppSessionMeta::default();
-    };
-
-    let title: Option<String> = db
+    let title: Option<String> = data_db
         .query_row(
             "SELECT title FROM sessions WHERE id = ?",
             params![session_id],
@@ -4109,6 +4291,108 @@ mod tests {
         path
     }
 
+    fn create_copilot_app_registry_from_events(app_dir: &Path) {
+        let store = Connection::open(app_dir.join("session-store.db")).unwrap();
+        let session_ids: Vec<String> = store
+            .prepare("SELECT DISTINCT session_id FROM assistant_usage_events")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        drop(store);
+
+        let data_db = Connection::open(app_dir.join("data.db")).unwrap();
+        data_db
+            .execute(
+                "CREATE TABLE IF NOT EXISTS sessions (
+                    id TEXT PRIMARY KEY,
+                    title TEXT
+                 )",
+                [],
+            )
+            .unwrap();
+        for session_id in session_ids {
+            data_db
+                .execute(
+                    "INSERT OR IGNORE INTO sessions (id, title) VALUES (?, NULL)",
+                    params![session_id],
+                )
+                .unwrap();
+        }
+    }
+
+    fn create_copilot_app_registry(app_dir: &Path, session_ids: &[&str]) {
+        let data_db = Connection::open(app_dir.join("data.db")).unwrap();
+        data_db
+            .execute(
+                "CREATE TABLE IF NOT EXISTS sessions (
+                    id TEXT PRIMARY KEY,
+                    title TEXT
+                 )",
+                [],
+            )
+            .unwrap();
+        for session_id in session_ids {
+            data_db
+                .execute(
+                    "INSERT OR IGNORE INTO sessions (id, title) VALUES (?, NULL)",
+                    params![session_id],
+                )
+                .unwrap();
+        }
+    }
+
+    fn create_test_copilot_session_store(app_dir: &Path) -> Connection {
+        let store = Connection::open(app_dir.join("session-store.db")).unwrap();
+        store
+            .execute(
+                "CREATE TABLE assistant_usage_events (
+                    id INTEGER PRIMARY KEY,
+                    session_id TEXT,
+                    turn_index INTEGER,
+                    model TEXT,
+                    input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    cache_read_tokens INTEGER,
+                    cache_write_tokens INTEGER,
+                    reasoning_tokens INTEGER,
+                    duration_ms INTEGER,
+                    reasoning_effort TEXT,
+                    created_at TEXT
+                 )",
+                [],
+            )
+            .unwrap();
+        store
+    }
+
+    fn insert_test_copilot_event(
+        store: &Connection,
+        id: i64,
+        session_id: &str,
+        turn_index: i64,
+        created_at: &str,
+    ) {
+        store
+            .execute(
+                "INSERT INTO assistant_usage_events
+                    (id, session_id, turn_index, model,
+                     input_tokens, output_tokens,
+                     cache_read_tokens, cache_write_tokens,
+                     reasoning_tokens, duration_ms,
+                     reasoning_effort, created_at)
+                 VALUES (?, ?, ?, 'gpt-5', 100, 10, 0, 0, 0, 100, 'medium', ?)",
+                params![id, session_id, turn_index, created_at],
+            )
+            .unwrap();
+    }
+
+    fn test_copilot_source_key(app_dir: &Path) -> String {
+        let canonical = app_dir.canonicalize().unwrap();
+        encode_hex(canonical.as_os_str().as_encoded_bytes())
+    }
+
     fn sample_import_record() -> UsageDayExportRecord {
         UsageDayExportRecord {
             entry: UsageEntry {
@@ -5509,6 +5793,7 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
 
+        create_copilot_app_registry_from_events(&app_dir);
         sync_copilot_app_usage_logs(&mut conn).unwrap();
 
         let turn0_total: i64 = conn
@@ -5642,12 +5927,14 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
 
+        create_copilot_app_registry_from_events(&app_dir_a);
         // Sync from A first; this establishes a cursor at 2026-07-20 10:00:00.
         std::env::set_var("COPILOT_APP_DIR", &app_dir_a);
         sync_copilot_app_usage_logs(&mut conn).unwrap();
 
         // Switch to B. A correct scoped cursor must NOT reuse A's cursor; B's
         // earlier event must still be ingested.
+        create_copilot_app_registry_from_events(&app_dir_b);
         std::env::set_var("COPILOT_APP_DIR", &app_dir_b);
         sync_copilot_app_usage_logs(&mut conn).unwrap();
 
@@ -5737,6 +6024,7 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
 
+        create_copilot_app_registry_from_events(&app_dir);
         sync_copilot_app_usage_logs(&mut conn).unwrap();
         let cursor: String = conn
             .query_row(
@@ -5833,6 +6121,7 @@ mod tests {
         let cursor_prefix = format!("{}{}::", COPILOT_APP_CURSOR_PREFIX, source_key);
         let mut conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
+        create_copilot_app_registry_from_events(&app_dir);
         conn.execute(
             "INSERT INTO sync_state (filename, last_synced_size, last_synced_time)
              VALUES (?, 0, 0)",
@@ -5935,6 +6224,7 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
 
+        create_copilot_app_registry_from_events(&app_dir);
         sync_copilot_app_usage_logs(&mut conn).unwrap();
 
         let row: (i64, i64, i64, i64, i64, i64, i64) = conn
@@ -6044,6 +6334,7 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
 
+        create_copilot_app_registry_from_events(&app_dir);
         sync_copilot_app_usage_logs(&mut conn).unwrap();
 
         // The cursor must be at the max raw event tuple, not the per-turn MIN.
@@ -6149,6 +6440,7 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
 
+        create_copilot_app_registry_from_events(&app_dir);
         // First sync succeeds and establishes a cursor at 10:00:00.
         sync_copilot_app_usage_logs(&mut conn).unwrap();
         let cursor_after_first: String = conn
@@ -6279,6 +6571,7 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
 
+        create_copilot_app_registry_from_events(&app_dir);
         sync_copilot_app_usage_logs(&mut conn).unwrap();
 
         let import_source_id: String = conn
@@ -6391,11 +6684,13 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
 
+        create_copilot_app_registry_from_events(&app_dir_a);
         // Sync A first.
         std::env::set_var("COPILOT_APP_DIR", &app_dir_a);
         sync_copilot_app_usage_logs(&mut conn).unwrap();
 
         // Sync B (same session_id, same turn). Must NOT overwrite A's row.
+        create_copilot_app_registry_from_events(&app_dir_b);
         std::env::set_var("COPILOT_APP_DIR", &app_dir_b);
         sync_copilot_app_usage_logs(&mut conn).unwrap();
 
@@ -6432,6 +6727,333 @@ mod tests {
             vec![100, 200],
             "both directories' rows must be present with their own totals"
         );
+
+        if let Some(value) = old_app_dir {
+            std::env::set_var("COPILOT_APP_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_APP_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn copilot_app_registry_excludes_cli_and_unknown_events_without_stalling_cursor() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_app_dir = std::env::var("COPILOT_APP_DIR").ok();
+        let base_dir = temp_jsonl_path("copilot-app-registry-classification").with_extension("");
+        let app_dir = base_dir.join("copilot-app");
+        fs::create_dir_all(app_dir.join("session-state").join("cli-session")).unwrap();
+        let store = create_test_copilot_session_store(&app_dir);
+        insert_test_copilot_event(&store, 1, "app-session", 0, "2026-07-20 10:00:00");
+        insert_test_copilot_event(&store, 2, "cli-session", 0, "2026-07-20 10:00:01");
+        insert_test_copilot_event(&store, 3, "unknown-session", 0, "2026-07-20 10:00:02");
+        fs::write(
+            app_dir
+                .join("session-state")
+                .join("cli-session")
+                .join("events.jsonl"),
+            "{}\n",
+        )
+        .unwrap();
+        create_copilot_app_registry(&app_dir, &["app-session"]);
+        std::env::set_var("COPILOT_APP_DIR", &app_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, timestamp, date, session_id, turn_no,
+                tokens_input, tokens_output, tokens_total
+             ) VALUES ('copilot', 'copilot-cli', '2026-07-20T10:00:01Z', '2026-07-20',
+                       'cli-session', 1, 100, 10, 110)",
+            [],
+        )
+        .unwrap();
+
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+
+        let app_sessions: Vec<String> = conn
+            .prepare(
+                "SELECT session_id FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(app_sessions, vec!["app-session"]);
+        let cli_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-cli'
+                   AND session_id = 'cli-session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cli_rows, 1);
+        let cursor: String = conn
+            .query_row(
+                "SELECT filename FROM sync_state
+                 WHERE filename LIKE 'sync:copilot_app:cursor:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(cursor.ends_with("::2026-07-20 10:00:02::3"));
+
+        if let Some(value) = old_app_dir {
+            std::env::set_var("COPILOT_APP_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_APP_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn copilot_app_reconciliation_removes_stale_rows_but_keeps_cli_rows() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_app_dir = std::env::var("COPILOT_APP_DIR").ok();
+        let base_dir = temp_jsonl_path("copilot-app-reconciliation-cleanup").with_extension("");
+        let app_dir = base_dir.join("copilot-app");
+        fs::create_dir_all(&app_dir).unwrap();
+        let store = create_test_copilot_session_store(&app_dir);
+        insert_test_copilot_event(&store, 1, "valid-app", 0, "2026-07-20 10:00:00");
+        create_copilot_app_registry(&app_dir, &["valid-app"]);
+        std::env::set_var("COPILOT_APP_DIR", &app_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let source_key = test_copilot_source_key(&app_dir);
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, tokens_input, tokens_output, tokens_total,
+                import_source_id
+             ) VALUES
+                ('copilot', 'copilot-app', ?, '2026-07-20T09:00:00Z', '2026-07-20',
+                 'stale-session', 1, 20, 2, 22, 'stale-app-row'),
+                ('copilot', 'copilot-cli', NULL, '2026-07-20T09:00:00Z', '2026-07-20',
+                 'stale-session', 1, 30, 3, 33, 'stale-cli-row')",
+            params![source_key],
+        )
+        .unwrap();
+
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+
+        let stale_app_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE source_kind = 'copilot-app' AND source_dir_key = ?
+                   AND session_id = 'stale-session'",
+                params![source_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let stale_cli_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE source_kind = 'copilot-cli' AND session_id = 'stale-session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let valid_app_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE source_kind = 'copilot-app' AND session_id = 'valid-app'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale_app_rows, 0);
+        assert_eq!(stale_cli_rows, 1);
+        assert_eq!(valid_app_rows, 1);
+
+        if let Some(value) = old_app_dir {
+            std::env::set_var("COPILOT_APP_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_APP_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn copilot_app_reconciliation_imports_history_after_registry_arrives() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_app_dir = std::env::var("COPILOT_APP_DIR").ok();
+        let base_dir = temp_jsonl_path("copilot-app-registry-late").with_extension("");
+        let app_dir = base_dir.join("copilot-app");
+        fs::create_dir_all(&app_dir).unwrap();
+        let store = create_test_copilot_session_store(&app_dir);
+        insert_test_copilot_event(&store, 1, "late-app", 0, "2026-07-20 10:00:00");
+        create_copilot_app_registry(&app_dir, &[]);
+        std::env::set_var("COPILOT_APP_DIR", &app_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+        let cursor_before: String = conn
+            .query_row(
+                "SELECT filename FROM sync_state
+                 WHERE filename LIKE 'sync:copilot_app:cursor:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM usage_entries WHERE source_kind = 'copilot-app'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+
+        create_copilot_app_registry(&app_dir, &["late-app"]);
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE source_kind = 'copilot-app' AND session_id = 'late-app'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+        let cursor_after: String = conn
+            .query_row(
+                "SELECT filename FROM sync_state
+                 WHERE filename LIKE 'sync:copilot_app:cursor:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cursor_after, cursor_before);
+
+        if let Some(value) = old_app_dir {
+            std::env::set_var("COPILOT_APP_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_APP_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn copilot_app_sync_skips_when_data_db_is_invalid() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_app_dir = std::env::var("COPILOT_APP_DIR").ok();
+        let base_dir = temp_jsonl_path("copilot-app-invalid-data-db").with_extension("");
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        for (name, data_db_kind) in [
+            ("missing", 0u8),
+            ("missing-table", 1u8),
+            ("unopenable", 2u8),
+        ] {
+            let app_dir = base_dir.join(name);
+            fs::create_dir_all(&app_dir).unwrap();
+            let store = create_test_copilot_session_store(&app_dir);
+            insert_test_copilot_event(&store, 1, "unsafe-session", 0, "2026-07-20 10:00:00");
+            drop(store);
+            let data_db_path = app_dir.join("data.db");
+            match data_db_kind {
+                0 => {}
+                1 => {
+                    Connection::open(&data_db_path).unwrap();
+                }
+                2 => {
+                    fs::create_dir(&data_db_path).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            std::env::set_var("COPILOT_APP_DIR", &app_dir);
+            sync_copilot_app_usage_logs(&mut conn).unwrap();
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM usage_entries WHERE source_kind = 'copilot-app'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                0
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM sync_state
+                     WHERE filename LIKE 'sync:copilot_app:cursor:%'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                0
+            );
+        }
+
+        if let Some(value) = old_app_dir {
+            std::env::set_var("COPILOT_APP_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_APP_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn copilot_app_noop_sync_preserves_row_identity_content_and_cursor() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_app_dir = std::env::var("COPILOT_APP_DIR").ok();
+        let base_dir = temp_jsonl_path("copilot-app-noop").with_extension("");
+        let app_dir = base_dir.join("copilot-app");
+        fs::create_dir_all(&app_dir).unwrap();
+        let store = create_test_copilot_session_store(&app_dir);
+        insert_test_copilot_event(&store, 1, "stable-session", 0, "2026-07-20 10:00:00");
+        create_copilot_app_registry(&app_dir, &["stable-session"]);
+        std::env::set_var("COPILOT_APP_DIR", &app_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+        let first_row: (i64, i64, i64) = conn
+            .query_row(
+                "SELECT id, tokens_input, tokens_total FROM usage_entries
+                 WHERE source_kind = 'copilot-app' AND session_id = 'stable-session'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let first_cursor: String = conn
+            .query_row(
+                "SELECT filename FROM sync_state
+                 WHERE filename LIKE 'sync:copilot_app:cursor:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+        let second_row: (i64, i64, i64) = conn
+            .query_row(
+                "SELECT id, tokens_input, tokens_total FROM usage_entries
+                 WHERE source_kind = 'copilot-app' AND session_id = 'stable-session'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let second_cursor: String = conn
+            .query_row(
+                "SELECT filename FROM sync_state
+                 WHERE filename LIKE 'sync:copilot_app:cursor:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(second_row, first_row);
+        assert_eq!(second_cursor, first_cursor);
 
         if let Some(value) = old_app_dir {
             std::env::set_var("COPILOT_APP_DIR", value);
@@ -6615,6 +7237,8 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
 
+        create_copilot_app_registry_from_events(&app_dir_a);
+        create_copilot_app_registry_from_events(&app_dir_b);
         std::env::set_var("COPILOT_APP_DIR", &app_dir_a);
         sync_copilot_app_usage_logs(&mut conn).unwrap();
         std::env::set_var("COPILOT_APP_DIR", &app_dir_b);
