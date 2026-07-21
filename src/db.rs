@@ -6342,6 +6342,17 @@ mod tests {
         all_totals.sort();
         assert_eq!(all_totals, vec![100, 200], "each session keeps its own tokens");
 
+        // Verify source_kind is "copilot-app" for all entries so the frontend
+        // renders the App badge, not the CLI fallback.
+        for (record, _ast) in &entries {
+            let e = &record.entry;
+            assert_eq!(
+                e.source_kind.as_deref(),
+                Some("copilot-app"),
+                "copilot-app entries must have source_kind = 'copilot-app' for correct frontend badge"
+            );
+        }
+
         if let Some(value) = old_app_dir {
             std::env::set_var("COPILOT_APP_DIR", value);
         } else {
