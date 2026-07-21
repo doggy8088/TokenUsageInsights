@@ -47,6 +47,11 @@ pub struct UsageEntry {
     pub cost: Option<CostStats>,
     #[serde(default)]
     pub source_kind: Option<String>,
+    /// Source directory key (hex-encoded canonical path) for Copilot App rows.
+    /// `None` for all other collectors. Used to isolate sessions from different
+    /// COPILOT_APP_DIR values that may share the same session_id.
+    #[serde(default)]
+    pub source_dir_key: Option<String>,
 
     // Codex-specific / Extended fields
     pub parent_session_id: Option<String>,
@@ -437,26 +442,78 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
     // source_dir_key isolates Copilot App rows by source directory so that
     // identical (session_id, turn_no) from different COPILOT_APP_DIR values
     // do not REPLACE each other via the unique index. NULL for all other
-    // collectors; SQLite treats NULLs as distinct in unique indexes, so
-    // existing behavior is unchanged.
+    // collectors.
     let _ = conn.execute(
         "ALTER TABLE usage_entries ADD COLUMN source_dir_key TEXT",
         [],
     );
 
-    // Include the original source in the identity so VS Code and Copilot CLI
-    // records can be aggregated without colliding on a reused session id.
-    // For copilot-app, source_dir_key further isolates rows by source directory.
+    // Migration: delete legacy copilot-app rows that predate source_dir_key.
+    // These rows have source_kind = 'copilot-app', source_dir_key IS NULL, and
+    // the old import_source_id format (copilot-app:<session>:<turn>, without
+    // the hex source key segment). They cannot be attributed to a specific
+    // source directory, so they must be removed to avoid double-counting when
+    // the new collector re-syncs the same turns from the actual directory.
+    let legacy_deleted: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM usage_entries
+             WHERE source_kind = 'copilot-app'
+               AND source_dir_key IS NULL
+               AND import_source_id LIKE 'copilot-app:%:%'
+               AND import_source_id NOT LIKE 'copilot-app:%:%:%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    if legacy_deleted > 0 {
+        let _ = conn.execute(
+            "DELETE FROM usage_entries
+             WHERE source_kind = 'copilot-app'
+               AND source_dir_key IS NULL
+               AND import_source_id LIKE 'copilot-app:%:%'
+               AND import_source_id NOT LIKE 'copilot-app:%:%:%'",
+            [],
+        );
+        println!(
+            "✅ 遷移：清除 {} 筆舊版 Copilot App 資料（無 source_dir_key）",
+            legacy_deleted
+        );
+    }
+
+    // Use two partial unique indexes to preserve original uniqueness semantics
+    // for non-copilot-app collectors while isolating copilot-app rows by source
+    // directory. A single nullable-column index would treat NULLs as distinct,
+    // breaking uniqueness for codex/claude/cursor/copilot-cli/vscode.
     let _ = conn.execute("DROP INDEX IF EXISTS uidx_assistant_session_turn", []);
     let _ = conn.execute("DROP INDEX IF EXISTS uidx_assistant_source_session_turn", []);
+    let _ = conn.execute("DROP INDEX IF EXISTS uidx_assistant_source_dir_session_turn", []);
+
+    // Partial index for collectors without source_dir_key (NULL): preserves
+    // the original (assistant_type, source_kind, session_id, turn_no) uniqueness.
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS uidx_assistant_source_session_turn
-         ON usage_entries(assistant_type, source_kind, source_dir_key, session_id, turn_no)",
+         ON usage_entries(assistant_type, source_kind, session_id, turn_no)
+         WHERE source_dir_key IS NULL",
         [],
     )
     .map_err(|e| {
         format!(
             "建立唯一索引 uidx_assistant_source_session_turn 失敗: {}",
+            e
+        )
+    })?;
+
+    // Partial index for copilot-app rows (source_dir_key IS NOT NULL): includes
+    // source_dir_key so different COPILOT_APP_DIR values are isolated.
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uidx_assistant_source_dir_session_turn
+         ON usage_entries(assistant_type, source_kind, source_dir_key, session_id, turn_no)
+         WHERE source_dir_key IS NOT NULL",
+        [],
+    )
+    .map_err(|e| {
+        format!(
+            "建立唯一索引 uidx_assistant_source_dir_session_turn 失敗: {}",
             e
         )
     })?;
@@ -1429,6 +1486,7 @@ fn parse_codex_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String> 
             context,
             cost: None,
             source_kind: None,
+            source_dir_key: None,
             parent_session_id: parent_session_id.clone(),
             agent_nickname: agent_nickname.clone(),
             agent_role: agent_role.clone(),
@@ -2274,6 +2332,7 @@ fn parse_claude_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String>
             context: None,
             cost: None,
             source_kind: None,
+            source_dir_key: None,
             parent_session_id: None,
             agent_nickname: None,
             agent_role: None,
@@ -2671,6 +2730,7 @@ fn parse_cursor_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String>
                 context: None,
                 cost: None,
                 source_kind: None,
+                source_dir_key: None,
                 parent_session_id: None,
                 agent_nickname: None,
                 agent_role: None,
@@ -3153,7 +3213,7 @@ pub fn get_usage_entries_by_date(
             timestamp, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
             tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_reasoning, tokens_total,
             delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total,
-            duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, assistant_type, reasoning_effort, import_source_id, source_kind
+            duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, assistant_type, reasoning_effort, import_source_id, source_kind, source_dir_key
          FROM usage_entries WHERE date = ?".to_string();
     let mut params_vec = Vec::new();
     params_vec.push(rusqlite::types::Value::Text(date.to_string()));
@@ -3300,6 +3360,7 @@ pub fn get_usage_entries_by_date(
                 context: None,
                 cost,
                 source_kind: row.get(29).ok(),
+                source_dir_key: row.get(30).ok(),
                 parent_session_id: row.get(23).ok(),
                 agent_nickname: row.get(24).ok(),
                 agent_role: row.get(25).ok(),
@@ -3462,10 +3523,11 @@ pub fn get_session_assistant_and_transcript(
     conn: &rusqlite::Connection,
     assistant: &str,
     session_id: &str,
-) -> Result<(String, Option<String>, String), String> {
+) -> Result<(String, Option<String>, String, Option<String>), String> {
     let mut stmt = conn
         .prepare(
-            "SELECT assistant_type, transcript_path, source_kind FROM usage_entries WHERE session_id = ? AND assistant_type = ? LIMIT 1",
+            "SELECT assistant_type, transcript_path, source_kind, source_dir_key
+             FROM usage_entries WHERE session_id = ? AND assistant_type = ? LIMIT 1",
         )
         .map_err(|e| e.to_string())?;
     let mut rows = stmt
@@ -3479,7 +3541,8 @@ pub fn get_session_assistant_and_transcript(
             .ok()
             .flatten()
             .unwrap_or_else(|| "legacy".to_string());
-        Ok((ast, path, source_kind))
+        let source_dir_key: Option<String> = row.get(3).ok().flatten();
+        Ok((ast, path, source_kind, source_dir_key))
     } else {
         Err("Session not found".to_string())
     }
@@ -3488,11 +3551,14 @@ pub fn get_session_assistant_and_transcript(
 pub fn get_session_cwd(
     conn: &rusqlite::Connection,
     session_id: &str,
+    source_dir_key: Option<&str>,
 ) -> Result<Option<String>, String> {
     let mut stmt = conn
-        .prepare("SELECT cwd FROM usage_entries WHERE session_id = ? AND cwd IS NOT NULL LIMIT 1")
+        .prepare("SELECT cwd FROM usage_entries WHERE session_id = ? AND cwd IS NOT NULL AND (? IS NULL OR source_dir_key = ?) LIMIT 1")
         .map_err(|e| e.to_string())?;
-    let mut rows = stmt.query(params![session_id]).map_err(|e| e.to_string())?;
+    let mut rows = stmt
+        .query(params![session_id, source_dir_key, source_dir_key])
+        .map_err(|e| e.to_string())?;
     if let Some(row) = rows.next().map_err(|e| e.to_string())? {
         Ok(row.get::<_, String>(0).ok())
     } else {
@@ -3503,13 +3569,18 @@ pub fn get_session_cwd(
 pub fn get_session_turns_token_stats(
     conn: &rusqlite::Connection,
     session_id: &str,
+    source_dir_key: Option<&str>,
 ) -> Result<HashMap<u32, (TokenStats, String)>, String> {
     let mut map = HashMap::new();
     let mut stmt = conn.prepare(
         "SELECT turn_no, delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total, model
-         FROM usage_entries WHERE session_id = ? ORDER BY turn_no ASC"
+         FROM usage_entries
+         WHERE session_id = ? AND (? IS NULL OR source_dir_key = ?)
+         ORDER BY turn_no ASC"
     ).map_err(|e| e.to_string())?;
-    let mut rows = stmt.query(params![session_id]).map_err(|e| e.to_string())?;
+    let mut rows = stmt
+        .query(params![session_id, source_dir_key, source_dir_key])
+        .map_err(|e| e.to_string())?;
     while let Some(row) = rows.next().map_err(|e| e.to_string())? {
         if let (Ok(turn_no), Ok(delta_input), Ok(delta_output), Ok(delta_total)) = (
             row.get::<_, i64>(0),
@@ -3610,7 +3681,7 @@ pub fn get_usage_entries_by_month(
             tokens_input, tokens_output, tokens_cache_read, tokens_reasoning, tokens_total,
             delta_input, delta_output, delta_cache_read, delta_reasoning, delta_total,
             duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, assistant_type, reasoning_effort,
-            date, source_kind
+            date, source_kind, source_dir_key
          FROM usage_entries WHERE date LIKE ?".to_string();
     let mut params_vec = Vec::new();
     params_vec.push(rusqlite::types::Value::Text(query_month));
@@ -3746,6 +3817,7 @@ pub fn get_usage_entries_by_month(
                 context: None,
                 cost,
                 source_kind: row.get(27).ok(),
+                source_dir_key: row.get(28).ok(),
                 parent_session_id: row.get(21).ok(),
                 agent_nickname: row.get(22).ok(),
                 agent_role: row.get(23).ok(),
@@ -3809,7 +3881,7 @@ pub fn get_usage_entries_by_year(
             tokens_input, tokens_output, tokens_cache_read, tokens_reasoning, tokens_total,
             delta_input, delta_output, delta_cache_read, delta_reasoning, delta_total,
             duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, assistant_type, reasoning_effort,
-            date, source_kind
+            date, source_kind, source_dir_key
          FROM usage_entries WHERE date LIKE ?".to_string();
     let mut params_vec = Vec::new();
     params_vec.push(rusqlite::types::Value::Text(query_year));
@@ -3945,6 +4017,7 @@ pub fn get_usage_entries_by_year(
                 context: None,
                 cost,
                 source_kind: row.get(27).ok(),
+                source_dir_key: row.get(28).ok(),
                 parent_session_id: row.get(21).ok(),
                 agent_nickname: row.get(22).ok(),
                 agent_role: row.get(23).ok(),
@@ -4020,6 +4093,7 @@ mod tests {
                     total_premium_requests: Some(1.0),
                 }),
                 source_kind: None,
+                source_dir_key: None,
                 parent_session_id: Some("parent-session".to_string()),
                 agent_nickname: Some("worker".to_string()),
                 agent_role: Some("analysis".to_string()),
@@ -6054,6 +6128,219 @@ mod tests {
             .map(|r| r.unwrap())
             .collect();
         assert_eq!(totals, vec![100, 200], "both directories' rows must be present with their own totals");
+
+        if let Some(value) = old_app_dir {
+            std::env::set_var("COPILOT_APP_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_APP_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    /// Verify init_db migrates legacy copilot-app rows (old import_source_id
+    /// format, NULL source_dir_key) by deleting them so they do not coexist
+    /// with new rows and cause double-counting.
+    #[test]
+    fn init_db_migrates_legacy_copilot_app_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // Insert a legacy copilot-app row (old import_source_id format, no
+        // source_dir_key).
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, import_source_id
+             ) VALUES (
+                'copilot', 'copilot-app', NULL, '2026-07-01T10:00:00Z', '2026-07-01',
+                'legacy-sess', 1, 'copilot-app:legacy-sess:0'
+             )",
+            [],
+        )
+        .unwrap();
+
+        // Insert a non-copilot-app row to ensure it is NOT deleted.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, import_source_id
+             ) VALUES (
+                'codex', 'legacy', NULL, '2026-07-01T10:00:00Z', '2026-07-01',
+                'codex-sess', 1, 'codex-import-1'
+             )",
+            [],
+        )
+        .unwrap();
+
+        // Re-run init_db to trigger migration.
+        init_db(&conn).unwrap();
+
+        let legacy_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE source_kind = 'copilot-app' AND source_dir_key IS NULL
+                   AND import_source_id = 'copilot-app:legacy-sess:0'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_count, 0, "legacy copilot-app row must be deleted");
+
+        let codex_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries WHERE session_id = 'codex-sess'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(codex_count, 1, "non-copilot-app row must be preserved");
+    }
+
+    /// Verify that non-copilot-app collectors (codex, claude, cursor) retain
+    /// their uniqueness after the partial index change. Two identical
+    /// (assistant_type, source_kind, session_id, turn_no) rows with NULL
+    /// source_dir_key must not coexist.
+    #[test]
+    fn init_db_partial_index_preserves_non_copilot_uniqueness() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // Insert a codex row.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no
+             ) VALUES ('codex', 'legacy', NULL, '2026-07-01T10:00:00Z', '2026-07-01', 'codex-sess', 1)",
+            [],
+        )
+        .unwrap();
+
+        // Attempt to insert a duplicate codex row with the same identity. This
+        // should fail (or be a no-op via INSERT OR IGNORE) because the partial
+        // unique index WHERE source_dir_key IS NULL enforces uniqueness.
+        let dup_result = conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no
+             ) VALUES ('codex', 'legacy', NULL, '2026-07-01T11:00:00Z', '2026-07-01', 'codex-sess', 1)",
+            [],
+        );
+
+        assert!(
+            dup_result.is_err(),
+            "duplicate non-copilot-app row must be rejected by partial unique index"
+        );
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries WHERE session_id = 'codex-sess'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "only one codex row should exist");
+    }
+
+    /// Verify that two copilot-app sources with the same session_id are not
+    /// merged in the daily summary aggregation. Each source should appear as
+    /// a separate session.
+    #[test]
+    fn daily_summary_separates_same_session_id_across_source_dirs() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_app_dir = std::env::var("COPILOT_APP_DIR").ok();
+
+        let base_dir = temp_jsonl_path("copilot-app-daily-merge").with_extension("");
+        let app_dir_a = base_dir.join("app-a");
+        let app_dir_b = base_dir.join("app-b");
+        fs::create_dir_all(&app_dir_a).unwrap();
+        fs::create_dir_all(&app_dir_b).unwrap();
+
+        let build_store = |dir: &Path| {
+            let store = Connection::open(dir.join("session-store.db")).unwrap();
+            store
+                .execute(
+                    "CREATE TABLE assistant_usage_events (
+                        id TEXT PRIMARY KEY,
+                        session_id TEXT,
+                        turn_index INTEGER,
+                        model TEXT,
+                        input_tokens INTEGER,
+                        output_tokens INTEGER,
+                        cache_read_tokens INTEGER,
+                        cache_write_tokens INTEGER,
+                        reasoning_tokens INTEGER,
+                        duration_ms INTEGER,
+                        reasoning_effort TEXT,
+                        created_at TEXT
+                     )",
+                    [],
+                )
+                .unwrap();
+            store
+        };
+
+        let store_a = build_store(&app_dir_a);
+        let store_b = build_store(&app_dir_b);
+
+        // Both directories use the SAME session_id but different token counts.
+        store_a
+            .execute(
+                "INSERT INTO assistant_usage_events
+                    (id, session_id, turn_index, model,
+                     input_tokens, output_tokens,
+                     cache_read_tokens, cache_write_tokens,
+                     reasoning_tokens, duration_ms,
+                     reasoning_effort, created_at)
+                 VALUES ('a-0', 'shared-sess', 0, 'gpt-5', 100, 10, 0, 0, 0, 100, 'medium', '2026-07-20 10:00:00')",
+                [],
+            )
+            .unwrap();
+        store_b
+            .execute(
+                "INSERT INTO assistant_usage_events
+                    (id, session_id, turn_index, model,
+                     input_tokens, output_tokens,
+                     cache_read_tokens, cache_write_tokens,
+                     reasoning_tokens, duration_ms,
+                     reasoning_effort, created_at)
+                 VALUES ('b-0', 'shared-sess', 0, 'gpt-5', 200, 20, 0, 0, 0, 100, 'medium', '2026-07-20 09:00:00')",
+                [],
+            )
+            .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        std::env::set_var("COPILOT_APP_DIR", &app_dir_a);
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+        std::env::set_var("COPILOT_APP_DIR", &app_dir_b);
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+
+        // Fetch entries for the date and verify the two sources are NOT merged.
+        let entries = get_usage_entries_by_date(&conn, "2026-07-20", "copilot").unwrap();
+
+        // Group by (session_id, source_dir_key) to simulate daily summary logic.
+        let mut sessions: HashMap<(String, Option<String>), Vec<i64>> = HashMap::new();
+        for (record, _ast) in &entries {
+            let e = &record.entry;
+            let key = (e.session_id.clone(), e.source_dir_key.clone());
+            sessions
+                .entry(key)
+                .or_default()
+                .push(e.tokens.as_ref().map(|t| t.input as i64).unwrap_or(0));
+        }
+
+        // There must be 2 separate sessions (one per source dir), not 1 merged.
+        assert_eq!(
+            sessions.len(),
+            2,
+            "two source dirs with same session_id must be 2 separate sessions, not merged"
+        );
+
+        // Verify the token totals are distinct (100 and 200, not 300 merged).
+        let mut all_totals: Vec<i64> = sessions.values().map(|v| v[0]).collect();
+        all_totals.sort();
+        assert_eq!(all_totals, vec![100, 200], "each session keeps its own tokens");
 
         if let Some(value) = old_app_dir {
             std::env::set_var("COPILOT_APP_DIR", value);

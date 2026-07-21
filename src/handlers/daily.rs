@@ -500,20 +500,24 @@ pub async fn get_usage_details(
     }
 
     let mut summary = DaySummary::default();
-    let mut sessions_map: HashMap<String, (Vec<UsageEntry>, String)> = HashMap::new();
+    // Session identity = (session_id, source_dir_key) so that rows from
+    // different COPILOT_APP_DIR with the same session_id are not merged.
+    let mut sessions_map: HashMap<(String, Option<String>), (Vec<UsageEntry>, String)> =
+        HashMap::new();
     let mut entries = Vec::new();
 
     for (record, ast_type) in &entries_with_type {
         let e = &record.entry;
         entries.push(e.clone());
+        let key = (e.session_id.clone(), e.source_dir_key.clone());
         let (list, _) = sessions_map
-            .entry(e.session_id.clone())
+            .entry(key)
             .or_insert_with(|| (Vec::new(), ast_type.clone()));
         list.push(e.clone());
     }
 
     summary.total_sessions = sessions_map.len();
-    let mut session_last_entries: HashMap<String, UsageEntry> = HashMap::new();
+    let mut session_last_entries: HashMap<(String, Option<String>), UsageEntry> = HashMap::new();
 
     for e in &entries {
         if let Some(ref tokens) = e.delta_tokens {
@@ -534,8 +538,8 @@ pub async fn get_usage_details(
             }
         }
 
-        let sid = e.session_id.clone();
-        let last_e = session_last_entries.entry(sid).or_insert_with(|| e.clone());
+        let key = (e.session_id.clone(), e.source_dir_key.clone());
+        let last_e = session_last_entries.entry(key).or_insert_with(|| e.clone());
         if e.turn_no > last_e.turn_no {
             *last_e = e.clone();
         }
@@ -544,9 +548,10 @@ pub async fn get_usage_details(
     let pricing_rules = load_pricing_rules();
     let mut sessions_summary = Vec::new();
 
-    for (session_id, (s_entries, ast_type)) in &sessions_map {
+    for ((session_id, _source_dir_key), (s_entries, ast_type)) in &sessions_map {
+        let key = (session_id.clone(), _source_dir_key.clone());
         let last_entry = session_last_entries
-            .get(session_id)
+            .get(&key)
             .cloned()
             .unwrap_or_else(|| s_entries[0].clone());
 
@@ -885,7 +890,7 @@ pub async fn get_session_details(
             .into_response();
     }
 
-    let session_info: Result<(String, Option<String>, String), String> =
+    let session_info: Result<(String, Option<String>, String, Option<String>), String> =
         tokio::task::spawn_blocking({
             let sid = session_id.clone();
             let assistant_name = assistant.clone();
@@ -897,7 +902,7 @@ pub async fn get_session_details(
         .await
         .unwrap_or_else(|_| Err("執行緒執行失敗".to_string()));
 
-    let (resolved_assistant, transcript_path_db, source_kind) = match session_info {
+    let (resolved_assistant, transcript_path_db, source_kind, source_dir_key) = match session_info {
         Ok(info) => info,
         Err(e) => {
             return (
@@ -948,11 +953,14 @@ pub async fn get_session_details(
 
     // 3. 預先載入 SQLite 中的回合 (turn_no) 增量 token 數據
     let sid_clone = session_id.clone();
+    let sdk_clone = source_dir_key.clone();
     let (db_entries, session_cwd): (HashMap<u32, (TokenStats, String)>, Option<String>) =
         tokio::task::spawn_blocking(move || {
             if let Ok(conn) = db::get_db_conn() {
-                let session_cwd = db::get_session_cwd(&conn, &sid_clone).unwrap_or(None);
-                let map = db::get_session_turns_token_stats(&conn, &sid_clone).unwrap_or_default();
+                let session_cwd =
+                    db::get_session_cwd(&conn, &sid_clone, sdk_clone.as_deref()).unwrap_or(None);
+                let map = db::get_session_turns_token_stats(&conn, &sid_clone, sdk_clone.as_deref())
+                    .unwrap_or_default();
                 (map, session_cwd)
             } else {
                 (HashMap::new(), None)

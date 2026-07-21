@@ -306,6 +306,7 @@ pub fn to_usage_entries(session: &ChatSession, path: &Path) -> Vec<UsageEntry> {
                 context: None,
                 cost,
                 source_kind: Some(SOURCE_KIND.to_string()),
+                source_dir_key: None,
                 parent_session_id: None,
                 agent_nickname: None,
                 agent_role: None,
