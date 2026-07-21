@@ -112,11 +112,11 @@ const COPILOT_SOURCE_KIND_MIGRATION_KEY: &str = "migration:copilot_source_kind_v
 const COPILOT_APP_SOURCE_KIND: &str = "copilot-app";
 
 /// `sync_state.filename` key prefix storing the maximum
-/// `assistant_usage_events.created_at` (textual UTC timestamp) seen during the
-/// last Copilot App sync. The full cursor filename is
-/// `sync:copilot_app:cursor:<canonical_source_path>::<ts>`, so the cursor is
-/// scoped per source directory and switching `COPILOT_APP_DIR`/`COPILOT_DIR`
-/// starts a fresh cursor instead of reusing the previous directory's.
+/// The full cursor filename is
+/// `sync:copilot_app:cursor:<hex(canonical_source_path)>::<created_at>::<id>`.
+/// The cursor is scoped per source directory and switching
+/// `COPILOT_APP_DIR`/`COPILOT_DIR` starts a fresh cursor instead of reusing the
+/// previous directory's.
 const COPILOT_APP_CURSOR_PREFIX: &str = "sync:copilot_app:cursor:";
 const VSCODE_EMPTY_SESSION_MIGRATION_KEY: &str = "migration:vscode_empty_sessions_v1";
 const COPILOT_CACHED_INPUT_MIGRATION_KEY: &str = "migration:copilot_cached_input_v1";
@@ -1559,8 +1559,8 @@ fn portable_relative_path(root: &Path, path: &Path) -> String {
 /// deduplicates via the `import_source_id` unique index
 /// (`copilot-app:<session_id>:<turn_index>`).
 ///
-/// Incremental sync is tracked by storing the maximum `created_at` seen in
-/// `sync_state`, scoped by the canonical source directory so switching
+/// Incremental sync is tracked by storing the maximum `(created_at, id)` seen
+/// in `sync_state`, scoped by the canonical source directory so switching
 /// `COPILOT_APP_DIR`/`COPILOT_DIR` starts a fresh cursor.
 ///
 /// Because `assistant_usage_events` records per-API-call usage (not cumulative
@@ -1631,15 +1631,11 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
         let _ = c.busy_timeout(std::time::Duration::from_secs(2));
     }
 
-    // Load last sync cursor (scoped by canonical source path). The cursor
-    // stores the textual `created_at` value as the suffix of the filename:
-    //   sync:copilot_app:cursor:<hex(canonical_path)>::<ts>
-    // The hex prefix is injective and contains only [0-9a-f], so a LIKE
-    // lookup on `<prefix>%` cannot wildcard-match another directory's
-    // cursor, and `:`->`_` style collisions are impossible. We still use
-    // `>= cursor` plus upsert so events sharing the cursor timestamp are
-    // re-processed idempotently.
-    let last_cursor: Option<String> = conn
+    // Load last sync cursor (scoped by canonical source path). New cursors
+    // store `created_at` and the INTEGER event id. A legacy timestamp-only
+    // cursor is read as `(timestamp, i64::MIN)` so all events at that
+    // timestamp are safely re-processed once before it is upgraded.
+    let stored_cursor: Option<String> = conn
         .query_row(
             "SELECT filename FROM sync_state WHERE filename LIKE ? ESCAPE '\\' LIMIT 1",
             params![format!("{}%", cursor_key_prefix)],
@@ -1647,41 +1643,42 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
         )
         .ok()
         .and_then(|f| f.strip_prefix(&cursor_key_prefix).map(|s| s.to_string()));
+    let (last_cursor, legacy_cursor) = stored_cursor
+        .map(|suffix| parse_copilot_app_cursor(&suffix))
+        .unwrap_or((None, false));
 
-    // Determine the set of (session_id, turn_index) pairs that have any event
-    // at or after the cursor, plus the maximum raw event `created_at` across
-    // all touched rows. These are the "touched" turns that must be
-    // re-aggregated from the full event history (not just new events), so
-    // turns that received additional API calls after the first sync are
-    // updated rather than silently dropped by INSERT OR IGNORE.
-    //
-    // The cursor advances to the max raw event timestamp (not MIN(created_at)
-    // per turn) so a turn whose events straddle the cursor does not keep the
-    // cursor pinned at its earliest event and get re-aggregated forever.
+    // Scan new events in stable high-water-mark order. The legacy path uses
+    // the same strict tuple predicate, with the minimum INTEGER id as its
+    // one-time compatibility baseline.
     let touched_query = if last_cursor.is_some() {
-        "SELECT DISTINCT session_id, turn_index, MAX(created_at) AS max_ts
+        "SELECT session_id, turn_index, created_at, id
          FROM assistant_usage_events
-         WHERE created_at >= ?
-         GROUP BY session_id, turn_index"
+         WHERE created_at > ?
+            OR (created_at = ? AND id > ?)
+         ORDER BY created_at ASC, id ASC"
     } else {
-        "SELECT session_id, turn_index, MAX(created_at) AS max_ts
+        "SELECT session_id, turn_index, created_at, id
          FROM assistant_usage_events
-         GROUP BY session_id, turn_index"
+         ORDER BY created_at ASC, id ASC"
     };
 
     let mut touched_stmt = session_store
         .prepare(touched_query)
         .map_err(|e| format!("準備 Copilot App touched-turns 查詢失敗: {}", e))?;
-    let map_touched = |row: &rusqlite::Row| -> rusqlite::Result<(String, i64, String)> {
+    let map_touched = |row: &rusqlite::Row| -> rusqlite::Result<(String, i64, String, i64)> {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, i64>(1)?,
             row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
         ))
     };
     let touched_iter = if let Some(ref cursor) = last_cursor {
         touched_stmt
-            .query_map(params![cursor.as_str()], map_touched)
+            .query_map(
+                params![cursor.0.as_str(), cursor.0.as_str(), cursor.1],
+                map_touched,
+            )
             .map_err(|e| format!("執行 Copilot App touched-turns 查詢失敗: {}", e))?
     } else {
         touched_stmt
@@ -1689,22 +1686,59 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
             .map_err(|e| format!("執行 Copilot App touched-turns 查詢失敗: {}", e))?
     };
 
-    // (session_id, turn_index) plus the max raw event ts seen this sync.
+    // Deduplicate touched turns while preserving the stable event order, and
+    // retain the final event tuple as the source high-water mark.
     let mut touched_turns: Vec<(String, i64)> = Vec::new();
-    let mut max_event_ts: Option<String> = None;
+    let mut touched_set: HashSet<(String, i64)> = HashSet::new();
+    let mut max_event_cursor: Option<(String, i64)> = None;
+    let mut scan_failed = false;
     for row_res in touched_iter {
         match row_res {
-            Ok((session_id, turn_index, ts)) => {
-                if max_event_ts.as_deref().is_none_or(|m| ts.as_str() > m) {
-                    max_event_ts = Some(ts);
+            Ok((session_id, turn_index, created_at, id)) => {
+                max_event_cursor = Some((created_at, id));
+                if touched_set.insert((session_id.clone(), turn_index)) {
+                    touched_turns.push((session_id, turn_index));
                 }
-                touched_turns.push((session_id, turn_index));
             }
-            Err(e) => eprintln!("⚠️ 讀取 Copilot App touched-turn 失敗: {}", e),
+            Err(e) => {
+                eprintln!("⚠️ 讀取 Copilot App touched-turn 失敗: {}", e);
+                scan_failed = true;
+            }
         }
     }
 
+    if scan_failed {
+        return Ok(());
+    }
+
+    // Upgrade a legacy timestamp-only cursor even when there are no events
+    // after it. The maximum id at the legacy timestamp is the safest tuple
+    // boundary and prevents the old timestamp from causing repeated scans.
     if touched_turns.is_empty() {
+        if legacy_cursor {
+            let legacy_timestamp = last_cursor
+                .as_ref()
+                .map(|cursor| cursor.0.as_str())
+                .ok_or_else(|| "Copilot App legacy cursor 遺失 timestamp".to_string())?;
+            let max_id: Option<i64> = session_store
+                .query_row(
+                    "SELECT MAX(id) FROM assistant_usage_events WHERE created_at = ?",
+                    params![legacy_timestamp],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("讀取 Copilot App legacy cursor id 失敗: {}", e))?;
+            let tx = conn.transaction().map_err(|e| {
+                format!("開啟 Copilot App cursor migration transaction 失敗: {}", e)
+            })?;
+            write_copilot_app_cursor(
+                &tx,
+                &cursor_key_prefix,
+                legacy_timestamp,
+                max_id.unwrap_or(0),
+            )?;
+            tx.commit()
+                .map_err(|e| format!("Copilot App cursor migration COMMIT 失敗: {}", e))?;
+        }
         return Ok(());
     }
 
@@ -1736,7 +1770,6 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
         .map_err(|e| format!("準備 Copilot App 聚合查詢失敗: {}", e))?;
 
     let mut turn_rows: Vec<CopilotAppTurnRow> = Vec::new();
-    let mut failed = 0usize;
     for (session_id, turn_index) in &touched_turns {
         let row_res = agg_stmt.query_row(params![session_id, turn_index], |row| {
             let raw_input: i64 = row.get::<_, Option<i64>>(1)?.unwrap_or(0).max(0);
@@ -1764,7 +1797,7 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
                     "⚠️ 聚合 Copilot App turn (session {} turn {}) 失敗: {}",
                     session_id, turn_index, e
                 );
-                failed += 1;
+                return Ok(());
             }
         }
     }
@@ -1867,13 +1900,13 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
                     "⚠️ 寫入 Copilot App usage 失敗 (session {} turn {}): {}",
                     row.session_id, row.turn_index, e
                 );
-                failed += 1;
+                let _ = tx.rollback();
+                return Ok(());
             }
         }
     }
 
-    // Update cursor: delete old cursor row(s) for this source directory and
-    // insert a new one with the textual timestamp encoded in the filename.
+    // Store the maximum raw event tuple for this source directory.
     // Use the max raw event `created_at` (not per-turn MIN) so a turn whose
     // events straddle the cursor does not pin the cursor at its earliest event
     // and get re-aggregated on every subsequent sync.
@@ -1882,27 +1915,12 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
     // written successfully. If any turn failed (aggregation or upsert error),
     // keep the cursor at its previous value so the failed turns are retried on
     // the next sync instead of being permanently skipped.
-    if failed == 0 {
-        if let Some(ts) = max_event_ts {
-            let now = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64;
-            let _ = tx.execute(
-                "DELETE FROM sync_state WHERE filename LIKE ? ESCAPE '\\'",
-                params![format!("{}%", cursor_key_prefix)],
-            );
-            let cursor_sentinel = format!("{}{}", cursor_key_prefix, ts);
-            let _ = tx.execute(
-                "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time) VALUES (?, ?, ?)",
-                params![cursor_sentinel, 0i64, now],
-            );
+    if let Some((created_at, id)) = max_event_cursor {
+        if let Err(e) = write_copilot_app_cursor(&tx, &cursor_key_prefix, &created_at, id) {
+            eprintln!("⚠️ 寫入 Copilot App cursor 失敗: {}", e);
+            let _ = tx.rollback();
+            return Ok(());
         }
-    } else {
-        eprintln!(
-            "⚠️ Copilot App 同步有 {} 個 turn 失敗，cursor 不前進以便下次重試",
-            failed
-        );
     }
 
     tx.commit()
@@ -1911,6 +1929,46 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
     if upserted > 0 {
         println!("✅ 同步 Copilot App：{} 筆 turn（upsert）", upserted);
     }
+    Ok(())
+}
+
+fn parse_copilot_app_cursor(suffix: &str) -> (Option<(String, i64)>, bool) {
+    if let Some((created_at, id)) = suffix.rsplit_once("::") {
+        if !created_at.is_empty() {
+            if let Ok(id) = id.parse::<i64>() {
+                return (Some((created_at.to_string(), id)), false);
+            }
+        }
+    }
+
+    if suffix.is_empty() {
+        (None, false)
+    } else {
+        (Some((suffix.to_string(), i64::MIN)), true)
+    }
+}
+
+fn write_copilot_app_cursor(
+    tx: &rusqlite::Transaction<'_>,
+    cursor_key_prefix: &str,
+    created_at: &str,
+    id: i64,
+) -> Result<(), String> {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    tx.execute(
+        "DELETE FROM sync_state WHERE filename LIKE ? ESCAPE '\\'",
+        params![format!("{}%", cursor_key_prefix)],
+    )
+    .map_err(|e| format!("刪除舊 Copilot App cursor 失敗: {}", e))?;
+    let cursor_sentinel = format!("{}{}::{}", cursor_key_prefix, created_at, id);
+    tx.execute(
+        "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time) VALUES (?, ?, ?)",
+        params![cursor_sentinel, 0i64, now],
+    )
+    .map_err(|e| format!("寫入 Copilot App cursor 失敗: {}", e))?;
     Ok(())
 }
 
@@ -5201,7 +5259,7 @@ mod tests {
         session_store
             .execute(
                 "CREATE TABLE assistant_usage_events (
-                    id TEXT PRIMARY KEY,
+                    id INTEGER PRIMARY KEY,
                     session_id TEXT,
                     turn_index INTEGER,
                     model TEXT,
@@ -5222,7 +5280,7 @@ mod tests {
         let session_b = "app-session-b";
         for turn in 0..3i64 {
             for session_id in [session_a, session_b] {
-                let id = format!("{}-{}-{}", session_id, turn, 0);
+                let id = turn * 2 + if session_id == session_a { 1 } else { 2 };
                 let ts = format!("2026-07-20 10:0{}:00", turn);
                 session_store
                     .execute(
@@ -5347,7 +5405,23 @@ mod tests {
             .unwrap();
         assert_eq!(cursor_count, 1);
 
-        // Second run should insert 0 new rows (idempotent upsert via import_source_id).
+        let snapshot_before_second: Vec<(String, i64, i64, i64)> = conn
+            .prepare(
+                "SELECT session_id, turn_no, tokens_input, tokens_total
+                 FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'
+                 ORDER BY session_id, turn_no",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+
+        // Second run has no new events: it must be quiet and perform zero
+        // upserts, leaving all persisted turn data unchanged.
         sync_copilot_app_usage_logs(&mut conn).unwrap();
         let total_after: u64 = conn
             .query_row(
@@ -5358,6 +5432,21 @@ mod tests {
             )
             .unwrap();
         assert_eq!(total_after, 6, "second sync should not duplicate rows");
+        let snapshot_after_second: Vec<(String, i64, i64, i64)> = conn
+            .prepare(
+                "SELECT session_id, turn_no, tokens_input, tokens_total
+                 FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'
+                 ORDER BY session_id, turn_no",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(snapshot_after_second, snapshot_before_second);
 
         if let Some(value) = old_app_dir {
             std::env::set_var("COPILOT_APP_DIR", value);
@@ -5383,7 +5472,7 @@ mod tests {
         session_store
             .execute(
                 "CREATE TABLE assistant_usage_events (
-                    id TEXT PRIMARY KEY,
+                    id INTEGER PRIMARY KEY,
                     session_id TEXT,
                     turn_index INTEGER,
                     model TEXT,
@@ -5410,7 +5499,7 @@ mod tests {
                      cache_read_tokens, cache_write_tokens,
                      reasoning_tokens, duration_ms,
                      reasoning_effort, created_at)
-                 VALUES ('a-0-0', ?, 0, 'gpt-5', 100, 10, 0, 0, 0, 100, 'medium', '2026-07-20 10:00:00')",
+                 VALUES (1, ?, 0, 'gpt-5', 100, 10, 0, 0, 0, 100, 'medium', '2026-07-20 10:00:00')",
                 params![session_a],
             )
             .unwrap();
@@ -5442,7 +5531,7 @@ mod tests {
                      cache_read_tokens, cache_write_tokens,
                      reasoning_tokens, duration_ms,
                      reasoning_effort, created_at)
-                 VALUES ('a-0-1', ?, 0, 'gpt-5', 250, 20, 0, 0, 0, 100, 'medium', '2026-07-20 10:00:05')",
+                 VALUES (2, ?, 0, 'gpt-5', 250, 20, 0, 0, 0, 100, 'medium', '2026-07-20 10:00:05')",
                 params![session_a],
             )
             .unwrap();
@@ -5500,7 +5589,7 @@ mod tests {
             store
                 .execute(
                     "CREATE TABLE assistant_usage_events (
-                        id TEXT PRIMARY KEY,
+                        id INTEGER PRIMARY KEY,
                         session_id TEXT,
                         turn_index INTEGER,
                         model TEXT,
@@ -5531,7 +5620,7 @@ mod tests {
                      cache_read_tokens, cache_write_tokens,
                      reasoning_tokens, duration_ms,
                      reasoning_effort, created_at)
-                 VALUES ('a-a-0', 'sess-a', 0, 'gpt-5', 100, 10, 0, 0, 0, 100, 'medium', '2026-07-20 10:00:00')",
+                 VALUES (1, 'sess-a', 0, 'gpt-5', 100, 10, 0, 0, 0, 100, 'medium', '2026-07-20 10:00:00')",
                 [],
             )
             .unwrap();
@@ -5545,7 +5634,7 @@ mod tests {
                      cache_read_tokens, cache_write_tokens,
                      reasoning_tokens, duration_ms,
                      reasoning_effort, created_at)
-                 VALUES ('b-b-0', 'sess-b', 0, 'gpt-5', 50, 5, 0, 0, 0, 100, 'medium', '2026-07-19 09:00:00')",
+                 VALUES (1, 'sess-b', 0, 'gpt-5', 50, 5, 0, 0, 0, 100, 'medium', '2026-07-19 09:00:00')",
                 [],
             )
             .unwrap();
@@ -5595,6 +5684,202 @@ mod tests {
         let _ = fs::remove_dir_all(base_dir);
     }
 
+    /// Events can share a timestamp, so the event id must be part of both the
+    /// ordering and the high-water mark.
+    #[test]
+    fn sync_copilot_app_usage_logs_imports_same_timestamp_events_once() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_app_dir = std::env::var("COPILOT_APP_DIR").ok();
+
+        let base_dir = temp_jsonl_path("copilot-app-same-timestamp").with_extension("");
+        let app_dir = base_dir.join("copilot-app");
+        fs::create_dir_all(&app_dir).unwrap();
+        let session_store = Connection::open(app_dir.join("session-store.db")).unwrap();
+        session_store
+            .execute(
+                "CREATE TABLE assistant_usage_events (
+                    id INTEGER PRIMARY KEY,
+                    session_id TEXT,
+                    turn_index INTEGER,
+                    model TEXT,
+                    input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    cache_read_tokens INTEGER,
+                    cache_write_tokens INTEGER,
+                    reasoning_tokens INTEGER,
+                    duration_ms INTEGER,
+                    reasoning_effort TEXT,
+                    created_at TEXT
+                 )",
+                [],
+            )
+            .unwrap();
+
+        for (id, session_id, turn_index, input) in [
+            (1i64, "same-ts", 0i64, 10i64),
+            (2, "same-ts", 1, 20),
+            (3, "same-ts", 0, 30),
+        ] {
+            session_store
+                .execute(
+                    "INSERT INTO assistant_usage_events
+                        (id, session_id, turn_index, model, input_tokens,
+                         output_tokens, cache_read_tokens, cache_write_tokens,
+                         reasoning_tokens, duration_ms, reasoning_effort, created_at)
+                     VALUES (?, ?, ?, 'gpt-5', ?, 1, 0, 0, 0, 100, 'medium',
+                             '2026-07-20 10:00:00')",
+                    params![id, session_id, turn_index, input],
+                )
+                .unwrap();
+        }
+
+        std::env::set_var("COPILOT_APP_DIR", &app_dir);
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+        let cursor: String = conn
+            .query_row(
+                "SELECT filename FROM sync_state
+                 WHERE filename LIKE 'sync:copilot_app:cursor:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(cursor.ends_with("::2026-07-20 10:00:00::3"));
+
+        let first_snapshot: Vec<(i64, i64)> = conn
+            .prepare(
+                "SELECT turn_no, tokens_input FROM usage_entries
+                 WHERE source_kind = 'copilot-app' ORDER BY turn_no",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(first_snapshot, vec![(1, 40), (2, 20)]);
+
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+        let second_snapshot: Vec<(i64, i64)> = conn
+            .prepare(
+                "SELECT turn_no, tokens_input FROM usage_entries
+                 WHERE source_kind = 'copilot-app' ORDER BY turn_no",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(second_snapshot, first_snapshot);
+
+        if let Some(value) = old_app_dir {
+            std::env::set_var("COPILOT_APP_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_APP_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    /// A timestamp-only cursor must re-scan its timestamp boundary once and
+    /// then persist the upgraded tuple cursor without recurring re-syncs.
+    #[test]
+    fn sync_copilot_app_usage_logs_upgrades_legacy_timestamp_cursor() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_app_dir = std::env::var("COPILOT_APP_DIR").ok();
+
+        let base_dir = temp_jsonl_path("copilot-app-legacy-cursor").with_extension("");
+        let app_dir = base_dir.join("copilot-app");
+        fs::create_dir_all(&app_dir).unwrap();
+        let session_store = Connection::open(app_dir.join("session-store.db")).unwrap();
+        session_store
+            .execute(
+                "CREATE TABLE assistant_usage_events (
+                    id INTEGER PRIMARY KEY,
+                    session_id TEXT,
+                    turn_index INTEGER,
+                    model TEXT,
+                    input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    cache_read_tokens INTEGER,
+                    cache_write_tokens INTEGER,
+                    reasoning_tokens INTEGER,
+                    duration_ms INTEGER,
+                    reasoning_effort TEXT,
+                    created_at TEXT
+                 )",
+                [],
+            )
+            .unwrap();
+        session_store
+            .execute(
+                "INSERT INTO assistant_usage_events
+                    (id, session_id, turn_index, model, input_tokens,
+                     output_tokens, cache_read_tokens, cache_write_tokens,
+                     reasoning_tokens, duration_ms, reasoning_effort, created_at)
+                 VALUES (1, 'legacy-sess', 0, 'gpt-5', 10, 1, 0, 0, 0, 100,
+                         'medium', '2026-07-20 10:00:00'),
+                        (2, 'legacy-sess', 1, 'gpt-5', 20, 2, 0, 0, 0, 100,
+                         'medium', '2026-07-20 10:00:00'),
+                        (3, 'legacy-sess', 0, 'gpt-5', 30, 3, 0, 0, 0, 100,
+                         'medium', '2026-07-20 10:05:00')",
+                [],
+            )
+            .unwrap();
+
+        std::env::set_var("COPILOT_APP_DIR", &app_dir);
+        let canonical_app_dir = app_dir.canonicalize().unwrap();
+        let source_key = encode_hex(canonical_app_dir.as_os_str().as_encoded_bytes());
+        let cursor_prefix = format!("{}{}::", COPILOT_APP_CURSOR_PREFIX, source_key);
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES (?, 0, 0)",
+            params![format!("{}2026-07-20 10:00:00", cursor_prefix)],
+        )
+        .unwrap();
+
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+        let cursor: String = conn
+            .query_row(
+                "SELECT filename FROM sync_state WHERE filename LIKE 'sync:copilot_app:cursor:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(cursor.ends_with("::2026-07-20 10:05:00::3"));
+
+        let totals: (i64, i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*),
+                        (SELECT tokens_input FROM usage_entries WHERE turn_no = 1),
+                        (SELECT tokens_input FROM usage_entries WHERE turn_no = 2)
+                 FROM usage_entries WHERE source_kind = 'copilot-app'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(totals, (2, 40, 20));
+
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+        let count_after_second: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries WHERE source_kind = 'copilot-app'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count_after_second, 2);
+
+        if let Some(value) = old_app_dir {
+            std::env::set_var("COPILOT_APP_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_APP_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
     /// Verify that cache-read tokens are not double-counted.
     /// `assistant_usage_events.input_tokens` already includes cache reads, so
     /// `tokens_input` must be normalized to `input - cache_read`, and
@@ -5612,7 +5897,7 @@ mod tests {
         session_store
             .execute(
                 "CREATE TABLE assistant_usage_events (
-                    id TEXT PRIMARY KEY,
+                    id INTEGER PRIMARY KEY,
                     session_id TEXT,
                     turn_index INTEGER,
                     model TEXT,
@@ -5640,7 +5925,7 @@ mod tests {
                      cache_read_tokens, cache_write_tokens,
                      reasoning_tokens, duration_ms,
                      reasoning_effort, created_at)
-                 VALUES ('c-0', 'sess-c', 0, 'gpt-5', 443554, 1370, 401024, 0, 384, 100, 'medium', '2026-07-20 10:00:00')",
+                 VALUES (1, 'sess-c', 0, 'gpt-5', 443554, 1370, 401024, 0, 384, 100, 'medium', '2026-07-20 10:00:00')",
                 [],
             )
             .unwrap();
@@ -5694,9 +5979,9 @@ mod tests {
         let _ = fs::remove_dir_all(base_dir);
     }
 
-    /// Verify the cursor advances to the max raw event `created_at`, not the
-    /// per-turn MIN, so a turn whose events straddle the cursor does not get
-    /// re-aggregated forever on subsequent syncs.
+    /// Verify the cursor advances to the max raw event `(created_at, id)`, not
+    /// the per-turn MIN, so a turn whose events straddle the cursor does not
+    /// get re-aggregated forever on subsequent syncs.
     #[test]
     fn sync_copilot_app_usage_logs_cursor_advances_to_max_event_ts() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -5710,7 +5995,7 @@ mod tests {
         session_store
             .execute(
                 "CREATE TABLE assistant_usage_events (
-                    id TEXT PRIMARY KEY,
+                    id INTEGER PRIMARY KEY,
                     session_id TEXT,
                     turn_index INTEGER,
                     model TEXT,
@@ -5737,7 +6022,7 @@ mod tests {
                      cache_read_tokens, cache_write_tokens,
                      reasoning_tokens, duration_ms,
                      reasoning_effort, created_at)
-                 VALUES ('a-0-0', ?, 0, 'gpt-5', 100, 10, 0, 0, 0, 100, 'medium', '2026-07-20 10:00:00')",
+                 VALUES (1, ?, 0, 'gpt-5', 100, 10, 0, 0, 0, 100, 'medium', '2026-07-20 10:00:00')",
                 params![session_a],
             )
             .unwrap();
@@ -5749,7 +6034,7 @@ mod tests {
                      cache_read_tokens, cache_write_tokens,
                      reasoning_tokens, duration_ms,
                      reasoning_effort, created_at)
-                 VALUES ('a-0-1', ?, 0, 'gpt-5', 200, 20, 0, 0, 0, 100, 'medium', '2026-07-20 10:05:00')",
+                 VALUES (2, ?, 0, 'gpt-5', 200, 20, 0, 0, 0, 100, 'medium', '2026-07-20 10:05:00')",
                 params![session_a],
             )
             .unwrap();
@@ -5761,7 +6046,7 @@ mod tests {
 
         sync_copilot_app_usage_logs(&mut conn).unwrap();
 
-        // The cursor must be at 10:05 (max raw event ts), not 10:00 (per-turn MIN).
+        // The cursor must be at the max raw event tuple, not the per-turn MIN.
         let cursor: String = conn
             .query_row(
                 "SELECT filename FROM sync_state
@@ -5771,14 +6056,13 @@ mod tests {
             )
             .unwrap();
         assert!(
-            cursor.ends_with("::2026-07-20 10:05:00"),
-            "cursor must advance to max raw event ts, got: {}",
+            cursor.ends_with("::2026-07-20 10:05:00::2"),
+            "cursor must advance to max raw event tuple, got: {}",
             cursor
         );
 
-        // A second sync with NO new events is idempotent: the turn straddling
-        // the cursor (10:05 == cursor) is re-aggregated but upserted to the
-        // same row, so the total stays at 300 and no duplicate rows appear.
+        // A second sync with NO new events is quiet: the turn straddling the
+        // old timestamp is not re-aggregated, so the total stays at 300.
         sync_copilot_app_usage_logs(&mut conn).unwrap();
         let row_count: u64 = conn
             .query_row(
@@ -5812,7 +6096,7 @@ mod tests {
         let _ = fs::remove_dir_all(base_dir);
     }
 
-    /// Verify the cursor does NOT advance when a turn fails to write, so the
+    /// Verify the cursor and usage rows do NOT change when a turn fails to write, so the
     /// failed turn is retried on the next sync instead of being permanently
     /// skipped. We simulate a write failure by installing a trigger on
     /// `usage_entries` that rejects inserts for `copilot-app` source_kind.
@@ -5829,7 +6113,7 @@ mod tests {
         session_store
             .execute(
                 "CREATE TABLE assistant_usage_events (
-                    id TEXT PRIMARY KEY,
+                    id INTEGER PRIMARY KEY,
                     session_id TEXT,
                     turn_index INTEGER,
                     model TEXT,
@@ -5855,7 +6139,7 @@ mod tests {
                      cache_read_tokens, cache_write_tokens,
                      reasoning_tokens, duration_ms,
                      reasoning_effort, created_at)
-                 VALUES ('a-0', ?, 0, 'gpt-5', 100, 10, 0, 0, 0, 100, 'medium', '2026-07-20 10:00:00')",
+                 VALUES (1, ?, 0, 'gpt-5', 100, 10, 0, 0, 0, 100, 'medium', '2026-07-20 10:00:00')",
                 params![session_a],
             )
             .unwrap();
@@ -5876,7 +6160,7 @@ mod tests {
             )
             .unwrap();
         assert!(
-            cursor_after_first.ends_with("::2026-07-20 10:00:00"),
+            cursor_after_first.ends_with("::2026-07-20 10:00:00::1"),
             "cursor should be at 10:00:00 after first sync, got: {}",
             cursor_after_first
         );
@@ -5904,7 +6188,7 @@ mod tests {
                      cache_read_tokens, cache_write_tokens,
                      reasoning_tokens, duration_ms,
                      reasoning_effort, created_at)
-                 VALUES ('a-1', ?, 1, 'gpt-5', 200, 20, 0, 0, 0, 100, 'medium', '2026-07-20 10:05:00')",
+                 VALUES (2, ?, 1, 'gpt-5', 200, 20, 0, 0, 0, 100, 'medium', '2026-07-20 10:05:00')",
                 params![session_a],
             )
             .unwrap();
@@ -5913,6 +6197,15 @@ mod tests {
 
         // Cursor must NOT have advanced to 10:05 because the upsert failed; it
         // must remain at 10:00:00 so the turn is retried next sync.
+        let usage_count_after_failure: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(usage_count_after_failure, 1, "failed upsert must rollback");
         let cursor_after_failure: String = conn
             .query_row(
                 "SELECT filename FROM sync_state
@@ -5922,7 +6215,7 @@ mod tests {
             )
             .unwrap();
         assert!(
-            cursor_after_failure.ends_with("::2026-07-20 10:00:00"),
+            cursor_after_failure.ends_with("::2026-07-20 10:00:00::1"),
             "cursor must not advance on write failure, got: {}",
             cursor_after_failure
         );
@@ -5951,7 +6244,7 @@ mod tests {
         session_store
             .execute(
                 "CREATE TABLE assistant_usage_events (
-                    id TEXT PRIMARY KEY,
+                    id INTEGER PRIMARY KEY,
                     session_id TEXT,
                     turn_index INTEGER,
                     model TEXT,
@@ -5976,7 +6269,7 @@ mod tests {
                      cache_read_tokens, cache_write_tokens,
                      reasoning_tokens, duration_ms,
                      reasoning_effort, created_at)
-                 VALUES ('x-0', 'sess-x', 0, 'gpt-5', 100, 10, 0, 0, 0, 100, 'medium', '2026-07-20 10:00:00')",
+                 VALUES (1, 'sess-x', 0, 'gpt-5', 100, 10, 0, 0, 0, 100, 'medium', '2026-07-20 10:00:00')",
                 [],
             )
             .unwrap();
@@ -6046,7 +6339,7 @@ mod tests {
             store
                 .execute(
                     "CREATE TABLE assistant_usage_events (
-                        id TEXT PRIMARY KEY,
+                        id INTEGER PRIMARY KEY,
                         session_id TEXT,
                         turn_index INTEGER,
                         model TEXT,
@@ -6078,7 +6371,7 @@ mod tests {
                      cache_read_tokens, cache_write_tokens,
                      reasoning_tokens, duration_ms,
                      reasoning_effort, created_at)
-                 VALUES ('a-0', 'shared-sess', 0, 'gpt-5', 100, 10, 0, 0, 0, 100, 'medium', '2026-07-20 10:00:00')",
+                 VALUES (1, 'shared-sess', 0, 'gpt-5', 100, 10, 0, 0, 0, 100, 'medium', '2026-07-20 10:00:00')",
                 [],
             )
             .unwrap();
@@ -6090,7 +6383,7 @@ mod tests {
                      cache_read_tokens, cache_write_tokens,
                      reasoning_tokens, duration_ms,
                      reasoning_effort, created_at)
-                 VALUES ('b-0', 'shared-sess', 0, 'gpt-5', 200, 20, 0, 0, 0, 100, 'medium', '2026-07-20 09:00:00')",
+                 VALUES (1, 'shared-sess', 0, 'gpt-5', 200, 20, 0, 0, 0, 100, 'medium', '2026-07-20 09:00:00')",
                 [],
             )
             .unwrap();
@@ -6271,7 +6564,7 @@ mod tests {
             store
                 .execute(
                     "CREATE TABLE assistant_usage_events (
-                        id TEXT PRIMARY KEY,
+                        id INTEGER PRIMARY KEY,
                         session_id TEXT,
                         turn_index INTEGER,
                         model TEXT,
@@ -6302,7 +6595,7 @@ mod tests {
                      cache_read_tokens, cache_write_tokens,
                      reasoning_tokens, duration_ms,
                      reasoning_effort, created_at)
-                 VALUES ('a-0', 'shared-sess', 0, 'gpt-5', 100, 10, 0, 0, 0, 100, 'medium', '2026-07-20 10:00:00')",
+                 VALUES (1, 'shared-sess', 0, 'gpt-5', 100, 10, 0, 0, 0, 100, 'medium', '2026-07-20 10:00:00')",
                 [],
             )
             .unwrap();
@@ -6314,7 +6607,7 @@ mod tests {
                      cache_read_tokens, cache_write_tokens,
                      reasoning_tokens, duration_ms,
                      reasoning_effort, created_at)
-                 VALUES ('b-0', 'shared-sess', 0, 'gpt-5', 200, 20, 0, 0, 0, 100, 'medium', '2026-07-20 09:00:00')",
+                 VALUES (1, 'shared-sess', 0, 'gpt-5', 200, 20, 0, 0, 0, 100, 'medium', '2026-07-20 09:00:00')",
                 [],
             )
             .unwrap();
