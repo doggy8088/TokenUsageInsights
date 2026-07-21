@@ -385,6 +385,11 @@ pub async fn get_setup_info(Path(assistant): Path<String>) -> impl IntoResponse 
     let cursor_dir = db::get_cursor_dir();
     let cursor_exists = cursor_dir.join("projects").exists();
 
+    let copilot_app_dir = crate::paths::copilot_app_dir();
+    let copilot_app_data_db = copilot_app_dir.join("data.db");
+    let copilot_app_session_db = copilot_app_dir.join("session-store.db");
+    let copilot_app_exists = copilot_app_data_db.exists() || copilot_app_session_db.exists();
+
     Json(SetupInfoResponse {
         platform: std::env::consts::OS.to_string(),
         workspace_dir,
@@ -410,6 +415,14 @@ pub async fn get_setup_info(Path(assistant): Path<String>) -> impl IntoResponse 
                 .join("settings.json")
                 .to_string_lossy()
                 .into_owned(),
+        },
+        copilot_app: AssistantSetupStatus {
+            dir_path: copilot_app_dir.to_string_lossy().into_owned(),
+            data_path: copilot_app_session_db.to_string_lossy().into_owned(),
+            exists: copilot_app_exists,
+            script_path: "".to_string(),
+            source_script_path: "".to_string(),
+            settings_path: "".to_string(),
         },
         codex: AssistantSetupStatus {
             dir_path: codex_dir.to_string_lossy().into_owned(),

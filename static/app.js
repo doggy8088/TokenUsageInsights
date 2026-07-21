@@ -3280,9 +3280,11 @@ function renderSessionTable(sessions) {
     }
     const sourceBadge = s.source_kind === 'vscode-chat'
       ? '<span class="badge source-badge" title="GitHub Copilot in VS Code">VS Code</span>'
-      : (s.assistant_type === 'copilot'
-        ? '<span class="badge source-badge" title="GitHub Copilot CLI">CLI</span>'
-        : '');
+      : (s.source_kind === 'copilot-app'
+        ? '<span class="badge source-badge" title="GitHub Copilot App">App</span>'
+        : (s.assistant_type === 'copilot'
+          ? '<span class="badge source-badge" title="GitHub Copilot CLI">CLI</span>'
+          : ''));
 
     const astColumn = (currentAssistant === 'all' || currentAssistant.includes(',')) ? `<td>${assistantBadge}</td>` : '';
 
