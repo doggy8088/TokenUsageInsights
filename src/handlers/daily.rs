@@ -186,6 +186,10 @@ fn resolve_session_file_path(
             })?;
             resolve_vscode_transcript_path(path).map_err(|error| (StatusCode::BAD_REQUEST, error))
         }
+        "copilot" if source_kind == "copilot-app" => Err((
+            StatusCode::NOT_FOUND,
+            "Copilot App session 暫不提供逐 turn 對話內容。".to_string(),
+        )),
         "copilot" => {
             let copilot_dir = db::get_copilot_dir();
             let events_path = copilot_dir

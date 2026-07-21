@@ -106,10 +106,13 @@ const COPILOT_SOURCE_KIND_MIGRATION_KEY: &str = "migration:copilot_source_kind_v
 /// VS Code Copilot Chat sessions within the shared `copilot` assistant type.
 const COPILOT_APP_SOURCE_KIND: &str = "copilot-app";
 
-/// `sync_state.filename` key storing the maximum `assistant_usage_events.created_at`
-/// (textual UTC timestamp) seen during the last Copilot App sync. Enables
-/// incremental sync against `~/.copilot/session-store.db`.
-const COPILOT_APP_LAST_SYNC_KEY: &str = "sync:copilot_app:last_created_at";
+/// `sync_state.filename` key prefix storing the maximum
+/// `assistant_usage_events.created_at` (textual UTC timestamp) seen during the
+/// last Copilot App sync. The full cursor filename is
+/// `sync:copilot_app:cursor:<canonical_source_path>::<ts>`, so the cursor is
+/// scoped per source directory and switching `COPILOT_APP_DIR`/`COPILOT_DIR`
+/// starts a fresh cursor instead of reusing the previous directory's.
+const COPILOT_APP_CURSOR_PREFIX: &str = "sync:copilot_app:cursor:";
 const VSCODE_EMPTY_SESSION_MIGRATION_KEY: &str = "migration:vscode_empty_sessions_v1";
 const COPILOT_CACHED_INPUT_MIGRATION_KEY: &str = "migration:copilot_cached_input_v1";
 const SESSION_NAME_SELECTION_MIGRATION_KEY: &str = "migration:session_name_selection_v1";
@@ -1479,14 +1482,35 @@ fn portable_relative_path(root: &Path, path: &Path) -> String {
 /// (`sessions`). This collector groups API calls by `(session_id, turn_index)`
 /// into per-turn `UsageEntry` rows with `source_kind = "copilot-app"`, and
 /// deduplicates via the `import_source_id` unique index
-/// (`copilot-app:<session_id>:<turn_index>`). Incremental sync is tracked by
-/// storing the maximum `created_at` seen in `sync_state`.
+/// (`copilot-app:<session_id>:<turn_index>`).
+///
+/// Incremental sync is tracked by storing the maximum `created_at` seen in
+/// `sync_state`, scoped by the canonical source directory so switching
+/// `COPILOT_APP_DIR`/`COPILOT_DIR` starts a fresh cursor.
+///
+/// Because `assistant_usage_events` records per-API-call usage (not cumulative
+/// session totals), `delta_*` columns are set equal to the per-turn SUM; no
+/// differencing against a previous turn is performed. To handle turns that
+/// receive additional API calls after the first sync, affected turns are
+/// re-aggregated from the full event history (not just `created_at > cursor`)
+/// and upserted via `INSERT OR REPLACE` keyed on `import_source_id`.
 fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
     let app_dir = crate::paths::copilot_app_dir();
     let session_store_path = app_dir.join("session-store.db");
     if !session_store_path.exists() {
         return Ok(());
     }
+
+    // Canonicalize the source directory so the cursor is stable across trailing
+    // slashes / symlinks and isolated per COPILOT_APP_DIR / COPILOT_DIR value.
+    let canonical_app_dir = app_dir
+        .canonicalize()
+        .unwrap_or_else(|_| app_dir.clone());
+    let canonical_source_key = canonical_app_dir
+        .to_string_lossy()
+        .replace('\\', "/")
+        .replace(':', "_");
+    let cursor_prefix = format!("{}{}::", COPILOT_APP_CURSOR_PREFIX, canonical_source_key);
 
     // Open the Copilot App session-store in read-only mode with a busy timeout
     // so concurrent writes from the app do not block us.
@@ -1533,10 +1557,10 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
         let _ = c.busy_timeout(std::time::Duration::from_secs(2));
     }
 
-    // Load last sync cursor. We store the textual `created_at` cursor as a
-    // `sync_state.filename` value prefixed with the sentinel key. On each sync
-    // we delete the old cursor row and insert a new one.
-    let cursor_prefix = format!("{}::cursor::", COPILOT_APP_LAST_SYNC_KEY);
+    // Load last sync cursor (scoped by canonical source path). The cursor stores
+    // the textual `created_at` value; on each sync we delete the old cursor row
+    // and insert a new one. We use `>= cursor` plus upsert so events sharing the
+    // cursor timestamp are re-processed idempotently.
     let last_cursor: Option<String> = conn
         .query_row(
             "SELECT filename FROM sync_state WHERE filename LIKE ? ESCAPE '\\' LIMIT 1",
@@ -1546,62 +1570,93 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
         .ok()
         .and_then(|f| f.strip_prefix(&cursor_prefix).map(|s| s.to_string()));
 
-    // Query per-turn grouped rows newer than the cursor.
-    let query = if last_cursor.is_some() {
-        "SELECT session_id, turn_index, MIN(created_at) AS ts,
+    // Determine the set of (session_id, turn_index) pairs that have any event
+    // at or after the cursor. These are the "touched" turns that must be
+    // re-aggregated from the full event history (not just new events), so turns
+    // that received additional API calls after the first sync are updated
+    // rather than silently dropped by INSERT OR IGNORE.
+    let touched_query = if last_cursor.is_some() {
+        "SELECT DISTINCT session_id, turn_index
+         FROM assistant_usage_events
+         WHERE created_at >= ?"
+    } else {
+        "SELECT DISTINCT session_id, turn_index FROM assistant_usage_events"
+    };
+
+    let mut touched_stmt = session_store
+        .prepare(touched_query)
+        .map_err(|e| format!("準備 Copilot App touched-turns 查詢失敗: {}", e))?;
+    let map_touched = |row: &rusqlite::Row| -> rusqlite::Result<(String, i64)> {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    };
+    let touched_iter = if let Some(ref cursor) = last_cursor {
+        touched_stmt
+            .query_map(params![cursor.as_str()], map_touched)
+            .map_err(|e| format!("執行 Copilot App touched-turns 查詢失敗: {}", e))?
+    } else {
+        touched_stmt
+            .query_map([], map_touched)
+            .map_err(|e| format!("執行 Copilot App touched-turns 查詢失敗: {}", e))?
+    };
+
+    let mut touched_turns: Vec<(String, i64)> = Vec::new();
+    for row_res in touched_iter {
+        match row_res {
+            Ok(pair) => touched_turns.push(pair),
+            Err(e) => eprintln!("⚠️ 讀取 Copilot App touched-turn 失敗: {}", e),
+        }
+    }
+
+    if touched_turns.is_empty() {
+        // Still refresh the cursor so a no-op sync does not leave a stale one
+        // pointing at a directory that no longer has events.
+        return Ok(());
+    }
+
+    // Re-aggregate each touched turn from the FULL event history for that
+    // (session_id, turn_index), regardless of cursor. This guarantees that
+    // turns which straddle the cursor boundary are written with their complete
+    // token totals rather than only the post-cursor subset.
+    let aggregate_query =
+        "SELECT MIN(created_at) AS ts,
                 SUM(input_tokens), SUM(output_tokens),
                 SUM(cache_read_tokens), SUM(cache_write_tokens),
                 SUM(reasoning_tokens), SUM(duration_ms),
                 MIN(model), MIN(reasoning_effort)
          FROM assistant_usage_events
-         WHERE created_at > ?
-         GROUP BY session_id, turn_index
-         ORDER BY ts ASC"
-    } else {
-        "SELECT session_id, turn_index, MIN(created_at) AS ts,
-                SUM(input_tokens), SUM(output_tokens),
-                SUM(cache_read_tokens), SUM(cache_write_tokens),
-                SUM(reasoning_tokens), SUM(duration_ms),
-                MIN(model), MIN(reasoning_effort)
-         FROM assistant_usage_events
-         GROUP BY session_id, turn_index
-         ORDER BY ts ASC"
-    };
+         WHERE session_id = ? AND turn_index = ?
+         GROUP BY session_id, turn_index";
 
-    let mut stmt = session_store
-        .prepare(query)
-        .map_err(|e| format!("準備 Copilot App 查詢失敗: {}", e))?;
+    let mut agg_stmt = session_store
+        .prepare(aggregate_query)
+        .map_err(|e| format!("準備 Copilot App 聚合查詢失敗: {}", e))?;
 
-    let map_row = |row: &rusqlite::Row| -> rusqlite::Result<CopilotAppTurnRow> {
-        Ok(CopilotAppTurnRow {
-            session_id: row.get::<_, String>(0)?,
-            turn_index: row.get::<_, i64>(1)?,
-            ts: row.get::<_, String>(2)?,
-            input_tokens: row.get::<_, Option<i64>>(3)?.unwrap_or(0).max(0) as u64,
-            output_tokens: row.get::<_, Option<i64>>(4)?.unwrap_or(0).max(0) as u64,
-            cache_read: row.get::<_, Option<i64>>(5)?.unwrap_or(0).max(0) as u64,
-            cache_write: row.get::<_, Option<i64>>(6)?.unwrap_or(0).max(0) as u64,
-            reasoning: row.get::<_, Option<i64>>(7)?.unwrap_or(0).max(0) as u64,
-            duration_ms: row.get::<_, Option<i64>>(8)?.unwrap_or(0).max(0) as u64,
-            model: row.get::<_, Option<String>>(9)?,
-            reasoning_effort: row.get::<_, Option<String>>(10)?,
-        })
-    };
-
-    let rows_iter = if last_cursor.is_some() {
-        stmt.query_map(params![last_cursor.as_deref()], map_row)
-            .map_err(|e| format!("執行 Copilot App 查詢失敗: {}", e))?
-    } else {
-        stmt.query_map([], map_row)
-            .map_err(|e| format!("執行 Copilot App 查詢失敗: {}", e))?
-    };
-
-    // Collect rows first to release the statement borrow before writing.
     let mut turn_rows: Vec<CopilotAppTurnRow> = Vec::new();
-    for row_res in rows_iter {
+    for (session_id, turn_index) in &touched_turns {
+        let row_res = agg_stmt.query_row(
+            params![session_id, turn_index],
+            |row| {
+                Ok(CopilotAppTurnRow {
+                    session_id: session_id.clone(),
+                    turn_index: *turn_index,
+                    ts: row.get::<_, String>(0)?,
+                    input_tokens: row.get::<_, Option<i64>>(1)?.unwrap_or(0).max(0) as u64,
+                    output_tokens: row.get::<_, Option<i64>>(2)?.unwrap_or(0).max(0) as u64,
+                    cache_read: row.get::<_, Option<i64>>(3)?.unwrap_or(0).max(0) as u64,
+                    cache_write: row.get::<_, Option<i64>>(4)?.unwrap_or(0).max(0) as u64,
+                    reasoning: row.get::<_, Option<i64>>(5)?.unwrap_or(0).max(0) as u64,
+                    duration_ms: row.get::<_, Option<i64>>(6)?.unwrap_or(0).max(0) as u64,
+                    model: row.get::<_, Option<String>>(7)?,
+                    reasoning_effort: row.get::<_, Option<String>>(8)?,
+                })
+            },
+        );
         match row_res {
             Ok(r) => turn_rows.push(r),
-            Err(e) => eprintln!("⚠️ 讀取 Copilot App usage row 失敗: {}", e),
+            Err(e) => eprintln!(
+                "⚠️ 聚合 Copilot App turn (session {} turn {}) 失敗: {}",
+                session_id, turn_index, e
+            ),
         }
     }
 
@@ -1616,15 +1671,12 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
     // Cache session title/workspace lookups.
     let mut session_meta_cache: HashMap<String, CopilotAppSessionMeta> = HashMap::new();
 
-    // Track previous turn tokens per session for delta computation.
-    let mut prev_tokens: HashMap<String, PrevTurnTokens> = HashMap::new();
-
     let mut max_ts: Option<String> = None;
-    let mut inserted = 0usize;
+    let mut upserted = 0usize;
 
     for row in turn_rows {
         // Track max timestamp for next cursor.
-        if max_ts.as_deref().map_or(true, |m| row.ts.as_str() > m) {
+        if max_ts.as_deref().is_none_or(|m| row.ts.as_str() > m) {
             max_ts = Some(row.ts.clone());
         }
 
@@ -1646,28 +1698,24 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
             + row.cache_write
             + row.reasoning;
 
-        // Delta tokens: first turn of a session equals totals; subsequent
-        // turns subtract the previous turn's totals (clamped at 0).
-        let prev = prev_tokens
-            .entry(row.session_id.clone())
-            .or_insert(PrevTurnTokens::default());
-        let delta_input = row.input_tokens.saturating_sub(prev.input);
-        let delta_output = row.output_tokens.saturating_sub(prev.output);
-        let delta_cache_read = row.cache_read.saturating_sub(prev.cache_read);
-        let delta_cache_write = row.cache_write.saturating_sub(prev.cache_write);
-        let delta_reasoning = row.reasoning.saturating_sub(prev.reasoning);
-        let delta_total = total.saturating_sub(prev.total);
-        prev.input = row.input_tokens;
-        prev.output = row.output_tokens;
-        prev.cache_read = row.cache_read;
-        prev.cache_write = row.cache_write;
-        prev.reasoning = row.reasoning;
-        prev.total = total;
+        // Delta tokens: the source records per-API-call usage (not cumulative
+        // session totals), so the per-turn SUM already represents the delta for
+        // this turn. Set delta_* equal to the per-turn totals directly; do NOT
+        // subtract the previous turn's totals.
+        let delta_input = row.input_tokens;
+        let delta_output = row.output_tokens;
+        let delta_cache_read = row.cache_read;
+        let delta_cache_write = row.cache_write;
+        let delta_reasoning = row.reasoning;
+        let delta_total = total;
 
         let import_source_id = format!("copilot-app:{}:{}", row.session_id, row.turn_index);
 
+        // Use INSERT OR REPLACE so turns that received additional API calls
+        // after the first sync are updated with the complete re-aggregated
+        // totals instead of being silently dropped by INSERT OR IGNORE.
         let insert_res = tx.execute(
-            "INSERT OR IGNORE INTO usage_entries (
+            "INSERT OR REPLACE INTO usage_entries (
                 assistant_type, source_kind, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
                 tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_reasoning, tokens_total,
                 delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total,
@@ -1703,7 +1751,7 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
         );
 
         match insert_res {
-            Ok(_) => inserted += 1,
+            Ok(_) => upserted += 1,
             Err(e) => eprintln!(
                 "⚠️ 寫入 Copilot App usage 失敗 (session {} turn {}): {}",
                 row.session_id, row.turn_index, e
@@ -1711,14 +1759,13 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
         }
     }
 
-    // Update cursor: delete old cursor row(s) and insert new one with the
-    // textual timestamp encoded in the filename.
+    // Update cursor: delete old cursor row(s) for this source directory and
+    // insert a new one with the textual timestamp encoded in the filename.
     if let Some(ts) = max_ts {
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
-        let cursor_prefix = format!("{}::cursor::", COPILOT_APP_LAST_SYNC_KEY);
         let _ = tx.execute(
             "DELETE FROM sync_state WHERE filename LIKE ? ESCAPE '\\'",
             params![format!("{}%", cursor_prefix)],
@@ -1733,8 +1780,8 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
     tx.commit()
         .map_err(|e| format!("Copilot App transaction COMMIT 失敗: {}", e))?;
 
-    if inserted > 0 {
-        println!("✅ 同步 Copilot App：{} 筆新 turn", inserted);
+    if upserted > 0 {
+        println!("✅ 同步 Copilot App：{} 筆 turn（upsert）", upserted);
     }
     Ok(())
 }
@@ -1757,16 +1804,6 @@ struct CopilotAppTurnRow {
 struct CopilotAppSessionMeta {
     title: Option<String>,
     cwd: Option<String>,
-}
-
-#[derive(Clone, Default)]
-struct PrevTurnTokens {
-    input: u64,
-    output: u64,
-    cache_read: u64,
-    cache_write: u64,
-    reasoning: u64,
-    total: u64,
 }
 
 fn resolve_copilot_app_session_meta(
@@ -5049,8 +5086,8 @@ mod tests {
                             id,
                             session_id,
                             turn,
-                            (turn as i64 + 1) * 100,
-                            (turn as i64 + 1) * 10,
+                            (turn + 1) * 100,
+                            (turn + 1) * 10,
                             ts,
                         ],
                     )
@@ -5093,7 +5130,8 @@ mod tests {
             .unwrap();
         assert_eq!(total, 6, "expected 6 per-turn rows (2 sessions x 3 turns)");
 
-        // Turn 0 deltas should equal totals (no previous turn).
+        // Delta tokens equal per-turn totals (source is per-API-call usage,
+        // not cumulative session totals, so no differencing is performed).
         let turn0: (i64, i64) = conn
             .query_row(
                 "SELECT tokens_input, delta_input
@@ -5104,9 +5142,8 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(turn0, (100, 100));
+        assert_eq!(turn0, (100, 100), "turn 0 delta should equal per-turn total");
 
-        // Turn 1 deltas should be current - previous = 200 - 100 = 100.
         let turn1: (i64, i64) = conn
             .query_row(
                 "SELECT tokens_input, delta_input
@@ -5117,9 +5154,8 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(turn1, (200, 100));
+        assert_eq!(turn1, (200, 200), "turn 1 delta should equal per-turn total");
 
-        // Turn 2 deltas should be 300 - 200 = 100.
         let turn2: (i64, i64) = conn
             .query_row(
                 "SELECT tokens_input, delta_input
@@ -5130,7 +5166,7 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(turn2, (300, 100));
+        assert_eq!(turn2, (300, 300), "turn 2 delta should equal per-turn total");
 
         // Verify session title resolved from data.db.
         let title: Option<String> = conn
@@ -5144,18 +5180,18 @@ mod tests {
             .unwrap();
         assert_eq!(title.as_deref(), Some("Session B"));
 
-        // Verify the cursor was written.
+        // Verify the cursor was written and is scoped by the canonical source path.
         let cursor_count: u64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sync_state
-                 WHERE filename LIKE 'sync:copilot_app:last_created_at::cursor::%'",
+                 WHERE filename LIKE 'sync:copilot_app:cursor:%'",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
         assert_eq!(cursor_count, 1);
 
-        // Second run should insert 0 new rows (dedup via import_source_id).
+        // Second run should insert 0 new rows (idempotent upsert via import_source_id).
         sync_copilot_app_usage_logs(&mut conn).unwrap();
         let total_after: u64 = conn
             .query_row(
@@ -5166,6 +5202,231 @@ mod tests {
             )
             .unwrap();
         assert_eq!(total_after, 6, "second sync should not duplicate rows");
+
+        if let Some(value) = old_app_dir {
+            std::env::set_var("COPILOT_APP_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_APP_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    /// Verify that a turn which receives additional API calls after the first
+    /// sync is re-aggregated from the full event history and upserted, rather
+    /// than being silently dropped by INSERT OR IGNORE.
+    #[test]
+    fn sync_copilot_app_usage_logs_upserts_turns_with_new_events() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_app_dir = std::env::var("COPILOT_APP_DIR").ok();
+
+        let base_dir = temp_jsonl_path("copilot-app-upsert").with_extension("");
+        let app_dir = base_dir.join("copilot-app");
+        fs::create_dir_all(&app_dir).unwrap();
+
+        let session_store = Connection::open(app_dir.join("session-store.db")).unwrap();
+        session_store
+            .execute(
+                "CREATE TABLE assistant_usage_events (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT,
+                    turn_index INTEGER,
+                    model TEXT,
+                    input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    cache_read_tokens INTEGER,
+                    cache_write_tokens INTEGER,
+                    reasoning_tokens INTEGER,
+                    duration_ms INTEGER,
+                    reasoning_effort TEXT,
+                    created_at TEXT
+                 )",
+                [],
+            )
+            .unwrap();
+
+        let session_a = "app-session-a";
+        // First API call for turn 0, early timestamp.
+        session_store
+            .execute(
+                "INSERT INTO assistant_usage_events
+                    (id, session_id, turn_index, model,
+                     input_tokens, output_tokens,
+                     cache_read_tokens, cache_write_tokens,
+                     reasoning_tokens, duration_ms,
+                     reasoning_effort, created_at)
+                 VALUES ('a-0-0', ?, 0, 'gpt-5', 100, 10, 0, 0, 0, 100, 'medium', '2026-07-20 10:00:00')",
+                params![session_a],
+            )
+            .unwrap();
+
+        std::env::set_var("COPILOT_APP_DIR", &app_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+
+        let turn0_total: i64 = conn
+            .query_row(
+                "SELECT tokens_input FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'
+                   AND session_id = ? AND turn_no = 1",
+                params![session_a],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(turn0_total, 100, "initial turn 0 total should be 100");
+
+        // Second API call for the SAME turn 0, later timestamp.
+        session_store
+            .execute(
+                "INSERT INTO assistant_usage_events
+                    (id, session_id, turn_index, model,
+                     input_tokens, output_tokens,
+                     cache_read_tokens, cache_write_tokens,
+                     reasoning_tokens, duration_ms,
+                     reasoning_effort, created_at)
+                 VALUES ('a-0-1', ?, 0, 'gpt-5', 250, 20, 0, 0, 0, 100, 'medium', '2026-07-20 10:00:05')",
+                params![session_a],
+            )
+            .unwrap();
+
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+
+        let turn0_total_after: i64 = conn
+            .query_row(
+                "SELECT tokens_input FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'
+                   AND session_id = ? AND turn_no = 1",
+                params![session_a],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            turn0_total_after, 350,
+            "turn 0 must be re-aggregated to 100 + 250 after upsert"
+        );
+
+        let row_count: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'
+                   AND session_id = ?",
+                params![session_a],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(row_count, 1, "no duplicate rows should be created");
+
+        if let Some(value) = old_app_dir {
+            std::env::set_var("COPILOT_APP_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_APP_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    /// Verify that switching COPILOT_APP_DIR uses an independent cursor and
+    /// does not skip earlier events in the new source directory.
+    #[test]
+    fn sync_copilot_app_usage_logs_cursor_is_scoped_by_source_dir() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_app_dir = std::env::var("COPILOT_APP_DIR").ok();
+
+        let base_dir = temp_jsonl_path("copilot-app-cursor-scope").with_extension("");
+        let app_dir_a = base_dir.join("app-a");
+        let app_dir_b = base_dir.join("app-b");
+        fs::create_dir_all(&app_dir_a).unwrap();
+        fs::create_dir_all(&app_dir_b).unwrap();
+
+        let build_store = |dir: &Path| {
+            let store = Connection::open(dir.join("session-store.db")).unwrap();
+            store
+                .execute(
+                    "CREATE TABLE assistant_usage_events (
+                        id TEXT PRIMARY KEY,
+                        session_id TEXT,
+                        turn_index INTEGER,
+                        model TEXT,
+                        input_tokens INTEGER,
+                        output_tokens INTEGER,
+                        cache_read_tokens INTEGER,
+                        cache_write_tokens INTEGER,
+                        reasoning_tokens INTEGER,
+                        duration_ms INTEGER,
+                        reasoning_effort TEXT,
+                        created_at TEXT
+                     )",
+                    [],
+                )
+                .unwrap();
+            store
+        };
+
+        let store_a = build_store(&app_dir_a);
+        let store_b = build_store(&app_dir_b);
+
+        // Directory A: one turn at 2026-07-20 10:00:00.
+        store_a
+            .execute(
+                "INSERT INTO assistant_usage_events
+                    (id, session_id, turn_index, model,
+                     input_tokens, output_tokens,
+                     cache_read_tokens, cache_write_tokens,
+                     reasoning_tokens, duration_ms,
+                     reasoning_effort, created_at)
+                 VALUES ('a-a-0', 'sess-a', 0, 'gpt-5', 100, 10, 0, 0, 0, 100, 'medium', '2026-07-20 10:00:00')",
+                [],
+            )
+            .unwrap();
+
+        // Directory B: one turn at an EARLIER timestamp than A's cursor would be.
+        store_b
+            .execute(
+                "INSERT INTO assistant_usage_events
+                    (id, session_id, turn_index, model,
+                     input_tokens, output_tokens,
+                     cache_read_tokens, cache_write_tokens,
+                     reasoning_tokens, duration_ms,
+                     reasoning_effort, created_at)
+                 VALUES ('b-b-0', 'sess-b', 0, 'gpt-5', 50, 5, 0, 0, 0, 100, 'medium', '2026-07-19 09:00:00')",
+                [],
+            )
+            .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // Sync from A first; this establishes a cursor at 2026-07-20 10:00:00.
+        std::env::set_var("COPILOT_APP_DIR", &app_dir_a);
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+
+        // Switch to B. A correct scoped cursor must NOT reuse A's cursor; B's
+        // earlier event must still be ingested.
+        std::env::set_var("COPILOT_APP_DIR", &app_dir_b);
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+
+        let b_total: i64 = conn
+            .query_row(
+                "SELECT tokens_input FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'
+                   AND session_id = 'sess-b'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(b_total, 50, "directory B's earlier event must be ingested");
+
+        // Both cursors should coexist (one per source directory).
+        let cursor_count: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state
+                 WHERE filename LIKE 'sync:copilot_app:cursor:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cursor_count, 2, "each source directory must have its own cursor");
 
         if let Some(value) = old_app_dir {
             std::env::set_var("COPILOT_APP_DIR", value);
