@@ -1503,15 +1503,14 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
 
     // Canonicalize the source directory so the cursor is stable across trailing
     // slashes / symlinks and isolated per COPILOT_APP_DIR / COPILOT_DIR value.
-    // Hex-encode the canonical path so the cursor key is injective (no two
-    // distinct paths map to the same key, unlike a `:`->`_` replace) and free
-    // of LIKE wildcard characters (`%`, `_`), letting us use exact equality
-    // instead of LIKE for cursor lookup.
+    // Hex-encode the canonical path's raw OS-encoded bytes so the cursor key is
+    // injective (no two distinct paths map to the same key) and free of LIKE
+    // wildcard characters (`%`, `_`). Encoding raw bytes (not lossy UTF-8) avoids
+    // collisions from Unicode replacement chars and from `\\` vs `/` normalization.
     let canonical_app_dir = app_dir
         .canonicalize()
         .unwrap_or_else(|_| app_dir.clone());
-    let canonical_path_str = canonical_app_dir.to_string_lossy().replace('\\', "/");
-    let source_key = encode_hex(canonical_path_str.as_bytes());
+    let source_key = encode_hex(canonical_app_dir.as_os_str().as_encoded_bytes());
     let cursor_key_prefix = format!("{}{}::", COPILOT_APP_CURSOR_PREFIX, source_key);
 
     // Open the Copilot App session-store in read-only mode with a busy timeout
@@ -1665,6 +1664,7 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
         .map_err(|e| format!("準備 Copilot App 聚合查詢失敗: {}", e))?;
 
     let mut turn_rows: Vec<CopilotAppTurnRow> = Vec::new();
+    let mut failed = 0usize;
     for (session_id, turn_index) in &touched_turns {
         let row_res = agg_stmt.query_row(
             params![session_id, turn_index],
@@ -1690,10 +1690,13 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
         );
         match row_res {
             Ok(r) => turn_rows.push(r),
-            Err(e) => eprintln!(
-                "⚠️ 聚合 Copilot App turn (session {} turn {}) 失敗: {}",
-                session_id, turn_index, e
-            ),
+            Err(e) => {
+                eprintln!(
+                    "⚠️ 聚合 Copilot App turn (session {} turn {}) 失敗: {}",
+                    session_id, turn_index, e
+                );
+                failed += 1;
+            }
         }
     }
 
@@ -1742,7 +1745,13 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
         let delta_reasoning = row.reasoning;
         let delta_total = total;
 
-        let import_source_id = format!("copilot-app:{}:{}", row.session_id, row.turn_index);
+        // Include the source directory key in import_source_id so turns from
+        // different COPILOT_APP_DIR with the same (session_id, turn_index) do
+        // not upsert-overwrite each other.
+        let import_source_id = format!(
+            "copilot-app:{}:{}:{}",
+            source_key, row.session_id, row.turn_index
+        );
 
         // Use INSERT OR REPLACE so turns that received additional API calls
         // after the first sync are updated with the complete re-aggregated
@@ -1785,10 +1794,13 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
 
         match insert_res {
             Ok(_) => upserted += 1,
-            Err(e) => eprintln!(
-                "⚠️ 寫入 Copilot App usage 失敗 (session {} turn {}): {}",
-                row.session_id, row.turn_index, e
-            ),
+            Err(e) => {
+                eprintln!(
+                    "⚠️ 寫入 Copilot App usage 失敗 (session {} turn {}): {}",
+                    row.session_id, row.turn_index, e
+                );
+                failed += 1;
+            }
         }
     }
 
@@ -1797,19 +1809,31 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
     // Use the max raw event `created_at` (not per-turn MIN) so a turn whose
     // events straddle the cursor does not pin the cursor at its earliest event
     // and get re-aggregated on every subsequent sync.
-    if let Some(ts) = max_event_ts {
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-        let _ = tx.execute(
-            "DELETE FROM sync_state WHERE filename LIKE ? ESCAPE '\\'",
-            params![format!("{}%", cursor_key_prefix)],
-        );
-        let cursor_sentinel = format!("{}{}", cursor_key_prefix, ts);
-        let _ = tx.execute(
-            "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time) VALUES (?, ?, ?)",
-            params![cursor_sentinel, 0i64, now],
+    //
+    // Only advance the cursor when every touched turn was aggregated and
+    // written successfully. If any turn failed (aggregation or upsert error),
+    // keep the cursor at its previous value so the failed turns are retried on
+    // the next sync instead of being permanently skipped.
+    if failed == 0 {
+        if let Some(ts) = max_event_ts {
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            let _ = tx.execute(
+                "DELETE FROM sync_state WHERE filename LIKE ? ESCAPE '\\'",
+                params![format!("{}%", cursor_key_prefix)],
+            );
+            let cursor_sentinel = format!("{}{}", cursor_key_prefix, ts);
+            let _ = tx.execute(
+                "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time) VALUES (?, ?, ?)",
+                params![cursor_sentinel, 0i64, now],
+            );
+        }
+    } else {
+        eprintln!(
+            "⚠️ Copilot App 同步有 {} 個 turn 失敗，cursor 不前進以便下次重試",
+            failed
         );
     }
 
@@ -5685,6 +5709,221 @@ mod tests {
             )
             .unwrap();
         assert_eq!(total_input, 300, "turn 0 total should remain 300 after idempotent re-sync");
+
+        if let Some(value) = old_app_dir {
+            std::env::set_var("COPILOT_APP_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_APP_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    /// Verify the cursor does NOT advance when a turn fails to write, so the
+    /// failed turn is retried on the next sync instead of being permanently
+    /// skipped. We simulate a write failure by installing a trigger on
+    /// `usage_entries` that rejects inserts for `copilot-app` source_kind.
+    #[test]
+    fn sync_copilot_app_usage_logs_cursor_rollback_on_write_failure() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_app_dir = std::env::var("COPILOT_APP_DIR").ok();
+
+        let base_dir = temp_jsonl_path("copilot-app-cursor-rollback").with_extension("");
+        let app_dir = base_dir.join("copilot-app");
+        fs::create_dir_all(&app_dir).unwrap();
+
+        let session_store = Connection::open(app_dir.join("session-store.db")).unwrap();
+        session_store
+            .execute(
+                "CREATE TABLE assistant_usage_events (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT,
+                    turn_index INTEGER,
+                    model TEXT,
+                    input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    cache_read_tokens INTEGER,
+                    cache_write_tokens INTEGER,
+                    reasoning_tokens INTEGER,
+                    duration_ms INTEGER,
+                    reasoning_effort TEXT,
+                    created_at TEXT
+                 )",
+                [],
+            )
+            .unwrap();
+
+        let session_a = "sess-a";
+        session_store
+            .execute(
+                "INSERT INTO assistant_usage_events
+                    (id, session_id, turn_index, model,
+                     input_tokens, output_tokens,
+                     cache_read_tokens, cache_write_tokens,
+                     reasoning_tokens, duration_ms,
+                     reasoning_effort, created_at)
+                 VALUES ('a-0', ?, 0, 'gpt-5', 100, 10, 0, 0, 0, 100, 'medium', '2026-07-20 10:00:00')",
+                params![session_a],
+            )
+            .unwrap();
+
+        std::env::set_var("COPILOT_APP_DIR", &app_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // First sync succeeds and establishes a cursor at 10:00:00.
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+        let cursor_after_first: String = conn
+            .query_row(
+                "SELECT filename FROM sync_state
+                 WHERE filename LIKE 'sync:copilot_app:cursor:%' LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert!(
+            cursor_after_first.ends_with("::2026-07-20 10:00:00"),
+            "cursor should be at 10:00:00 after first sync, got: {}",
+            cursor_after_first
+        );
+
+        // Install a trigger that rejects new inserts for copilot-app rows,
+        // simulating a persistent write failure (e.g. schema drift, disk).
+        conn.execute(
+            "CREATE TRIGGER reject_copilot_app_insert
+             BEFORE INSERT ON usage_entries
+             WHEN NEW.source_kind = 'copilot-app'
+             BEGIN
+                 SELECT RAFAIL('simulated write failure');
+             END",
+            [],
+        )
+        .unwrap();
+
+        // Add a new event at 10:05 so the touched-turns query returns a row that
+        // will fail to upsert.
+        session_store
+            .execute(
+                "INSERT INTO assistant_usage_events
+                    (id, session_id, turn_index, model,
+                     input_tokens, output_tokens,
+                     cache_read_tokens, cache_write_tokens,
+                     reasoning_tokens, duration_ms,
+                     reasoning_effort, created_at)
+                 VALUES ('a-1', ?, 1, 'gpt-5', 200, 20, 0, 0, 0, 100, 'medium', '2026-07-20 10:05:00')",
+                params![session_a],
+            )
+            .unwrap();
+
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+
+        // Cursor must NOT have advanced to 10:05 because the upsert failed; it
+        // must remain at 10:00:00 so the turn is retried next sync.
+        let cursor_after_failure: String = conn
+            .query_row(
+                "SELECT filename FROM sync_state
+                 WHERE filename LIKE 'sync:copilot_app:cursor:%' LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert!(
+            cursor_after_failure.ends_with("::2026-07-20 10:00:00"),
+            "cursor must not advance on write failure, got: {}",
+            cursor_after_failure
+        );
+
+        if let Some(value) = old_app_dir {
+            std::env::set_var("COPILOT_APP_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_APP_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    /// Verify import_source_id includes the source directory key so turns from
+    /// different COPILOT_APP_DIR with the same (session_id, turn_index) do not
+    /// share a dedup key.
+    #[test]
+    fn sync_copilot_app_usage_logs_import_source_id_includes_source_dir() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_app_dir = std::env::var("COPILOT_APP_DIR").ok();
+
+        let base_dir = temp_jsonl_path("copilot-app-import-src").with_extension("");
+        let app_dir = base_dir.join("copilot-app");
+        fs::create_dir_all(&app_dir).unwrap();
+
+        let session_store = Connection::open(app_dir.join("session-store.db")).unwrap();
+        session_store
+            .execute(
+                "CREATE TABLE assistant_usage_events (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT,
+                    turn_index INTEGER,
+                    model TEXT,
+                    input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    cache_read_tokens INTEGER,
+                    cache_write_tokens INTEGER,
+                    reasoning_tokens INTEGER,
+                    duration_ms INTEGER,
+                    reasoning_effort TEXT,
+                    created_at TEXT
+                 )",
+                [],
+            )
+            .unwrap();
+
+        session_store
+            .execute(
+                "INSERT INTO assistant_usage_events
+                    (id, session_id, turn_index, model,
+                     input_tokens, output_tokens,
+                     cache_read_tokens, cache_write_tokens,
+                     reasoning_tokens, duration_ms,
+                     reasoning_effort, created_at)
+                 VALUES ('x-0', 'sess-x', 0, 'gpt-5', 100, 10, 0, 0, 0, 100, 'medium', '2026-07-20 10:00:00')",
+                [],
+            )
+            .unwrap();
+
+        std::env::set_var("COPILOT_APP_DIR", &app_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+
+        let import_source_id: String = conn
+            .query_row(
+                "SELECT import_source_id FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'
+                   AND session_id = 'sess-x' AND turn_no = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        // import_source_id must be copilot-app:<hex_source_key>:sess-x:0.
+        assert!(
+            import_source_id.starts_with("copilot-app:"),
+            "import_source_id must start with copilot-app: prefix, got: {}",
+            import_source_id
+        );
+        let rest = &import_source_id["copilot-app:".len()..];
+        // The remainder is <hex>:sess-x:0; the hex segment is the first colon-
+        // delimited component and must be non-empty hex.
+        let hex_segment = rest.split(':').next().unwrap_or("");
+        assert!(
+            !hex_segment.is_empty() && hex_segment.chars().all(|c| c.is_ascii_hexdigit()),
+            "import_source_id must include a non-empty hex source key, got: {}",
+            import_source_id
+        );
+        assert!(
+            import_source_id.ends_with(":sess-x:0"),
+            "import_source_id must end with :sess-x:0, got: {}",
+            import_source_id
+        );
 
         if let Some(value) = old_app_dir {
             std::env::set_var("COPILOT_APP_DIR", value);
