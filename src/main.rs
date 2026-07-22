@@ -9,6 +9,7 @@ use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 
 mod db;
+mod grok;
 mod handlers;
 mod paths;
 mod pricing;

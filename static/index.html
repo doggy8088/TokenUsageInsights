@@ -68,6 +68,10 @@
             <img class="assistant-logo" src="/static/cursor-logo.svg" alt="Cursor" />
             <span class="agent-name-tooltip">Cursor</span>
           </button>
+          <button class="assistant-badge-btn" data-value="grok" title="Grok Build" aria-label="Grok Build">
+            <img class="assistant-logo" src="/static/grok-logo.svg" alt="Grok Build" />
+            <span class="agent-name-tooltip">Grok Build</span>
+          </button>
         </div>
       </div>
 
@@ -317,6 +321,7 @@
               <span class="title-text" data-i18n="select_date_prompt">請選擇日期以載入數據</span>
             </h2>
             <p class="description" data-i18n="header_description">一站式監控與分析您本地終端 AI Agent 的 Token 消耗與會話詳細數據</p>
+            <p id="assistant-billing-note" class="assistant-billing-note hidden" aria-live="polite"></p>
           </div>
         </div>
         <div class="header-controls" style="display: flex; align-items: center; gap: 10px;">
@@ -1055,6 +1060,28 @@
         <div class="modal-section">
           <h3 data-i18n="cursor_setup_step_3"><span>03</span> 3. 費用估算邏輯</h3>
           <p class="modal-text" data-i18n="cursor_setup_step_3_desc">由於 Cursor 本地日誌不包含 Token 統計，費用會根據字數估算 Token 數量，再以標準模型價格為基準進行即時成本計算。</p>
+        </div>
+      </div>
+
+      <!-- Grok Build Setup Content -->
+      <div class="modal-body" id="setup-body-grok" style="display: none;">
+        <div class="modal-text">
+          <p data-i18n="grok_setup_modal_intro">本看板會讀取 Grok Build 自動保存的本地 session stream。Grok Build 不需要額外安裝狀態列腳本。</p>
+        </div>
+
+        <div class="modal-section">
+          <h3 data-i18n="grok_setup_step_1"><span>01</span> 1. 確認 Grok Build 已在使用</h3>
+          <p class="modal-text" data-i18n="grok_setup_step_1_desc">在終端機中使用過 Grok Build 後，session 會自動保存至 <code>~/.grok/sessions</code>。</p>
+        </div>
+
+        <div class="modal-section">
+          <h3 data-i18n="grok_setup_step_2"><span>02</span> 2. 偵測本機資料路徑</h3>
+          <p class="modal-text" data-i18n="grok_setup_step_2_desc">目前偵測到的 Grok Build session 目錄為：<code id="lbl-detected-home-grok">~/.grok/sessions</code>。</p>
+        </div>
+
+        <div class="modal-section">
+          <h3 data-i18n="grok_setup_step_3"><span>03</span> 3. 了解計費資料來源</h3>
+          <p class="modal-text" data-i18n="grok_setup_step_3_desc">若本機 session 含 provider usage，會優先使用該資料；若只有 context token snapshot，畫面會以 xAI API list price 顯示估算，並標示來源，不代表訂閱方案的週配額。</p>
         </div>
       </div>
     </div>

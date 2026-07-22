@@ -289,6 +289,7 @@ pub fn to_usage_entries(session: &ChatSession, path: &Path) -> Vec<UsageEntry> {
                 total_api_duration_ms: Some(elapsed_ms as f64),
                 total_duration_ms: Some(elapsed_ms as f64),
                 total_premium_requests: None,
+                reported_cost_usd: None,
             });
 
             UsageEntry {

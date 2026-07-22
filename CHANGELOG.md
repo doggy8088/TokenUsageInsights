@@ -4,7 +4,17 @@
 
 ## [未發行]
 
-目前沒有尚未發行的變更。
+### 新增與改善
+
+- 新增 Grok Build 支援，直接掃描 `~/.grok/sessions/**/updates.jsonl`，呈現 Session、Token、工具呼叫與時間軸資料。
+- Grok Build 優先保存 provider 回報的 usage 與成本；若只有 context token snapshot，改以來源標記及 xAI API list price 估算，避免與訂閱週配額混淆。
+- UI 新增 Grok Build Agent 徽章、設定導覽、計費提示與 Usage／Context 來源標記。
+- Grok Build 的估算費用支援 xAI API 200K tokens 長上下文價格級距。
+- 修正 Grok Build 模型與定價資料，改為只記錄 `Grok 4.5` 及 Low／Medium／High reasoning effort 變體。
+
+### 資料影響
+
+- `usage_entries` 新增可選的 provider 回報成本欄位；既有資料會以空值相容，不需要手動遷移。
 
 ## [0.5.0] - 2026-07-20
 

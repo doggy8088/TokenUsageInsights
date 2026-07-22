@@ -1,6 +1,6 @@
 # Token 戰情室
 
-**Token 戰情室是本地優先的 AI CLI 與 VS Code Copilot Token 使用量與會話還原看板。** 它會讀取本機上的 Google Antigravity CLI、GitHub Copilot CLI、GitHub Copilot Chat（VS Code）、Codex CLI 與 Claude Code 記錄，集中呈現每日、月度、年度的 Token 消耗、快取使用、推理 Token、估算費用、模型分佈、專案目錄分佈與完整 Session 時間軸。
+**Token 戰情室是本地優先的 AI CLI 與 VS Code Copilot Token 使用量與會話還原看板。** 它會讀取本機上的 Google Antigravity CLI、GitHub Copilot CLI、GitHub Copilot Chat（VS Code）、Codex CLI、Claude Code、Cursor 與 Grok Build 記錄，集中呈現每日、月度、年度的 Token 消耗、快取使用、推理 Token、估算費用、模型分佈、專案目錄分佈與完整 Session 時間軸。
 
 本專案不會替你呼叫 AI 供應商 API 查詢資料；核心資料來源是本機日誌、Status Line 收集檔與本機 SQLite。
 
@@ -41,8 +41,10 @@ http://localhost:3003
 | GitHub Copilot Chat（VS Code） | 不需要 | VS Code `workspaceStorage/chatSessions` | 看板直接掃描 VS Code Stable 與 Insiders 的本機聊天 Session |
 | Codex CLI | 不需要 | `~/.codex/sessions` | 看板會直接掃描 Codex CLI 本機 Session 記錄 |
 | Claude Code | 不需要 | `~/.claude/projects` | 看板會直接掃描 Claude Code 本機專案 Session 記錄 |
+| Cursor | 不需要 | `~/.cursor/projects` | 看板會直接掃描 Cursor 本機 Session 記錄 |
+| Grok Build | 不需要 | `~/.grok/sessions` | 看板會直接掃描 Grok Build 的 `updates.jsonl` Session stream |
 
-**只使用 VS Code Copilot、Codex CLI 或 Claude Code 時，執行一行安裝指令並開啟看板即可。**
+**只使用 VS Code Copilot、Codex CLI、Claude Code、Cursor 或 Grok Build 時，執行一行安裝指令並開啟看板即可。**
 
 ### Windows 原生使用
 
@@ -58,6 +60,7 @@ Windows 預設使用下列原生路徑：
 | Codex | `%USERPROFILE%\.codex` |
 | Claude Code | `%USERPROFILE%\.claude` |
 | Cursor | `%USERPROFILE%\.cursor` |
+| Grok Build | `%USERPROFILE%\.grok` |
 
 看板內的設定指南會在 Windows 顯示 PowerShell 複製、設定與診斷命令。PowerShell collector 使用 .NET JSON 與檔案 API，不依賴 Bash、`jq`、`sed` 或 `awk`。
 
@@ -87,7 +90,7 @@ Windows 預設使用下列原生路徑：
 
 ### 介面操作
 
-- 四種 CLI 徽章切換
+- 七種 Agent 徽章切換
 - 每日、月度、年度視圖
 - 日期、月份、年份快速切換
 - 5 秒、10 秒、30 秒即時自動刷新
@@ -280,6 +283,34 @@ $env:VSCODE_USER_DATA_DIR = "C:\path\to\vscode-user-data"; & "$HOME\bin\token-us
 
 * * *
 
+## Grok Build 設定
+
+**Grok Build 不需要安裝 Hook、Status Line 或額外收集腳本。**
+
+看板會直接掃描：
+
+```text
+~/.grok/sessions/**/updates.jsonl
+```
+
+使用方式：
+
+1. 先正常使用 Grok Build 產生至少一個 Session。
+2. 啟動本專案。
+3. 在左側選擇 Grok Build。
+4. 按右上角同步按鈕，或等待背景同步。
+
+### Token 與費用來源
+
+- 若 session stream 含 `usage`、`modelUsage`、`total_cost_usd` 或 `total_cost_usd_ticks`，看板會保存 provider 回報的 input、cache、output、reasoning 與成本資料。
+- 部分 OAuth／訂閱流程的本機記錄只有 `_meta.totalTokens` context snapshot；這類資料會以 `grok-build-context` 標記，避免誤稱為 provider 帳單。
+- Grok provider usage 的 `cachedReadTokens` 是 `inputTokens` 的子集；看板會將輸入拆成非快取輸入與快取讀取，總 Token 仍包含兩者與輸出，估算費用則依 xAI 的快取折扣價格分開計算。
+- Grok Build 目前記錄 `Grok 4.5`，並依 `reasoning_effort` 顯示 `Grok 4.5 (Low)`、`Grok 4.5 (Medium)` 或 `Grok 4.5 (High)`。對沒有 provider 回報成本的資料，會依 `pricing.csv` 的 xAI API list price 估算：一般上下文輸入 `$2.00`、快取輸入 `$0.30`、輸出 `$6.00`；總上下文達 200K tokens 時，長上下文輸入 `$4.00`、快取輸入 `$0.60`、輸出 `$12.00`（每百萬 Token）。這不代表 SuperGrok 或其他訂閱方案的週配額。
+
+官方格式參考：[Grok Build sessions](https://docs.x.ai/build/enterprise)、[headless usage output](https://docs.x.ai/build/cli/headless-scripting)、[Grok 4.5 pricing](https://docs.x.ai/developers/models/grok-4.5)。
+
+* * *
+
 ## 本地資料同步方式
 
 啟動服務時，後端會初始化本機 SQLite 並立即同步一次資料。服務啟動後，也會每 5 秒背景同步一次。
@@ -304,7 +335,7 @@ GET /api/:assistant/sync
 
 CLI 工具僅提供給從原始碼建置的進階使用者；Release 安裝包目前不包含 CLI 執行檔。
 
-`--agent` 會指定助理（`antigravity` / `copilot` / `codex` / `claude` / `cursor`）
+`--agent` 會指定助理（`antigravity` / `copilot` / `codex` / `claude` / `cursor` / `grok`）
 
 ### 從原始碼使用 CLI
 
@@ -358,6 +389,7 @@ cargo build --release --bin token-usage-insights-cli
 | `CODEX_DIR` | `~/.codex` | Codex CLI 資料目錄 |
 | `CLAUDE_DIR` | `~/.claude` | Claude Code 資料目錄 |
 | `CURSOR_DIR` | `~/.cursor` | Cursor 資料目錄 |
+| `GROK_DIR` | `~/.grok` | Grok Build 資料目錄 |
 | `CORS_ALLOWED_ORIGINS` | `http://localhost:<PORT>,http://127.0.0.1:<PORT>` | 允許的 CORS 來源，逗號分隔 |
 
 範例：
@@ -543,6 +575,8 @@ ls ~/.gemini/antigravity-cli/usage
 ls ~/.copilot/usage
 ls ~/.codex/sessions
 ls ~/.claude/projects
+ls ~/.cursor/projects
+ls ~/.grok/sessions
 ```
 
 Antigravity CLI 與 Copilot CLI 還需要確認 `settings.json` 已設定 `statusLine`，且腳本具備執行權限。
@@ -554,6 +588,8 @@ Get-ChildItem "$env:USERPROFILE\.gemini\antigravity-cli\usage"
 Get-ChildItem "$env:USERPROFILE\.copilot\usage"
 Get-ChildItem "$env:USERPROFILE\.codex\sessions"
 Get-ChildItem "$env:USERPROFILE\.claude\projects"
+Get-ChildItem "$env:USERPROFILE\.cursor\projects"
+Get-ChildItem "$env:USERPROFILE\.grok\sessions"
 ```
 
 ### Status Line 腳本無法執行

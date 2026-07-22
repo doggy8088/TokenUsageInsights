@@ -71,6 +71,9 @@ const assistantAliasMap = {
   'claude-code': 'claude',
   'claude_code': 'claude',
   'claudecode': 'claude',
+  'grok-build': 'grok',
+  'grok_build': 'grok',
+  'grokbuild': 'grok',
 };
 
 const assistantMeta = {
@@ -114,6 +117,14 @@ const assistantMeta = {
     badgeStyle: 'background: rgba(139, 92, 246, 0.15); color: #a78bfa; border: 1px solid rgba(139, 92, 246, 0.3); display: inline-flex; align-items: center;',
     senderName: 'CURSOR AGENT',
   },
+  grok: {
+    logo: '/static/grok-logo.svg',
+    label: 'Grok Build',
+    shortLabel: 'Grok',
+    alt: 'Grok Build',
+    badgeStyle: 'background: rgba(239, 68, 68, 0.13); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.28); display: inline-flex; align-items: center;',
+    senderName: 'GROK BUILD AGENT',
+  },
 };
 
 function normalizeAssistant(rawValue) {
@@ -133,6 +144,7 @@ function getAssistantMeta(rawValue) {
     label: normalized || 'Agent',
     shortLabel: normalized || 'Agent',
     alt: normalized || 'Agent',
+    mark: '?',
     badgeStyle: 'display: inline-flex; align-items: center;',
     senderName: 'AGENT',
   };
@@ -140,6 +152,9 @@ function getAssistantMeta(rawValue) {
 
 function getAssistantLogoHtml(rawValue, className = 'badge-logo') {
   const meta = getAssistantMeta(rawValue);
+  if (!meta.logo) {
+    return `<span class="${className} grok-mark" aria-hidden="true">${meta.mark || 'G'}</span>`;
+  }
   return `<img class="${className}" src="${meta.logo}" alt="${meta.alt}" />`;
 }
 
@@ -311,8 +326,18 @@ function updateBrandLogo() {
   if (!brandLogo) return;
 
   const meta = getAssistantMeta(currentAssistant);
-  brandLogo.src = meta.logo;
-  brandLogo.alt = meta.alt;
+  brandLogo.src = meta.logo || '/static/favicon-v2.png';
+  brandLogo.alt = meta.logo ? meta.alt : 'Token 戰情室';
+}
+
+function updateAssistantBillingNote() {
+  const note = document.getElementById('assistant-billing-note');
+  if (!note) return;
+  const isGrok = currentAssistant === 'grok';
+  note.classList.toggle('hidden', !isGrok);
+  if (isGrok) {
+    note.innerHTML = t('billing_note');
+  }
 }
 
 function languageMeta(lang) {
@@ -455,6 +480,7 @@ function updateLanguageUI() {
 
   // Update dynamic brand logo in sidebar
   updateBrandLogo();
+  updateAssistantBillingNote();
   syncSidebarToggleButton();
   updateDailyChartControls();
   updateCodexRateLimit();
@@ -1597,7 +1623,7 @@ function showNoDataForDate(date) {
     .replace('{agent}', meta.label)
     .replace('{date}', date);
   const desc = t('no_data_for_date_desc');
-  const logoMarkup = `<div class="card-icon"><img src="${meta.logo}" alt="${meta.alt}" style="width: 56px; height: 56px; object-fit: contain;" /></div>`;
+  const logoMarkup = `<div class="card-icon empty-agent-logo-wrap">${getAssistantLogoHtml(currentAssistant, 'empty-agent-logo')}</div>`;
 
   const emptyContainer = document.getElementById('empty-state-container');
   const dailyView = document.getElementById('daily-view-container');
@@ -1678,11 +1704,10 @@ function renderMetricValue(elementId, getValFn, formatFn, sessions, activeAgents
     let html = '<div class="stat-value-list">';
     activeAgents.forEach(a => {
       const meta = getAssistantMeta(a);
-      let logoUrl = meta.logo;
       let displayName = meta.label;
       html += `
         <div class="stat-value-item">
-          <span class="agent-name" title="${displayName}"><img class="badge-logo" src="${logoUrl}" alt="${displayName}" /></span>
+          <span class="agent-name" title="${displayName}">${getAssistantLogoHtml(a)}</span>
           <span class="val">${formatFn(agentData[a])}</span>
         </div>
       `;
@@ -1704,13 +1729,12 @@ function renderMonthlyMetricValue(elementId, getValFn, formatFn, agentBreakdown,
     let html = '<div class="stat-value-list">';
     activeAgents.forEach(a => {
       const meta = getAssistantMeta(a);
-      let logoUrl = meta.logo;
       let displayName = meta.label;
       
       const val = (agentBreakdown && agentBreakdown[a]) ? getValFn(agentBreakdown[a]) : 0;
       html += `
         <div class="stat-value-item">
-          <span class="agent-name" title="${displayName}"><img class="badge-logo" src="${logoUrl}" alt="${displayName}" /></span>
+          <span class="agent-name" title="${displayName}">${getAssistantLogoHtml(a)}</span>
           <span class="val">${formatFn(val)}</span>
         </div>
       `;
@@ -3282,7 +3306,11 @@ function renderSessionTable(sessions) {
       ? '<span class="badge source-badge" title="GitHub Copilot in VS Code">VS Code</span>'
       : (s.assistant_type === 'copilot'
         ? '<span class="badge source-badge" title="GitHub Copilot CLI">CLI</span>'
-        : '');
+        : (s.source_kind === 'grok-build-usage'
+          ? `<span class="badge source-badge" title="${t('grok_source_usage_title')}">${t('grok_source_usage')}</span>`
+          : (s.source_kind === 'grok-build-context'
+            ? `<span class="badge source-badge" title="${t('grok_source_context_title')}">${t('grok_source_context')}</span>`
+            : '')));
 
     const astColumn = (currentAssistant === 'all' || currentAssistant.includes(',')) ? `<td>${assistantBadge}</td>` : '';
 
@@ -4184,12 +4212,11 @@ function renderYearlyDashboard(data) {
     let sessionsHtml = '<div class="stat-value-list">';
     activeAgents.forEach(a => {
       const meta = getAssistantMeta(a);
-      let logoUrl = meta.logo;
       let displayName = meta.label;
       const val = (agent_breakdown && agent_breakdown[a]) ? agent_breakdown[a].total_sessions : 0;
       sessionsHtml += `
         <div class="stat-value-item">
-          <span class="agent-name" title="${displayName}"><img class="badge-logo" src="${logoUrl}" alt="${displayName}" /></span>
+          <span class="agent-name" title="${displayName}">${getAssistantLogoHtml(a)}</span>
           <span class="val">${formatNumber(val)}</span>
         </div>
       `;
@@ -4247,12 +4274,11 @@ function renderYearlyMetricValue(elementId, getter, formatter, agentBreakdown, a
   let html = '<div class="stat-value-list">';
   activeAgents.forEach(a => {
     const meta = getAssistantMeta(a);
-      let logoUrl = meta.logo;
-      let displayName = meta.label;
+    let displayName = meta.label;
     const val = (agentBreakdown && agentBreakdown[a]) ? getter(agentBreakdown[a]) : 0;
     html += `
       <div class="stat-value-item">
-        <span class="agent-name" title="${displayName}"><img class="badge-logo" src="${logoUrl}" alt="${displayName}" /></span>
+        <span class="agent-name" title="${displayName}">${getAssistantLogoHtml(a)}</span>
         <span class="val">${formatter(val)}</span>
       </div>
     `;
@@ -5251,10 +5277,12 @@ function openSetupModal() {
     const codexBody = document.getElementById('setup-body-codex');
     const claudeBody = document.getElementById('setup-body-claude');
     const cursorBody = document.getElementById('setup-body-cursor');
+    const grokBody = document.getElementById('setup-body-grok');
     if (statuslineBody) statuslineBody.style.display = 'none';
     if (codexBody) codexBody.style.display = 'none';
     if (claudeBody) claudeBody.style.display = 'none';
     if (cursorBody) cursorBody.style.display = 'none';
+    if (grokBody) grokBody.style.display = 'none';
 
     if (currentAssistant === 'codex') {
       if (codexBody) codexBody.style.display = 'block';
@@ -5262,6 +5290,8 @@ function openSetupModal() {
       if (claudeBody) claudeBody.style.display = 'block';
     } else if (currentAssistant === 'cursor') {
       if (cursorBody) cursorBody.style.display = 'block';
+    } else if (currentAssistant === 'grok') {
+      if (grokBody) grokBody.style.display = 'block';
     } else {
       if (statuslineBody) statuslineBody.style.display = 'none';
       if (statuslineBody) statuslineBody.style.display = 'block';
@@ -5300,6 +5330,8 @@ async function loadSetupInfo() {
         titleH2.setAttribute('data-i18n', 'claude_setup_modal_title');
       } else if (currentAssistant === 'cursor') {
         titleH2.setAttribute('data-i18n', 'cursor_setup_modal_title');
+      } else if (currentAssistant === 'grok') {
+        titleH2.setAttribute('data-i18n', 'grok_setup_modal_title');
       } else {
         titleH2.setAttribute('data-i18n', 'setup_modal_title');
       }
@@ -5423,6 +5455,9 @@ async function loadSetupInfo() {
     } else if (currentAssistant === 'cursor') {
       const homeLabelCursor = document.getElementById('lbl-detected-home-cursor');
       if (homeLabelCursor) homeLabelCursor.textContent = abbreviateHomePath(data.cursor?.data_path || '');
+    } else if (currentAssistant === 'grok') {
+      const homeLabelGrok = document.getElementById('lbl-detected-home-grok');
+      if (homeLabelGrok) homeLabelGrok.textContent = abbreviateHomePath(data.grok?.data_path || '');
     }
 
     // Apply updated language translations
@@ -5481,12 +5516,10 @@ function toggleEmptyState(showEmpty) {
           </div>
         `;
       } else {
-        const meta = getAssistantMeta(currentAssistant);
-        let emptyLogoUrl = meta.logo;
         emptyContainer.innerHTML = `
           <div class="welcome-setup-card">
             <div class="card-icon" style="display: flex; justify-content: center; align-items: center; filter: drop-shadow(0 0 10px rgba(255,255,255,0.1)); margin-bottom: 12px;">
-              <img src="${emptyLogoUrl}" alt="${meta.alt}" style="width: 48px; height: 48px; border-radius: 8px; object-fit: cover;" />
+              ${getAssistantLogoHtml(currentAssistant, 'empty-agent-logo')}
             </div>
             <h2>${t('empty_title')}</h2>
             <p>${t('empty_desc')}</p>

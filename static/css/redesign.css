@@ -1309,6 +1309,66 @@ input {
   }
 }
 
+.grok-mark {
+  box-sizing: border-box;
+  display: inline-grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  flex: 0 0 auto;
+  border: 1px solid rgba(239, 68, 68, 0.45);
+  border-radius: var(--radius-sm);
+  background: rgba(239, 68, 68, 0.16);
+  color: #fb7185;
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.agent-selector-section .assistant-badge-btn .grok-mark {
+  width: 24px;
+  height: 24px;
+  border-radius: var(--radius-sm);
+}
+
+.badge-logo.grok-mark {
+  width: 14px;
+  height: 14px;
+  margin-right: 6px;
+  border-radius: 3px;
+  font-size: 0.58rem;
+}
+
+.empty-agent-logo-wrap {
+  display: grid;
+  place-items: center;
+}
+
+.empty-agent-logo {
+  width: 56px;
+  height: 56px;
+  border-radius: var(--radius-lg);
+  object-fit: contain;
+}
+
+.assistant-billing-note {
+  max-width: 72ch;
+  margin: 8px 0 0;
+  padding: 7px 10px;
+  border-left: 2px solid #fb7185;
+  background: color-mix(in srgb, #ef4444 8%, var(--surface-1));
+  color: var(--text-secondary);
+  font-size: 0.74rem;
+  line-height: 1.45;
+}
+
+.assistant-billing-note code {
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+}
+
 @media (pointer: coarse) {
   .reload-btn,
   .sidebar-toggle-btn,
