@@ -3868,15 +3868,39 @@ pub fn import_usage_day_entries(
     })
 }
 
+/// Session identity tuple returned by [`get_session_assistant_and_transcript`]:
+/// `(assistant_type, transcript_path, source_kind, source_dir_key,
+/// parent_session_id, agent_nickname)`.
+pub type SessionIdentity = (
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+/// Returns `(assistant_type, transcript_path, source_kind, source_dir_key,
+/// parent_session_id, agent_nickname)` for a given session id.
+///
+/// `parent_session_id` and `agent_nickname` are populated for Copilot App
+/// subagent synthetic rows (`<main>__<agent_id>`); they are `None` for main
+/// agent rows and for non-Copilot-App sessions. The session detail handler uses
+/// them to locate the shared `events.jsonl` under the parent session
+/// directory and to filter events by agent id, so it must NOT derive the
+/// parent/agent from string-splitting the synthetic id.
 pub fn get_session_assistant_and_transcript(
     conn: &rusqlite::Connection,
     assistant: &str,
     session_id: &str,
-) -> Result<(String, Option<String>, String, Option<String>), String> {
+) -> Result<SessionIdentity, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT assistant_type, transcript_path, source_kind, source_dir_key
-             FROM usage_entries WHERE session_id = ? AND assistant_type = ? LIMIT 1",
+            "SELECT assistant_type, transcript_path, source_kind, source_dir_key,
+                    parent_session_id, agent_nickname
+             FROM usage_entries WHERE session_id = ? AND assistant_type = ?
+             ORDER BY (parent_session_id IS NULL) ASC, turn_no ASC
+             LIMIT 1",
         )
         .map_err(|e| e.to_string())?;
     let mut rows = stmt
@@ -3891,7 +3915,24 @@ pub fn get_session_assistant_and_transcript(
             .flatten()
             .unwrap_or_else(|| "legacy".to_string());
         let source_dir_key: Option<String> = row.get(3).ok().flatten();
-        Ok((ast, path, source_kind, source_dir_key))
+        let parent_session_id = row
+            .get::<_, Option<String>>(4)
+            .ok()
+            .flatten()
+            .filter(|s| !s.is_empty());
+        let agent_nickname = row
+            .get::<_, Option<String>>(5)
+            .ok()
+            .flatten()
+            .filter(|s| !s.is_empty());
+        Ok((
+            ast,
+            path,
+            source_kind,
+            source_dir_key,
+            parent_session_id,
+            agent_nickname,
+        ))
     } else {
         Err("Session not found".to_string())
     }

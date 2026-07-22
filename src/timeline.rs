@@ -257,11 +257,42 @@ pub fn parse_antigravity_timeline(
     );
 }
 
+/// Backwards-compatible entry point that reconstructs a Copilot CLI timeline
+/// without any agent filtering. Kept as a thin shim so existing callers and
+/// documentation continue to resolve; the Copilot CLI events never carry a
+/// top-level `agentId`, so forwarding `None` reproduces the original behavior.
+#[allow(dead_code)]
 pub fn parse_copilot_timeline(
     reader: BufReader<File>,
     db_entries: &HashMap<u32, (TokenStats, String)>,
     timeline: &mut Vec<TimelineItem>,
     metadata: &mut HashMap<String, serde_json::Value>,
+) {
+    parse_copilot_timeline_filtered(reader, db_entries, timeline, metadata, None);
+}
+
+/// Copilot App-aware variant of [`parse_copilot_timeline`].
+///
+/// `agent_filter` selects which agent's events are reconstructed from the
+/// shared `events.jsonl` of a Copilot App session:
+/// - `None`: main agent view. Events that carry a non-null top-level `agentId`
+///   (subagent `assistant.message`, subagent `tool.execution_*`, `hook.*`,
+///   `subagent.*`, `session.error` ...) are skipped so the main agent timeline
+///   never lists a subagent's reply or tool execution as the main agent's own.
+/// - `Some(agent_id)`: subagent view. Only events whose top-level `agentId`
+///   equals `agent_id` are reconstructed, plus shared context events
+///   (`session.start`, `session.shutdown`, `session.info`, `user.message`,
+///   `system.message`) that have no `agentId` so the user prompt and session
+///   metadata remain visible.
+///
+/// Copilot CLI calls [`parse_copilot_timeline`] which forwards `None`, so its
+/// behavior is unchanged (CLI events never carry a top-level `agentId`).
+pub fn parse_copilot_timeline_filtered(
+    reader: BufReader<File>,
+    db_entries: &HashMap<u32, (TokenStats, String)>,
+    timeline: &mut Vec<TimelineItem>,
+    metadata: &mut HashMap<String, serde_json::Value>,
+    agent_filter: Option<&str>,
 ) {
     let mut current_turn_no = 1;
     let mut has_seen_user_prompt = false;
@@ -279,6 +310,35 @@ pub fn parse_copilot_timeline(
         };
 
         let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let event_agent_id = event.get("agentId").and_then(|v| v.as_str());
+
+        // Apply the agent filter before any state mutation so per-agent
+        // `tool_calls_map` and `current_turn_no` bookkeeping stay consistent
+        // with the filtered event stream.
+        let keep = match agent_filter {
+            None => event_agent_id.is_none(),
+            Some(filter) => match event_agent_id {
+                Some(a) => a == filter,
+                // Shared context events (no agentId) are useful for both views;
+                // skip subagent lifecycle events themselves from the shared
+                // set because they are tagged with their own agentId above.
+                None => matches!(
+                    event_type,
+                    "session_meta"
+                        | "SESSION_STARTED"
+                        | "session.start"
+                        | "session.shutdown"
+                        | "session.info"
+                        | "user.message"
+                        | "USER_PROMPT"
+                        | "system.message"
+                ),
+            },
+        };
+        if !keep {
+            continue;
+        }
+
         let timestamp = event
             .get("timestamp")
             .and_then(|t| t.as_str())
@@ -594,6 +654,49 @@ pub fn parse_copilot_timeline(
                     timestamp,
                     status_type: "session_end".to_string(),
                     message: "會話結束 (Session Ended)".to_string(),
+                });
+            }
+            // Copilot App subagent lifecycle markers. These events carry a
+            // top-level `agentId`; the filter above ensures only the matching
+            // subagent view (or, for the main view, none of them) reaches here.
+            "subagent.started" => {
+                let p = data.or(payload);
+                let display = p
+                    .and_then(|p| p.get("agentDisplayName"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Subagent");
+                let name = p
+                    .and_then(|p| p.get("agentName"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let model = p.and_then(|p| p.get("model")).and_then(|v| v.as_str());
+                let message = match (display, name, model) {
+                    (d, n, Some(m)) if !n.is_empty() => {
+                        format!("子代理啟動 (Subagent Started): {d} [{n}] @ {m}")
+                    }
+                    (d, n, None) if !n.is_empty() => {
+                        format!("子代理啟動 (Subagent Started): {d} [{n}]")
+                    }
+                    (d, _, _) => format!("子代理啟動 (Subagent Started): {d}"),
+                };
+                timeline.push(TimelineItem::SystemStatus {
+                    timestamp,
+                    status_type: "subagent_started".to_string(),
+                    message,
+                });
+            }
+            "subagent.completed" => {
+                timeline.push(TimelineItem::SystemStatus {
+                    timestamp,
+                    status_type: "subagent_completed".to_string(),
+                    message: "子代理完成 (Subagent Completed)".to_string(),
+                });
+            }
+            "subagent.failed" => {
+                timeline.push(TimelineItem::SystemStatus {
+                    timestamp,
+                    status_type: "subagent_failed".to_string(),
+                    message: "子代理失敗 (Subagent Failed)".to_string(),
                 });
             }
             _ => {}
@@ -1505,4 +1608,180 @@ fn cursor_content_to_text(content: &serde_json::Value) -> String {
         }
     }
     parts.join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// Write the given JSONL lines to a temp file and return a `BufReader`.
+    /// Each test gets a unique file so parallel test runs do not collide.
+    fn reader_for_events(lines: &[&str]) -> (BufReader<File>, std::path::PathBuf) {
+        let mut path = std::env::temp_dir();
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        path.push(format!(
+            "token-insights-timeline-test-{}-{}-{}.jsonl",
+            std::process::id(),
+            n,
+            unique
+        ));
+        fs::write(&path, lines.join("\n")).unwrap();
+        let file = File::open(&path).unwrap();
+        (BufReader::new(file), path)
+    }
+
+    fn extract_replies(timeline: &[TimelineItem]) -> Vec<String> {
+        timeline
+            .iter()
+            .filter_map(|item| match item {
+                TimelineItem::AgentReply { reply, .. } => Some(reply.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn extract_tool_names(timeline: &[TimelineItem]) -> Vec<String> {
+        timeline
+            .iter()
+            .filter_map(|item| match item {
+                TimelineItem::ToolStep { tool_name, .. } => Some(tool_name.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A shared events.jsonl containing a main agent turn, a subagent
+    /// (`call_v4b32z66`) assistant message + tool execution, and subagent
+    /// lifecycle markers. Mirrors the real Copilot App layout.
+    fn shared_events() -> Vec<&'static str> {
+        vec![
+            r#"{"type":"session.start","data":{"copilotVersion":"1.0"},"timestamp":"2026-07-22T10:00:00Z"}"#,
+            r#"{"type":"user.message","data":{"content":"Please summarize"},"timestamp":"2026-07-22T10:00:01Z"}"#,
+            r#"{"type":"assistant.message","data":{"content":"Main agent reply"},"timestamp":"2026-07-22T10:00:02Z"}"#,
+            r#"{"type":"tool.execution_start","data":{"toolCallId":"main-tool-1","toolName":"Bash"},"timestamp":"2026-07-22T10:00:03Z"}"#,
+            r#"{"type":"tool.execution_complete","data":{"toolCallId":"main-tool-1","success":true,"result":{"content":"done"}},"timestamp":"2026-07-22T10:00:04Z"}"#,
+            r#"{"type":"subagent.started","agentId":"call_v4b32z66","data":{"agentDisplayName":"K2.7","agentName":"K2.7","model":"cbc40143"},"timestamp":"2026-07-22T10:00:05Z"}"#,
+            r#"{"type":"assistant.message","agentId":"call_v4b32z66","data":{"content":"Subagent reply"},"timestamp":"2026-07-22T10:00:06Z"}"#,
+            r#"{"type":"tool.execution_start","agentId":"call_v4b32z66","data":{"toolCallId":"sub-tool-1","toolName":"Grep"},"timestamp":"2026-07-22T10:00:07Z"}"#,
+            r#"{"type":"tool.execution_complete","agentId":"call_v4b32z66","data":{"toolCallId":"sub-tool-1","success":true,"result":{"content":"found"}},"timestamp":"2026-07-22T10:00:08Z"}"#,
+            r#"{"type":"subagent.completed","agentId":"call_v4b32z66","timestamp":"2026-07-22T10:00:09Z"}"#,
+            r#"{"type":"session.shutdown","timestamp":"2026-07-22T10:00:10Z"}"#,
+        ]
+    }
+
+    #[test]
+    fn main_agent_filter_excludes_subagent_assistant_and_tool_events() {
+        let (reader, path) = reader_for_events(&shared_events());
+        let db_entries = HashMap::new();
+        let mut timeline = Vec::new();
+        let mut metadata = HashMap::new();
+        parse_copilot_timeline_filtered(reader, &db_entries, &mut timeline, &mut metadata, None);
+
+        let replies = extract_replies(&timeline);
+        assert_eq!(replies, vec!["Main agent reply".to_string()]);
+        let tools = extract_tool_names(&timeline);
+        assert_eq!(tools, vec!["Bash".to_string()]);
+        // No subagent lifecycle marker should leak into the main agent view.
+        assert!(!timeline.iter().any(|item| matches!(
+            item,
+            TimelineItem::SystemStatus { status_type, .. }
+                if status_type == "subagent_started" || status_type == "subagent_completed"
+        )));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn subagent_filter_keeps_only_its_agent_events_plus_shared_context() {
+        let (reader, path) = reader_for_events(&shared_events());
+        let db_entries = HashMap::new();
+        let mut timeline = Vec::new();
+        let mut metadata = HashMap::new();
+        parse_copilot_timeline_filtered(
+            reader,
+            &db_entries,
+            &mut timeline,
+            &mut metadata,
+            Some("call_v4b32z66"),
+        );
+
+        let replies = extract_replies(&timeline);
+        assert_eq!(replies, vec!["Subagent reply".to_string()]);
+        let tools = extract_tool_names(&timeline);
+        assert_eq!(tools, vec!["Grep".to_string()]);
+        // Shared context (user.message + session.start/shutdown) should be kept
+        // so the subagent drawer still shows the originating prompt.
+        assert!(timeline.iter().any(|item| matches!(
+            item,
+            TimelineItem::UserPrompt { prompt, .. } if prompt == "Please summarize"
+        )));
+        // Subagent lifecycle markers for this agent should be present.
+        assert!(timeline.iter().any(|item| matches!(
+            item,
+            TimelineItem::SystemStatus { status_type, .. } if status_type == "subagent_started"
+        )));
+        // Main agent reply must NOT appear.
+        assert!(!extract_replies(&timeline)
+            .iter()
+            .any(|r| r == "Main agent reply"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn cli_timeline_with_no_agent_filter_is_unchanged_when_events_have_no_agentid() {
+        // Pure Copilot CLI events (no top-level agentId) must reconstruct
+        // identically to the original behavior, i.e. both the shim and the
+        // filtered parser with None produce the same timeline.
+        let cli_events = vec![
+            r#"{"type":"session.start","data":{"copilotVersion":"1.0"},"timestamp":"2026-07-22T10:00:00Z"}"#,
+            r#"{"type":"user.message","data":{"content":"hi"},"timestamp":"2026-07-22T10:00:01Z"}"#,
+            r#"{"type":"assistant.message","data":{"content":"hello back"},"timestamp":"2026-07-22T10:00:02Z"}"#,
+        ];
+        let (reader, path) = reader_for_events(&cli_events);
+        let db_entries = HashMap::new();
+        let mut timeline = Vec::new();
+        let mut metadata = HashMap::new();
+        parse_copilot_timeline_filtered(reader, &db_entries, &mut timeline, &mut metadata, None);
+
+        assert_eq!(extract_replies(&timeline), vec!["hello back".to_string()]);
+        assert!(timeline.iter().any(|item| matches!(
+            item,
+            TimelineItem::UserPrompt { prompt, .. } if prompt == "hi"
+        )));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn subagent_filter_with_no_matching_events_yields_no_agent_specific_items() {
+        // No event carries agentId "ghost"; the subagent filter should keep
+        // only shared context (user.message/session.start) and no agent-specific
+        // replies, tool steps, or subagent lifecycle markers. The handler maps
+        // a timeline with no agent-specific items to content_unavailable.
+        let (reader, path) = reader_for_events(&shared_events());
+        let db_entries = HashMap::new();
+        let mut timeline = Vec::new();
+        let mut metadata = HashMap::new();
+        parse_copilot_timeline_filtered(
+            reader,
+            &db_entries,
+            &mut timeline,
+            &mut metadata,
+            Some("ghost"),
+        );
+        assert!(extract_replies(&timeline).is_empty());
+        assert!(extract_tool_names(&timeline).is_empty());
+        assert!(!timeline.iter().any(|item| matches!(
+            item,
+            TimelineItem::SystemStatus { status_type, .. }
+                if status_type == "subagent_started" || status_type == "subagent_completed"
+        )));
+        let _ = fs::remove_file(path);
+    }
 }
