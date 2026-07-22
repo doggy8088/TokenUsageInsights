@@ -4013,7 +4013,7 @@ fn migrate_records(
     }
 
     let mut stmt = src_conn.prepare(
-        "SELECT 
+        "SELECT
             timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
             tokens_input, tokens_output, tokens_cache_read, tokens_reasoning, tokens_total,
             delta_input, delta_output, delta_cache_read, delta_reasoning, delta_total,
@@ -4227,7 +4227,7 @@ pub fn get_usage_entries_by_date(
     date: &str,
     assistant: &str,
 ) -> Result<Vec<(UsageDayExportRecord, String)>, String> {
-    let mut query = "SELECT 
+    let mut query = "SELECT
             timestamp, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
             tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_reasoning, tokens_total,
             delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total,
@@ -4735,7 +4735,7 @@ pub fn get_usage_entries_by_month(
     assistant: &str,
 ) -> Result<Vec<(UsageEntry, String, String)>, String> {
     let query_month = format!("{}-%", year_month);
-    let mut query = "SELECT 
+    let mut query = "SELECT
             timestamp, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
             tokens_input, tokens_output, tokens_cache_read, tokens_reasoning, tokens_total,
             delta_input, delta_output, delta_cache_read, delta_reasoning, delta_total,
@@ -4935,7 +4935,7 @@ pub fn get_usage_entries_by_year(
     assistant: &str,
 ) -> Result<Vec<(UsageEntry, String, String)>, String> {
     let query_year = format!("{}-%", year);
-    let mut query = "SELECT 
+    let mut query = "SELECT
             timestamp, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
             tokens_input, tokens_output, tokens_cache_read, tokens_reasoning, tokens_total,
             delta_input, delta_output, delta_cache_read, delta_reasoning, delta_total,
