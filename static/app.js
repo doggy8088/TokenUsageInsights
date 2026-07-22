@@ -3294,7 +3294,11 @@ function renderSessionTable(sessions) {
       const paddingLeft = s.depth * 16;
       const connectorLeft = (s.depth - 1) * 16 + 4;
       const nickname = s.agent_nickname || '';
-      const role = s.agent_role || '';
+      // Subagent 第一列只顯示具實際語意的角色，排除與 Subagent badge 重複的 sub-agent/subagent
+      const rawRole = (s.agent_role || '').trim();
+      const semanticRole = rawRole && !['sub-agent', 'subagent'].includes(rawRole.toLowerCase()) ? rawRole : '';
+      // Subagent 顯示 parent session title，避免 collector 自動產生的 (subagent call_xxx) 後綴
+      const subagentDisplayName = s.parentName || s.session_name;
       nameCellContent = `
         <div class="session-name-wrapper is-subagent" style="padding-left: ${paddingLeft}px;">
           <span class="tree-connector" style="left: ${connectorLeft}px;">└─</span>
@@ -3302,10 +3306,9 @@ function renderSessionTable(sessions) {
             <span class="badge subagent-badge" title="Subagent of: ${escapeHtml(s.parentName || '')}">Subagent</span>
             ${sourceBadge}
             ${nickname ? `<span class="badge agent-nickname-badge" title="Agent Nickname: ${escapeHtml(nickname)}">${escapeHtml(nickname)}</span>` : ''}
-            ${role ? `<span class="badge agent-role-badge" title="Agent Role: ${escapeHtml(role)}">${escapeHtml(role)}</span>` : ''}
+            ${semanticRole ? `<span class="badge agent-role-badge" title="Agent Role: ${escapeHtml(semanticRole)}">${escapeHtml(semanticRole)}</span>` : ''}
           </div>
-          <span class="session-name-text" title="${escapeHtml(s.session_name)}">${escapeHtml(s.session_name)}</span>
-          ${sourceBadge}
+          <span class="session-name-text" title="${escapeHtml(subagentDisplayName)}">${escapeHtml(subagentDisplayName)}</span>
           <span class="session-id-sub">${escapeHtml(String(s.session_id))}</span>
         </div>
       `;
