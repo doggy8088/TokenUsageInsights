@@ -17,8 +17,8 @@ Gemini 3.1 Pro Preview (<200k),Google AI,1M Tokens,2.00,0.20,12.00,1.00/0.20/6.0
 Gemini 3.1 Pro Preview (>200k),Google AI,1M Tokens,4.00,0.40,18.00,2.00/0.40/9.00
 Gemini 3.1 Pro Preview,Google AI,1M Tokens,2.00,0.20,12.00,1.00/0.20/6.00
 Claude Sonnet 4.6 (Thinking),Global,1M Tokens,3.00,0.30,15.00,N/A
-Claude Opus 4.6 (Thinking) (<272k),Global,1M Tokens,5.00,0.50,25.00,N/A
-Claude Opus 4.6 (Thinking) (>272k),Global,1M Tokens,10.00,1.00,37.50,N/A
+Claude Opus 4.6 (Thinking) (<200k),Global,1M Tokens,5.00,0.50,25.00,N/A
+Claude Opus 4.6 (Thinking) (>200k),Global,1M Tokens,10.00,1.00,37.50,N/A
 Claude Opus 4.6 (Thinking),Global,1M Tokens,5.00,0.50,25.00,N/A
 GPT-OSS 120B (Medium),Local/OSS,1M Tokens,0.00,0.00,0.00,N/A
 gpt-5.6-sol,Global,1M Tokens,5.00,0.50,30.00,N/A
@@ -41,8 +41,8 @@ Claude Fable 5,Global,1M Tokens,10.00,1.00,50.00,N/A
 Claude Opus 4.8-fast,Global,1M Tokens,10.00,1.00,50.00,N/A
 Claude Opus 4.8,Global,1M Tokens,5.00,0.50,25.00,N/A
 Claude Opus 4.7,Global,1M Tokens,5.00,0.50,25.00,N/A
-Claude Opus 4.6 (<272k),Global,1M Tokens,5.00,0.50,25.00,N/A
-Claude Opus 4.6 (>272k),Global,1M Tokens,10.00,1.00,37.50,N/A
+Claude Opus 4.6 (<200k),Global,1M Tokens,5.00,0.50,25.00,N/A
+Claude Opus 4.6 (>200k),Global,1M Tokens,10.00,1.00,37.50,N/A
 Claude Opus 4.6,Global,1M Tokens,5.00,0.50,25.00,N/A
 Claude Opus 4.5,Global,1M Tokens,5.00,0.50,25.00,N/A
 Codex Auto Review,Global,1M Tokens,0.10,0.00,0.10,N/A
