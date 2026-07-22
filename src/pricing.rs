@@ -3,6 +3,8 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 
+use crate::db::UsageEntry;
+
 #[derive(Debug, Clone)]
 pub struct PricingRule {
     pub model_name: String,
@@ -77,27 +79,160 @@ pub fn load_pricing_rules() -> Vec<PricingRule> {
     rules
 }
 
-fn parse_threshold_rule(name: &str) -> (String, Option<bool>) {
+/// Parsed long-context threshold marker from a pricing rule label.
+/// `is_greater` is true for `>Nk` / `(>Nk)` and false for `<Nk` / `(<Nk)`.
+/// `threshold_tokens` is the token count boundary (for example, 200_000).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ThresholdRule {
+    is_greater: bool,
+    threshold_tokens: u64,
+}
+
+/// Parse a model/rule label into a normalized base name and optional threshold.
+///
+/// The pricing CSV has used both `(>272k)` and `(>272k context length)` forms,
+/// and newer rows can use a different boundary such as 200k. Parse the marker
+/// instead of tying matching behavior to one specific number or suffix.
+fn parse_threshold_rule(name: &str) -> (String, Option<ThresholdRule>) {
     let lower = name.to_lowercase();
-    let is_greater = if lower.contains(">272k") || lower.contains("> 272k") {
-        Some(true)
-    } else if lower.contains("<272k") || lower.contains("< 272k") {
-        Some(false)
+    let chars: Vec<char> = lower.chars().collect();
+    let context_length: Vec<char> = "context length".chars().collect();
+    let mut threshold = None;
+    let mut cleaned = String::with_capacity(lower.len());
+    let mut i = 0;
+
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '>' || c == '<' {
+            let is_greater = c == '>';
+            let mut j = i + 1;
+            while j < chars.len() && chars[j].is_ascii_whitespace() {
+                j += 1;
+            }
+
+            let digits_start = j;
+            while j < chars.len() && chars[j].is_ascii_digit() {
+                j += 1;
+            }
+
+            if j > digits_start && j < chars.len() && chars[j] == 'k' {
+                let digits: String = chars[digits_start..j].iter().collect();
+                if let Ok(value) = digits.parse::<u64>() {
+                    if threshold.is_none() {
+                        threshold = Some(ThresholdRule {
+                            is_greater,
+                            threshold_tokens: value.saturating_mul(1_000),
+                        });
+                    }
+
+                    // Preserve compatibility with the legacy
+                    // `(<272k context length)` spelling. Parentheses and
+                    // whitespace are discarded during normalization anyway.
+                    j += 1;
+                    while j < chars.len() && chars[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    if chars
+                        .get(j..j + context_length.len())
+                        .is_some_and(|suffix| suffix == context_length.as_slice())
+                    {
+                        j += context_length.len();
+                    }
+                    while j < chars.len() && chars[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    if j < chars.len() && chars[j] == ')' {
+                        j += 1;
+                    }
+
+                    i = j;
+                    continue;
+                }
+            }
+        }
+
+        cleaned.push(c);
+        i += 1;
+    }
+
+    let normalized = cleaned.chars().filter(|ch| ch.is_alphanumeric()).collect();
+    (normalized, threshold)
+}
+
+fn threshold_matches(rule: ThresholdRule, prompt_tokens: u64) -> bool {
+    if rule.is_greater {
+        prompt_tokens > rule.threshold_tokens
     } else {
-        None
+        // The pricing rows use `<Nk` as the short-context tier, which includes
+        // the exact boundary shown by the providers as `<=Nk`.
+        prompt_tokens <= rule.threshold_tokens
+    }
+}
+
+fn rule_applies_to_context(
+    rule_base: &str,
+    rule_threshold: Option<ThresholdRule>,
+    model_base: &str,
+    prompt_tokens: u64,
+    contains_match: bool,
+) -> bool {
+    if rule_base.is_empty() {
+        return false;
+    }
+
+    let base_matches = if contains_match {
+        model_base.contains(rule_base) || rule_base.contains(model_base)
+    } else {
+        rule_base == model_base
     };
+    if !base_matches {
+        return false;
+    }
 
-    let base = lower
-        .replace("<272k", "")
-        .replace(">272k", "")
-        .replace("(<272k)", "")
-        .replace("(>272k)", "")
-        .replace("(<272k context length)", "")
-        .replace("(>272k context length)", "");
+    rule_threshold
+        .map(|threshold| threshold_matches(threshold, prompt_tokens))
+        .unwrap_or(true)
+}
 
-    let normalized = base.chars().filter(|c| c.is_alphanumeric()).collect();
+/// Find a matching rule while ensuring an applicable threshold row wins over
+/// an unthresholded default row, regardless of CSV ordering.
+fn find_pricing_rule<'a>(
+    rules: &'a [PricingRule],
+    model_base: &str,
+    prompt_tokens: u64,
+    contains_match: bool,
+) -> Option<&'a PricingRule> {
+    let mut default_rule = None;
 
-    (normalized, is_greater)
+    for rule in rules {
+        let (rule_base, rule_threshold) = parse_threshold_rule(&rule.model_name);
+        if !rule_applies_to_context(
+            &rule_base,
+            rule_threshold,
+            model_base,
+            prompt_tokens,
+            contains_match,
+        ) {
+            continue;
+        }
+
+        if rule_threshold.is_some() {
+            return Some(rule);
+        }
+        if default_rule.is_none() {
+            default_rule = Some(rule);
+        }
+    }
+
+    default_rule
+}
+
+fn canonical_model_base(base: &str) -> &str {
+    match base {
+        "grok45latest" | "grokbuildlatest" | "grokbuild" | "grokbuild01" | "grokcodefast1"
+        | "grokcodefast" | "grokcodefast10825" => "grok45",
+        _ => base,
+    }
 }
 
 #[allow(dead_code)]
@@ -116,6 +251,7 @@ pub fn calculate_cost(
     cache_read: u64,
 ) -> Result<f64, String> {
     let (m_base, _) = parse_threshold_rule(model_name);
+    let m_base = canonical_model_base(&m_base);
     if m_base.is_empty() {
         return Err(format!(
             "模型名稱為空，無法估算成本。來源模型：{}",
@@ -123,52 +259,18 @@ pub fn calculate_cost(
         ));
     }
 
-    let total_context = input + cache_read + output;
-    let is_long_context = total_context > 272_000;
+    // Long-context pricing tiers are based on prompt/input tokens. `input`
+    // already contains cache-write tokens for parsers that expose them, while
+    // cache reads are kept separately for their discounted rate. Generated
+    // output does not change the prompt tier.
+    let prompt_tokens = input.saturating_add(cache_read);
 
-    // 1. First attempt: exact base name match
-    let mut rule = rules.iter().find(|r| {
-        let (r_base, r_thresh) = parse_threshold_rule(&r.model_name);
-        if r_base.is_empty() {
-            return false;
-        }
-        if r_base != m_base {
-            return false;
-        }
-        match r_thresh {
-            Some(greater) => {
-                if greater {
-                    is_long_context
-                } else {
-                    !is_long_context
-                }
-            }
-            None => true,
-        }
-    });
+    // 1. Exact base name match (threshold-aware)
+    let mut rule = find_pricing_rule(rules, m_base, prompt_tokens, false);
 
     // 2. Fallback: contains base name match
     if rule.is_none() {
-        rule = rules.iter().find(|r| {
-            let (r_base, r_thresh) = parse_threshold_rule(&r.model_name);
-            if r_base.is_empty() {
-                return false;
-            }
-            let base_matches = m_base.contains(&r_base) || r_base.contains(&m_base);
-            if !base_matches {
-                return false;
-            }
-            match r_thresh {
-                Some(greater) => {
-                    if greater {
-                        is_long_context
-                    } else {
-                        !is_long_context
-                    }
-                }
-                None => true,
-            }
-        });
+        rule = find_pricing_rule(rules, m_base, prompt_tokens, true);
     }
 
     if let Some(r) = rule {
@@ -199,9 +301,51 @@ pub fn calculate_usage_cost(
     calculate_cost(rules, model_name, input, output, cache_read)
 }
 
+pub fn calculate_entries_cost(
+    rules: &[PricingRule],
+    entries: &[UsageEntry],
+    model_name: Option<&str>,
+    input: u64,
+    output: u64,
+    cache_read: u64,
+) -> Result<f64, String> {
+    let mut reported_cost = 0.0;
+    let mut has_reported_cost = false;
+    let mut estimated_entries = Vec::new();
+    for entry in entries {
+        if let Some(cost) = entry.cost.as_ref().and_then(|cost| cost.reported_cost_usd) {
+            reported_cost += cost;
+            has_reported_cost = true;
+        } else {
+            estimated_entries.push(entry);
+        }
+    }
+    if !has_reported_cost {
+        return calculate_usage_cost(rules, model_name, input, output, cache_read);
+    }
+
+    let mut estimated_cost = 0.0;
+    for entry in estimated_entries {
+        let Some(tokens) = entry.delta_tokens.as_ref() else {
+            continue;
+        };
+        let entry_model = entry.model.as_deref().or(model_name);
+        estimated_cost += calculate_usage_cost(
+            rules,
+            entry_model,
+            tokens.input,
+            tokens.output,
+            tokens.cache_read.unwrap_or(0),
+        )?;
+    }
+
+    Ok(reported_cost + estimated_cost)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::TokenStats;
 
     #[test]
     fn zero_token_usage_without_model_costs_zero() {
@@ -234,5 +378,203 @@ mod tests {
         .unwrap();
 
         assert!((cost - 0.068_139_3).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn grok_build_long_context_uses_xai_long_context_rates() {
+        let rules = [
+            PricingRule {
+                model_name: "Grok 4.5 (High) (<200k)".to_string(),
+                input_price: 1.00,
+                cache_input_price: 0.20,
+                output_price: 2.00,
+            },
+            PricingRule {
+                model_name: "Grok 4.5 (High) (>200k)".to_string(),
+                input_price: 2.00,
+                cache_input_price: 0.40,
+                output_price: 4.00,
+            },
+        ];
+
+        let short_cost =
+            calculate_usage_cost(&rules, Some("Grok 4.5 (High)"), 200_000, 0, 0).unwrap();
+        let long_cost =
+            calculate_usage_cost(&rules, Some("Grok 4.5 (High)"), 200_001, 0, 0).unwrap();
+
+        assert!((short_cost - 0.2).abs() < f64::EPSILON);
+        assert!((long_cost - 0.400_002).abs() < 1e-12);
+    }
+
+    #[test]
+    fn reported_and_estimated_entry_costs_are_combined() {
+        let rules = [PricingRule {
+            model_name: "Grok 4.5".to_string(),
+            input_price: 1.00,
+            cache_input_price: 0.20,
+            output_price: 2.00,
+        }];
+        let token_stats = |input| TokenStats {
+            input,
+            output: 0,
+            cache_read: None,
+            cache_write: None,
+            reasoning: None,
+            total: input,
+        };
+        let base_entry = || UsageEntry {
+            timestamp: String::new(),
+            session_id: String::new(),
+            session_name: None,
+            transcript_path: None,
+            cwd: None,
+            version: None,
+            turn_no: 1,
+            model: Some("Grok 4.5".to_string()),
+            model_id: None,
+            tokens: None,
+            delta_tokens: None,
+            context: None,
+            cost: None,
+            source_kind: None,
+            parent_session_id: None,
+            agent_nickname: None,
+            agent_role: None,
+            reasoning_effort: None,
+        };
+
+        let mut reported_entry = base_entry();
+        reported_entry.cost = Some(crate::db::CostStats {
+            total_api_duration_ms: None,
+            total_duration_ms: None,
+            total_premium_requests: None,
+            reported_cost_usd: Some(0.01),
+        });
+        reported_entry.delta_tokens = Some(token_stats(100));
+
+        let mut estimated_entry = base_entry();
+        estimated_entry.delta_tokens = Some(token_stats(1_000_000));
+
+        let cost = calculate_entries_cost(
+            &rules,
+            &[reported_entry, estimated_entry],
+            Some("Grok 4.5"),
+            1_000_100,
+            0,
+            0,
+        )
+        .unwrap();
+
+        assert!((cost - 1.01).abs() < 1e-12);
+    }
+
+    fn gemini_pro_rules() -> Vec<PricingRule> {
+        vec![
+            PricingRule {
+                model_name: "Gemini 3.1 Pro (Low) (<200k)".to_string(),
+                input_price: 2.00,
+                cache_input_price: 0.20,
+                output_price: 12.00,
+            },
+            PricingRule {
+                model_name: "Gemini 3.1 Pro (Low) (>200k)".to_string(),
+                input_price: 4.00,
+                cache_input_price: 0.40,
+                output_price: 18.00,
+            },
+            PricingRule {
+                model_name: "Gemini 3.1 Pro (Low)".to_string(),
+                input_price: 2.00,
+                cache_input_price: 0.20,
+                output_price: 12.00,
+            },
+        ]
+    }
+
+    #[test]
+    fn parse_threshold_rule_supports_variable_boundaries_and_legacy_suffix() {
+        let (short_base, short) = parse_threshold_rule("Gemini 3.1 Pro (Low) (< 200K)");
+        assert_eq!(short_base, "gemini31prolow");
+        assert_eq!(
+            short,
+            Some(ThresholdRule {
+                is_greater: false,
+                threshold_tokens: 200_000,
+            })
+        );
+
+        let (long_base, long) = parse_threshold_rule("GPT-5.5 (>272k context length)");
+        assert_eq!(long_base, "gpt55");
+        assert_eq!(
+            long,
+            Some(ThresholdRule {
+                is_greater: true,
+                threshold_tokens: 272_000,
+            })
+        );
+    }
+
+    #[test]
+    fn threshold_uses_prompt_tokens_without_counting_output() {
+        let rules = gemini_pro_rules();
+
+        // The prompt is 190k, so the 20k output must not move it to the >200k tier.
+        let cost = calculate_cost(&rules, "Gemini 3.1 Pro (Low)", 190_000, 20_000, 0).unwrap();
+        let expected = (190_000.0 / 1_000_000.0) * 2.00 + (20_000.0 / 1_000_000.0) * 12.00;
+        assert!((cost - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn cache_read_tokens_count_toward_prompt_threshold() {
+        let rules = gemini_pro_rules();
+
+        // 190k input + 11k cached prompt = 201k prompt tokens, so the long tier applies.
+        let cost = calculate_cost(&rules, "Gemini 3.1 Pro (Low)", 190_000, 20_000, 11_000).unwrap();
+        let expected = (190_000.0 / 1_000_000.0) * 4.00
+            + (11_000.0 / 1_000_000.0) * 0.40
+            + (20_000.0 / 1_000_000.0) * 18.00;
+        assert!((cost - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn threshold_boundary_uses_short_tier() {
+        let rules = gemini_pro_rules();
+
+        // Exactly 200k prompt tokens remains in the <=200k tier, even with output.
+        let cost = calculate_cost(&rules, "Gemini 3.1 Pro (Low)", 200_000, 20_000, 0).unwrap();
+        let expected = (200_000.0 / 1_000_000.0) * 2.00 + (20_000.0 / 1_000_000.0) * 12.00;
+        assert!((cost - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn threshold_rule_wins_when_default_is_listed_first() {
+        let rules = [
+            PricingRule {
+                model_name: "GPT-5.5".to_string(),
+                input_price: 5.00,
+                cache_input_price: 0.50,
+                output_price: 30.00,
+            },
+            PricingRule {
+                model_name: "GPT-5.5 (>272k context length)".to_string(),
+                input_price: 10.00,
+                cache_input_price: 1.00,
+                output_price: 45.00,
+            },
+            PricingRule {
+                model_name: "GPT-5.5 (<272k context length)".to_string(),
+                input_price: 5.00,
+                cache_input_price: 0.50,
+                output_price: 30.00,
+            },
+        ];
+
+        let short = calculate_cost(&rules, "GPT-5.5", 100_000, 20_000, 0).unwrap();
+        let short_expected = (100_000.0 / 1_000_000.0) * 5.00 + (20_000.0 / 1_000_000.0) * 30.00;
+        assert!((short - short_expected).abs() < 1e-12);
+
+        let long = calculate_cost(&rules, "GPT-5.5", 300_000, 20_000, 0).unwrap();
+        let long_expected = (300_000.0 / 1_000_000.0) * 10.00 + (20_000.0 / 1_000_000.0) * 45.00;
+        assert!((long - long_expected).abs() < 1e-12);
     }
 }

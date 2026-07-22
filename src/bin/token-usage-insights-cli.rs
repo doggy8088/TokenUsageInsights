@@ -10,6 +10,9 @@ use std::path::PathBuf;
 #[path = "../db.rs"]
 #[allow(dead_code)]
 mod db;
+#[path = "../grok.rs"]
+#[allow(dead_code)]
+mod grok;
 #[path = "../paths.rs"]
 #[allow(dead_code)]
 mod paths;
@@ -25,7 +28,7 @@ const HELP_TEXT: &str = r#"Token 使用量 CLI 匯入 / 匯出工具
   import  匯入匯出 JSON 檔（預設以檔內日期為準，可用 --date 覆蓋）
 
 共用參數:
-  --agent <name>      助理名稱: antigravity / copilot / codex / claude / cursor
+  --agent <name>      助理名稱: antigravity / copilot / codex / claude / cursor / grok
                      亦可使用 claude-code / claude_code / claudecode（會正規化為 claude）
 
 匯出:
@@ -403,6 +406,7 @@ fn normalize_assistant_name(assistant: &str) -> String {
     match normalized.as_str() {
         "claude-code" | "claude_code" | "claudecode" => "claude".to_string(),
         "cursor" => "cursor".to_string(),
+        "grok-build" | "grok_build" | "grokbuild" => "grok".to_string(),
         _ => normalized,
     }
 }
@@ -410,7 +414,7 @@ fn normalize_assistant_name(assistant: &str) -> String {
 fn is_supported_assistant(assistant: &str) -> bool {
     matches!(
         normalize_assistant_name(assistant).as_str(),
-        "antigravity" | "copilot" | "codex" | "claude" | "cursor"
+        "antigravity" | "copilot" | "codex" | "claude" | "cursor" | "grok"
     )
 }
 
@@ -447,7 +451,7 @@ fn print_export_help() {
   token-usage-insights-cli export --agent <name> --date YYYY-MM-DD --out <path>
 
 參數:
-  --agent <name>    助理名稱（antigravity/copilot/codex/claude/cursor）
+  --agent <name>    助理名稱（antigravity/copilot/codex/claude/cursor/grok）
   --date YYYY-MM-DD  匯出日期
   --out <path>      輸出檔案路徑，不指定則輸出到 stdout
   --help, -h        顯示此說明
@@ -461,7 +465,7 @@ fn print_import_help() {
   token-usage-insights-cli import --agent <name> --file <path> [--date YYYY-MM-DD]
 
 參數:
-  --agent <name>      助理名稱（antigravity/copilot/codex/claude/cursor）
+  --agent <name>      助理名稱（antigravity/copilot/codex/claude/cursor/grok）
   --file <path>       匯入檔案
   --date YYYY-MM-DD    覆蓋匯入日期，不指定則使用檔案中的 date
   --help, -h          顯示此說明

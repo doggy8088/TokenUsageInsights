@@ -1,20 +1,36 @@
 模型名稱,部署類型,單位,輸入價格(美金),快取輸入價格(美金),輸出價格(美金),批次 API 價格(美金)
-Gemini 3.5 Flash,Google AI,1M Tokens,1.50,0.375,9.00,0.75/0.1875/4.50
-Gemini 3.5 Flash (Medium),Google AI,1M Tokens,1.50,0.375,9.00,0.75/0.1875/4.50
-Gemini 3.5 Flash (High),Google AI,1M Tokens,1.50,0.375,9.00,0.75/0.1875/4.50
-Gemini 3.5 Flash (Low),Google AI,1M Tokens,1.50,0.375,9.00,0.75/0.1875/4.50
-Gemini 3.1 Pro (Low) (<272k),Google AI,1M Tokens,2.00,0.50,12.00,1.00/0.25/6.00
-Gemini 3.1 Pro (Low) (>272k),Google AI,1M Tokens,4.00,1.00,18.00,2.00/0.50/9.00
-Gemini 3.1 Pro (Low),Google AI,1M Tokens,2.00,0.50,12.00,1.00/0.25/6.00
-Gemini 3.1 Pro (High) (<272k),Google AI,1M Tokens,2.00,0.50,12.00,1.00/0.25/6.00
-Gemini 3.1 Pro (High) (>272k),Google AI,1M Tokens,4.00,1.00,18.00,2.00/0.50/9.00
-Gemini 3.1 Pro (High),Google AI,1M Tokens,2.00,0.50,12.00,1.00/0.25/6.00
-Gemini 3.1 Pro Preview (<272k),Google AI,1M Tokens,2.00,0.50,12.00,1.00/0.25/6.00
-Gemini 3.1 Pro Preview (>272k),Google AI,1M Tokens,4.00,1.00,18.00,2.00/0.50/9.00
-Gemini 3.1 Pro Preview,Google AI,1M Tokens,2.00,0.50,12.00,1.00/0.25/6.00
+Grok 4.5 (<200k),xAI API,1M Tokens,2.00,0.30,6.00,N/A
+Grok 4.5 (>200k),xAI API,1M Tokens,4.00,0.60,12.00,N/A
+Grok 4.5,xAI API,1M Tokens,2.00,0.30,6.00,N/A
+Grok 4.5 (Low) (<200k),xAI API,1M Tokens,2.00,0.30,6.00,N/A
+Grok 4.5 (Low) (>200k),xAI API,1M Tokens,4.00,0.60,12.00,N/A
+Grok 4.5 (Low),xAI API,1M Tokens,2.00,0.30,6.00,N/A
+Grok 4.5 (Medium) (<200k),xAI API,1M Tokens,2.00,0.30,6.00,N/A
+Grok 4.5 (Medium) (>200k),xAI API,1M Tokens,4.00,0.60,12.00,N/A
+Grok 4.5 (Medium),xAI API,1M Tokens,2.00,0.30,6.00,N/A
+Grok 4.5 (High) (<200k),xAI API,1M Tokens,2.00,0.30,6.00,N/A
+Grok 4.5 (High) (>200k),xAI API,1M Tokens,4.00,0.60,12.00,N/A
+Grok 4.5 (High),xAI API,1M Tokens,2.00,0.30,6.00,N/A
+Gemini 3.6 Flash,Google AI,1M Tokens,1.50,0.15,7.50,0.75/0.075/3.75
+Gemini 3.6 Flash (Medium),Google AI,1M Tokens,1.50,0.15,7.50,0.75/0.075/3.75
+Gemini 3.6 Flash (High),Google AI,1M Tokens,1.50,0.15,7.50,0.75/0.075/3.75
+Gemini 3.6 Flash (Low),Google AI,1M Tokens,1.50,0.15,7.50,0.75/0.075/3.75
+Gemini 3.5 Flash,Google AI,1M Tokens,1.50,0.15,9.00,0.75/0.075/4.50
+Gemini 3.5 Flash (Medium),Google AI,1M Tokens,1.50,0.15,9.00,0.75/0.075/4.50
+Gemini 3.5 Flash (High),Google AI,1M Tokens,1.50,0.15,9.00,0.75/0.075/4.50
+Gemini 3.5 Flash (Low),Google AI,1M Tokens,1.50,0.15,9.00,0.75/0.075/4.50
+Gemini 3.1 Pro (Low) (<200k),Google AI,1M Tokens,2.00,0.20,12.00,1.00/0.20/6.00
+Gemini 3.1 Pro (Low) (>200k),Google AI,1M Tokens,4.00,0.40,18.00,2.00/0.40/9.00
+Gemini 3.1 Pro (Low),Google AI,1M Tokens,2.00,0.20,12.00,1.00/0.20/6.00
+Gemini 3.1 Pro (High) (<200k),Google AI,1M Tokens,2.00,0.20,12.00,1.00/0.20/6.00
+Gemini 3.1 Pro (High) (>200k),Google AI,1M Tokens,4.00,0.40,18.00,2.00/0.40/9.00
+Gemini 3.1 Pro (High),Google AI,1M Tokens,2.00,0.20,12.00,1.00/0.20/6.00
+Gemini 3.1 Pro Preview (<200k),Google AI,1M Tokens,2.00,0.20,12.00,1.00/0.20/6.00
+Gemini 3.1 Pro Preview (>200k),Google AI,1M Tokens,4.00,0.40,18.00,2.00/0.40/9.00
+Gemini 3.1 Pro Preview,Google AI,1M Tokens,2.00,0.20,12.00,1.00/0.20/6.00
 Claude Sonnet 4.6 (Thinking),Global,1M Tokens,3.00,0.30,15.00,N/A
-Claude Opus 4.6 (Thinking) (<272k),Global,1M Tokens,5.00,0.50,25.00,N/A
-Claude Opus 4.6 (Thinking) (>272k),Global,1M Tokens,10.00,1.00,37.50,N/A
+Claude Opus 4.6 (Thinking) (<200k),Global,1M Tokens,5.00,0.50,25.00,N/A
+Claude Opus 4.6 (Thinking) (>200k),Global,1M Tokens,10.00,1.00,37.50,N/A
 Claude Opus 4.6 (Thinking),Global,1M Tokens,5.00,0.50,25.00,N/A
 GPT-OSS 120B (Medium),Local/OSS,1M Tokens,0.00,0.00,0.00,N/A
 gpt-5.6-sol,Global,1M Tokens,5.00,0.50,30.00,N/A
@@ -37,8 +53,8 @@ Claude Fable 5,Global,1M Tokens,10.00,1.00,50.00,N/A
 Claude Opus 4.8-fast,Global,1M Tokens,10.00,1.00,50.00,N/A
 Claude Opus 4.8,Global,1M Tokens,5.00,0.50,25.00,N/A
 Claude Opus 4.7,Global,1M Tokens,5.00,0.50,25.00,N/A
-Claude Opus 4.6 (<272k),Global,1M Tokens,5.00,0.50,25.00,N/A
-Claude Opus 4.6 (>272k),Global,1M Tokens,10.00,1.00,37.50,N/A
+Claude Opus 4.6 (<200k),Global,1M Tokens,5.00,0.50,25.00,N/A
+Claude Opus 4.6 (>200k),Global,1M Tokens,10.00,1.00,37.50,N/A
 Claude Opus 4.6,Global,1M Tokens,5.00,0.50,25.00,N/A
 Claude Opus 4.5,Global,1M Tokens,5.00,0.50,25.00,N/A
 Codex Auto Review,Global,1M Tokens,0.10,0.00,0.10,N/A
@@ -64,7 +80,7 @@ nemotron-3-ultra,Local/OSS,1M Tokens,0.00,0.00,0.00,N/A
 gpt-oss,Local/OSS,1M Tokens,0.00,0.00,0.00,N/A
 qwen3-coder,Cloud,1M Tokens,0.22,0.055,1.80,N/A
 glm-4.7,Cloud,1M Tokens,0.56,0.28,2.24,N/A
-gemini-3-flash-preview,Google AI,1M Tokens,0.50,0.125,3.00,N/A
+gemini-3-flash-preview,Google AI,1M Tokens,0.50,0.05,3.00,0.25/0.05/1.50
 minimax-m2.1,Cloud,1M Tokens,0.30,0.075,1.20,N/A
 deepseek-v3.2,Cloud,1M Tokens,0.14,0.0028,0.28,N/A
 ministral-3,Cloud,1M Tokens,0.15,0.0375,0.15,N/A
@@ -118,6 +134,3 @@ claude-opus-4-7-fast,Cursor,1M Tokens,10.00,1.00,50.00,N/A
 claude-opus-4-7,Cursor,1M Tokens,5.00,0.50,25.00,N/A
 claude-opus-4-6,Cursor,1M Tokens,5.00,0.50,25.00,N/A
 claude-opus-4-5,Cursor,1M Tokens,5.00,0.50,25.00,N/A
-
-
-

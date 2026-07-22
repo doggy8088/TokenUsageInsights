@@ -79,3 +79,35 @@
 - Detection signal: useful v0.1.1 output was present, but the batch exited non-zero only because the remote audit file did not exist.
 - Prevention rule: probe optional paths separately or explicitly normalize their absence to success; only required release artifacts may gate discovery.
 - Tripwire: label every remote read as required or optional before composing parallel release checks.
+
+## 2026-07-22 Assistant selection must be captured across async UI work
+
+- Classification: incorrect assumption about frontend state timing.
+- Failure mode: asynchronous date, usage, and setup requests read mutable `currentAssistant` after a user switched agents, allowing stale Antigravity work to repaint the Grok empty state and modal.
+- Detection signal: selecting Grok and opening its empty-state setup guide showed Antigravity copy or branding.
+- Prevention rule: capture the normalized assistant at request/render start, use it for endpoint and UI payloads, and ignore the response if the current selection changed.
+- Tripwire: exercise the sequence “select Grok → open setup guide immediately” and assert Grok title, Grok body, Grok logo, and `~/.grok/sessions` path; event handlers must wrap assistant-argument callbacks so the click event is not passed as the assistant.
+
+## 2026-07-22 Shell quoting can alter JavaScript assertions
+
+- Classification: missing verification.
+- Failure mode: a shell single-quoted `node -e` assertion contained JavaScript single quotes, so the shell stripped part of the expected string and produced a false failing check.
+- Detection signal: Node displayed an assertion string missing its embedded quotes.
+- Prevention rule: keep JavaScript assertions free of shell quote delimiters or use a dedicated script/input mode when nested quoting is required.
+- Tripwire: inspect the effective command text in the error before changing production code when a source-string assertion fails unexpectedly.
+
+## 2026-07-22 Frontend asset versions are part of the implementation
+
+- Classification: missing verification.
+- Failure mode: changing JavaScript and adding localized UI content without bumping the imported i18n/CSS asset versions allowed a browser to combine new markup with stale dictionaries or styles.
+- Detection signal: Grok setup content rendered translation keys and the visual layout did not match the current stylesheet even though the repository source was correct.
+- Prevention rule: whenever static frontend content, translations, or CSS changes, update the corresponding cache-busting version and verify the served asset URLs.
+- Tripwire: assert the homepage references the new `app.js`, `i18n.js`, and stylesheet versions, then fetch each asset before manual UI validation.
+
+## 2026-07-23 Preserve the existing PR base when committing follow-up fixes
+
+- Classification: misunderstanding user intent.
+- Failure mode: treating a request to commit follow-up changes as permission to squash the existing feature commit that already serves as a pull request base.
+- Detection signal: the resulting branch no longer retained `c064548` as its first commit.
+- Prevention rule: when a pull request already exists, preserve its base commit and create a new commit for the working-tree delta unless history rewriting is explicitly requested.
+- Tripwire: compare `HEAD`, the PR branch tip, and the intended base before any reset; after committing, assert the original commit remains an ancestor of the new `HEAD`.

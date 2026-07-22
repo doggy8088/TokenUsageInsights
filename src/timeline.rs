@@ -1,4 +1,5 @@
 use crate::db::{parse_cursor_timestamp, TokenStats};
+use crate::grok::{timestamp_to_rfc3339, value_to_text};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -1505,4 +1506,288 @@ fn cursor_content_to_text(content: &serde_json::Value) -> String {
         }
     }
     parts.join(" ")
+}
+
+fn grok_turn_number(
+    update: &serde_json::Value,
+    next_turn: u32,
+    zero_based: &mut Option<bool>,
+) -> u32 {
+    if let Some(raw) = update
+        .get("turn_number")
+        .and_then(|value| value.as_u64())
+        .and_then(|value| u32::try_from(value).ok())
+    {
+        let is_zero_based = zero_based.get_or_insert(raw == 0);
+        return raw
+            .checked_add(u32::from(*is_zero_based))
+            .unwrap_or(next_turn.max(1));
+    }
+    update
+        .get("turnNo")
+        .or_else(|| update.get("turnNumber"))
+        .or_else(|| update.get("turn"))
+        .and_then(|value| value.as_u64())
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(next_turn.max(1))
+}
+
+fn grok_update_content(update: &serde_json::Value) -> String {
+    value_to_text(
+        update
+            .get("content")
+            .or_else(|| update.get("chunk"))
+            .or_else(|| update.get("message"))
+            .or_else(|| update.get("text")),
+    )
+}
+
+fn grok_tool_output(update: &serde_json::Value) -> (String, String) {
+    let output = update
+        .get("rawOutput")
+        .or_else(|| update.get("raw_output"))
+        .or_else(|| update.get("content"));
+    if let Some(output) = output {
+        let stdout = value_to_text(Some(output));
+        if !stdout.is_empty() {
+            return (stdout, String::new());
+        }
+        if let Some(value) = output.get("stdout").and_then(|value| value.as_str()) {
+            let stderr = output
+                .get("stderr")
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .to_string();
+            return (value.to_string(), stderr);
+        }
+    }
+    (String::new(), String::new())
+}
+
+pub fn parse_grok_timeline(
+    reader: BufReader<File>,
+    db_entries: &HashMap<u32, (TokenStats, String)>,
+    timeline: &mut Vec<TimelineItem>,
+    metadata: &mut HashMap<String, serde_json::Value>,
+) {
+    let mut current_turn = 0u32;
+    let mut next_turn = 1u32;
+    let mut zero_based = None;
+    let mut current_model = "Grok 4.5".to_string();
+    let mut user_indices = HashMap::<u32, usize>::new();
+    let mut reply_parts = HashMap::<u32, Vec<String>>::new();
+    let mut reasoning_parts = HashMap::<u32, Vec<String>>::new();
+    let mut tool_indices = HashMap::<String, usize>::new();
+    let mut session_started = false;
+
+    for line_res in reader.lines() {
+        let Ok(line) = line_res else {
+            continue;
+        };
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let update = event
+            .get("params")
+            .and_then(|params| params.get("update"))
+            .unwrap_or(&event);
+        let update_type = update
+            .get("sessionUpdate")
+            .or_else(|| update.get("session_update"))
+            .or_else(|| update.get("type"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let timestamp = timestamp_to_rfc3339(event.get("timestamp"));
+
+        if let Some(model) = update
+            .get("model")
+            .or_else(|| update.get("model_id"))
+            .or_else(|| update.get("modelId"))
+            .and_then(|value| value.as_str())
+        {
+            current_model = model.to_string();
+        }
+
+        if matches!(update_type, "turn_started" | "user_message_chunk") && current_turn == 0 {
+            current_turn = grok_turn_number(update, next_turn, &mut zero_based);
+            next_turn = current_turn.saturating_add(1);
+            if !session_started {
+                timeline.push(TimelineItem::SystemStatus {
+                    timestamp: timestamp.clone(),
+                    status_type: "session_start".to_string(),
+                    message: "Grok Build session started".to_string(),
+                });
+                session_started = true;
+            }
+        }
+
+        if update_type == "user_message_chunk" {
+            let prompt = grok_update_content(update);
+            if !prompt.is_empty() {
+                if let Some(index) = user_indices.get(&current_turn).copied() {
+                    if let Some(TimelineItem::UserPrompt { prompt: text, .. }) =
+                        timeline.get_mut(index)
+                    {
+                        text.push_str(&prompt);
+                    }
+                } else {
+                    user_indices.insert(current_turn, timeline.len());
+                    timeline.push(TimelineItem::UserPrompt {
+                        timestamp: timestamp.clone(),
+                        prompt,
+                        context: None,
+                        turn_no: current_turn,
+                    });
+                }
+            }
+        } else if update_type == "agent_message_chunk" {
+            let reply = grok_update_content(update);
+            if !reply.is_empty() {
+                reply_parts.entry(current_turn).or_default().push(reply);
+            }
+        } else if update_type == "agent_thought_chunk" {
+            let thought = grok_update_content(update);
+            if !thought.is_empty() {
+                reasoning_parts
+                    .entry(current_turn)
+                    .or_default()
+                    .push(thought);
+            }
+        } else if update_type == "tool_call" {
+            let call_id = update
+                .get("toolCallId")
+                .or_else(|| update.get("tool_call_id"))
+                .or_else(|| update.get("id"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .to_string();
+            let tool_name = update
+                .get("title")
+                .or_else(|| update.get("name"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("tool_call")
+                .to_string();
+            let arguments = update
+                .get("rawInput")
+                .or_else(|| update.get("raw_input"))
+                .or_else(|| update.get("input"))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let index = timeline.len();
+            if !call_id.is_empty() {
+                tool_indices.insert(call_id.clone(), index);
+            }
+            timeline.push(TimelineItem::ToolStep {
+                timestamp,
+                tool_name,
+                arguments,
+                env: None,
+                exit_code: None,
+                stdout: String::new(),
+                stderr: String::new(),
+                tool_call_id: (!call_id.is_empty()).then_some(call_id),
+                status: "running".to_string(),
+            });
+        } else if update_type == "tool_call_update" {
+            let call_id = update
+                .get("toolCallId")
+                .or_else(|| update.get("tool_call_id"))
+                .or_else(|| update.get("id"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            if let Some(index) = tool_indices.get(call_id).copied() {
+                let (stdout, stderr) = grok_tool_output(update);
+                let raw_status = update
+                    .get("status")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                if let Some(TimelineItem::ToolStep {
+                    stdout: current_stdout,
+                    stderr: current_stderr,
+                    exit_code,
+                    status,
+                    ..
+                }) = timeline.get_mut(index)
+                {
+                    if !stdout.is_empty() {
+                        *current_stdout = stdout;
+                    }
+                    if !stderr.is_empty() {
+                        *current_stderr = stderr;
+                    }
+                    match raw_status {
+                        "completed" | "complete" | "success" | "succeeded" => {
+                            *status = "success".to_string();
+                            *exit_code = Some(0);
+                        }
+                        "failed" | "error" | "cancelled" | "canceled" => {
+                            *status = "failed".to_string();
+                            *exit_code = Some(1);
+                        }
+                        _ if !raw_status.is_empty() => *status = raw_status.to_string(),
+                        _ => {}
+                    }
+                }
+            }
+        } else if update_type == "turn_completed" {
+            let reply = reply_parts
+                .remove(&current_turn)
+                .unwrap_or_default()
+                .join("");
+            let reasoning = reasoning_parts
+                .remove(&current_turn)
+                .map(|parts| parts.join(""))
+                .filter(|text| !text.is_empty());
+            let (tokens, model) = db_entries
+                .get(&current_turn)
+                .map(|(stats, model)| (Some(stats.clone()), model.clone()))
+                .unwrap_or((None, current_model.clone()));
+            current_model = model.clone();
+            if !reply.is_empty() || tokens.is_some() {
+                timeline.push(TimelineItem::AgentReply {
+                    timestamp,
+                    reply,
+                    reasoning,
+                    turn_no: current_turn,
+                    model,
+                    tokens,
+                    duration_ms: None,
+                    reasoning_effort: None,
+                });
+            }
+            current_turn = 0;
+        }
+    }
+
+    if current_turn != 0 {
+        let reply = reply_parts
+            .remove(&current_turn)
+            .unwrap_or_default()
+            .join("");
+        let reasoning = reasoning_parts
+            .remove(&current_turn)
+            .map(|parts| parts.join(""))
+            .filter(|text| !text.is_empty());
+        let (tokens, model) = db_entries
+            .get(&current_turn)
+            .map(|(stats, model)| (Some(stats.clone()), model.clone()))
+            .unwrap_or((None, current_model.clone()));
+        if !reply.is_empty() || tokens.is_some() {
+            timeline.push(TimelineItem::AgentReply {
+                timestamp: String::new(),
+                reply,
+                reasoning,
+                turn_no: current_turn,
+                model,
+                tokens,
+                duration_ms: None,
+                reasoning_effort: None,
+            });
+        }
+    }
+
+    metadata.insert(
+        "selected_model".to_string(),
+        serde_json::Value::String(current_model),
+    );
 }

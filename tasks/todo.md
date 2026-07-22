@@ -1,4 +1,73 @@
+# 2026-07-22 修正 Grok 教學翻譯與圖示版型回歸
+
+## Goal and acceptance criteria
+
+- [ ] Grok Build 教學顯示實際中文或英文翻譯文字，不顯示 i18n key。
+- [ ] Setup modal 的 body 保留既有 flex 版型，所有助理 logo 與步驟圖示維持正確尺寸。
+- [ ] 前端資源版本號更新，避免載入舊版 i18n/CSS 快取。
+- [ ] 通過前端語法、Rust 測試、格式與零警告驗證。
+
+## Plan
+
+- [x] 比對 JS、i18n、CSS 與靜態資源快取版本，確認回歸根因。
+- [x] 修正翻譯查找、modal body 顯示方式與資源 cache bust。
+- [x] 驗證 Grok setup-info 路徑、翻譯 key 對應與 icon 版型規則。
+- [x] 完成前端與 Rust 全套驗證並記錄結果。
+
+## Risk and rollback
+
+- Risk: low；僅調整前端翻譯查找、modal 顯示樣式與靜態資源版本號。
+- Rollback: 還原 `static/app.js`、`static/index.html`、`static/styles.css` 與本節任務紀錄。
+
+## Working notes
+
+- `static/app.js` 原本仍引用 `i18n.js?v=27`；本次資源版本已加入 Grok 字串，需避免舊快取覆蓋。
+- `.modal-body` 的既有 CSS 是 `display: flex`；選取 body 不應以 `display: block` 覆蓋它。
+
+## Results
+
+- `t()` 現在會先尋找正確的 assistant-specific key，再回退到通用 key；完整的 `grok_*` key 不會再被重複加上 `grok_` 前綴。
+- Setup modal 選取 body 時恢復原本的 `display: flex`，不再以 `display: block` 破壞 modal 內容版型。
+- cache-bust 已更新：`styles.css?v=21`、`redesign.css?v=19`、`i18n.js?v=28`、`app.js?v=42`。
+- HTTP smoke 驗證首頁資源版本與 `/api/grok/setup-info` 的 `~/.grok/sessions` 路徑。
+- 驗證通過：`node --check static/app.js`、Grok 中英文翻譯 key 檢查、`cargo fmt -- --check`、`cargo test --locked`（53 + 38）、`cargo build --release --locked`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、`git diff --check`。
+
 # 2026-07-10 windows_native_support
+
+# 2026-07-22 重新實作 Grok Build 前置設定教學
+
+## Goal and acceptance criteria
+
+- [x] 切換至 Grok Build 後，空資料卡與前置設定教學都只使用 Grok Build 的文字與 logo。
+- [x] Grok Build 教學顯示與 Codex/Claude 相同的自動記錄說明，路徑使用 `~/.grok/sessions`。
+- [x] 舊助理的非同步日期、使用量或 setup 回應不得覆蓋目前選取的助理。
+- [x] Antigravity/Copilot 的 Status Line 教學維持原本行為。
+- [x] 通過前端語法、Rust 測試、格式與零警告驗證。
+
+## Plan
+
+- [x] 恢復本次任務前的乾淨工作樹並重新檢查完整流程。
+- [x] 讓助理選取狀態透過 snapshot 傳遞至空資料畫面、setup modal 與相關請求。
+- [x] 加入最小必要的 modal body/title 路由修正。
+- [x] 驗證 Grok 路徑、logo、教學內容與非同步切換邊界。
+- [x] 更新結果與 lessons。
+
+## Risk and rollback
+
+- Risk: medium；調整前端助理切換與資料載入的狀態傳遞。
+- Rollback: 還原 `static/app.js`、`static/index.html` 與本節任務紀錄的變更。
+
+## Working notes
+
+- Grok setup data path 的權威來源是 `src/handlers/daily.rs` 的 `get_grok_dir().join("sessions")`。
+- `static/index.html` 已有 Grok 專屬 modal body；本次重點是保證正確的 assistant snapshot 路由到該 body。
+
+## Results
+
+- `static/app.js` 現在以 assistant snapshot 路由 setup modal、空資料卡 logo/按鈕與日期/使用量請求。
+- Grok setup path 由 `/api/grok/setup-info` 提供，驗證值為 `/Users/sdsg5bpnl/.grok/sessions`。
+- 驗證通過：`node --check static/app.js`、前端結構回歸檢查、`cargo fmt -- --check`、`cargo test --locked`（53 + 38）、`cargo clippy --locked --all-targets --all-features -- -D warnings`、`git diff --check`。
+- 執行 `cargo run` 時曾遇到 3003 埠被既存服務占用；確認占用者結束後重新啟動成功，API 與靜態版本檢查通過。
 
 ## Goal and acceptance criteria
 

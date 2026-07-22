@@ -1,4 +1,4 @@
-import i18n from './i18n.js?v=27';
+import i18n from './i18n.js?v=28';
 import {
   aggregateDailyTokenCandles,
   calculateCandleViewport,
@@ -71,6 +71,9 @@ const assistantAliasMap = {
   'claude-code': 'claude',
   'claude_code': 'claude',
   'claudecode': 'claude',
+  'grok-build': 'grok',
+  'grok_build': 'grok',
+  'grokbuild': 'grok',
 };
 
 const assistantMeta = {
@@ -114,6 +117,14 @@ const assistantMeta = {
     badgeStyle: 'background: rgba(139, 92, 246, 0.15); color: #a78bfa; border: 1px solid rgba(139, 92, 246, 0.3); display: inline-flex; align-items: center;',
     senderName: 'CURSOR AGENT',
   },
+  grok: {
+    logo: '/static/grok-logo.svg',
+    label: 'Grok Build',
+    shortLabel: 'Grok',
+    alt: 'Grok Build',
+    badgeStyle: 'background: rgba(239, 68, 68, 0.13); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.28); display: inline-flex; align-items: center;',
+    senderName: 'GROK BUILD AGENT',
+  },
 };
 
 function normalizeAssistant(rawValue) {
@@ -133,6 +144,7 @@ function getAssistantMeta(rawValue) {
     label: normalized || 'Agent',
     shortLabel: normalized || 'Agent',
     alt: normalized || 'Agent',
+    mark: '?',
     badgeStyle: 'display: inline-flex; align-items: center;',
     senderName: 'AGENT',
   };
@@ -140,6 +152,9 @@ function getAssistantMeta(rawValue) {
 
 function getAssistantLogoHtml(rawValue, className = 'badge-logo') {
   const meta = getAssistantMeta(rawValue);
+  if (!meta.logo) {
+    return `<span class="${className} grok-mark" aria-hidden="true">${meta.mark || 'G'}</span>`;
+  }
   return `<img class="${className}" src="${meta.logo}" alt="${meta.alt}" />`;
 }
 
@@ -274,13 +289,22 @@ let isQueryingCodexResets = false;
 
 // i18n localization dictionary is now loaded from /static/i18n.js
 
-function t(key) {
-  const isSingle = isSupportedAssistant(currentAssistant);
-  if (isSingle) {
-    const prefix = currentAssistant + '_';
-    return i18n[currentLang][prefix + key] || i18n[currentLang][key] || i18n['zh-TW'][prefix + key] || i18n['zh-TW'][key] || key;
+function t(key, assistant = currentAssistant) {
+  const resolvedAssistant = normalizeAssistant(assistant);
+  const currentTranslations = i18n[currentLang] || {};
+  const fallbackTranslations = i18n['zh-TW'] || {};
+  const assistantPrefix = isSupportedAssistant(resolvedAssistant) && !key.startsWith(`${resolvedAssistant}_`)
+    ? `${resolvedAssistant}_`
+    : '';
+  const candidateKeys = assistantPrefix ? [`${assistantPrefix}${key}`, key] : [key];
+
+  for (const candidateKey of candidateKeys) {
+    if (currentTranslations[candidateKey] !== undefined) return currentTranslations[candidateKey];
   }
-  return i18n[currentLang][key] || i18n['zh-TW'][key] || key;
+  for (const candidateKey of candidateKeys) {
+    if (fallbackTranslations[candidateKey] !== undefined) return fallbackTranslations[candidateKey];
+  }
+  return key;
 }
 
 function iconMarkup(name, extraClass = '') {
@@ -311,8 +335,18 @@ function updateBrandLogo() {
   if (!brandLogo) return;
 
   const meta = getAssistantMeta(currentAssistant);
-  brandLogo.src = meta.logo;
-  brandLogo.alt = meta.alt;
+  brandLogo.src = meta.logo || '/static/favicon-v2.png';
+  brandLogo.alt = meta.logo ? meta.alt : 'Token 戰情室';
+}
+
+function updateAssistantBillingNote() {
+  const note = document.getElementById('assistant-billing-note');
+  if (!note) return;
+  const isGrok = currentAssistant === 'grok';
+  note.classList.toggle('hidden', !isGrok);
+  if (isGrok) {
+    note.innerHTML = t('billing_note');
+  }
 }
 
 function languageMeta(lang) {
@@ -414,6 +448,52 @@ function toggleSidebar() {
   setSidebarCollapsed(!appContainer.classList.contains('sidebar-collapsed'), { persist: true });
 }
 
+const setupModalTitleKeys = {
+  antigravity: 'setup_modal_title',
+  copilot: 'copilot_setup_modal_title',
+  codex: 'codex_setup_modal_title',
+  claude: 'claude_setup_modal_title',
+  cursor: 'cursor_setup_modal_title',
+  grok: 'grok_setup_modal_title',
+};
+
+function getSetupModalTitleKey(assistant) {
+  return setupModalTitleKeys[assistant] || setupModalTitleKeys.antigravity;
+}
+
+function setSetupModalTitle(assistant) {
+  const titleH2 = document.getElementById('setup-modal-title');
+  if (!titleH2) return;
+
+  const titleKey = getSetupModalTitleKey(assistant);
+  titleH2.setAttribute('data-i18n', titleKey);
+  titleH2.innerHTML = t(titleKey, assistant);
+}
+
+function setSetupModalBody(assistant) {
+  const bodyIds = {
+    antigravity: 'setup-body-statusline',
+    copilot: 'setup-body-statusline',
+    codex: 'setup-body-codex',
+    claude: 'setup-body-claude',
+    cursor: 'setup-body-cursor',
+    grok: 'setup-body-grok',
+  };
+  const bodyElements = Object.values(bodyIds)
+    .filter((bodyId, index, ids) => ids.indexOf(bodyId) === index)
+    .map(bodyId => document.getElementById(bodyId))
+    .filter(Boolean);
+
+  const selectedBody = document.getElementById(bodyIds[assistant]);
+  bodyElements.forEach(body => {
+    if (body === selectedBody) {
+      body.style.removeProperty('display');
+    } else {
+      body.style.display = 'none';
+    }
+  });
+}
+
 function updateLanguageUI() {
   document.title = 'Token 戰情室';
 
@@ -455,6 +535,7 @@ function updateLanguageUI() {
 
   // Update dynamic brand logo in sidebar
   updateBrandLogo();
+  updateAssistantBillingNote();
   syncSidebarToggleButton();
   updateDailyChartControls();
   updateCodexRateLimit();
@@ -601,7 +682,7 @@ function initApp() {
         }
 
         // 切換 agent 時保留目前日期，當日無資料則顯示提示
-        await fetchDates(null, true);
+        await fetchDates(null, true, currentAssistant);
         await fetchMonths();
         await fetchYears();
       });
@@ -1359,16 +1440,19 @@ async function refreshLiveData() {
 // =========================================================================
 // API 呼叫: 載入日期清單
 // =========================================================================
-async function fetchDates(selectedDate = null, keepDate = false) {
+async function fetchDates(selectedDate = null, keepDate = false, assistant = currentAssistant) {
   try {
-    const res = await fetch(`/api/${currentAssistant}/dates`);
+    const resolvedAssistant = normalizeAssistant(assistant);
+    const res = await fetch(`/api/${resolvedAssistant}/dates`);
     const data = await res.json();
+
+    if (currentAssistant !== resolvedAssistant) return;
     
     const dateSelect = document.getElementById('date-select');
     availableDates = data.dates || [];
 
     if (availableDates.length === 0 && !keepDate) {
-      toggleEmptyState(true);
+      toggleEmptyState(true, resolvedAssistant);
       return;
     }
 
@@ -1397,13 +1481,13 @@ async function fetchDates(selectedDate = null, keepDate = false) {
         }
       }
       dateSelect.value = dateToLoad;
-      toggleEmptyState(false);
+      toggleEmptyState(false, resolvedAssistant);
     }
 
     // 載入所選日期的數據（keepDate 時即使不在清單也直接請求，讓後端回 404）
     // 若目前在 monthly tab，不呼叫 loadUsageData（避免 showNoDataForDate 蓋掉月報畫面）
     if (!keepDate || activeTab === 'daily') {
-      await loadUsageData(dateToLoad);
+      await loadUsageData(dateToLoad, resolvedAssistant);
     }
 
   } catch (err) {
@@ -1424,25 +1508,28 @@ async function reloadDailyData() {
 // =========================================================================
 // API 呼叫: 載入當日使用量數據
 // =========================================================================
-async function loadUsageData(date) {
+async function loadUsageData(date, assistant = currentAssistant) {
   if (!date || date === 'undefined' || date === 'null') {
     return;
   }
+  const resolvedAssistant = normalizeAssistant(assistant);
   updateUrlParams();
   try {
     // 顯示加載動畫 (可在此擴展)
     setTitleMarkup('sync', date);
 
-    const res = await fetch(`/api/${currentAssistant}/usage/${date}`);
+    const res = await fetch(`/api/${resolvedAssistant}/usage/${date}`);
+    if (currentAssistant !== resolvedAssistant) return;
     if (res.status === 404) {
       // 顯示「此 Agent 當日無資料」提示畫面，不改變日期
-      showNoDataForDate(date);
+      showNoDataForDate(date, resolvedAssistant);
       await updateCodexRateLimit();
       return;
     }
     
     const data = await res.json();
-    toggleEmptyState(false);
+    if (currentAssistant !== resolvedAssistant) return;
+    toggleEmptyState(false, resolvedAssistant);
     renderDashboard(data);
     await updateCodexRateLimit();
 
@@ -1591,13 +1678,14 @@ async function importUsageDayFromFile(file) {
 }
 
 // 顯示「此 Agent 於當日無資料」的提示畫面
-function showNoDataForDate(date) {
-  const meta = getAssistantMeta(currentAssistant);
-  const title = t('no_data_for_date')
+function showNoDataForDate(date, assistant = currentAssistant) {
+  const resolvedAssistant = normalizeAssistant(assistant);
+  const meta = getAssistantMeta(resolvedAssistant);
+  const title = t('no_data_for_date', resolvedAssistant)
     .replace('{agent}', meta.label)
     .replace('{date}', date);
-  const desc = t('no_data_for_date_desc');
-  const logoMarkup = `<div class="card-icon"><img src="${meta.logo}" alt="${meta.alt}" style="width: 56px; height: 56px; object-fit: contain;" /></div>`;
+  const desc = t('no_data_for_date_desc', resolvedAssistant);
+  const logoMarkup = `<div class="card-icon empty-agent-logo-wrap">${getAssistantLogoHtml(resolvedAssistant, 'empty-agent-logo')}</div>`;
 
   const emptyContainer = document.getElementById('empty-state-container');
   const dailyView = document.getElementById('daily-view-container');
@@ -1612,15 +1700,15 @@ function showNoDataForDate(date) {
         <h2>${title}</h2>
         <p style="text-align: center; max-width: 100%;">${desc}</p>
         <div class="action-buttons">
-          <button class="primary-btn" id="btn-no-data-setup-guide">${t('btn_empty_setup')}</button>
-          <button class="secondary-btn" id="btn-no-data-refresh">${t('btn_empty_refresh')}</button>
+          <button class="primary-btn" id="btn-no-data-setup-guide">${t('btn_empty_setup', resolvedAssistant)}</button>
+          <button class="secondary-btn" id="btn-no-data-refresh">${t('btn_empty_refresh', resolvedAssistant)}</button>
         </div>
       </div>
     `;
 
     const noDataGuideBtn = document.getElementById('btn-no-data-setup-guide');
     if (noDataGuideBtn) {
-      noDataGuideBtn.addEventListener('click', openSetupModal);
+      noDataGuideBtn.addEventListener('click', () => openSetupModal(resolvedAssistant));
     }
 
     const noDataRefreshBtn = document.getElementById('btn-no-data-refresh');
@@ -1632,7 +1720,7 @@ function showNoDataForDate(date) {
           if (dateSelect) {
             dateSelect.value = date;
           }
-          await fetchDates(null, true);
+          await fetchDates(null, true, resolvedAssistant);
         } finally {
           noDataRefreshBtn.classList.remove('loading');
         }
@@ -1678,11 +1766,10 @@ function renderMetricValue(elementId, getValFn, formatFn, sessions, activeAgents
     let html = '<div class="stat-value-list">';
     activeAgents.forEach(a => {
       const meta = getAssistantMeta(a);
-      let logoUrl = meta.logo;
       let displayName = meta.label;
       html += `
         <div class="stat-value-item">
-          <span class="agent-name" title="${displayName}"><img class="badge-logo" src="${logoUrl}" alt="${displayName}" /></span>
+          <span class="agent-name" title="${displayName}">${getAssistantLogoHtml(a)}</span>
           <span class="val">${formatFn(agentData[a])}</span>
         </div>
       `;
@@ -1704,13 +1791,12 @@ function renderMonthlyMetricValue(elementId, getValFn, formatFn, agentBreakdown,
     let html = '<div class="stat-value-list">';
     activeAgents.forEach(a => {
       const meta = getAssistantMeta(a);
-      let logoUrl = meta.logo;
       let displayName = meta.label;
       
       const val = (agentBreakdown && agentBreakdown[a]) ? getValFn(agentBreakdown[a]) : 0;
       html += `
         <div class="stat-value-item">
-          <span class="agent-name" title="${displayName}"><img class="badge-logo" src="${logoUrl}" alt="${displayName}" /></span>
+          <span class="agent-name" title="${displayName}">${getAssistantLogoHtml(a)}</span>
           <span class="val">${formatFn(val)}</span>
         </div>
       `;
@@ -3282,7 +3368,11 @@ function renderSessionTable(sessions) {
       ? '<span class="badge source-badge" title="GitHub Copilot in VS Code">VS Code</span>'
       : (s.assistant_type === 'copilot'
         ? '<span class="badge source-badge" title="GitHub Copilot CLI">CLI</span>'
-        : '');
+        : (s.source_kind === 'grok-build-usage'
+          ? `<span class="badge source-badge" title="${t('grok_source_usage_title')}">${t('grok_source_usage')}</span>`
+          : (s.source_kind === 'grok-build-context'
+            ? `<span class="badge source-badge" title="${t('grok_source_context_title')}">${t('grok_source_context')}</span>`
+            : '')));
 
     const astColumn = (currentAssistant === 'all' || currentAssistant.includes(',')) ? `<td>${assistantBadge}</td>` : '';
 
@@ -4184,12 +4274,11 @@ function renderYearlyDashboard(data) {
     let sessionsHtml = '<div class="stat-value-list">';
     activeAgents.forEach(a => {
       const meta = getAssistantMeta(a);
-      let logoUrl = meta.logo;
       let displayName = meta.label;
       const val = (agent_breakdown && agent_breakdown[a]) ? agent_breakdown[a].total_sessions : 0;
       sessionsHtml += `
         <div class="stat-value-item">
-          <span class="agent-name" title="${displayName}"><img class="badge-logo" src="${logoUrl}" alt="${displayName}" /></span>
+          <span class="agent-name" title="${displayName}">${getAssistantLogoHtml(a)}</span>
           <span class="val">${formatNumber(val)}</span>
         </div>
       `;
@@ -4247,12 +4336,11 @@ function renderYearlyMetricValue(elementId, getter, formatter, agentBreakdown, a
   let html = '<div class="stat-value-list">';
   activeAgents.forEach(a => {
     const meta = getAssistantMeta(a);
-      let logoUrl = meta.logo;
-      let displayName = meta.label;
+    let displayName = meta.label;
     const val = (agentBreakdown && agentBreakdown[a]) ? getter(agentBreakdown[a]) : 0;
     html += `
       <div class="stat-value-item">
-        <span class="agent-name" title="${displayName}"><img class="badge-logo" src="${logoUrl}" alt="${displayName}" /></span>
+        <span class="agent-name" title="${displayName}">${getAssistantLogoHtml(a)}</span>
         <span class="val">${formatter(val)}</span>
       </div>
     `;
@@ -5218,7 +5306,7 @@ function initSetupGuide() {
   const modalOverlay = document.getElementById('setup-guide-modal');
 
   if (setupBtn && modalOverlay) {
-    setupBtn.addEventListener('click', openSetupModal);
+    setupBtn.addEventListener('click', () => openSetupModal(currentAssistant));
   }
 
   if (closeBtn && modalOverlay) {
@@ -5244,31 +5332,17 @@ function initSetupGuide() {
   initClipboardButtons();
 }
 
-function openSetupModal() {
+function openSetupModal(assistant = currentAssistant) {
   const modal = document.getElementById('setup-guide-modal');
-  if (modal) {
-    const statuslineBody = document.getElementById('setup-body-statusline');
-    const codexBody = document.getElementById('setup-body-codex');
-    const claudeBody = document.getElementById('setup-body-claude');
-    const cursorBody = document.getElementById('setup-body-cursor');
-    if (statuslineBody) statuslineBody.style.display = 'none';
-    if (codexBody) codexBody.style.display = 'none';
-    if (claudeBody) claudeBody.style.display = 'none';
-    if (cursorBody) cursorBody.style.display = 'none';
+  if (!modal) return;
 
-    if (currentAssistant === 'codex') {
-      if (codexBody) codexBody.style.display = 'block';
-    } else if (currentAssistant === 'claude') {
-      if (claudeBody) claudeBody.style.display = 'block';
-    } else if (currentAssistant === 'cursor') {
-      if (cursorBody) cursorBody.style.display = 'block';
-    } else {
-      if (statuslineBody) statuslineBody.style.display = 'none';
-      if (statuslineBody) statuslineBody.style.display = 'block';
-    }
-    loadSetupInfo();
-    modal.classList.add('active');
-  }
+  const resolvedAssistant = normalizeAssistant(assistant);
+  if (!isSupportedAssistant(resolvedAssistant)) return;
+
+  setSetupModalTitle(resolvedAssistant);
+  setSetupModalBody(resolvedAssistant);
+  modal.classList.add('active');
+  loadSetupInfo(resolvedAssistant);
 }
 
 function closeSetupModal() {
@@ -5278,40 +5352,29 @@ function closeSetupModal() {
   }
 }
 
-async function loadSetupInfo() {
+async function loadSetupInfo(assistant = currentAssistant) {
   try {
-    const resolvedAssistant = isSupportedAssistant(currentAssistant) ? currentAssistant : 'antigravity';
+    const resolvedAssistant = normalizeAssistant(assistant);
+    if (!isSupportedAssistant(resolvedAssistant)) return;
+
     const res = await fetch(`/api/${resolvedAssistant}/setup-info`);
     const data = await res.json();
+    if (currentAssistant !== resolvedAssistant) return;
     currentSessionHomeDir = typeof data.home_dir === 'string' ? data.home_dir : currentSessionHomeDir;
     
     const isWindows = data.platform === 'windows';
     const quotePowerShell = value => `'${String(value).replace(/'/g, "''")}'`;
     const quoteShell = value => `'${String(value).replace(/'/g, `'"'"'`)}'`;
 
-    // Localize modal title based on selected assistant
-    const titleH2 = document.getElementById('setup-modal-title');
-    if (titleH2) {
-      if (currentAssistant === 'copilot') {
-        titleH2.setAttribute('data-i18n', 'copilot_setup_modal_title');
-      } else if (currentAssistant === 'codex') {
-        titleH2.setAttribute('data-i18n', 'codex_setup_modal_title');
-      } else if (currentAssistant === 'claude') {
-        titleH2.setAttribute('data-i18n', 'claude_setup_modal_title');
-      } else if (currentAssistant === 'cursor') {
-        titleH2.setAttribute('data-i18n', 'cursor_setup_modal_title');
-      } else {
-        titleH2.setAttribute('data-i18n', 'setup_modal_title');
-      }
-    }
+    setSetupModalTitle(resolvedAssistant);
     
-    if (currentAssistant === 'antigravity' || currentAssistant === 'copilot') {
-      const assistantSetup = data[currentAssistant] || {};
+    if (resolvedAssistant === 'antigravity' || resolvedAssistant === 'copilot') {
+      const assistantSetup = data[resolvedAssistant] || {};
       const targetScriptPath = assistantSetup.script_path || '';
       const sourceScriptPath = assistantSetup.source_script_path || '';
       const settingsPath = assistantSetup.settings_path || '';
       const targetScriptCommand = isWindows
-        ? `powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${targetScriptPath}" -Assistant ${currentAssistant}`
+        ? `powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${targetScriptPath}" -Assistant ${resolvedAssistant}`
         : targetScriptPath;
 
       const settingsJson = JSON.stringify({
@@ -5348,7 +5411,7 @@ async function loadSetupInfo() {
       const step5H3 = document.getElementById('setup-step-5');
       const step5DescP = document.getElementById('setup-step-5-desc');
 
-      if (currentAssistant === 'copilot') {
+      if (resolvedAssistant === 'copilot') {
         if (introP) introP.setAttribute('data-i18n', 'copilot_setup_modal_intro');
         if (stepCloneH3) stepCloneH3.setAttribute('data-i18n', 'copilot_setup_step_clone');
         if (stepCloneDescP) stepCloneDescP.setAttribute('data-i18n', 'copilot_setup_step_clone_desc');
@@ -5406,7 +5469,7 @@ async function loadSetupInfo() {
       }
       if (troubleshootAEl) {
         troubleshootAEl.textContent = isWindows
-          ? `Write-Output '{}' | powershell.exe -NoProfile -ExecutionPolicy Bypass -File ${quotePowerShell(targetScriptPath)} -Assistant ${currentAssistant}`
+          ? `Write-Output '{}' | powershell.exe -NoProfile -ExecutionPolicy Bypass -File ${quotePowerShell(targetScriptPath)} -Assistant ${resolvedAssistant}`
           : `echo '{}' | ${quoteShell(targetScriptPath)}`;
       }
       if (troubleshootBEl) {
@@ -5414,15 +5477,18 @@ async function loadSetupInfo() {
           ? `Get-Content -Raw -LiteralPath ${quotePowerShell(settingsPath)} | ConvertFrom-Json | Out-Null`
           : `jq . ${quoteShell(settingsPath)}`;
       }
-    } else if (currentAssistant === 'codex') {
+    } else if (resolvedAssistant === 'codex') {
       const homeLabelCodex = document.getElementById('lbl-detected-home-codex');
       if (homeLabelCodex) homeLabelCodex.textContent = abbreviateHomePath(data.codex?.data_path || '');
-    } else if (currentAssistant === 'claude') {
+    } else if (resolvedAssistant === 'claude') {
       const homeLabelClaude = document.getElementById('lbl-detected-home-claude');
       if (homeLabelClaude) homeLabelClaude.textContent = abbreviateHomePath(data.claude?.data_path || '');
-    } else if (currentAssistant === 'cursor') {
+    } else if (resolvedAssistant === 'cursor') {
       const homeLabelCursor = document.getElementById('lbl-detected-home-cursor');
       if (homeLabelCursor) homeLabelCursor.textContent = abbreviateHomePath(data.cursor?.data_path || '');
+    } else if (resolvedAssistant === 'grok') {
+      const homeLabelGrok = document.getElementById('lbl-detected-home-grok');
+      if (homeLabelGrok) homeLabelGrok.textContent = abbreviateHomePath(data.grok?.data_path || '');
     }
 
     // Apply updated language translations
@@ -5462,8 +5528,9 @@ function initClipboardButtons() {
   });
 }
 
-function toggleEmptyState(showEmpty) {
+function toggleEmptyState(showEmpty, assistant = currentAssistant) {
   isEmptyState = showEmpty;
+  const resolvedAssistant = normalizeAssistant(assistant);
   const emptyContainer = document.getElementById('empty-state-container');
   const dailyView = document.getElementById('daily-view-container');
   const monthlyView = document.getElementById('monthly-view-container');
@@ -5472,41 +5539,39 @@ function toggleEmptyState(showEmpty) {
   if (showEmpty) {
     if (emptyContainer) {
       emptyContainer.classList.remove('hidden');
-      if (currentAssistant === 'none') {
+      if (resolvedAssistant === 'none') {
         emptyContainer.innerHTML = `
           <div class="welcome-setup-card no-agent-card">
             ${cardIconMarkup('alert')}
-            <h2>${t('no_agent_selected_title')}</h2>
-            <p>${t('no_agent_selected_desc')}</p>
+            <h2>${t('no_agent_selected_title', resolvedAssistant)}</h2>
+            <p>${t('no_agent_selected_desc', resolvedAssistant)}</p>
           </div>
         `;
       } else {
-        const meta = getAssistantMeta(currentAssistant);
-        let emptyLogoUrl = meta.logo;
         emptyContainer.innerHTML = `
           <div class="welcome-setup-card">
             <div class="card-icon" style="display: flex; justify-content: center; align-items: center; filter: drop-shadow(0 0 10px rgba(255,255,255,0.1)); margin-bottom: 12px;">
-              <img src="${emptyLogoUrl}" alt="${meta.alt}" style="width: 48px; height: 48px; border-radius: 8px; object-fit: cover;" />
+              ${getAssistantLogoHtml(resolvedAssistant, 'empty-agent-logo')}
             </div>
-            <h2>${t('empty_title')}</h2>
-            <p>${t('empty_desc')}</p>
+            <h2>${t('empty_title', resolvedAssistant)}</h2>
+            <p>${t('empty_desc', resolvedAssistant)}</p>
             <div class="action-buttons">
-              <button class="primary-btn" id="btn-empty-setup-guide">${t('btn_empty_setup')}</button>
-              <button class="secondary-btn" id="btn-empty-refresh">${t('btn_empty_refresh')}</button>
+              <button class="primary-btn" id="btn-empty-setup-guide">${t('btn_empty_setup', resolvedAssistant)}</button>
+              <button class="secondary-btn" id="btn-empty-refresh">${t('btn_empty_refresh', resolvedAssistant)}</button>
             </div>
           </div>
         `;
         
         const emptyGuideBtn = document.getElementById('btn-empty-setup-guide');
         if (emptyGuideBtn) {
-          emptyGuideBtn.addEventListener('click', openSetupModal);
+          emptyGuideBtn.addEventListener('click', () => openSetupModal(resolvedAssistant));
         }
         
         const emptyRefreshBtn = document.getElementById('btn-empty-refresh');
         if (emptyRefreshBtn) {
           emptyRefreshBtn.addEventListener('click', async () => {
             emptyRefreshBtn.classList.add('loading');
-            await fetchDates();
+            await fetchDates(null, false, resolvedAssistant);
             emptyRefreshBtn.classList.remove('loading');
           });
         }
