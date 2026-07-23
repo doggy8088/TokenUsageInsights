@@ -17,7 +17,7 @@ use crate::db::{self, TokenStats};
 use crate::pricing::{calculate_usage_cost, load_pricing_rules};
 use crate::timeline::{
     parse_antigravity_timeline, parse_claude_timeline, parse_codex_timeline,
-    parse_copilot_timeline, parse_cursor_timeline, parse_vscode_timeline, TimelineItem,
+    parse_copilot_timeline_filtered, parse_cursor_timeline, parse_vscode_timeline, TimelineItem,
 };
 
 fn is_safe_session_id(session_id: &str) -> bool {
@@ -164,14 +164,260 @@ fn resolve_vscode_transcript_path(transcript_path_db: &str) -> Result<PathBuf, S
     Ok(canonical_path)
 }
 
+/// Resolve the `events.jsonl` path for a Copilot App session drawer request.
+///
+/// `events_session_id` is the *parent* (original main) session id when the
+/// request is for a subagent synthetic session (`<main>__<agent_id>`), or the
+/// session id itself for a main agent request. Callers MUST obtain this from
+/// the database `parent_session_id` column rather than splitting the synthetic
+/// id, so a tampered id cannot escape the session-state root.
+///
+/// `agent_nickname` is only used to craft a precise `content_unavailable`
+/// reason when the file resolves but parsing the agent-specific slice yields no
+/// timeline items; it does not affect path resolution.
+///
+/// Security: the canonicalized path must remain within the
+/// `<copilot_app_dir>/session-state` root. Any traversal attempt (synthetic id
+/// with `..`, symlinks pointing outside, ...) is rejected with `file_missing`.
+fn resolve_copilot_app_events_path(
+    copilot_app_dir: &StdPath,
+    events_session_id: &str,
+    agent_nickname: Option<&str>,
+) -> Result<PathBuf, SessionFileErrorExt> {
+    if !is_safe_session_id(events_session_id) {
+        return Err(SessionFileErrorExt::with_reason(
+            StatusCode::NOT_FOUND,
+            "Copilot App session id 格式不正確，無法定位 events.jsonl。",
+            "file_missing",
+        ));
+    }
+
+    let session_state_root = copilot_app_dir.join("session-state");
+    let session_dir = session_state_root.join(events_session_id);
+    let events_path = session_dir.join("events.jsonl");
+
+    // Canonicalize defensively. If the directory/file is missing we still want
+    // a precise reason, so handle missing paths before canonicalization (which
+    // would error on non-existent paths).
+    if !events_path.exists() {
+        let reason = if session_dir.exists() {
+            "no_events_yet"
+        } else {
+            "file_missing"
+        };
+        return Err(SessionFileErrorExt::with_reason(
+            StatusCode::NOT_FOUND,
+            if reason == "no_events_yet" {
+                "找不到 Copilot App session 的 events.jsonl（session 目錄存在但尚未產生事件檔）。"
+                    .to_string()
+            } else if agent_nickname.is_some() {
+                "找不到 Copilot App session 的 events.jsonl（subagent 對應的主 session 目錄不存在）。".to_string()
+            } else {
+                "找不到 Copilot App session 的 events.jsonl。".to_string()
+            },
+            reason,
+        ));
+    }
+
+    let root_canonical = match session_state_root.canonicalize() {
+        Ok(p) => p,
+        Err(_) => {
+            return Err(SessionFileErrorExt::with_reason(
+                StatusCode::NOT_FOUND,
+                "無法存取 Copilot App session-state 根目錄。",
+                "file_missing",
+            ));
+        }
+    };
+    let canonical_path = match events_path.canonicalize() {
+        Ok(p) => p,
+        Err(_) => {
+            return Err(SessionFileErrorExt::with_reason(
+                StatusCode::NOT_FOUND,
+                "無法解析 Copilot App events.jsonl 路徑。",
+                "file_missing",
+            ));
+        }
+    };
+
+    if !canonical_path.starts_with(&root_canonical) {
+        return Err(SessionFileErrorExt::with_reason(
+            StatusCode::NOT_FOUND,
+            "Copilot App events.jsonl 路徑不在允許的 session-state 目錄內。",
+            "file_missing",
+        ));
+    }
+
+    // The final path component must be events.jsonl and its parent directory
+    // name must equal the requested session id, preventing a symlinked file
+    // from impersonating another session.
+    let parent_name = canonical_path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str());
+    if parent_name != Some(events_session_id) {
+        return Err(SessionFileErrorExt::with_reason(
+            StatusCode::NOT_FOUND,
+            "Copilot App events.jsonl 路徑與 session id 不一致。",
+            "file_missing",
+        ));
+    }
+    let file_name = canonical_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    if file_name != "events.jsonl" {
+        return Err(SessionFileErrorExt::with_reason(
+            StatusCode::NOT_FOUND,
+            "Copilot App session 路徑未指向 events.jsonl。",
+            "file_missing",
+        ));
+    }
+
+    Ok(canonical_path)
+}
+
+/// Resolve the `events.jsonl` path for a Copilot CLI subagent drawer request.
+///
+/// CLI subagent rows use a synthetic session id (`<parent_session_id>__<agent_id>`)
+/// and share the parent's `events.jsonl` under
+/// `<copilot_dir>/session-state/<parent_session_id>/events.jsonl`. The caller
+/// MUST pass the database-sourced `parent_session_id` (never a string-split
+/// synthetic id) so a tampered id cannot escape the session-state root.
+///
+/// Mirrors [`resolve_copilot_app_events_path`] security checks but against the
+/// Copilot CLI directory ([`db::get_copilot_dir`]).
+fn resolve_copilot_cli_subagent_events_path(
+    copilot_dir: &StdPath,
+    parent_session_id: &str,
+) -> Result<PathBuf, SessionFileErrorExt> {
+    if !is_safe_session_id(parent_session_id) {
+        return Err(SessionFileErrorExt::with_reason(
+            StatusCode::NOT_FOUND,
+            "Copilot CLI subagent 的 parent session id 格式不正確，無法定位 events.jsonl。",
+            "file_missing",
+        ));
+    }
+
+    let session_state_root = copilot_dir.join("session-state");
+    let session_dir = session_state_root.join(parent_session_id);
+    let events_path = session_dir.join("events.jsonl");
+
+    if !events_path.exists() {
+        let reason = if session_dir.exists() {
+            "no_events_yet"
+        } else {
+            "file_missing"
+        };
+        return Err(SessionFileErrorExt::with_reason(
+            StatusCode::NOT_FOUND,
+            if reason == "no_events_yet" {
+                "找不到 Copilot CLI subagent 對應的主 session events.jsonl（主 session 目錄存在但尚未產生事件檔）。".to_string()
+            } else {
+                "找不到 Copilot CLI subagent 對應的主 session events.jsonl（subagent 對應的主 session 目錄不存在）。".to_string()
+            },
+            reason,
+        ));
+    }
+
+    let root_canonical = match session_state_root.canonicalize() {
+        Ok(p) => p,
+        Err(_) => {
+            return Err(SessionFileErrorExt::with_reason(
+                StatusCode::NOT_FOUND,
+                "無法存取 Copilot CLI session-state 根目錄。",
+                "file_missing",
+            ));
+        }
+    };
+    let canonical_path = match events_path.canonicalize() {
+        Ok(p) => p,
+        Err(_) => {
+            return Err(SessionFileErrorExt::with_reason(
+                StatusCode::NOT_FOUND,
+                "無法解析 Copilot CLI subagent events.jsonl 路徑。",
+                "file_missing",
+            ));
+        }
+    };
+
+    if !canonical_path.starts_with(&root_canonical) {
+        return Err(SessionFileErrorExt::with_reason(
+            StatusCode::NOT_FOUND,
+            "Copilot CLI subagent events.jsonl 路徑不在允許的 session-state 目錄內。",
+            "file_missing",
+        ));
+    }
+
+    let parent_name = canonical_path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str());
+    if parent_name != Some(parent_session_id) {
+        return Err(SessionFileErrorExt::with_reason(
+            StatusCode::NOT_FOUND,
+            "Copilot CLI subagent events.jsonl 路徑與 parent session id 不一致。",
+            "file_missing",
+        ));
+    }
+    let file_name = canonical_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    if file_name != "events.jsonl" {
+        return Err(SessionFileErrorExt::with_reason(
+            StatusCode::NOT_FOUND,
+            "Copilot CLI subagent 路徑未指向 events.jsonl。",
+            "file_missing",
+        ));
+    }
+
+    Ok(canonical_path)
+}
+
 type SessionFileError = (StatusCode, String);
+
+/// Extended error carrying a machine-readable `reason` code for the frontend.
+/// `reason` is `None` for generic errors (the frontend falls back to a generic
+/// "load failed" message) and `Some("no_events_yet" | "file_missing" |
+/// "content_unavailable")` for Copilot App session drawer cases.
+#[derive(Debug)]
+struct SessionFileErrorExt {
+    status: StatusCode,
+    error: String,
+    reason: Option<String>,
+}
+
+impl SessionFileErrorExt {
+    fn new(status: StatusCode, error: impl Into<String>) -> Self {
+        Self {
+            status,
+            error: error.into(),
+            reason: None,
+        }
+    }
+
+    fn with_reason(
+        status: StatusCode,
+        error: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            status,
+            error: error.into(),
+            reason: Some(reason.into()),
+        }
+    }
+}
 
 fn resolve_session_file_path(
     assistant: &str,
     session_id: &str,
     transcript_path_db: Option<&str>,
     source_kind: &str,
-) -> Result<PathBuf, SessionFileError> {
+    copilot_app_parent_session_id: Option<&str>,
+    copilot_app_agent_nickname: Option<&str>,
+) -> Result<PathBuf, SessionFileErrorExt> {
     match assistant {
         "antigravity" => Ok(db::get_antigravity_dir()
             .join("brain")
@@ -179,12 +425,26 @@ fn resolve_session_file_path(
             .join(".system_generated/logs/transcript_full.jsonl")),
         "copilot" if source_kind == crate::vscode::SOURCE_KIND => {
             let path = transcript_path_db.ok_or_else(|| {
-                (
+                SessionFileErrorExt::new(
                     StatusCode::NOT_FOUND,
-                    "找不到 VS Code Copilot 聊天檔案路徑。".to_string(),
+                    "找不到 VS Code Copilot 聊天檔案路徑。",
                 )
             })?;
-            resolve_vscode_transcript_path(path).map_err(|error| (StatusCode::BAD_REQUEST, error))
+            resolve_vscode_transcript_path(path)
+                .map_err(|error| SessionFileErrorExt::new(StatusCode::BAD_REQUEST, error))
+        }
+        "copilot" if source_kind == "copilot-app" => resolve_copilot_app_events_path(
+            &crate::paths::copilot_app_dir(),
+            copilot_app_parent_session_id.unwrap_or(session_id),
+            copilot_app_agent_nickname,
+        ),
+        "copilot" if source_kind == "copilot-cli" && copilot_app_parent_session_id.is_some() => {
+            // CLI subagent synthetic session: locate the shared events.jsonl
+            // under the parent session's directory, not the synthetic id's.
+            resolve_copilot_cli_subagent_events_path(
+                &db::get_copilot_dir(),
+                copilot_app_parent_session_id.unwrap(),
+            )
         }
         "copilot" => {
             let copilot_dir = db::get_copilot_dir();
@@ -202,36 +462,48 @@ fn resolve_session_file_path(
         }
         "codex" => {
             let path = transcript_path_db.ok_or_else(|| {
-                (
+                SessionFileErrorExt::new(
                     StatusCode::NOT_FOUND,
-                    "找不到 Codex CLI 會話日誌檔案路徑。".to_string(),
+                    "找不到 Codex CLI 會話日誌檔案路徑。",
                 )
             })?;
             resolve_codex_transcript_path(&db::get_codex_dir(), path)
-                .map_err(|error| (StatusCode::BAD_REQUEST, error))
+                .map_err(|error| SessionFileErrorExt::new(StatusCode::BAD_REQUEST, error))
         }
         "claude" => {
             let path = transcript_path_db.ok_or_else(|| {
-                (
+                SessionFileErrorExt::new(
                     StatusCode::NOT_FOUND,
-                    "找不到 Claude Code 會話日誌檔案路徑。".to_string(),
+                    "找不到 Claude Code 會話日誌檔案路徑。",
                 )
             })?;
             resolve_claude_transcript_path(&db::get_claude_dir(), session_id, path)
-                .map_err(|error| (StatusCode::BAD_REQUEST, error))
+                .map_err(|error| SessionFileErrorExt::new(StatusCode::BAD_REQUEST, error))
         }
         "cursor" => {
             let path = transcript_path_db.ok_or_else(|| {
-                (
-                    StatusCode::NOT_FOUND,
-                    "找不到 Cursor 會話日誌檔案路徑。".to_string(),
-                )
+                SessionFileErrorExt::new(StatusCode::NOT_FOUND, "找不到 Cursor 會話日誌檔案路徑。")
             })?;
             resolve_cursor_transcript_path(&db::get_cursor_dir(), session_id, path)
-                .map_err(|error| (StatusCode::BAD_REQUEST, error))
+                .map_err(|error| SessionFileErrorExt::new(StatusCode::BAD_REQUEST, error))
         }
-        _ => Err((StatusCode::BAD_REQUEST, "不支援的助理類型".to_string())),
+        _ => Err(SessionFileErrorExt::new(
+            StatusCode::BAD_REQUEST,
+            "不支援的助理類型",
+        )),
     }
+}
+
+/// Aggregated per-session DB data fetched before parsing the timeline file:
+/// per-turn token stats, the session cwd, and the canonical session model.
+/// The model is the child session's own model for subagent synthetic rows,
+/// used to seed the Copilot timeline parser so the subagent drawer shows the
+/// child model instead of the shared parent `session.start.selectedModel`.
+#[derive(Default)]
+struct SessionDbData {
+    db_entries: HashMap<u32, (TokenStats, String)>,
+    session_cwd: Option<String>,
+    session_model: Option<String>,
 }
 
 fn parse_session_timeline_file(
@@ -239,6 +511,8 @@ fn parse_session_timeline_file(
     source_kind: &str,
     filepath: &StdPath,
     db_entries: &HashMap<u32, (TokenStats, String)>,
+    copilot_app_agent_filter: Option<&str>,
+    copilot_session_model: Option<&str>,
 ) -> Result<(Vec<TimelineItem>, HashMap<String, serde_json::Value>), SessionFileError> {
     let mut timeline = Vec::new();
     let mut metadata = HashMap::new();
@@ -261,7 +535,29 @@ fn parse_session_timeline_file(
         "antigravity" => {
             parse_antigravity_timeline(reader, db_entries, &mut timeline, &mut metadata)
         }
-        "copilot" => parse_copilot_timeline(reader, db_entries, &mut timeline, &mut metadata),
+        // Copilot App sessions share one events.jsonl across the main agent and
+        // every subagent; the agent filter keeps each drawer's timeline scoped
+        // to the right agent. Copilot CLI calls never carry an agentId, so
+        // passing `None` here preserves the original CLI behavior. The
+        // DB-sourced session model seeds the parser so a subagent drawer starts
+        // from its own child model instead of the shared parent
+        // `session.start.selectedModel`.
+        "copilot" if source_kind == "copilot-app" => parse_copilot_timeline_filtered(
+            reader,
+            db_entries,
+            &mut timeline,
+            &mut metadata,
+            copilot_app_agent_filter,
+            copilot_session_model,
+        ),
+        "copilot" => parse_copilot_timeline_filtered(
+            reader,
+            db_entries,
+            &mut timeline,
+            &mut metadata,
+            copilot_app_agent_filter,
+            copilot_session_model,
+        ),
         "codex" => parse_codex_timeline(reader, db_entries, &mut timeline, &mut metadata),
         "claude" => parse_claude_timeline(reader, db_entries, &mut timeline, &mut metadata),
         "cursor" => parse_cursor_timeline(reader, db_entries, &mut timeline, &mut metadata),
@@ -385,6 +681,11 @@ pub async fn get_setup_info(Path(assistant): Path<String>) -> impl IntoResponse 
     let cursor_dir = db::get_cursor_dir();
     let cursor_exists = cursor_dir.join("projects").exists();
 
+    let copilot_app_dir = crate::paths::copilot_app_dir();
+    let copilot_app_data_db = copilot_app_dir.join("data.db");
+    let copilot_app_session_db = copilot_app_dir.join("session-store.db");
+    let copilot_app_exists = copilot_app_data_db.exists() || copilot_app_session_db.exists();
+
     Json(SetupInfoResponse {
         platform: std::env::consts::OS.to_string(),
         workspace_dir,
@@ -410,6 +711,14 @@ pub async fn get_setup_info(Path(assistant): Path<String>) -> impl IntoResponse 
                 .join("settings.json")
                 .to_string_lossy()
                 .into_owned(),
+        },
+        copilot_app: AssistantSetupStatus {
+            dir_path: copilot_app_dir.to_string_lossy().into_owned(),
+            data_path: copilot_app_session_db.to_string_lossy().into_owned(),
+            exists: copilot_app_exists,
+            script_path: "".to_string(),
+            source_script_path: "".to_string(),
+            settings_path: "".to_string(),
         },
         codex: AssistantSetupStatus {
             dir_path: codex_dir.to_string_lossy().into_owned(),
@@ -483,20 +792,30 @@ pub async fn get_usage_details(
     }
 
     let mut summary = DaySummary::default();
-    let mut sessions_map: HashMap<String, (Vec<UsageEntry>, String)> = HashMap::new();
+    // Session identity = (source_kind, session_id, source_dir_key) so that
+    // rows from different sources (copilot-cli, copilot-app, vscode-chat) with
+    // the same session_id are not merged, and different COPILOT_APP_DIR values
+    // remain isolated.
+    type SessionKey = (String, String, Option<String>);
+    let mut sessions_map: HashMap<SessionKey, (Vec<UsageEntry>, String)> = HashMap::new();
     let mut entries = Vec::new();
 
     for (record, ast_type) in &entries_with_type {
         let e = &record.entry;
         entries.push(e.clone());
+        let source_kind = e
+            .source_kind
+            .clone()
+            .unwrap_or_else(|| "legacy".to_string());
+        let key = (source_kind, e.session_id.clone(), e.source_dir_key.clone());
         let (list, _) = sessions_map
-            .entry(e.session_id.clone())
+            .entry(key)
             .or_insert_with(|| (Vec::new(), ast_type.clone()));
         list.push(e.clone());
     }
 
     summary.total_sessions = sessions_map.len();
-    let mut session_last_entries: HashMap<String, UsageEntry> = HashMap::new();
+    let mut session_last_entries: HashMap<SessionKey, UsageEntry> = HashMap::new();
 
     for e in &entries {
         if let Some(ref tokens) = e.delta_tokens {
@@ -517,8 +836,12 @@ pub async fn get_usage_details(
             }
         }
 
-        let sid = e.session_id.clone();
-        let last_e = session_last_entries.entry(sid).or_insert_with(|| e.clone());
+        let source_kind = e
+            .source_kind
+            .clone()
+            .unwrap_or_else(|| "legacy".to_string());
+        let key = (source_kind, e.session_id.clone(), e.source_dir_key.clone());
+        let last_e = session_last_entries.entry(key).or_insert_with(|| e.clone());
         if e.turn_no > last_e.turn_no {
             *last_e = e.clone();
         }
@@ -527,9 +850,14 @@ pub async fn get_usage_details(
     let pricing_rules = load_pricing_rules();
     let mut sessions_summary = Vec::new();
 
-    for (session_id, (s_entries, ast_type)) in &sessions_map {
+    for ((source_kind, session_id, _source_dir_key), (s_entries, ast_type)) in &sessions_map {
+        let key = (
+            source_kind.clone(),
+            session_id.clone(),
+            _source_dir_key.clone(),
+        );
         let last_entry = session_last_entries
-            .get(session_id)
+            .get(&key)
             .cloned()
             .unwrap_or_else(|| s_entries[0].clone());
 
@@ -646,10 +974,7 @@ pub async fn get_usage_details(
                 .session_name
                 .unwrap_or_else(|| "Start Coding Session".to_string()),
             assistant_type: ast_type.clone(),
-            source_kind: last_entry
-                .source_kind
-                .clone()
-                .unwrap_or_else(|| "legacy".to_string()),
+            source_kind: source_kind.clone(),
             cwd: last_entry.cwd.unwrap_or_default(),
             model: last_entry
                 .model
@@ -759,6 +1084,8 @@ pub async fn search_sessions_by_user_prompt(
                     &session.session_id,
                     session.transcript_path.as_deref(),
                     &session.source_kind,
+                    None,
+                    None,
                 ) {
                     Ok(path) if path.exists() => path,
                     _ => {
@@ -772,6 +1099,8 @@ pub async fn search_sessions_by_user_prompt(
                     &session.source_kind,
                     &filepath,
                     &db_entries,
+                    None,
+                    None,
                 ) {
                     Ok(result) => result,
                     Err(_) => {
@@ -868,19 +1197,25 @@ pub async fn get_session_details(
             .into_response();
     }
 
-    let session_info: Result<(String, Option<String>, String), String> =
-        tokio::task::spawn_blocking({
-            let sid = session_id.clone();
-            let assistant_name = assistant.clone();
-            move || {
-                let conn = db::get_db_conn()?;
-                db::get_session_assistant_and_transcript(&conn, &assistant_name, &sid)
-            }
-        })
-        .await
-        .unwrap_or_else(|_| Err("執行緒執行失敗".to_string()));
+    let session_info: Result<db::SessionIdentity, String> = tokio::task::spawn_blocking({
+        let sid = session_id.clone();
+        let assistant_name = assistant.clone();
+        move || {
+            let conn = db::get_db_conn()?;
+            db::get_session_assistant_and_transcript(&conn, &assistant_name, &sid)
+        }
+    })
+    .await
+    .unwrap_or_else(|_| Err("執行緒執行失敗".to_string()));
 
-    let (resolved_assistant, transcript_path_db, source_kind) = match session_info {
+    let (
+        resolved_assistant,
+        transcript_path_db,
+        source_kind,
+        source_dir_key,
+        copilot_app_parent_session_id,
+        copilot_app_agent_nickname,
+    ) = match session_info {
         Ok(info) => info,
         Err(e) => {
             return (
@@ -905,19 +1240,45 @@ pub async fn get_session_details(
         &session_id,
         transcript_path_db.as_deref(),
         &source_kind,
+        copilot_app_parent_session_id.as_deref(),
+        copilot_app_agent_nickname.as_deref(),
     ) {
         Ok(path) => path,
-        Err((status, error)) => {
-            return (status, Json(serde_json::json!({ "error": error }))).into_response();
+        Err(err) => {
+            let mut payload = serde_json::json!({ "error": err.error });
+            if let Some(reason) = err.reason {
+                payload["reason"] = serde_json::Value::String(reason);
+            }
+            return (err.status, Json(payload)).into_response();
         }
     };
 
     if !filepath.exists() {
         // 判斷是否為「尚未開始交談」（session 目錄存在但 events.jsonl 尚未產生）
+        // For Copilot subagent synthetic sessions (App or CLI), the events file
+        // lives under the parent session's directory, so check that directory.
         let is_session_dir_present = match resolved_assistant.as_str() {
             "copilot" => {
-                let cop_dir = db::get_copilot_dir();
-                cop_dir.join("session-state").join(&session_id).exists()
+                // Copilot App and Copilot CLI subagent synthetic sessions store
+                // their events.jsonl under the parent session's session-state
+                // directory. App sessions live under `paths::copilot_app_dir()`
+                // (honors COPILOT_APP_DIR), while CLI sessions live under
+                // `db::get_copilot_dir()` (honors COPILOT_DIR). Using the wrong
+                // base would misclassify missing App sessions when the two env
+                // vars point to different directories.
+                let cop_dir = if source_kind == "copilot-app" {
+                    crate::paths::copilot_app_dir()
+                } else {
+                    db::get_copilot_dir()
+                };
+                let dir_id = if source_kind == "copilot-app" || source_kind == "copilot-cli" {
+                    copilot_app_parent_session_id
+                        .as_deref()
+                        .unwrap_or(&session_id)
+                } else {
+                    &session_id
+                };
+                cop_dir.join("session-state").join(dir_id).exists()
             }
             _ => false,
         };
@@ -926,36 +1287,100 @@ pub async fn get_session_details(
         } else {
             "file_missing"
         };
-        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": format!("找不到該會話的本地日誌檔: {:?}", filepath), "reason": reason }))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "找不到該會話的本地日誌檔。", "reason": reason })),
+        )
+            .into_response();
     }
 
     // 3. 預先載入 SQLite 中的回合 (turn_no) 增量 token 數據
     let sid_clone = session_id.clone();
-    let (db_entries, session_cwd): (HashMap<u32, (TokenStats, String)>, Option<String>) =
-        tokio::task::spawn_blocking(move || {
-            if let Ok(conn) = db::get_db_conn() {
-                let session_cwd = db::get_session_cwd(&conn, &sid_clone).unwrap_or(None);
-                let map = db::get_session_turns_token_stats(&conn, &sid_clone).unwrap_or_default();
-                (map, session_cwd)
-            } else {
-                (HashMap::new(), None)
+    let sdk_clone = source_dir_key.clone();
+    let session_db_data: SessionDbData = tokio::task::spawn_blocking(move || {
+        if let Ok(conn) = db::get_db_conn() {
+            let session_cwd =
+                db::get_session_cwd(&conn, &sid_clone, sdk_clone.as_deref()).unwrap_or(None);
+            let session_model =
+                db::get_session_model(&conn, &sid_clone, sdk_clone.as_deref()).unwrap_or(None);
+            let map = db::get_session_turns_token_stats(&conn, &sid_clone, sdk_clone.as_deref())
+                .unwrap_or_default();
+            SessionDbData {
+                db_entries: map,
+                session_cwd,
+                session_model,
             }
-        })
-        .await
-        .unwrap_or_else(|_| (HashMap::new(), None));
+        } else {
+            SessionDbData::default()
+        }
+    })
+    .await
+    .unwrap_or_default();
+    let SessionDbData {
+        db_entries,
+        session_cwd,
+        session_model,
+    } = session_db_data;
 
-    // 依據不同助理格式解析日誌
+    // Agent filter: Copilot App and Copilot CLI synthetic subagent rows both
+    // share the parent session's events.jsonl and rely on a top-level
+    // `agentId` field to keep subagent events out of the main agent view and
+    // vice versa. The filter value is the database-sourced `agent_nickname`
+    // (the real agent_id), never a string-split synthetic id.
+    let copilot_agent_filter: Option<&str> = if resolved_assistant == "copilot"
+        && matches!(source_kind.as_str(), "copilot-app" | "copilot-cli")
+    {
+        copilot_app_agent_nickname.as_deref()
+    } else {
+        None
+    };
     let (timeline, mut metadata) = match parse_session_timeline_file(
         &resolved_assistant,
         &source_kind,
         &filepath,
         &db_entries,
+        copilot_agent_filter,
+        session_model.as_deref(),
     ) {
         Ok(result) => result,
         Err((status, error)) => {
             return (status, Json(serde_json::json!({ "error": error }))).into_response();
         }
     };
+
+    // Copilot App / CLI subagent requests may resolve the shared events.jsonl
+    // but find no agent-specific events carrying the requested agentId (e.g.
+    // the subagent row was imported from a usage snapshot before its lifecycle
+    // events were written, or the agent id drifted between DB and file).
+    // Shared context (session start, user prompt) is intentionally kept for
+    // readability, so the drawer is "unavailable" only when there are no
+    // agent-specific items at all. Surface a recognizable reason instead of a
+    // context-only drawer so the frontend can explain it.
+    if matches!(source_kind.as_str(), "copilot-app" | "copilot-cli")
+        && copilot_agent_filter.is_some()
+    {
+        let has_agent_specific = timeline.iter().any(|item| match item {
+            TimelineItem::AgentReply { .. } => true,
+            TimelineItem::ToolStep { .. } => true,
+            TimelineItem::SystemStatus { status_type, .. } => {
+                matches!(
+                    status_type.as_str(),
+                    "subagent_started" | "subagent_completed" | "subagent_failed"
+                )
+            }
+            _ => false,
+        });
+        if !has_agent_specific {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": "Copilot subagent 的 events.jsonl 中找不到對應 agentId 的事件，可能該 subagent 尚未寫入事件或檔案已被置換。",
+                    "reason": "content_unavailable",
+                })),
+            )
+                .into_response();
+        }
+    }
 
     // 補充或覆寫 Git 與 CWD 相關資訊（若 metadata 未包含但資料庫中有紀錄）
     if let Some(ref cwd) = session_cwd {
@@ -1110,6 +1535,9 @@ pub async fn get_session_details(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::Connection;
+    use std::collections::HashMap;
+    use std::fs;
 
     fn user_prompt(prompt: &str, turn_no: u32) -> TimelineItem {
         TimelineItem::UserPrompt {
@@ -1142,5 +1570,494 @@ mod tests {
         ];
 
         assert!(!timeline_matches_user_prompt(&timeline, "secret keyword"));
+    }
+
+    /// Regression test: same session_id with copilot-cli and copilot-app rows
+    /// must produce two separate session summaries with correct source_kind,
+    /// not one merged session. This mirrors the aggregation logic in
+    /// get_usage_details using get_usage_entries_by_date.
+    #[test]
+    fn daily_summary_separates_copilot_cli_and_app_with_same_session_id() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        // Insert a copilot-cli row for session "shared-sess".
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, session_name,
+                tokens_input, tokens_output, tokens_total,
+                delta_input, delta_output, delta_total
+             ) VALUES (
+                'copilot', 'copilot-cli', NULL, '2026-07-20T10:00:00Z', '2026-07-20',
+                'shared-sess', 1, 'CLI Session',
+                50, 5, 55,
+                50, 5, 55
+             )",
+            [],
+        )
+        .unwrap();
+
+        // Insert a copilot-app row for the SAME session_id (simulating what
+        // sync_copilot_app_usage_logs would produce).
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, session_name,
+                tokens_input, tokens_output, tokens_total,
+                delta_input, delta_output, delta_total,
+                model
+             ) VALUES (
+                'copilot', 'copilot-app', 'abcdef00', '2026-07-20T10:00:00Z', '2026-07-20',
+                'shared-sess', 1, 'App Session',
+                100, 10, 110,
+                100, 10, 110,
+                'GLM5.2'
+             )",
+            [],
+        )
+        .unwrap();
+
+        // Fetch entries for the date — should have copilot-cli and copilot-app.
+        let entries = crate::db::get_usage_entries_by_date(&conn, "2026-07-20", "copilot").unwrap();
+
+        // Group by (source_kind, session_id, source_dir_key) mirroring the handler.
+        let mut sessions: HashMap<(String, String, Option<String>), Vec<&crate::db::UsageEntry>> =
+            HashMap::new();
+        for (record, _ast) in &entries {
+            let e = &record.entry;
+            let sk = e
+                .source_kind
+                .clone()
+                .unwrap_or_else(|| "legacy".to_string());
+            let key = (sk, e.session_id.clone(), e.source_dir_key.clone());
+            sessions.entry(key).or_default().push(e);
+        }
+
+        // Must be 2 separate sessions.
+        assert_eq!(
+            sessions.len(),
+            2,
+            "copilot-cli and copilot-app with same session_id must be 2 separate sessions"
+        );
+
+        // Verify each session has the correct source_kind.
+        let source_kinds: Vec<String> = sessions.keys().map(|(sk, _, _)| sk.clone()).collect();
+        assert!(
+            source_kinds.contains(&"copilot-cli".to_string()),
+            "must have a copilot-cli session, got: {:?}",
+            source_kinds
+        );
+        assert!(
+            source_kinds.contains(&"copilot-app".to_string()),
+            "must have a copilot-app session, got: {:?}",
+            source_kinds
+        );
+
+        // Verify the copilot-app session has model GLM5.2 and source_kind copilot-app.
+        let app_session = sessions
+            .iter()
+            .find(|(key, _)| key.0 == "copilot-app")
+            .map(|(_, entries)| entries)
+            .unwrap();
+        assert_eq!(
+            app_session[0].model.as_deref(),
+            Some("GLM5.2"),
+            "copilot-app session model should be GLM5.2"
+        );
+        assert_eq!(
+            app_session[0].source_kind.as_deref(),
+            Some("copilot-app"),
+            "copilot-app session source_kind must be copilot-app"
+        );
+    }
+
+    /// Shared helper: build a temp Copilot App directory layout with a single
+    /// `session-state/<session_id>/events.jsonl` file containing the provided
+    /// lines. Returns the app dir path. Tests clean it up by removing the
+    /// returned base dir.
+    fn copilot_app_fixture_dir(prefix: &str) -> PathBuf {
+        let mut base = std::env::temp_dir();
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        base.push(format!(
+            "token-insights-test-{}-{}-{}",
+            prefix,
+            std::process::id(),
+            unique
+        ));
+        base
+    }
+
+    fn write_copilot_app_events(app_dir: &StdPath, session_id: &str, lines: &[&str]) {
+        let session_dir = app_dir.join("session-state").join(session_id);
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let content = lines.join("\n");
+        std::fs::write(session_dir.join("events.jsonl"), content).unwrap();
+    }
+
+    #[test]
+    fn copilot_app_main_session_resolves_events_jsonl_under_session_state() {
+        let app_dir = copilot_app_fixture_dir("app-main-resolve");
+        let session_id = "74b6d236-d311-4675-9855-fee91bc508e5";
+        write_copilot_app_events(&app_dir, session_id, &["{}"]);
+
+        let resolved = resolve_copilot_app_events_path(&app_dir, session_id, None).unwrap();
+        assert!(resolved.ends_with("events.jsonl"));
+        assert!(resolved.parent().unwrap().ends_with(session_id));
+
+        let _ = std::fs::remove_dir_all(&app_dir);
+    }
+
+    #[test]
+    fn copilot_app_subagent_uses_parent_session_id_for_path() {
+        let app_dir = copilot_app_fixture_dir("app-sub-resolve");
+        let parent = "74b6d236-d311-4675-9855-fee91bc508e5";
+        let agent = "call_v4b32z66";
+        write_copilot_app_events(&app_dir, parent, &["{}"]);
+
+        // The synthetic id must NOT be combined into the path: the caller
+        // resolves the parent from the DB and passes it in.
+        let resolved = resolve_copilot_app_events_path(&app_dir, parent, Some(agent)).unwrap();
+        assert!(resolved.parent().unwrap().ends_with(parent));
+        assert!(!resolved.to_string_lossy().contains(&format!("__{agent}")));
+
+        let _ = std::fs::remove_dir_all(&app_dir);
+    }
+
+    #[test]
+    fn copilot_app_missing_session_dir_returns_file_missing_reason() {
+        let app_dir = copilot_app_fixture_dir("app-missing-dir");
+        let session_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+
+        let err = resolve_copilot_app_events_path(&app_dir, session_id, None).unwrap_err();
+        assert_eq!(err.status, StatusCode::NOT_FOUND);
+        assert_eq!(err.reason.as_deref(), Some("file_missing"));
+
+        let _ = std::fs::remove_dir_all(&app_dir);
+    }
+
+    #[test]
+    fn copilot_app_session_dir_without_events_returns_no_events_yet_reason() {
+        let app_dir = copilot_app_fixture_dir("app-no-events-yet");
+        let session_id = "55555555-6666-7777-8888-999999999999";
+        // Create the session directory but NOT events.jsonl.
+        std::fs::create_dir_all(app_dir.join("session-state").join(session_id)).unwrap();
+
+        let err = resolve_copilot_app_events_path(&app_dir, session_id, None).unwrap_err();
+        assert_eq!(err.status, StatusCode::NOT_FOUND);
+        assert_eq!(err.reason.as_deref(), Some("no_events_yet"));
+
+        let _ = std::fs::remove_dir_all(&app_dir);
+    }
+
+    #[test]
+    fn copilot_app_rejects_unsafe_session_id_before_path_lookup() {
+        let app_dir = copilot_app_fixture_dir("app-unsafe-id");
+        // A traversal attempt must be rejected without ever touching the FS.
+        let err = resolve_copilot_app_events_path(&app_dir, "..", None).unwrap_err();
+        assert_eq!(err.status, StatusCode::NOT_FOUND);
+        assert_eq!(err.reason.as_deref(), Some("file_missing"));
+
+        let _ = std::fs::remove_dir_all(&app_dir);
+    }
+
+    #[test]
+    fn get_session_assistant_and_transcript_returns_parent_and_agent_for_subagent_row() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        let parent = "74b6d236-d311-4675-9855-fee91bc508e5";
+        let agent = "call_v4b32z66";
+        let synthetic = format!("{parent}__{agent}");
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, model,
+                tokens_input, tokens_output, tokens_total,
+                delta_input, delta_output, delta_total,
+                parent_session_id, agent_nickname
+             ) VALUES (
+                'copilot', 'copilot-app', 'abcdef00', '2026-07-20T10:00:00Z', '2026-07-20',
+                ?, 1, 'K2.7',
+                100, 10, 110,
+                100, 10, 110,
+                ?, ?
+             )",
+            rusqlite::params![synthetic, parent, agent],
+        )
+        .unwrap();
+
+        let (_ast, _path, source_kind, _sdk, parent_id, nickname) =
+            crate::db::get_session_assistant_and_transcript(&conn, "copilot", &synthetic).unwrap();
+        assert_eq!(source_kind, "copilot-app");
+        assert_eq!(parent_id.as_deref(), Some(parent));
+        assert_eq!(nickname.as_deref(), Some(agent));
+
+        // Main agent row returns None for both.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, model,
+                tokens_input, tokens_output, tokens_total,
+                delta_input, delta_output, delta_total
+             ) VALUES (
+                'copilot', 'copilot-app', 'abcdef00', '2026-07-20T10:01:00Z', '2026-07-20',
+                ?, 1, 'DP4F',
+                50, 5, 55,
+                50, 5, 55
+             )",
+            rusqlite::params![parent],
+        )
+        .unwrap();
+        let (_ast, _path, _sk, _sdk, main_parent, main_nick) =
+            crate::db::get_session_assistant_and_transcript(&conn, "copilot", parent).unwrap();
+        assert!(main_parent.is_none());
+        assert!(main_nick.is_none());
+    }
+
+    /// Regression test: a Copilot CLI subagent synthetic session row must
+    /// resolve its drawer events.jsonl via the parent session's directory
+    /// (not the synthetic id's), and the agent filter must keep only that
+    /// subagent's events while preserving shared context.
+    #[test]
+    fn cli_subagent_drawer_resolves_via_parent_and_filters_by_agent_id() {
+        let tmp = std::env::temp_dir().join(format!(
+            "cli-drawer-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+        let parent = "drawer-parent-session";
+        let agent = "call_drawer";
+        let synthetic = format!("{parent}__{agent}");
+        let session_dir = tmp.join("session-state").join(parent);
+        fs::create_dir_all(&session_dir).unwrap();
+        // Write events: shared context (no agentId), main agent reply (no
+        // agentId), and the subagent's reply + tool call (tagged with agentId).
+        let events = vec![
+            serde_json::json!({
+                "type": "session.start",
+                "timestamp": "2026-07-22T10:00:00Z",
+                "data": { "copilotVersion": "1.0.0", "context": { "cwd": "/tmp" } }
+            }),
+            serde_json::json!({
+                "type": "user.message",
+                "timestamp": "2026-07-22T10:00:05Z",
+                "payload": { "content": "please run the subagent" }
+            }),
+            serde_json::json!({
+                "type": "assistant.message",
+                "timestamp": "2026-07-22T10:00:10Z",
+                "payload": { "content": "main agent reply" }
+            }),
+            serde_json::json!({
+                "type": "assistant.message",
+                "timestamp": "2026-07-22T10:00:20Z",
+                "agentId": agent,
+                "payload": { "content": "subagent reply" }
+            }),
+            serde_json::json!({
+                "type": "tool.execution_complete",
+                "timestamp": "2026-07-22T10:00:25Z",
+                "agentId": agent,
+                "payload": { "callId": "tool-1" }
+            }),
+        ];
+        let mut file_content = String::new();
+        for ev in &events {
+            file_content.push_str(&ev.to_string());
+            file_content.push('\n');
+        }
+        fs::write(session_dir.join("events.jsonl"), file_content).unwrap();
+
+        // Resolve the CLI subagent path directly against the temp copilot dir:
+        // must point at the parent's events.jsonl, not the synthetic id's.
+        let resolved = resolve_copilot_cli_subagent_events_path(&tmp, parent).unwrap();
+        assert!(
+            resolved.to_string_lossy().ends_with("events.jsonl"),
+            "resolved path must end with events.jsonl: {:?}",
+            resolved
+        );
+        assert!(
+            resolved.to_string_lossy().contains(parent),
+            "resolved path must be under the parent session dir: {:?}",
+            resolved
+        );
+        assert!(
+            !resolved.to_string_lossy().contains(&synthetic),
+            "must NOT resolve under the synthetic id dir: {:?}",
+            resolved
+        );
+
+        // Parse with the agent filter (simulating get_session_details'
+        // copilot_agent_filter decision for source_kind = "copilot-cli").
+        let file = std::fs::File::open(&resolved).unwrap();
+        let reader = std::io::BufReader::new(file);
+        let db_entries: HashMap<u32, (crate::db::TokenStats, String)> = HashMap::new();
+        let mut timeline = Vec::new();
+        let mut metadata = HashMap::new();
+        crate::timeline::parse_copilot_timeline_filtered(
+            reader,
+            &db_entries,
+            &mut timeline,
+            &mut metadata,
+            Some(agent),
+            None,
+        );
+
+        // The subagent view must include shared context (session start, user
+        // prompt) and the subagent's own reply + tool call, but NOT the main
+        // agent's reply.
+        let has_main_reply = timeline.iter().any(|item| match item {
+            TimelineItem::AgentReply { reply, .. } => reply.contains("main agent reply"),
+            _ => false,
+        });
+        assert!(
+            !has_main_reply,
+            "main agent reply must be filtered out of subagent view"
+        );
+
+        let has_subagent_reply = timeline.iter().any(|item| match item {
+            TimelineItem::AgentReply { reply, .. } => reply.contains("subagent reply"),
+            _ => false,
+        });
+        assert!(
+            has_subagent_reply,
+            "subagent reply must appear in its own view"
+        );
+
+        // Shared context preserved for readability.
+        let has_user_prompt = timeline
+            .iter()
+            .any(|item| matches!(item, TimelineItem::UserPrompt { .. }));
+        assert!(
+            has_user_prompt,
+            "shared user prompt must remain visible to subagent"
+        );
+
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    /// Regression: `parse_session_timeline_file` must thread the DB-sourced
+    /// child session model into the Copilot timeline parser so a subagent
+    /// drawer shows the child model, not the shared parent
+    /// `session.start.selectedModel`. Covers both `copilot-app` and
+    /// `copilot-cli` source kinds (they share `parse_copilot_timeline_filtered`).
+    #[test]
+    fn parse_session_timeline_file_threads_child_model_for_subagent_drawer() {
+        let tmp = std::env::temp_dir().join(format!(
+            "drawer-child-model-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+        let parent = "child-model-parent";
+        let agent = "call_child_model";
+        let session_dir = tmp.join("session-state").join(parent);
+        fs::create_dir_all(&session_dir).unwrap();
+        // Parent session.start carries GLM5.2-none, but the child DB model is
+        // gpt-5.4-mini. The subagent drawer must show gpt-5.4-mini.
+        let events = vec![
+            serde_json::json!({
+                "type": "session.start",
+                "timestamp": "2026-07-22T10:00:00Z",
+                "data": {
+                    "copilotVersion": "1.0.0",
+                    "context": { "cwd": "/tmp" },
+                    "selectedModel": "GLM5.2-none"
+                }
+            }),
+            serde_json::json!({
+                "type": "user.message",
+                "timestamp": "2026-07-22T10:00:01Z",
+                "payload": { "content": "please run the subagent" }
+            }),
+            serde_json::json!({
+                "type": "assistant.message",
+                "timestamp": "2026-07-22T10:00:02Z",
+                "payload": { "content": "main agent reply" }
+            }),
+            serde_json::json!({
+                "type": "subagent.started",
+                "timestamp": "2026-07-22T10:00:05Z",
+                "agentId": agent,
+                "data": { "agentDisplayName": "GPT", "agentName": "GPT" }
+            }),
+            serde_json::json!({
+                "type": "assistant.message",
+                "timestamp": "2026-07-22T10:00:06Z",
+                "agentId": agent,
+                "payload": { "content": "subagent reply" }
+            }),
+            serde_json::json!({
+                "type": "subagent.completed",
+                "timestamp": "2026-07-22T10:00:07Z",
+                "agentId": agent
+            }),
+        ];
+        let mut file_content = String::new();
+        for ev in &events {
+            file_content.push_str(&ev.to_string());
+            file_content.push('\n');
+        }
+        fs::write(session_dir.join("events.jsonl"), file_content).unwrap();
+
+        let resolved = resolve_copilot_cli_subagent_events_path(&tmp, parent).unwrap();
+        let db_entries: HashMap<u32, (crate::db::TokenStats, String)> = HashMap::new();
+        let (timeline, metadata) = parse_session_timeline_file(
+            "copilot",
+            "copilot-cli",
+            &resolved,
+            &db_entries,
+            Some(agent),
+            Some("gpt-5.4-mini"),
+        )
+        .unwrap();
+
+        let selected_model = metadata
+            .get("selected_model")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        assert_eq!(
+            selected_model.as_deref(),
+            Some("gpt-5.4-mini"),
+            "subagent drawer metadata.selected_model must be the child DB model"
+        );
+
+        let reply_models: Vec<(String, String)> = timeline
+            .iter()
+            .filter_map(|item| match item {
+                TimelineItem::AgentReply { model, reply, .. } => {
+                    Some((model.clone(), reply.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            reply_models.iter().all(|(m, _)| m == "gpt-5.4-mini"),
+            "every subagent AgentReply.model must be gpt-5.4-mini, got {:?}",
+            reply_models
+        );
+        assert!(
+            !reply_models.iter().any(|(m, _)| m == "GLM5.2-none"),
+            "GLM5.2-none must not appear in subagent AgentReply models: {:?}",
+            reply_models
+        );
+        // The main agent reply must be filtered out of the subagent view.
+        let replies: Vec<String> = reply_models.into_iter().map(|(_, r)| r).collect();
+        assert!(
+            !replies.iter().any(|r| r == "main agent reply"),
+            "main agent reply must not leak into the subagent drawer"
+        );
+
+        let _ = fs::remove_dir_all(tmp);
     }
 }

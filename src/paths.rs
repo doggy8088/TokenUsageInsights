@@ -93,6 +93,23 @@ pub fn find_resource(relative: impl AsRef<Path>) -> Option<PathBuf> {
         .find(|candidate| candidate.exists())
 }
 
+/// Resolve the Copilot App (Tauri desktop) data directory.
+///
+/// Honors `COPILOT_APP_DIR` first, then falls back to `COPILOT_DIR`, then to
+/// `~/.copilot`. The directory is expected to contain `data.db` and
+/// `session-store.db` written by the Copilot App.
+pub fn copilot_app_dir() -> PathBuf {
+    if let Some(path) = env_path("COPILOT_APP_DIR") {
+        return path;
+    }
+    if let Some(path) = env_path("COPILOT_DIR") {
+        return path;
+    }
+    dirs::home_dir()
+        .map(|h| h.join(".copilot"))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
 #[cfg(test)]
 mod tests {
     // Only used by the Windows-specific test below; avoids an unused-import

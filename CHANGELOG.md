@@ -4,7 +4,9 @@
 
 ## [未發行]
 
-目前沒有尚未發行的變更。
+### 新增
+
+- 支援 GitHub Copilot App（Tauri 桌面應用）的 Token 使用量同步，自動讀取 `~/.copilot/data.db` 與 `~/.copilot/session-store.db`，以 `(session_id, turn_index)` 為單位聚合 `assistant_usage_events` 並以 `source_kind = "copilot-app"` 與 CLI / VS Code 區分；Session 清單以 `App` 標示來源。新增 `COPILOT_APP_DIR` 環境變數自訂 App 資料目錄。
 
 ## [0.5.0] - 2026-07-20
 

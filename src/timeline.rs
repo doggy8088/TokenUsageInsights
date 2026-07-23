@@ -257,15 +257,66 @@ pub fn parse_antigravity_timeline(
     );
 }
 
+/// Backwards-compatible entry point that reconstructs a Copilot CLI timeline
+/// without any agent filtering. Kept as a thin shim so existing callers and
+/// documentation continue to resolve; the Copilot CLI events never carry a
+/// top-level `agentId`, so forwarding `None` reproduces the original behavior.
+#[allow(dead_code)]
 pub fn parse_copilot_timeline(
     reader: BufReader<File>,
     db_entries: &HashMap<u32, (TokenStats, String)>,
     timeline: &mut Vec<TimelineItem>,
     metadata: &mut HashMap<String, serde_json::Value>,
 ) {
+    parse_copilot_timeline_filtered(reader, db_entries, timeline, metadata, None, None);
+}
+
+/// Copilot App-aware variant of [`parse_copilot_timeline`].
+///
+/// `agent_filter` selects which agent's events are reconstructed from the
+/// shared `events.jsonl` of a Copilot App session:
+/// - `None`: main agent view. Events that carry a non-null top-level `agentId`
+///   (subagent `assistant.message`, subagent `tool.execution_*`, `hook.*`,
+///   `subagent.*`, `session.error` ...) are skipped so the main agent timeline
+///   never lists a subagent's reply or tool execution as the main agent's own.
+/// - `Some(agent_id)`: subagent view. Only events whose top-level `agentId`
+///   equals `agent_id` are reconstructed, plus shared context events
+///   (`session.start`, `session.shutdown`, `session.info`, `user.message`,
+///   `system.message`) that have no `agentId` so the user prompt and session
+///   metadata remain visible.
+///
+/// Copilot CLI calls [`parse_copilot_timeline`] which forwards `None`, so its
+/// behavior is unchanged (CLI events never carry a top-level `agentId`).
+///
+/// `db_session_model` is the canonical model for the session row being
+/// reconstructed, sourced from the database by the caller. For a subagent
+/// synthetic session (`<main>__<agent_id>`) this is the child session's own
+/// model (written by the collector), NOT the parent's. It seeds
+/// `current_model` so the subagent drawer's `metadata.selected_model` and
+/// `AgentReply.model` reflect the child model even when the shared
+/// `events.jsonl` only carries the parent's `session.start.selectedModel`.
+/// For main sessions it is `None` and the parser falls back to
+/// `session.start.selectedModel` as before. The shared `session.start` event
+/// is intentionally NOT allowed to override a non-`None` `db_session_model`,
+/// because that event belongs to the parent context.
+pub fn parse_copilot_timeline_filtered(
+    reader: BufReader<File>,
+    db_entries: &HashMap<u32, (TokenStats, String)>,
+    timeline: &mut Vec<TimelineItem>,
+    metadata: &mut HashMap<String, serde_json::Value>,
+    agent_filter: Option<&str>,
+    db_session_model: Option<&str>,
+) {
     let mut current_turn_no = 1;
     let mut has_seen_user_prompt = false;
-    let mut current_model = "GPT-4o".to_string();
+    // Seed the model from the DB child session model when available so a
+    // subagent drawer starts with its own model and is never overwritten by
+    // the shared parent `session.start.selectedModel`. Main sessions pass
+    // `None` and keep the original parser default.
+    let mut current_model = db_session_model
+        .filter(|m| !m.is_empty())
+        .map(|m| m.to_string())
+        .unwrap_or_else(|| "GPT-4o".to_string());
     let mut tool_calls_map = HashMap::new();
 
     for line_res in reader.lines() {
@@ -279,6 +330,35 @@ pub fn parse_copilot_timeline(
         };
 
         let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let event_agent_id = event.get("agentId").and_then(|v| v.as_str());
+
+        // Apply the agent filter before any state mutation so per-agent
+        // `tool_calls_map` and `current_turn_no` bookkeeping stay consistent
+        // with the filtered event stream.
+        let keep = match agent_filter {
+            None => event_agent_id.is_none(),
+            Some(filter) => match event_agent_id {
+                Some(a) => a == filter,
+                // Shared context events (no agentId) are useful for both views;
+                // skip subagent lifecycle events themselves from the shared
+                // set because they are tagged with their own agentId above.
+                None => matches!(
+                    event_type,
+                    "session_meta"
+                        | "SESSION_STARTED"
+                        | "session.start"
+                        | "session.shutdown"
+                        | "session.info"
+                        | "user.message"
+                        | "USER_PROMPT"
+                        | "system.message"
+                ),
+            },
+        };
+        if !keep {
+            continue;
+        }
+
         let timestamp = event
             .get("timestamp")
             .and_then(|t| t.as_str())
@@ -331,7 +411,12 @@ pub fn parse_copilot_timeline(
                         }
                     }
                     if let Some(model) = p.get("selectedModel").and_then(|m| m.as_str()) {
-                        if model != "auto" {
+                        // Only let the shared parent `session.start` event seed
+                        // the model when we do not already have a DB-sourced
+                        // child session model. Otherwise the parent's
+                        // `selectedModel` would clobber the subagent drawer's
+                        // canonical child model (see `db_session_model`).
+                        if db_session_model.is_none() && model != "auto" {
                             current_model = model.to_string();
                         }
                     }
@@ -594,6 +679,55 @@ pub fn parse_copilot_timeline(
                     timestamp,
                     status_type: "session_end".to_string(),
                     message: "會話結束 (Session Ended)".to_string(),
+                });
+            }
+            // Copilot App subagent lifecycle markers. These events carry a
+            // top-level `agentId`; the filter above ensures only the matching
+            // subagent view (or, for the main view, none of them) reaches here.
+            "subagent.started" => {
+                let p = data.or(payload);
+                let display = p
+                    .and_then(|p| p.get("agentDisplayName"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Subagent");
+                let name = p
+                    .and_then(|p| p.get("agentName"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let model = p.and_then(|p| p.get("model")).and_then(|v| v.as_str());
+                if let Some(m) = model {
+                    // The subagent lifecycle event carries the model the
+                    // subagent actually runs as; prefer it over any inherited
+                    // value so AgentReply labels reflect the child model.
+                    current_model = m.to_string();
+                }
+                let message = match (display, name, model) {
+                    (d, n, Some(m)) if !n.is_empty() => {
+                        format!("子代理啟動 (Subagent Started): {d} [{n}] @ {m}")
+                    }
+                    (d, n, None) if !n.is_empty() => {
+                        format!("子代理啟動 (Subagent Started): {d} [{n}]")
+                    }
+                    (d, _, _) => format!("子代理啟動 (Subagent Started): {d}"),
+                };
+                timeline.push(TimelineItem::SystemStatus {
+                    timestamp,
+                    status_type: "subagent_started".to_string(),
+                    message,
+                });
+            }
+            "subagent.completed" => {
+                timeline.push(TimelineItem::SystemStatus {
+                    timestamp,
+                    status_type: "subagent_completed".to_string(),
+                    message: "子代理完成 (Subagent Completed)".to_string(),
+                });
+            }
+            "subagent.failed" => {
+                timeline.push(TimelineItem::SystemStatus {
+                    timestamp,
+                    status_type: "subagent_failed".to_string(),
+                    message: "子代理失敗 (Subagent Failed)".to_string(),
                 });
             }
             _ => {}
@@ -1505,4 +1639,522 @@ fn cursor_content_to_text(content: &serde_json::Value) -> String {
         }
     }
     parts.join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// Write the given JSONL lines to a temp file and return a `BufReader`.
+    /// Each test gets a unique file so parallel test runs do not collide.
+    fn reader_for_events(lines: &[&str]) -> (BufReader<File>, std::path::PathBuf) {
+        let mut path = std::env::temp_dir();
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        path.push(format!(
+            "token-insights-timeline-test-{}-{}-{}.jsonl",
+            std::process::id(),
+            n,
+            unique
+        ));
+        fs::write(&path, lines.join("\n")).unwrap();
+        let file = File::open(&path).unwrap();
+        (BufReader::new(file), path)
+    }
+
+    fn extract_replies(timeline: &[TimelineItem]) -> Vec<String> {
+        timeline
+            .iter()
+            .filter_map(|item| match item {
+                TimelineItem::AgentReply { reply, .. } => Some(reply.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn extract_tool_names(timeline: &[TimelineItem]) -> Vec<String> {
+        timeline
+            .iter()
+            .filter_map(|item| match item {
+                TimelineItem::ToolStep { tool_name, .. } => Some(tool_name.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A shared events.jsonl containing a main agent turn, a subagent
+    /// (`call_v4b32z66`) assistant message + tool execution, and subagent
+    /// lifecycle markers. Mirrors the real Copilot App layout.
+    fn shared_events() -> Vec<&'static str> {
+        vec![
+            r#"{"type":"session.start","data":{"copilotVersion":"1.0"},"timestamp":"2026-07-22T10:00:00Z"}"#,
+            r#"{"type":"user.message","data":{"content":"Please summarize"},"timestamp":"2026-07-22T10:00:01Z"}"#,
+            r#"{"type":"assistant.message","data":{"content":"Main agent reply"},"timestamp":"2026-07-22T10:00:02Z"}"#,
+            r#"{"type":"tool.execution_start","data":{"toolCallId":"main-tool-1","toolName":"Bash"},"timestamp":"2026-07-22T10:00:03Z"}"#,
+            r#"{"type":"tool.execution_complete","data":{"toolCallId":"main-tool-1","success":true,"result":{"content":"done"}},"timestamp":"2026-07-22T10:00:04Z"}"#,
+            r#"{"type":"subagent.started","agentId":"call_v4b32z66","data":{"agentDisplayName":"K2.7","agentName":"K2.7","model":"cbc40143"},"timestamp":"2026-07-22T10:00:05Z"}"#,
+            r#"{"type":"assistant.message","agentId":"call_v4b32z66","data":{"content":"Subagent reply"},"timestamp":"2026-07-22T10:00:06Z"}"#,
+            r#"{"type":"tool.execution_start","agentId":"call_v4b32z66","data":{"toolCallId":"sub-tool-1","toolName":"Grep"},"timestamp":"2026-07-22T10:00:07Z"}"#,
+            r#"{"type":"tool.execution_complete","agentId":"call_v4b32z66","data":{"toolCallId":"sub-tool-1","success":true,"result":{"content":"found"}},"timestamp":"2026-07-22T10:00:08Z"}"#,
+            r#"{"type":"subagent.completed","agentId":"call_v4b32z66","timestamp":"2026-07-22T10:00:09Z"}"#,
+            r#"{"type":"session.shutdown","timestamp":"2026-07-22T10:00:10Z"}"#,
+        ]
+    }
+
+    #[test]
+    fn main_agent_filter_excludes_subagent_assistant_and_tool_events() {
+        let (reader, path) = reader_for_events(&shared_events());
+        let db_entries = HashMap::new();
+        let mut timeline = Vec::new();
+        let mut metadata = HashMap::new();
+        parse_copilot_timeline_filtered(
+            reader,
+            &db_entries,
+            &mut timeline,
+            &mut metadata,
+            None,
+            None,
+        );
+
+        let replies = extract_replies(&timeline);
+        assert_eq!(replies, vec!["Main agent reply".to_string()]);
+        let tools = extract_tool_names(&timeline);
+        assert_eq!(tools, vec!["Bash".to_string()]);
+        // No subagent lifecycle marker should leak into the main agent view.
+        assert!(!timeline.iter().any(|item| matches!(
+            item,
+            TimelineItem::SystemStatus { status_type, .. }
+                if status_type == "subagent_started" || status_type == "subagent_completed"
+        )));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn subagent_filter_keeps_only_its_agent_events_plus_shared_context() {
+        let (reader, path) = reader_for_events(&shared_events());
+        let db_entries = HashMap::new();
+        let mut timeline = Vec::new();
+        let mut metadata = HashMap::new();
+        parse_copilot_timeline_filtered(
+            reader,
+            &db_entries,
+            &mut timeline,
+            &mut metadata,
+            Some("call_v4b32z66"),
+            None,
+        );
+
+        let replies = extract_replies(&timeline);
+        assert_eq!(replies, vec!["Subagent reply".to_string()]);
+        let tools = extract_tool_names(&timeline);
+        assert_eq!(tools, vec!["Grep".to_string()]);
+        // Shared context (user.message + session.start/shutdown) should be kept
+        // so the subagent drawer still shows the originating prompt.
+        assert!(timeline.iter().any(|item| matches!(
+            item,
+            TimelineItem::UserPrompt { prompt, .. } if prompt == "Please summarize"
+        )));
+        // Subagent lifecycle markers for this agent should be present.
+        assert!(timeline.iter().any(|item| matches!(
+            item,
+            TimelineItem::SystemStatus { status_type, .. } if status_type == "subagent_started"
+        )));
+        // Main agent reply must NOT appear.
+        assert!(!extract_replies(&timeline)
+            .iter()
+            .any(|r| r == "Main agent reply"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn cli_timeline_with_no_agent_filter_is_unchanged_when_events_have_no_agentid() {
+        // Pure Copilot CLI events (no top-level agentId) must reconstruct
+        // identically to the original behavior, i.e. both the shim and the
+        // filtered parser with None produce the same timeline.
+        let cli_events = vec![
+            r#"{"type":"session.start","data":{"copilotVersion":"1.0"},"timestamp":"2026-07-22T10:00:00Z"}"#,
+            r#"{"type":"user.message","data":{"content":"hi"},"timestamp":"2026-07-22T10:00:01Z"}"#,
+            r#"{"type":"assistant.message","data":{"content":"hello back"},"timestamp":"2026-07-22T10:00:02Z"}"#,
+        ];
+        let (reader, path) = reader_for_events(&cli_events);
+        let db_entries = HashMap::new();
+        let mut timeline = Vec::new();
+        let mut metadata = HashMap::new();
+        parse_copilot_timeline_filtered(
+            reader,
+            &db_entries,
+            &mut timeline,
+            &mut metadata,
+            None,
+            None,
+        );
+
+        assert_eq!(extract_replies(&timeline), vec!["hello back".to_string()]);
+        assert!(timeline.iter().any(|item| matches!(
+            item,
+            TimelineItem::UserPrompt { prompt, .. } if prompt == "hi"
+        )));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn subagent_filter_with_no_matching_events_yields_no_agent_specific_items() {
+        // No event carries agentId "ghost"; the subagent filter should keep
+        // only shared context (user.message/session.start) and no agent-specific
+        // replies, tool steps, or subagent lifecycle markers. The handler maps
+        // a timeline with no agent-specific items to content_unavailable.
+        let (reader, path) = reader_for_events(&shared_events());
+        let db_entries = HashMap::new();
+        let mut timeline = Vec::new();
+        let mut metadata = HashMap::new();
+        parse_copilot_timeline_filtered(
+            reader,
+            &db_entries,
+            &mut timeline,
+            &mut metadata,
+            Some("ghost"),
+            None,
+        );
+        assert!(extract_replies(&timeline).is_empty());
+        assert!(extract_tool_names(&timeline).is_empty());
+        assert!(!timeline.iter().any(|item| matches!(
+            item,
+            TimelineItem::SystemStatus { status_type, .. }
+                if status_type == "subagent_started" || status_type == "subagent_completed"
+        )));
+        let _ = fs::remove_file(path);
+    }
+
+    /// Helper: extract every `(model, reply)` pair from AgentReply items.
+    fn extract_reply_models(timeline: &[TimelineItem]) -> Vec<(String, String)> {
+        timeline
+            .iter()
+            .filter_map(|item| match item {
+                TimelineItem::AgentReply { model, reply, .. } => {
+                    Some((model.clone(), reply.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Helper: read `metadata.selected_model` as a `String`.
+    fn metadata_model(metadata: &HashMap<String, serde_json::Value>) -> Option<String> {
+        metadata
+            .get("selected_model")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    }
+
+    /// Regression A: CLI parent/child model mismatch.
+    ///
+    /// parent `session.start.selectedModel` = GLM5.2-none, but the DB child
+    /// session model is gpt-5.4-mini. The subagent drawer's
+    /// `metadata.selected_model` and every child `AgentReply.model` must be
+    /// gpt-5.4-mini, and GLM5.2-none must NOT appear anywhere in the subagent
+    /// drawer output.
+    #[test]
+    fn cli_subagent_drawer_uses_child_db_model_not_parent_selected_model() {
+        let events = vec![
+            r#"{"type":"session.start","data":{"copilotVersion":"1.0","context":{"cwd":"/tmp"},"selectedModel":"GLM5.2-none"},"timestamp":"2026-07-22T10:00:00Z"}"#,
+            r#"{"type":"user.message","data":{"content":"please run the subagent"},"timestamp":"2026-07-22T10:00:01Z"}"#,
+            r#"{"type":"assistant.message","data":{"content":"main agent reply"},"timestamp":"2026-07-22T10:00:02Z"}"#,
+            r#"{"type":"subagent.started","agentId":"call_f91rg5gy","data":{"agentDisplayName":"GPT","agentName":"GPT"},"timestamp":"2026-07-22T10:00:05Z"}"#,
+            r#"{"type":"assistant.message","agentId":"call_f91rg5gy","data":{"content":"subagent reply"},"timestamp":"2026-07-22T10:00:06Z"}"#,
+            r#"{"type":"subagent.completed","agentId":"call_f91rg5gy","timestamp":"2026-07-22T10:00:09Z"}"#,
+        ];
+        let (reader, path) = reader_for_events(&events);
+        let db_entries = HashMap::new();
+        let mut timeline = Vec::new();
+        let mut metadata = HashMap::new();
+        parse_copilot_timeline_filtered(
+            reader,
+            &db_entries,
+            &mut timeline,
+            &mut metadata,
+            Some("call_f91rg5gy"),
+            Some("gpt-5.4-mini"),
+        );
+
+        assert_eq!(
+            metadata_model(&metadata).as_deref(),
+            Some("gpt-5.4-mini"),
+            "subagent drawer selected_model must be the child DB model"
+        );
+        let reply_models = extract_reply_models(&timeline);
+        assert!(
+            reply_models.iter().all(|(m, _)| m == "gpt-5.4-mini"),
+            "every subagent AgentReply.model must be gpt-5.4-mini, got {:?}",
+            reply_models
+        );
+        // The parent model must NOT leak into any subagent AgentReply.
+        assert!(
+            !reply_models.iter().any(|(m, _)| m == "GLM5.2-none"),
+            "GLM5.2-none must not appear in subagent AgentReply models: {:?}",
+            reply_models
+        );
+        // The parent main agent reply must be filtered out.
+        assert!(
+            !extract_replies(&timeline)
+                .iter()
+                .any(|r| r == "main agent reply"),
+            "main agent reply must not leak into subagent drawer"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    /// Regression B: Copilot App parent/child model mismatch.
+    ///
+    /// parent = GLM5.2-medium, child DB model = claude-haiku-4.5. The subagent
+    /// drawer's metadata and AgentReply models must show claude-haiku-4.5, and
+    /// GLM5.2-medium must NOT appear.
+    #[test]
+    fn app_subagent_drawer_uses_child_db_model_not_parent_selected_model() {
+        let events = vec![
+            r#"{"type":"session.start","data":{"copilotVersion":"1.0","context":{"cwd":"/tmp"},"selectedModel":"GLM5.2-medium"},"timestamp":"2026-07-22T10:00:00Z"}"#,
+            r#"{"type":"user.message","data":{"content":"please research"},"timestamp":"2026-07-22T10:00:01Z"}"#,
+            r#"{"type":"subagent.started","agentId":"call_2m0yl1q0","data":{"agentDisplayName":"Claude","agentName":"Claude"},"timestamp":"2026-07-22T10:00:05Z"}"#,
+            r#"{"type":"assistant.message","agentId":"call_2m0yl1q0","data":{"content":"research summary"},"timestamp":"2026-07-22T10:00:06Z"}"#,
+            r#"{"type":"subagent.completed","agentId":"call_2m0yl1q0","timestamp":"2026-07-22T10:00:09Z"}"#,
+        ];
+        let (reader, path) = reader_for_events(&events);
+        let db_entries = HashMap::new();
+        let mut timeline = Vec::new();
+        let mut metadata = HashMap::new();
+        parse_copilot_timeline_filtered(
+            reader,
+            &db_entries,
+            &mut timeline,
+            &mut metadata,
+            Some("call_2m0yl1q0"),
+            Some("claude-haiku-4.5"),
+        );
+
+        assert_eq!(
+            metadata_model(&metadata).as_deref(),
+            Some("claude-haiku-4.5"),
+            "App subagent drawer selected_model must be the child DB model"
+        );
+        let reply_models = extract_reply_models(&timeline);
+        assert!(
+            reply_models.iter().all(|(m, _)| m == "claude-haiku-4.5"),
+            "every App subagent AgentReply.model must be claude-haiku-4.5, got {:?}",
+            reply_models
+        );
+        assert!(
+            !reply_models.iter().any(|(m, _)| m == "GLM5.2-medium"),
+            "GLM5.2-medium must not appear in App subagent AgentReply models: {:?}",
+            reply_models
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    /// Regression C: another App mismatch (parent = DP4F, child = K2.7).
+    #[test]
+    fn app_subagent_drawer_dp4f_parent_k2_7_child_shows_k2_7() {
+        let events = vec![
+            r#"{"type":"session.start","data":{"copilotVersion":"1.0","context":{"cwd":"/tmp"},"selectedModel":"DP4F"},"timestamp":"2026-07-22T10:00:00Z"}"#,
+            r#"{"type":"user.message","data":{"content":"please explore"},"timestamp":"2026-07-22T10:00:01Z"}"#,
+            r#"{"type":"subagent.started","agentId":"call_o6g6unk8","data":{"agentDisplayName":"K2.7","agentName":"K2.7"},"timestamp":"2026-07-22T10:00:05Z"}"#,
+            r#"{"type":"assistant.message","agentId":"call_o6g6unk8","data":{"content":"explore result"},"timestamp":"2026-07-22T10:00:06Z"}"#,
+            r#"{"type":"subagent.completed","agentId":"call_o6g6unk8","timestamp":"2026-07-22T10:00:09Z"}"#,
+        ];
+        let (reader, path) = reader_for_events(&events);
+        let db_entries = HashMap::new();
+        let mut timeline = Vec::new();
+        let mut metadata = HashMap::new();
+        parse_copilot_timeline_filtered(
+            reader,
+            &db_entries,
+            &mut timeline,
+            &mut metadata,
+            Some("call_o6g6unk8"),
+            Some("K2.7"),
+        );
+
+        assert_eq!(
+            metadata_model(&metadata).as_deref(),
+            Some("K2.7"),
+            "App subagent drawer selected_model must be K2.7"
+        );
+        let reply_models = extract_reply_models(&timeline);
+        assert!(
+            reply_models.iter().all(|(m, _)| m == "K2.7"),
+            "every AgentReply.model must be K2.7, got {:?}",
+            reply_models
+        );
+        assert!(
+            !reply_models.iter().any(|(m, _)| m == "DP4F"),
+            "DP4F must not appear in App subagent AgentReply models: {:?}",
+            reply_models
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    /// Regression D: main session drawer still shows the main agent model and
+    /// is not overwritten by any subagent's DB model (db_session_model = None).
+    #[test]
+    fn main_session_drawer_keeps_main_model_without_subagent_override() {
+        // The main agent view passes db_session_model = None; the shared
+        // session.start.selectedModel seeds the model. Subagent events are
+        // filtered out entirely (None filter), so no subagent model can leak.
+        let events = vec![
+            r#"{"type":"session.start","data":{"copilotVersion":"1.0","context":{"cwd":"/tmp"},"selectedModel":"GLM5.2-medium"},"timestamp":"2026-07-22T10:00:00Z"}"#,
+            r#"{"type":"user.message","data":{"content":"hello"},"timestamp":"2026-07-22T10:00:01Z"}"#,
+            r#"{"type":"assistant.message","data":{"content":"main reply"},"timestamp":"2026-07-22T10:00:02Z"}"#,
+            r#"{"type":"subagent.started","agentId":"call_2m0yl1q0","data":{"agentDisplayName":"Claude","agentName":"Claude","model":"claude-haiku-4.5"},"timestamp":"2026-07-22T10:00:05Z"}"#,
+            r#"{"type":"assistant.message","agentId":"call_2m0yl1q0","data":{"content":"sub reply"},"timestamp":"2026-07-22T10:00:06Z"}"#,
+            r#"{"type":"subagent.completed","agentId":"call_2m0yl1q0","timestamp":"2026-07-22T10:00:09Z"}"#,
+        ];
+        let (reader, path) = reader_for_events(&events);
+        let db_entries = HashMap::new();
+        let mut timeline = Vec::new();
+        let mut metadata = HashMap::new();
+        // Main agent view: no agent filter and no DB-sourced child model.
+        parse_copilot_timeline_filtered(
+            reader,
+            &db_entries,
+            &mut timeline,
+            &mut metadata,
+            None,
+            None,
+        );
+
+        assert_eq!(
+            metadata_model(&metadata).as_deref(),
+            Some("GLM5.2-medium"),
+            "main session drawer must keep the parent selectedModel"
+        );
+        let replies = extract_replies(&timeline);
+        assert_eq!(replies, vec!["main reply".to_string()]);
+        let reply_models = extract_reply_models(&timeline);
+        assert!(
+            reply_models.iter().all(|(m, _)| m == "GLM5.2-medium"),
+            "main AgentReply.model must be the main model, got {:?}",
+            reply_models
+        );
+        // No subagent reply leaks into the main drawer.
+        assert!(
+            !replies.iter().any(|r| r == "sub reply"),
+            "subagent reply must not leak into main drawer"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    /// Regression E: multiple subagents under the same parent each show their
+    /// own DB-sourced model in their own synthetic-session drawer.
+    #[test]
+    fn multiple_subagents_each_show_their_own_child_model() {
+        let events = vec![
+            r#"{"type":"session.start","data":{"copilotVersion":"1.0","context":{"cwd":"/tmp"},"selectedModel":"GLM5.2-medium"},"timestamp":"2026-07-22T10:00:00Z"}"#,
+            r#"{"type":"user.message","data":{"content":"please research"},"timestamp":"2026-07-22T10:00:01Z"}"#,
+            r#"{"type":"subagent.started","agentId":"call_2m0yl1q0","data":{"agentDisplayName":"Claude","agentName":"Claude"},"timestamp":"2026-07-22T10:00:05Z"}"#,
+            r#"{"type":"assistant.message","agentId":"call_2m0yl1q0","data":{"content":"claude summary"},"timestamp":"2026-07-22T10:00:06Z"}"#,
+            r#"{"type":"subagent.completed","agentId":"call_2m0yl1q0","timestamp":"2026-07-22T10:00:07Z"}"#,
+            r#"{"type":"subagent.started","agentId":"call_o6g6unk8","data":{"agentDisplayName":"K2.7","agentName":"K2.7"},"timestamp":"2026-07-22T10:00:08Z"}"#,
+            r#"{"type":"assistant.message","agentId":"call_o6g6unk8","data":{"content":"k2 summary"},"timestamp":"2026-07-22T10:00:09Z"}"#,
+            r#"{"type":"subagent.completed","agentId":"call_o6g6unk8","timestamp":"2026-07-22T10:00:10Z"}"#,
+        ];
+        // First subagent drawer: claude-haiku-4.5.
+        {
+            let (reader, path) = reader_for_events(&events);
+            let db_entries = HashMap::new();
+            let mut timeline = Vec::new();
+            let mut metadata = HashMap::new();
+            parse_copilot_timeline_filtered(
+                reader,
+                &db_entries,
+                &mut timeline,
+                &mut metadata,
+                Some("call_2m0yl1q0"),
+                Some("claude-haiku-4.5"),
+            );
+            assert_eq!(
+                metadata_model(&metadata).as_deref(),
+                Some("claude-haiku-4.5"),
+                "first subagent drawer must show claude-haiku-4.5"
+            );
+            let reply_models = extract_reply_models(&timeline);
+            assert!(
+                reply_models.iter().all(|(m, _)| m == "claude-haiku-4.5"),
+                "first subagent AgentReply.model must be claude-haiku-4.5, got {:?}",
+                reply_models
+            );
+            assert!(extract_replies(&timeline) == vec!["claude summary".to_string()]);
+            let _ = fs::remove_file(path);
+        }
+        // Second subagent drawer: K2.7.
+        {
+            let (reader, path) = reader_for_events(&events);
+            let db_entries = HashMap::new();
+            let mut timeline = Vec::new();
+            let mut metadata = HashMap::new();
+            parse_copilot_timeline_filtered(
+                reader,
+                &db_entries,
+                &mut timeline,
+                &mut metadata,
+                Some("call_o6g6unk8"),
+                Some("K2.7"),
+            );
+            assert_eq!(
+                metadata_model(&metadata).as_deref(),
+                Some("K2.7"),
+                "second subagent drawer must show K2.7"
+            );
+            let reply_models = extract_reply_models(&timeline);
+            assert!(
+                reply_models.iter().all(|(m, _)| m == "K2.7"),
+                "second subagent AgentReply.model must be K2.7, got {:?}",
+                reply_models
+            );
+            assert!(extract_replies(&timeline) == vec!["k2 summary".to_string()]);
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    /// Regression: `subagent.started` event model updates the current model so
+    /// AgentReply labels reflect the subagent's runtime model even when no DB
+    /// session model was supplied (defensive fallback path).
+    #[test]
+    fn subagent_started_event_model_updates_current_model() {
+        let events = vec![
+            r#"{"type":"session.start","data":{"copilotVersion":"1.0","context":{"cwd":"/tmp"},"selectedModel":"GLM5.2-medium"},"timestamp":"2026-07-22T10:00:00Z"}"#,
+            r#"{"type":"user.message","data":{"content":"hi"},"timestamp":"2026-07-22T10:00:01Z"}"#,
+            r#"{"type":"subagent.started","agentId":"call_evt_model","data":{"agentDisplayName":"Claude","agentName":"Claude","model":"claude-haiku-4.5"},"timestamp":"2026-07-22T10:00:05Z"}"#,
+            r#"{"type":"assistant.message","agentId":"call_evt_model","data":{"content":"sub reply"},"timestamp":"2026-07-22T10:00:06Z"}"#,
+            r#"{"type":"subagent.completed","agentId":"call_evt_model","timestamp":"2026-07-22T10:00:07Z"}"#,
+        ];
+        let (reader, path) = reader_for_events(&events);
+        let db_entries = HashMap::new();
+        let mut timeline = Vec::new();
+        let mut metadata = HashMap::new();
+        parse_copilot_timeline_filtered(
+            reader,
+            &db_entries,
+            &mut timeline,
+            &mut metadata,
+            Some("call_evt_model"),
+            None,
+        );
+        assert_eq!(
+            metadata_model(&metadata).as_deref(),
+            Some("claude-haiku-4.5"),
+            "subagent.started model must seed the drawer when no DB model is supplied"
+        );
+        let reply_models = extract_reply_models(&timeline);
+        assert!(
+            reply_models.iter().all(|(m, _)| m == "claude-haiku-4.5"),
+            "AgentReply.model must follow subagent.started model, got {:?}",
+            reply_models
+        );
+        let _ = fs::remove_file(path);
+    }
 }

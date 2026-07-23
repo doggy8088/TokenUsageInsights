@@ -3280,9 +3280,11 @@ function renderSessionTable(sessions) {
     }
     const sourceBadge = s.source_kind === 'vscode-chat'
       ? '<span class="badge source-badge" title="GitHub Copilot in VS Code">VS Code</span>'
-      : (s.assistant_type === 'copilot'
-        ? '<span class="badge source-badge" title="GitHub Copilot CLI">CLI</span>'
-        : '');
+      : (s.source_kind === 'copilot-app'
+        ? '<span class="badge source-badge" title="GitHub Copilot App">App</span>'
+        : (s.assistant_type === 'copilot'
+          ? '<span class="badge source-badge" title="GitHub Copilot CLI">CLI</span>'
+          : ''));
 
     const astColumn = (currentAssistant === 'all' || currentAssistant.includes(',')) ? `<td>${assistantBadge}</td>` : '';
 
@@ -3292,7 +3294,11 @@ function renderSessionTable(sessions) {
       const paddingLeft = s.depth * 16;
       const connectorLeft = (s.depth - 1) * 16 + 4;
       const nickname = s.agent_nickname || '';
-      const role = s.agent_role || '';
+      // Subagent 第一列只顯示具實際語意的角色，排除與 Subagent badge 重複的 sub-agent/subagent
+      const rawRole = (s.agent_role || '').trim();
+      const semanticRole = rawRole && !['sub-agent', 'subagent'].includes(rawRole.toLowerCase()) ? rawRole : '';
+      // Subagent 顯示 parent session title，避免 collector 自動產生的 (subagent call_xxx) 後綴
+      const subagentDisplayName = s.parentName || s.session_name;
       nameCellContent = `
         <div class="session-name-wrapper is-subagent" style="padding-left: ${paddingLeft}px;">
           <span class="tree-connector" style="left: ${connectorLeft}px;">└─</span>
@@ -3300,10 +3306,9 @@ function renderSessionTable(sessions) {
             <span class="badge subagent-badge" title="Subagent of: ${escapeHtml(s.parentName || '')}">Subagent</span>
             ${sourceBadge}
             ${nickname ? `<span class="badge agent-nickname-badge" title="Agent Nickname: ${escapeHtml(nickname)}">${escapeHtml(nickname)}</span>` : ''}
-            ${role ? `<span class="badge agent-role-badge" title="Agent Role: ${escapeHtml(role)}">${escapeHtml(role)}</span>` : ''}
+            ${semanticRole ? `<span class="badge agent-role-badge" title="Agent Role: ${escapeHtml(semanticRole)}">${escapeHtml(semanticRole)}</span>` : ''}
           </div>
-          <span class="session-name-text" title="${escapeHtml(s.session_name)}">${escapeHtml(s.session_name)}</span>
-          ${sourceBadge}
+          <span class="session-name-text" title="${escapeHtml(subagentDisplayName)}">${escapeHtml(subagentDisplayName)}</span>
           <span class="session-id-sub">${escapeHtml(String(s.session_id))}</span>
         </div>
       `;
@@ -3459,8 +3464,22 @@ async function openSessionTimeline(session) {
     const res = await fetch(`/api/${encodeURIComponent(resolvedAssistant)}/session/${encodeURIComponent(sessionId)}`);
     if (res.status === 404) {
       const errData = await res.json().catch(() => ({}));
-      if (errData.reason === 'no_events_yet') {
+      const reason = errData.reason;
+      // Map the backend reason code to the right user-facing message. Generic
+      // errors (no reason) fall back to the "cleaned up" message only when we
+      // genuinely believe the file was removed; otherwise show the backend
+      // error text when present, or a generic load-failed message.
+      if (reason === 'no_events_yet') {
         timelineContainer.innerHTML = `<div class="placeholder-text">${t('drawer_no_events_yet')}</div>`;
+      } else if (reason === 'file_missing') {
+        timelineContainer.innerHTML = `<div class="placeholder-text" style="color: var(--neon-red);">${t('drawer_file_missing')}</div>`;
+      } else if (reason === 'content_unavailable') {
+        timelineContainer.innerHTML = `<div class="placeholder-text" style="color: var(--neon-red);">${t('drawer_content_unavailable')}</div>`;
+      } else if (errData && typeof errData.error === 'string' && errData.error.trim()) {
+        // Backend supplied a specific error (e.g. path validation) without a
+        // recognized reason code. Surface it directly rather than masking it
+        // as a "cleaned up" file, which was the previous misleading behavior.
+        timelineContainer.innerHTML = `<div class="placeholder-text" style="color: var(--neon-red);">${escapeHtml(errData.error)}</div>`;
       } else {
         timelineContainer.innerHTML = `<div class="placeholder-text" style="color: var(--neon-red);">${t('drawer_load_failed_cleaned')}</div>`;
       }
