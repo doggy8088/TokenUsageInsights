@@ -494,12 +494,25 @@ fn resolve_session_file_path(
     }
 }
 
+/// Aggregated per-session DB data fetched before parsing the timeline file:
+/// per-turn token stats, the session cwd, and the canonical session model.
+/// The model is the child session's own model for subagent synthetic rows,
+/// used to seed the Copilot timeline parser so the subagent drawer shows the
+/// child model instead of the shared parent `session.start.selectedModel`.
+#[derive(Default)]
+struct SessionDbData {
+    db_entries: HashMap<u32, (TokenStats, String)>,
+    session_cwd: Option<String>,
+    session_model: Option<String>,
+}
+
 fn parse_session_timeline_file(
     assistant: &str,
     source_kind: &str,
     filepath: &StdPath,
     db_entries: &HashMap<u32, (TokenStats, String)>,
     copilot_app_agent_filter: Option<&str>,
+    copilot_session_model: Option<&str>,
 ) -> Result<(Vec<TimelineItem>, HashMap<String, serde_json::Value>), SessionFileError> {
     let mut timeline = Vec::new();
     let mut metadata = HashMap::new();
@@ -525,17 +538,26 @@ fn parse_session_timeline_file(
         // Copilot App sessions share one events.jsonl across the main agent and
         // every subagent; the agent filter keeps each drawer's timeline scoped
         // to the right agent. Copilot CLI calls never carry an agentId, so
-        // passing `None` here preserves the original CLI behavior.
+        // passing `None` here preserves the original CLI behavior. The
+        // DB-sourced session model seeds the parser so a subagent drawer starts
+        // from its own child model instead of the shared parent
+        // `session.start.selectedModel`.
         "copilot" if source_kind == "copilot-app" => parse_copilot_timeline_filtered(
             reader,
             db_entries,
             &mut timeline,
             &mut metadata,
             copilot_app_agent_filter,
+            copilot_session_model,
         ),
-        "copilot" => {
-            parse_copilot_timeline_filtered(reader, db_entries, &mut timeline, &mut metadata, None)
-        }
+        "copilot" => parse_copilot_timeline_filtered(
+            reader,
+            db_entries,
+            &mut timeline,
+            &mut metadata,
+            copilot_app_agent_filter,
+            copilot_session_model,
+        ),
         "codex" => parse_codex_timeline(reader, db_entries, &mut timeline, &mut metadata),
         "claude" => parse_claude_timeline(reader, db_entries, &mut timeline, &mut metadata),
         "cursor" => parse_cursor_timeline(reader, db_entries, &mut timeline, &mut metadata),
@@ -1078,6 +1100,7 @@ pub async fn search_sessions_by_user_prompt(
                     &filepath,
                     &db_entries,
                     None,
+                    None,
                 ) {
                     Ok(result) => result,
                     Err(_) => {
@@ -1274,21 +1297,30 @@ pub async fn get_session_details(
     // 3. 預先載入 SQLite 中的回合 (turn_no) 增量 token 數據
     let sid_clone = session_id.clone();
     let sdk_clone = source_dir_key.clone();
-    let (db_entries, session_cwd): (HashMap<u32, (TokenStats, String)>, Option<String>) =
-        tokio::task::spawn_blocking(move || {
-            if let Ok(conn) = db::get_db_conn() {
-                let session_cwd =
-                    db::get_session_cwd(&conn, &sid_clone, sdk_clone.as_deref()).unwrap_or(None);
-                let map =
-                    db::get_session_turns_token_stats(&conn, &sid_clone, sdk_clone.as_deref())
-                        .unwrap_or_default();
-                (map, session_cwd)
-            } else {
-                (HashMap::new(), None)
+    let session_db_data: SessionDbData = tokio::task::spawn_blocking(move || {
+        if let Ok(conn) = db::get_db_conn() {
+            let session_cwd =
+                db::get_session_cwd(&conn, &sid_clone, sdk_clone.as_deref()).unwrap_or(None);
+            let session_model =
+                db::get_session_model(&conn, &sid_clone, sdk_clone.as_deref()).unwrap_or(None);
+            let map = db::get_session_turns_token_stats(&conn, &sid_clone, sdk_clone.as_deref())
+                .unwrap_or_default();
+            SessionDbData {
+                db_entries: map,
+                session_cwd,
+                session_model,
             }
-        })
-        .await
-        .unwrap_or_else(|_| (HashMap::new(), None));
+        } else {
+            SessionDbData::default()
+        }
+    })
+    .await
+    .unwrap_or_default();
+    let SessionDbData {
+        db_entries,
+        session_cwd,
+        session_model,
+    } = session_db_data;
 
     // Agent filter: Copilot App and Copilot CLI synthetic subagent rows both
     // share the parent session's events.jsonl and rely on a top-level
@@ -1308,6 +1340,7 @@ pub async fn get_session_details(
         &filepath,
         &db_entries,
         copilot_agent_filter,
+        session_model.as_deref(),
     ) {
         Ok(result) => result,
         Err((status, error)) => {
@@ -1874,6 +1907,7 @@ mod tests {
             &mut timeline,
             &mut metadata,
             Some(agent),
+            None,
         );
 
         // The subagent view must include shared context (session start, user
@@ -1904,6 +1938,124 @@ mod tests {
         assert!(
             has_user_prompt,
             "shared user prompt must remain visible to subagent"
+        );
+
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    /// Regression: `parse_session_timeline_file` must thread the DB-sourced
+    /// child session model into the Copilot timeline parser so a subagent
+    /// drawer shows the child model, not the shared parent
+    /// `session.start.selectedModel`. Covers both `copilot-app` and
+    /// `copilot-cli` source kinds (they share `parse_copilot_timeline_filtered`).
+    #[test]
+    fn parse_session_timeline_file_threads_child_model_for_subagent_drawer() {
+        let tmp = std::env::temp_dir().join(format!(
+            "drawer-child-model-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+        let parent = "child-model-parent";
+        let agent = "call_child_model";
+        let session_dir = tmp.join("session-state").join(parent);
+        fs::create_dir_all(&session_dir).unwrap();
+        // Parent session.start carries GLM5.2-none, but the child DB model is
+        // gpt-5.4-mini. The subagent drawer must show gpt-5.4-mini.
+        let events = vec![
+            serde_json::json!({
+                "type": "session.start",
+                "timestamp": "2026-07-22T10:00:00Z",
+                "data": {
+                    "copilotVersion": "1.0.0",
+                    "context": { "cwd": "/tmp" },
+                    "selectedModel": "GLM5.2-none"
+                }
+            }),
+            serde_json::json!({
+                "type": "user.message",
+                "timestamp": "2026-07-22T10:00:01Z",
+                "payload": { "content": "please run the subagent" }
+            }),
+            serde_json::json!({
+                "type": "assistant.message",
+                "timestamp": "2026-07-22T10:00:02Z",
+                "payload": { "content": "main agent reply" }
+            }),
+            serde_json::json!({
+                "type": "subagent.started",
+                "timestamp": "2026-07-22T10:00:05Z",
+                "agentId": agent,
+                "data": { "agentDisplayName": "GPT", "agentName": "GPT" }
+            }),
+            serde_json::json!({
+                "type": "assistant.message",
+                "timestamp": "2026-07-22T10:00:06Z",
+                "agentId": agent,
+                "payload": { "content": "subagent reply" }
+            }),
+            serde_json::json!({
+                "type": "subagent.completed",
+                "timestamp": "2026-07-22T10:00:07Z",
+                "agentId": agent
+            }),
+        ];
+        let mut file_content = String::new();
+        for ev in &events {
+            file_content.push_str(&ev.to_string());
+            file_content.push('\n');
+        }
+        fs::write(session_dir.join("events.jsonl"), file_content).unwrap();
+
+        let resolved = resolve_copilot_cli_subagent_events_path(&tmp, parent).unwrap();
+        let db_entries: HashMap<u32, (crate::db::TokenStats, String)> = HashMap::new();
+        let (timeline, metadata) = parse_session_timeline_file(
+            "copilot",
+            "copilot-cli",
+            &resolved,
+            &db_entries,
+            Some(agent),
+            Some("gpt-5.4-mini"),
+        )
+        .unwrap();
+
+        let selected_model = metadata
+            .get("selected_model")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        assert_eq!(
+            selected_model.as_deref(),
+            Some("gpt-5.4-mini"),
+            "subagent drawer metadata.selected_model must be the child DB model"
+        );
+
+        let reply_models: Vec<(String, String)> = timeline
+            .iter()
+            .filter_map(|item| match item {
+                TimelineItem::AgentReply { model, reply, .. } => {
+                    Some((model.clone(), reply.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            reply_models.iter().all(|(m, _)| m == "gpt-5.4-mini"),
+            "every subagent AgentReply.model must be gpt-5.4-mini, got {:?}",
+            reply_models
+        );
+        assert!(
+            !reply_models.iter().any(|(m, _)| m == "GLM5.2-none"),
+            "GLM5.2-none must not appear in subagent AgentReply models: {:?}",
+            reply_models
+        );
+        // The main agent reply must be filtered out of the subagent view.
+        let replies: Vec<String> = reply_models.into_iter().map(|(_, r)| r).collect();
+        assert!(
+            !replies.iter().any(|r| r == "main agent reply"),
+            "main agent reply must not leak into the subagent drawer"
         );
 
         let _ = fs::remove_dir_all(tmp);

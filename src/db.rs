@@ -1885,7 +1885,7 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
                 SUM(input_tokens), SUM(output_tokens),
                 SUM(cache_read_tokens), SUM(cache_write_tokens),
                 SUM(reasoning_tokens), SUM(duration_ms),
-                MIN(model), MIN(reasoning_effort), agent_id
+                MIN(model), MIN(reasoning_effort), agent_id, MIN(initiator)
          FROM assistant_usage_events
          WHERE session_id = ? AND turn_index = ?
          GROUP BY session_id, turn_index, agent_id";
@@ -1915,6 +1915,7 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
                     model: row.get::<_, Option<String>>(7)?,
                     reasoning_effort: row.get::<_, Option<String>>(8)?,
                     agent_id: row.get::<_, Option<String>>(9)?,
+                    initiator: row.get::<_, Option<String>>(10)?,
                 })
             })
             .map_err(|e| format!("執行 Copilot App 聚合查詢失敗: {}", e));
@@ -2026,19 +2027,28 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
         // the existing UI tree renders them under the main session. The `__`
         // separator keeps the synthetic id within the `is_safe_session_id`
         // charset. The main agent keeps its original session id.
-        let (row_session_id, parent_session_id, agent_nickname, agent_id_segment) =
+        let (row_session_id, parent_session_id, agent_nickname, agent_id_segment, agent_role) =
             match &row.agent_id {
                 Some(agent) if !agent.is_empty() => {
                     let synthetic = format!("{}__{}", row.session_id, agent);
                     let segment = agent.clone();
+                    // Only surface agent_role when the source explicitly marked
+                    // the agent as a sub-agent; never guess. Any other
+                    // initiator value (including NULL) leaves agent_role NULL.
+                    let role = if row.initiator.as_deref() == Some("sub-agent") {
+                        Some("sub-agent".to_string())
+                    } else {
+                        None
+                    };
                     (
                         synthetic,
                         Some(row.session_id.clone()),
                         Some(agent.clone()),
                         segment,
+                        role,
                     )
                 }
-                _ => (row.session_id.clone(), None, None, "main".to_string()),
+                _ => (row.session_id.clone(), None, None, "main".to_string(), None),
             };
 
         // Build a session name for subagents that surfaces their agent id.
@@ -2100,11 +2110,12 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
                 row.reasoning_effort,
                 parent_session_id,
                 agent_nickname,
-                // `agent_role` reuses `initiator` semantics; source schema marks
-                // subagents with `initiator = 'sub-agent'`, but we do not query
-                // it here to avoid coupling to a column the fixture may lack.
-                // Leave None to avoid mislabeling main agents.
-                None::<String>,
+                // `agent_role` reuses `initiator` semantics: only
+                // `initiator = 'sub-agent'` produces `agent_role = 'sub-agent'`
+                // for subagent rows; any other initiator (or the main agent)
+                // leaves agent_role NULL so the frontend Subagent badge is the
+                // sole role marker and never duplicates.
+                agent_role,
             ],
         );
 
@@ -2312,6 +2323,10 @@ struct CopilotAppTurnRow {
     /// `agent_id` from `assistant_usage_events`. `None` (NULL) identifies the
     /// main agent; a non-null value identifies a subagent (e.g. `call_v4b32z66`).
     agent_id: Option<String>,
+    /// `initiator` of the first event for this agent group, used only to label
+    /// subagent `agent_role` when it is `'sub-agent'`. Never guessed; any other
+    /// value (including NULL) leaves `agent_role` NULL.
+    initiator: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -4620,6 +4635,43 @@ pub fn get_session_cwd(
         .map_err(|e| e.to_string())?;
     if let Some(row) = rows.next().map_err(|e| e.to_string())? {
         Ok(row.get::<_, String>(0).ok())
+    } else {
+        Ok(None)
+    }
+}
+
+/// Returns the canonical model for a session row from the database.
+///
+/// For Copilot App / CLI subagent synthetic rows (`<main>__<agent_id>`), this
+/// returns the child session's own model (the one written by the collector for
+/// the subagent's usage), NOT the parent session's model. The session detail
+/// handler uses this to seed the timeline parser so the subagent drawer's
+/// `metadata.selected_model` and `AgentReply.model` reflect the child model
+/// even when the shared `events.jsonl` only carries the parent's
+/// `session.start.selectedModel`.
+///
+/// `source_dir_key` mirrors the same scoping as [`get_session_cwd`] and
+/// [`get_session_turns_token_stats`]. Returns `None` when the session has no
+/// model column populated (caller then falls back to the parser default).
+pub fn get_session_model(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    source_dir_key: Option<&str>,
+) -> Result<Option<String>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT model FROM usage_entries
+             WHERE session_id = ? AND model IS NOT NULL AND model != ''
+             AND (? IS NULL OR source_dir_key = ?)
+             ORDER BY (parent_session_id IS NULL) ASC, turn_no ASC
+             LIMIT 1",
+        )
+        .map_err(|e| e.to_string())?;
+    let mut rows = stmt
+        .query(params![session_id, source_dir_key, source_dir_key])
+        .map_err(|e| e.to_string())?;
+    if let Some(row) = rows.next().map_err(|e| e.to_string())? {
+        Ok(row.get::<_, Option<String>>(0).ok().flatten())
     } else {
         Ok(None)
     }
@@ -7535,9 +7587,9 @@ mod tests {
         create_copilot_app_registry(&app_dir, &[session_id]);
         sync_copilot_app_usage_logs(&mut conn).unwrap();
 
-        let main_row: (i64, i64, Option<String>, Option<String>, Option<String>) = conn
+        let main_row: (i64, i64, Option<String>, Option<String>, Option<String>, Option<String>) = conn
             .query_row(
-                "SELECT tokens_total, delta_total, model, parent_session_id, agent_nickname
+                "SELECT tokens_total, delta_total, model, parent_session_id, agent_nickname, agent_role
                  FROM usage_entries
                  WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'
                    AND session_id = ? AND turn_no = 1",
@@ -7549,6 +7601,7 @@ mod tests {
                         row.get(2)?,
                         row.get(3)?,
                         row.get(4)?,
+                        row.get(5)?,
                     ))
                 },
             )
@@ -7566,6 +7619,10 @@ mod tests {
             main_row.4.is_none(),
             "main agent must have no agent_nickname"
         );
+        assert!(
+            main_row.5.is_none(),
+            "main agent agent_role must be NULL (initiator is NULL)"
+        );
         // DP4F events: input 100000+1261894=1361894, output 800+17622=18422, reasoning 1500+88=1588
         let dp4f_total = 1361894 + 18422 + 1588;
         assert_eq!(
@@ -7578,9 +7635,9 @@ mod tests {
         );
 
         let synthetic_id = format!("{}__{}", session_id, agent_id);
-        let sub_row: (i64, i64, Option<String>, Option<String>, Option<String>) = conn
+        let sub_row: (i64, i64, Option<String>, Option<String>, Option<String>, Option<String>) = conn
             .query_row(
-                "SELECT tokens_total, delta_total, model, parent_session_id, agent_nickname
+                "SELECT tokens_total, delta_total, model, parent_session_id, agent_nickname, agent_role
                  FROM usage_entries
                  WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'
                    AND session_id = ? AND turn_no = 1",
@@ -7592,6 +7649,7 @@ mod tests {
                         row.get(2)?,
                         row.get(3)?,
                         row.get(4)?,
+                        row.get(5)?,
                     ))
                 },
             )
@@ -7610,6 +7668,11 @@ mod tests {
             sub_row.4.as_deref(),
             Some(agent_id),
             "subagent agent_nickname must be the agent_id"
+        );
+        assert_eq!(
+            sub_row.5.as_deref(),
+            Some("sub-agent"),
+            "subagent agent_role must be 'sub-agent' when initiator is 'sub-agent'"
         );
         // K2.7 events: input 2000000+1156615=3156615, output 20000+8069=28069, reasoning 100+97=197
         let k27_total = 3156615 + 28069 + 197;
@@ -7763,6 +7826,396 @@ mod tests {
             .unwrap();
         // 200+20 + 50+5 = 275
         assert_eq!(sub_total, 275, "subagent totals must reflect added events");
+
+        if let Some(value) = old_app_dir {
+            std::env::set_var("COPILOT_APP_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_APP_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    /// Verify that Copilot App subagent rows whose `initiator` is NULL or an
+    /// unknown value get `agent_role = NULL` (never guessed), while a subagent
+    /// with `initiator = 'sub-agent'` gets `agent_role = 'sub-agent'`. The main
+    /// agent row always has `agent_role = NULL`. This matches the Copilot CLI
+    /// collector semantics so the same subagent produces identical metadata
+    /// across App and CLI.
+    #[test]
+    fn sync_copilot_app_usage_logs_agent_role_follows_initiator() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_app_dir = std::env::var("COPILOT_APP_DIR").ok();
+
+        let base_dir = temp_jsonl_path("copilot-app-agent-role").with_extension("");
+        let app_dir = base_dir.join("copilot-app");
+        fs::create_dir_all(&app_dir).unwrap();
+
+        let session_store = Connection::open(app_dir.join("session-store.db")).unwrap();
+        session_store
+            .execute(
+                "CREATE TABLE assistant_usage_events (
+                    id INTEGER PRIMARY KEY,
+                    session_id TEXT,
+                    turn_index INTEGER,
+                    model TEXT,
+                    agent_id TEXT,
+                    initiator TEXT,
+                    input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    cache_read_tokens INTEGER,
+                    cache_write_tokens INTEGER,
+                    reasoning_tokens INTEGER,
+                    duration_ms INTEGER,
+                    reasoning_effort TEXT,
+                    created_at TEXT
+                 )",
+                [],
+            )
+            .unwrap();
+
+        let session_id = "role-sess";
+        // Main agent: initiator NULL → agent_role NULL.
+        // Subagent A: initiator 'sub-agent' → agent_role 'sub-agent'.
+        // Subagent B: initiator NULL → agent_role NULL (do not guess).
+        // Subagent C: initiator 'worker' (unknown) → agent_role NULL (do not guess).
+        session_store
+            .execute(
+                "INSERT INTO assistant_usage_events
+                    (id, session_id, turn_index, model, agent_id, initiator,
+                     input_tokens, output_tokens,
+                     cache_read_tokens, cache_write_tokens,
+                     reasoning_tokens, duration_ms,
+                     reasoning_effort, created_at)
+                 VALUES
+                    (1, ?, 0, 'DP4F', NULL, NULL, 100, 10, 0, 0, 0, 100, 'medium', '2026-07-22 10:00:00'),
+                    (2, ?, 0, 'K2.7', ?, 'sub-agent', 200, 20, 0, 0, 0, 200, NULL, '2026-07-22 10:00:01'),
+                    (3, ?, 0, 'K2.7', ?, NULL, 300, 30, 0, 0, 0, 300, NULL, '2026-07-22 10:00:02'),
+                    (4, ?, 0, 'K2.7', ?, 'worker', 400, 40, 0, 0, 0, 400, NULL, '2026-07-22 10:00:03')",
+                params![
+                    session_id,
+                    session_id, "call_sub",
+                    session_id, "call_null",
+                    session_id, "call_worker"
+                ],
+            )
+            .unwrap();
+
+        std::env::set_var("COPILOT_APP_DIR", &app_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        create_copilot_app_registry(&app_dir, &[session_id]);
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+
+        let role_of = |agent: &str| -> Option<String> {
+            let synthetic = format!("{}__{}", session_id, agent);
+            conn.query_row(
+                "SELECT agent_role FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'
+                   AND session_id = ? AND turn_no = 1",
+                params![synthetic],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        let main_role: Option<String> = conn
+            .query_row(
+                "SELECT agent_role FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'
+                   AND session_id = ? AND turn_no = 1 AND parent_session_id IS NULL",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(main_role.is_none(), "main agent agent_role must be NULL");
+
+        assert_eq!(
+            role_of("call_sub").as_deref(),
+            Some("sub-agent"),
+            "subagent with initiator='sub-agent' must get agent_role='sub-agent'"
+        );
+        assert_eq!(
+            role_of("call_null"),
+            None::<String>,
+            "subagent with NULL initiator must keep agent_role NULL (no guessing)"
+        );
+        assert_eq!(
+            role_of("call_worker"),
+            None::<String>,
+            "subagent with unknown initiator='worker' must keep agent_role NULL (no guessing)"
+        );
+
+        if let Some(value) = old_app_dir {
+            std::env::set_var("COPILOT_APP_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_APP_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    /// Verify that Copilot App and Copilot CLI produce identical subagent
+    /// metadata semantics: parent_session_id = main session id,
+    /// agent_nickname = agent_id, agent_role = 'sub-agent' only when the source
+    /// explicitly provides initiator='sub-agent'. Both collectors must not
+    /// guess a role (e.g. 'worker') for Copilot subagents.
+    #[test]
+    fn copilot_app_and_cli_subagent_metadata_consistent() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_dir = std::env::var("COPILOT_DIR").ok();
+        let old_app_dir = std::env::var("COPILOT_APP_DIR").ok();
+
+        let base_dir = temp_jsonl_path("copilot-app-cli-consistency").with_extension("");
+        let app_dir = base_dir.join("copilot");
+        fs::create_dir_all(&app_dir).unwrap();
+
+        // CLI fixture: a CLI-classified session with one main + one subagent.
+        let cli_session = "consistency-cli-sess";
+        let cli_agent = "call_cli_sub";
+        let store = build_cli_reconciler_fixture(&app_dir, &[], &[cli_session]);
+        insert_cli_event(
+            &store,
+            CliEventIdentity {
+                id: 1,
+                session_id: cli_session,
+                model: "DP4P",
+                agent_id: None,
+                initiator: None,
+            },
+            CliEventTokens {
+                input: 100,
+                output: 10,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+                duration_ms: 50,
+            },
+            "2026-07-22T10:00:00",
+        );
+        insert_cli_event(
+            &store,
+            CliEventIdentity {
+                id: 2,
+                session_id: cli_session,
+                model: "DP4P",
+                agent_id: Some(cli_agent),
+                initiator: Some("sub-agent"),
+            },
+            CliEventTokens {
+                input: 200,
+                output: 20,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+                duration_ms: 60,
+            },
+            "2026-07-22T10:00:01",
+        );
+
+        // App fixture: an App-registry session with one main + one subagent.
+        let app_session = "consistency-app-sess";
+        let app_agent = "call_app_sub";
+        create_copilot_app_registry(&app_dir, &[app_session]);
+        store
+            .execute(
+                "INSERT INTO assistant_usage_events
+                    (id, session_id, turn_index, model, agent_id, initiator,
+                     input_tokens, output_tokens,
+                     cache_read_tokens, cache_write_tokens,
+                     reasoning_tokens, duration_ms,
+                     reasoning_effort, created_at)
+                 VALUES
+                    (3, ?, 0, 'DP4F', NULL, NULL, 100, 10, 0, 0, 0, 100, 'medium', '2026-07-22 10:00:00'),
+                    (4, ?, 0, 'K2.7', ?, 'sub-agent', 200, 20, 0, 0, 0, 200, NULL, '2026-07-22 10:00:01')",
+                params![app_session, app_session, app_agent],
+            )
+            .unwrap();
+
+        std::env::set_var("COPILOT_DIR", &app_dir);
+        std::env::set_var("COPILOT_APP_DIR", &app_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        seed_cli_hook_row(&conn, cli_session, 330);
+
+        sync_copilot_cli_agent_usage_logs(&mut conn).unwrap();
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+
+        let read_subagent = |session: &str,
+                             agent: &str,
+                             source_kind: &str|
+         -> (String, Option<String>, Option<String>, Option<String>) {
+            let synthetic = format!("{}__{}", session, agent);
+            conn.query_row(
+                "SELECT session_id, parent_session_id, agent_nickname, agent_role
+                 FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = ?
+                   AND session_id = ? AND turn_no = 1",
+                params![source_kind, synthetic],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap()
+        };
+
+        let cli_sub = read_subagent(cli_session, cli_agent, "copilot-cli");
+        let app_sub = read_subagent(app_session, app_agent, "copilot-app");
+
+        // Synthetic session id format must match across collectors.
+        assert_eq!(
+            cli_sub.0,
+            format!("{}__{}", cli_session, cli_agent),
+            "CLI synthetic session id format"
+        );
+        assert_eq!(
+            app_sub.0,
+            format!("{}__{}", app_session, app_agent),
+            "App synthetic session id format"
+        );
+        // parent_session_id = main session id.
+        assert_eq!(cli_sub.1.as_deref(), Some(cli_session));
+        assert_eq!(app_sub.1.as_deref(), Some(app_session));
+        // agent_nickname = agent_id.
+        assert_eq!(cli_sub.2.as_deref(), Some(cli_agent));
+        assert_eq!(app_sub.2.as_deref(), Some(app_agent));
+        // agent_role = 'sub-agent' only when initiator='sub-agent'; never 'worker'.
+        assert_eq!(cli_sub.3.as_deref(), Some("sub-agent"));
+        assert_eq!(app_sub.3.as_deref(), Some("sub-agent"));
+
+        if let Some(value) = old_dir {
+            std::env::set_var("COPILOT_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_DIR");
+        }
+        if let Some(value) = old_app_dir {
+            std::env::set_var("COPILOT_APP_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_APP_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    /// Verify that re-syncing an existing Copilot App session whose subagent
+    /// rows were previously written with agent_role=NULL upgrades them to
+    /// agent_role='sub-agent' when the source events carry
+    /// initiator='sub-agent'. This is the one-time backfill path for existing
+    /// App rows, exercised by the normal INSERT OR REPLACE upsert: no duplicate
+    /// rows are created.
+    #[test]
+    fn sync_copilot_app_usage_logs_backfills_null_agent_role_on_resync() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_app_dir = std::env::var("COPILOT_APP_DIR").ok();
+
+        let base_dir = temp_jsonl_path("copilot-app-role-backfill").with_extension("");
+        let app_dir = base_dir.join("copilot-app");
+        fs::create_dir_all(&app_dir).unwrap();
+
+        let session_store = Connection::open(app_dir.join("session-store.db")).unwrap();
+        session_store
+            .execute(
+                "CREATE TABLE assistant_usage_events (
+                    id INTEGER PRIMARY KEY,
+                    session_id TEXT,
+                    turn_index INTEGER,
+                    model TEXT,
+                    agent_id TEXT,
+                    initiator TEXT,
+                    input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    cache_read_tokens INTEGER,
+                    cache_write_tokens INTEGER,
+                    reasoning_tokens INTEGER,
+                    duration_ms INTEGER,
+                    reasoning_effort TEXT,
+                    created_at TEXT
+                 )",
+                [],
+            )
+            .unwrap();
+
+        let session_id = "backfill-sess";
+        let agent_id = "call_backfill";
+        session_store
+            .execute(
+                "INSERT INTO assistant_usage_events
+                    (id, session_id, turn_index, model, agent_id, initiator,
+                     input_tokens, output_tokens,
+                     cache_read_tokens, cache_write_tokens,
+                     reasoning_tokens, duration_ms,
+                     reasoning_effort, created_at)
+                 VALUES
+                    (1, ?, 0, 'DP4F', NULL, NULL, 100, 10, 0, 0, 0, 100, 'medium', '2026-07-22 10:00:00'),
+                    (2, ?, 0, 'K2.7', ?, 'sub-agent', 200, 20, 0, 0, 0, 200, NULL, '2026-07-22 10:00:01')",
+                params![session_id, session_id, agent_id],
+            )
+            .unwrap();
+
+        std::env::set_var("COPILOT_APP_DIR", &app_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let source_key = test_copilot_source_key(&app_dir);
+        create_copilot_app_registry(&app_dir, &[session_id]);
+
+        // Simulate a pre-existing App subagent row written by the old collector
+        // with agent_role=NULL (the regression we are fixing). Same
+        // import_source_id as the new collector would produce so the upsert
+        // targets the same row instead of creating a duplicate.
+        let synthetic_id = format!("{}__{}", session_id, agent_id);
+        let import_source_id = format!("copilot-app:{}:{}:0:{}", source_key, session_id, agent_id);
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, import_source_id, model,
+                tokens_total, tokens_input, tokens_output, delta_total, delta_input, delta_output,
+                parent_session_id, agent_nickname, agent_role
+             ) VALUES (
+                'copilot', 'copilot-app', ?, '2026-07-22T10:00:01Z', '2026-07-22',
+                ?, 1, ?, 'K2.7',
+                220, 200, 20, 220, 200, 20,
+                ?, ?, NULL
+             )",
+            params![
+                source_key,
+                synthetic_id,
+                import_source_id,
+                session_id,
+                agent_id
+            ],
+        )
+        .unwrap();
+
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+
+        // No duplicate rows: exactly one subagent row for this synthetic id.
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'
+                   AND session_id = ?",
+                params![synthetic_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "resync must upsert, not duplicate the subagent row"
+        );
+
+        // The upserted row now carries agent_role='sub-agent'.
+        let role: Option<String> = conn
+            .query_row(
+                "SELECT agent_role FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'
+                   AND session_id = ?",
+                params![synthetic_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            role.as_deref(),
+            Some("sub-agent"),
+            "backfilled subagent row must carry agent_role='sub-agent'"
+        );
 
         if let Some(value) = old_app_dir {
             std::env::set_var("COPILOT_APP_DIR", value);
@@ -9961,5 +10414,98 @@ mod tests {
             std::env::remove_var("COPILOT_DIR");
         }
         let _ = fs::remove_dir_all(base_dir);
+    }
+
+    /// Regression: `get_session_model` must return the child session's own
+    /// model for a Copilot App subagent synthetic row (`<main>__<agent_id>`),
+    /// NOT the parent's model. The drawer parser relies on this so the
+    /// subagent drawer shows the child model and never the parent's
+    /// `session.start.selectedModel`.
+    #[test]
+    fn get_session_model_returns_child_model_for_subagent_synthetic_row() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let parent = "74b6d236-d311-4675-9855-fee91bc508e5";
+        let agent = "call_v4b32z66";
+        let synthetic = format!("{parent}__{agent}");
+
+        // Parent (main agent) row uses a different model.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, model,
+                tokens_input, tokens_output, tokens_total,
+                delta_input, delta_output, delta_total
+             ) VALUES (
+                'copilot', 'copilot-app', 'abcdef00', '2026-07-20T10:00:00Z', '2026-07-20',
+                ?, 1, 'GLM5.2-medium',
+                50, 5, 55,
+                50, 5, 55
+             )",
+            params![parent],
+        )
+        .unwrap();
+
+        // Subagent synthetic row uses K2.7.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, model,
+                tokens_input, tokens_output, tokens_total,
+                delta_input, delta_output, delta_total,
+                parent_session_id, agent_nickname
+             ) VALUES (
+                'copilot', 'copilot-app', 'abcdef00', '2026-07-20T10:00:30Z', '2026-07-20',
+                ?, 1, 'K2.7',
+                100, 10, 110,
+                100, 10, 110,
+                ?, ?
+             )",
+            params![synthetic, parent, agent],
+        )
+        .unwrap();
+
+        // The subagent synthetic row must resolve to K2.7 (its own model),
+        // not the parent's GLM5.2-medium.
+        let child_model = get_session_model(&conn, &synthetic, Some("abcdef00")).unwrap();
+        assert_eq!(child_model.as_deref(), Some("K2.7"));
+
+        // The main session must resolve to its own model.
+        let main_model = get_session_model(&conn, parent, Some("abcdef00")).unwrap();
+        assert_eq!(main_model.as_deref(), Some("GLM5.2-medium"));
+
+        // No source_dir_key scoping still resolves the child model.
+        let unscoped = get_session_model(&conn, &synthetic, None).unwrap();
+        assert_eq!(unscoped.as_deref(), Some("K2.7"));
+    }
+
+    /// Regression: `get_session_model` returns `None` when the session has no
+    /// populated model column (caller falls back to the parser default).
+    #[test]
+    fn get_session_model_returns_none_when_model_column_is_empty() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no,
+                tokens_input, tokens_output, tokens_total,
+                delta_input, delta_output, delta_total
+             ) VALUES (
+                'copilot', 'copilot-cli', NULL, '2026-07-20T10:00:00Z', '2026-07-20',
+                'no-model-sess', 1,
+                10, 1, 11,
+                10, 1, 11
+             )",
+            [],
+        )
+        .unwrap();
+        let model = get_session_model(&conn, "no-model-sess", None).unwrap();
+        assert!(
+            model.is_none(),
+            "expected None for model-less session, got {:?}",
+            model
+        );
     }
 }
