@@ -197,7 +197,7 @@ jq . ~/.copilot/settings.json
 
 **Copilot App（Tauri 桌面應用）不需任何設定。** 看板會自動讀取本機 `~/.copilot/data.db` 與 `~/.copilot/session-store.db`，將 App session 的 token 使用量與 CLI / VS Code 合併顯示在 Copilot 頁面；Session 清單以 `App` 標示來源，與 `CLI`、`VS Code` 區分。
 
-- 看板會在每次背景同步（每 5 秒）檢查這兩個 SQLite 並以 `created_at` 為 cursor 做增量同步，同一個 `(session_id, turn_index)` 不會重複寫入。
+- 看板會在每次背景同步（每 5 秒）檢查這兩個 SQLite 並以 `(created_at, id)` 複合游標做增量同步，避免同一時間戳的多筆 event 重複 upsert，同一個 `(session_id, turn_index)` 不會重複寫入。
 - App 的 `assistant_usage_events` 是 per-API-call 顆粒度，看板會以 `(session_id, turn_index)` group-by 成 per-turn 紀錄，與其他 collector 對齊。
 - Session 標題取自 `data.db.sessions.title`。
 

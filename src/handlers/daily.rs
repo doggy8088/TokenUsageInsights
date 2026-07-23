@@ -207,17 +207,14 @@ fn resolve_copilot_app_events_path(
         };
         return Err(SessionFileErrorExt::with_reason(
             StatusCode::NOT_FOUND,
-            format!(
-                "找不到 Copilot App session 的 events.jsonl：{:?}{}",
-                events_path,
-                if reason == "no_events_yet" {
-                    "（session 目錄存在但尚未產生事件檔）"
-                } else if agent_nickname.is_some() {
-                    "（subagent 對應的主 session 目錄不存在）"
-                } else {
-                    ""
-                }
-            ),
+            if reason == "no_events_yet" {
+                "找不到 Copilot App session 的 events.jsonl（session 目錄存在但尚未產生事件檔）。"
+                    .to_string()
+            } else if agent_nickname.is_some() {
+                "找不到 Copilot App session 的 events.jsonl（subagent 對應的主 session 目錄不存在）。".to_string()
+            } else {
+                "找不到 Copilot App session 的 events.jsonl。".to_string()
+            },
             reason,
         ));
     }
@@ -314,15 +311,11 @@ fn resolve_copilot_cli_subagent_events_path(
         };
         return Err(SessionFileErrorExt::with_reason(
             StatusCode::NOT_FOUND,
-            format!(
-                "找不到 Copilot CLI subagent 對應的主 session events.jsonl：{:?}（{}）",
-                events_path,
-                if reason == "no_events_yet" {
-                    "主 session 目錄存在但尚未產生事件檔"
-                } else {
-                    "subagent 對應的主 session 目錄不存在"
-                }
-            ),
+            if reason == "no_events_yet" {
+                "找不到 Copilot CLI subagent 對應的主 session events.jsonl（主 session 目錄存在但尚未產生事件檔）。".to_string()
+            } else {
+                "找不到 Copilot CLI subagent 對應的主 session events.jsonl（subagent 對應的主 session 目錄不存在）。".to_string()
+            },
             reason,
         ));
     }
@@ -1243,7 +1236,18 @@ pub async fn get_session_details(
         // lives under the parent session's directory, so check that directory.
         let is_session_dir_present = match resolved_assistant.as_str() {
             "copilot" => {
-                let cop_dir = db::get_copilot_dir();
+                // Copilot App and Copilot CLI subagent synthetic sessions store
+                // their events.jsonl under the parent session's session-state
+                // directory. App sessions live under `paths::copilot_app_dir()`
+                // (honors COPILOT_APP_DIR), while CLI sessions live under
+                // `db::get_copilot_dir()` (honors COPILOT_DIR). Using the wrong
+                // base would misclassify missing App sessions when the two env
+                // vars point to different directories.
+                let cop_dir = if source_kind == "copilot-app" {
+                    crate::paths::copilot_app_dir()
+                } else {
+                    db::get_copilot_dir()
+                };
                 let dir_id = if source_kind == "copilot-app" || source_kind == "copilot-cli" {
                     copilot_app_parent_session_id
                         .as_deref()
@@ -1260,7 +1264,11 @@ pub async fn get_session_details(
         } else {
             "file_missing"
         };
-        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": format!("找不到該會話的本地日誌檔: {:?}", filepath), "reason": reason }))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "找不到該會話的本地日誌檔。", "reason": reason })),
+        )
+            .into_response();
     }
 
     // 3. 預先載入 SQLite 中的回合 (turn_no) 增量 token 數據

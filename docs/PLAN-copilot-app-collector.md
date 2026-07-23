@@ -32,7 +32,7 @@ Copilot App 的 `assistant_usage_events` 是 per-API-call 顆粒度，而 Token 
 - `timestamp` 用該 turn 最早事件的 `created_at`。
 - `model` 取該 turn 內最多 token 的 event 的 model。
 - `tokens.input / output / cache_read / cache_write / reasoning` 直接加總。
-- `delta_tokens`：第一個 turn 等於 tokens；後續 turn 為 `current - previous`（參考 `statusline-token.sh` 的差值邏輯）。
+- `delta_tokens`：實作上將 `assistant_usage_events` 視為 per-call（非累計），`delta_*` 直接等於該 turn 內所有 event 的 SUM（與 Codex collector 的 per-turn SUM 語意一致，不採用 `current - previous` 差值）。
 - `total_tokens` = input + output + cache_read + cache_write + reasoning（與 JSONL 邏輯一致）。
 - `cwd` 取 `data.db.sessions` 表的 workspace/checkout 路徑（需 join `workspaces` / `project_checkouts`，或退而求其次用 `session-state/<id>/` 內的檔案推導）。
 - `session_name` 取 `data.db.sessions.title`；若空則 fallback 到現有 `get_copilot_session_name()`。
@@ -44,7 +44,7 @@ Copilot App 的 `assistant_usage_events` 是 per-API-call 顆粒度，而 Token 
 
 - 在 `usage_entries` 表新增一個 `import_source_id` 形式：`copilot-app:<session_id>:<turn_index>`，用來做重複偵測。
 - 已存在的 `import_source_id` 跳過，避免重複寫入。
-- 每次同步只讀 `created_at > last_synced_at` 的新 event（用一個 `session_state` key 記錄上次同步的 max `created_at`）。
+- 每次同步以 `(created_at, id)` 複合 high-water mark 推進 cursor，避免同一時間戳多筆 event 時重複 upsert 最後一筆。cursor 存於 `sync_state`（以 canonical source dir 為 key scope），不再使用 `session_state` 單一鍵。
 - 同步頻率沿用現有 5 秒背景循環。
 
 ### D. 環境變數
@@ -163,5 +163,5 @@ if let Err(e) = sync_copilot_app_usage_logs(conn) {
 ## 不在這次範圍
 
 - 不處理 Copilot App 的 `session_context_usage` 時間序列視覺化（未來可在 session drawer 加一條 context usage 折線圖）。
-- 不處理 Copilot App 的 subagent / background agent（`agent_id` 非空）的獨立攤分，先全部歸入主 session。
+- Copilot App subagent / background agent（`agent_id` 非空）已在本 PR 擴充範圍內：依 `agent_id` 分離 main agent 與 subagent token usage，並補齊 subagent timeline（與 Codex subagent 行為對齊）。
 - 不處理 `total_nano_aiu` 估算計價，因為 `pricing.csv` 目前是按 token 計價。
