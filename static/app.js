@@ -1,4 +1,4 @@
-import i18n from './i18n.js?v=28';
+import i18n from './i18n.js?v=29';
 import {
   aggregateDailyTokenCandles,
   calculateCandleViewport,
@@ -339,16 +339,6 @@ function updateBrandLogo() {
   brandLogo.alt = meta.logo ? meta.alt : 'Token 戰情室';
 }
 
-function updateAssistantBillingNote() {
-  const note = document.getElementById('assistant-billing-note');
-  if (!note) return;
-  const isGrok = currentAssistant === 'grok';
-  note.classList.toggle('hidden', !isGrok);
-  if (isGrok) {
-    note.innerHTML = t('billing_note');
-  }
-}
-
 function languageMeta(lang) {
   return lang === 'en'
     ? { label: 'United States', next: 'zh-TW' }
@@ -535,7 +525,6 @@ function updateLanguageUI() {
 
   // Update dynamic brand logo in sidebar
   updateBrandLogo();
-  updateAssistantBillingNote();
   syncSidebarToggleButton();
   updateDailyChartControls();
   updateCodexRateLimit();

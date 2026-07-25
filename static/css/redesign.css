@@ -1352,23 +1352,6 @@ input {
   object-fit: contain;
 }
 
-.assistant-billing-note {
-  max-width: 72ch;
-  margin: 8px 0 0;
-  padding: 7px 10px;
-  border-left: 2px solid #fb7185;
-  background: color-mix(in srgb, #ef4444 8%, var(--surface-1));
-  color: var(--text-secondary);
-  font-size: 0.74rem;
-  line-height: 1.45;
-}
-
-.assistant-billing-note code {
-  color: var(--text-primary);
-  font-family: var(--font-mono);
-  font-size: 0.9em;
-}
-
 @media (pointer: coarse) {
   .reload-btn,
   .sidebar-toggle-btn,

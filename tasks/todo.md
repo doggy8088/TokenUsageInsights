@@ -1,3 +1,37 @@
+# 2026-07-25 統一 Grok Build 介面文案
+
+## Goal and acceptance criteria
+
+- [x] Grok Build 的中文標題描述改為與其他 Agent 一致的「本地監控與分析您的 <Agent Name> 的 Token 消耗與會話詳細數據」格式。
+- [x] Grok Build 的英文標題描述同步表達本地分析 Token 使用量與會話詳細資訊。
+- [x] 移除 Grok Build 專屬計費提示的 HTML、JavaScript、CSS 與中英文翻譯 key；其他 Agent 文案維持不變。
+- [x] 前端資源 cache-bust 版本與實際異動同步更新，且通過前端語法、文案回歸、格式、測試與零警告驗證。
+
+## Plan
+
+- [x] 確認 Grok 標題與計費提示的權威來源、現有快取版本與專案規範。
+- [x] 更新 Grok 中英文標題文案，移除計費提示元件、邏輯、樣式與翻譯。
+- [x] 執行前端語法、文案回歸、格式、測試與零警告驗證。
+- [x] 記錄結果與可回溯的變更範圍。
+
+## Risk and rollback
+
+- Risk: low；僅調整靜態前端文案與不再使用的 Grok 專屬提示元件。
+- Rollback: 還原 `static/i18n.js`、`static/index.html`、`static/app.js`、`static/css/redesign.css` 與本節任務紀錄。
+
+## Working notes
+
+- 標題描述來源為 `static/i18n.js` 的 assistant-specific translation key。
+- 計費提示由 `static/index.html` 的元素、`static/app.js` 的更新函式與 `static/css/redesign.css` 的專用樣式共同組成。
+- `grok_source_usage` 與 `grok_source_context` 是資料來源標籤，不是本次要移除的計費提示，保留其既有功能。
+
+## Results
+
+- `static/i18n.js` 的 Grok Build 中英文標題已統一為本地分析 Token 使用量與會話詳細資訊的格式；`grok_billing_note` 中英文 key 已移除。
+- `static/index.html`、`static/app.js`、`static/css/redesign.css` 已移除計費提示的 DOM、更新函式／呼叫與專用樣式；保留 setup modal 內既有資料來源說明與來源標籤。
+- 靜態資源 cache-bust 已更新：`styles.css?v=22`、`i18n.js?v=29`、`app.js?v=43`。
+- 驗證通過：`node --check static/app.js`、前端文案／殘留引用斷言、`git diff --check`、`cargo fmt -- --check`、`cargo test --locked`（53 + 38）、`cargo build --release --locked`、`cargo build --release --locked --all-targets`、`cargo clippy --locked --all-targets --all-features -- -D warnings`；均無錯誤與警告。
+
 # 2026-07-22 修正 Grok 教學翻譯與圖示版型回歸
 
 ## Goal and acceptance criteria
