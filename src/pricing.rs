@@ -125,7 +125,18 @@ pub fn calculate_cost(
         ));
     }
 
-    let total_context = input + cache_read + cache_write_5m + cache_write_1h + output;
+    let is_claude_model = rules.iter().any(|rule| {
+        let (rule_base, _) = parse_threshold_rule(&rule.model_name);
+        !rule_base.is_empty()
+            && (rule_base == m_base || m_base.contains(&rule_base) || rule_base.contains(&m_base))
+            && rule.model_name.to_ascii_lowercase().contains("claude")
+    });
+    let (priced_cache_write_5m, priced_cache_write_1h) = if is_claude_model {
+        (cache_write_5m, cache_write_1h)
+    } else {
+        (0, 0)
+    };
+    let total_context = input + cache_read + priced_cache_write_5m + priced_cache_write_1h + output;
     let is_long_context = total_context > 272_000;
 
     // 1. First attempt: exact base name match
@@ -176,8 +187,10 @@ pub fn calculate_cost(
     if let Some(r) = rule {
         let input_cost = (input as f64 / 1_000_000.0) * r.input_price;
         let cache_cost = (cache_read as f64 / 1_000_000.0) * r.cache_input_price;
-        let cache_write_5m_cost = (cache_write_5m as f64 / 1_000_000.0) * r.input_price * 1.25;
-        let cache_write_1h_cost = (cache_write_1h as f64 / 1_000_000.0) * r.input_price * 2.0;
+        let cache_write_5m_cost =
+            (priced_cache_write_5m as f64 / 1_000_000.0) * r.input_price * 1.25;
+        let cache_write_1h_cost =
+            (priced_cache_write_1h as f64 / 1_000_000.0) * r.input_price * 2.0;
         let output_cost = (output as f64 / 1_000_000.0) * r.output_price;
         Ok(input_cost + cache_cost + cache_write_5m_cost + cache_write_1h_cost + output_cost)
     } else {
@@ -301,5 +314,28 @@ mod tests {
         .unwrap();
 
         assert!((cost - 93.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cache_write_ttl_fields_do_not_change_non_claude_cost() {
+        let rules = [PricingRule {
+            model_name: "GPT-5".to_string(),
+            input_price: 2.0,
+            cache_input_price: 0.2,
+            output_price: 8.0,
+        }];
+
+        let cost = calculate_usage_cost(
+            &rules,
+            Some("gpt-5"),
+            1_000_000,
+            1_000_000,
+            1_000_000,
+            1_000_000,
+            1_000_000,
+        )
+        .unwrap();
+
+        assert!((cost - 10.2).abs() < 1e-9);
     }
 }

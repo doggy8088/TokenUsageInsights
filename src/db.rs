@@ -208,17 +208,29 @@ fn normalize_import_source_id(raw: Option<&str>) -> Option<String> {
 
 fn build_import_token_signature(tokens: &Option<TokenStats>) -> String {
     if let Some(t) = tokens {
-        format!(
-            "{}|{}|{}|{}|{}|{}|{}|{}",
-            t.input,
-            t.output,
-            t.cache_read.unwrap_or(0),
-            t.cache_write.unwrap_or(0),
-            t.cache_write_5m.unwrap_or(0),
-            t.cache_write_1h.unwrap_or(0),
-            t.reasoning.unwrap_or(0),
-            t.total
-        )
+        if t.cache_write_5m.is_none() && t.cache_write_1h.is_none() {
+            format!(
+                "{}|{}|{}|{}|{}|{}",
+                t.input,
+                t.output,
+                t.cache_read.unwrap_or(0),
+                t.cache_write.unwrap_or(0),
+                t.reasoning.unwrap_or(0),
+                t.total
+            )
+        } else {
+            format!(
+                "{}|{}|{}|{}|{}|{}|{}|{}",
+                t.input,
+                t.output,
+                t.cache_read.unwrap_or(0),
+                t.cache_write.unwrap_or(0),
+                t.cache_write_5m.unwrap_or(0),
+                t.cache_write_1h.unwrap_or(0),
+                t.reasoning.unwrap_or(0),
+                t.total
+            )
+        }
     } else {
         "null".to_string()
     }
@@ -3255,6 +3267,7 @@ pub fn import_usage_day_entries(
     for record in records {
         let mut entry = record.entry;
         let normalized_id = normalize_import_source_id(record.import_source_id.as_deref());
+        let generated_source_id = build_usage_entry_import_source_id(assistant, date, &entry);
         let file_date = entry_date_from_timestamp(&entry.timestamp)
             .ok_or_else(|| "無效的 timestamp 格式，無法取得日期".to_string())?;
         if file_date != date {
@@ -3272,8 +3285,7 @@ pub fn import_usage_day_entries(
         } else if assistant == "claude" {
             normalize_legacy_claude_usage_entry(&mut entry);
         }
-        let source_id = normalized_id
-            .unwrap_or_else(|| build_usage_entry_import_source_id(assistant, date, &entry));
+        let source_id = normalized_id.unwrap_or(generated_source_id);
 
         let imported = tx
             .execute(
@@ -4244,6 +4256,74 @@ mod tests {
             )
             .unwrap();
         assert_eq!(imported_rows, 1);
+    }
+
+    #[test]
+    fn legacy_import_without_ttl_fields_keeps_previous_source_id() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut record = sample_import_record();
+        record.entry.session_id = "legacy-source-id".to_string();
+        record.entry.model = Some("claude-fable-5".to_string());
+        record.entry.model_id = Some("claude-fable-5".to_string());
+        record.import_source_id = None;
+
+        let entry = &record.entry;
+        let tokens = entry.tokens.as_ref().unwrap();
+        let delta = entry.delta_tokens.as_ref().unwrap();
+        let legacy_tokens_signature = format!(
+            "{}|{}|{}|{}|{}|{}",
+            tokens.input,
+            tokens.output,
+            tokens.cache_read.unwrap_or(0),
+            tokens.cache_write.unwrap_or(0),
+            tokens.reasoning.unwrap_or(0),
+            tokens.total
+        );
+        let legacy_delta_signature = format!(
+            "{}|{}|{}|{}|{}|{}",
+            delta.input,
+            delta.output,
+            delta.cache_read.unwrap_or(0),
+            delta.cache_write.unwrap_or(0),
+            delta.reasoning.unwrap_or(0),
+            delta.total
+        );
+        let legacy_signature = format!(
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            "claude",
+            "2026-07-10",
+            entry.timestamp,
+            entry.session_id,
+            entry.turn_no,
+            entry.model.as_deref().unwrap_or_default(),
+            entry.model_id.as_deref().unwrap_or_default(),
+            entry.version.as_deref().unwrap_or_default(),
+            entry.cwd.as_deref().unwrap_or_default(),
+            entry.transcript_path.as_deref().unwrap_or_default(),
+            entry.parent_session_id.as_deref().unwrap_or_default(),
+            entry.agent_nickname.as_deref().unwrap_or_default(),
+            entry.agent_role.as_deref().unwrap_or_default(),
+            legacy_tokens_signature,
+            legacy_delta_signature
+        );
+        let legacy_source_id = format!("{:016x}", hash_fnv1a_64(&legacy_signature));
+        assert_eq!(
+            build_usage_entry_import_source_id("claude", "2026-07-10", entry),
+            legacy_source_id
+        );
+
+        let mut existing_record = record.clone();
+        existing_record.import_source_id = Some(legacy_source_id);
+        let first =
+            import_usage_day_entries(&mut conn, "claude", "2026-07-10", vec![existing_record])
+                .unwrap();
+        assert_eq!(first.imported, 1);
+
+        let second =
+            import_usage_day_entries(&mut conn, "claude", "2026-07-10", vec![record]).unwrap();
+        assert_eq!(second.imported, 0);
+        assert_eq!(second.skipped_duplicates, 1);
     }
 
     #[test]
