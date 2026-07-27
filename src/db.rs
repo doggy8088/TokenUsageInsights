@@ -12,6 +12,10 @@ pub struct TokenStats {
     pub output: u64,
     pub cache_read: Option<u64>,
     pub cache_write: Option<u64>,
+    #[serde(default)]
+    pub cache_write_5m: Option<u64>,
+    #[serde(default)]
+    pub cache_write_1h: Option<u64>,
     pub reasoning: Option<u64>,
     pub total: u64,
 }
@@ -81,6 +85,16 @@ struct ClaudeUsage {
     cache_read_input_tokens: u64,
     #[serde(default)]
     output_tokens: u64,
+    #[serde(default)]
+    cache_creation: ClaudeCacheCreation,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ClaudeCacheCreation {
+    #[serde(default)]
+    ephemeral_5m_input_tokens: u64,
+    #[serde(default)]
+    ephemeral_1h_input_tokens: u64,
 }
 
 // Codex helper structs shared by the CLI and Desktop session formats.
@@ -109,6 +123,7 @@ const CODEX_EMPTY_TRANSCRIPT_SYNC_TIME: i64 = -1;
 const COPILOT_SOURCE_KIND_MIGRATION_KEY: &str = "migration:copilot_source_kind_v1";
 const VSCODE_EMPTY_SESSION_MIGRATION_KEY: &str = "migration:vscode_empty_sessions_v1";
 const COPILOT_CACHED_INPUT_MIGRATION_KEY: &str = "migration:copilot_cached_input_v1";
+const CLAUDE_CACHE_WRITE_PRICING_MIGRATION_KEY: &str = "migration:claude_cache_write_pricing_v1";
 const SESSION_NAME_SELECTION_MIGRATION_KEY: &str = "migration:session_name_selection_v1";
 
 #[derive(Default)]
@@ -194,11 +209,13 @@ fn normalize_import_source_id(raw: Option<&str>) -> Option<String> {
 fn build_import_token_signature(tokens: &Option<TokenStats>) -> String {
     if let Some(t) = tokens {
         format!(
-            "{}|{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}|{}|{}",
             t.input,
             t.output,
             t.cache_read.unwrap_or(0),
             t.cache_write.unwrap_or(0),
+            t.cache_write_5m.unwrap_or(0),
+            t.cache_write_1h.unwrap_or(0),
             t.reasoning.unwrap_or(0),
             t.total
         )
@@ -381,6 +398,8 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
             tokens_output INTEGER,
             tokens_cache_read INTEGER,
             tokens_cache_write INTEGER,
+            tokens_cache_write_5m INTEGER,
+            tokens_cache_write_1h INTEGER,
             tokens_reasoning INTEGER,
             tokens_total INTEGER,
             
@@ -389,6 +408,8 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
             delta_output INTEGER,
             delta_cache_read INTEGER,
             delta_cache_write INTEGER,
+            delta_cache_write_5m INTEGER,
+            delta_cache_write_1h INTEGER,
             delta_reasoning INTEGER,
             delta_total INTEGER,
             
@@ -418,6 +439,22 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
     );
     let _ = conn.execute(
         "ALTER TABLE usage_entries ADD COLUMN delta_cache_write INTEGER",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE usage_entries ADD COLUMN tokens_cache_write_5m INTEGER",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE usage_entries ADD COLUMN tokens_cache_write_1h INTEGER",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE usage_entries ADD COLUMN delta_cache_write_5m INTEGER",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE usage_entries ADD COLUMN delta_cache_write_1h INTEGER",
         [],
     );
     let _ = conn.execute(
@@ -589,6 +626,65 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
         .map_err(|error| format!("記錄 Copilot CLI 快取輸入遷移失敗: {error}"))?;
     }
 
+    let claude_cache_write_migration_done: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = ?)",
+            params![CLAUDE_CACHE_WRITE_PRICING_MIGRATION_KEY],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    if !claude_cache_write_migration_done {
+        conn.execute(
+            "UPDATE usage_entries
+             SET tokens_input = CASE
+                    WHEN tokens_input IS NULL THEN NULL
+                    WHEN tokens_input >= COALESCE(tokens_cache_write, 0)
+                    THEN tokens_input - COALESCE(tokens_cache_write, 0)
+                    ELSE 0
+                 END,
+                 tokens_cache_write_5m = COALESCE(tokens_cache_write, 0),
+                 tokens_cache_write_1h = 0,
+                 delta_input = CASE
+                    WHEN delta_input IS NULL THEN NULL
+                    WHEN delta_input >= COALESCE(delta_cache_write, 0)
+                    THEN delta_input - COALESCE(delta_cache_write, 0)
+                    ELSE 0
+                 END,
+                 delta_cache_write_5m = COALESCE(delta_cache_write, 0),
+                 delta_cache_write_1h = 0
+             WHERE (
+                    assistant_type = 'claude'
+                    OR (
+                        assistant_type = 'codex'
+                        AND transcript_path IS NOT NULL
+                        AND (
+                               transcript_path LIKE '%.claude/%'
+                            OR transcript_path LIKE '%/claude/%'
+                            OR transcript_path LIKE '%.claude\\%'
+                            OR transcript_path LIKE '%\\claude\\%'
+                        )
+                    )
+               )
+               AND tokens_cache_write_5m IS NULL
+               AND tokens_cache_write_1h IS NULL",
+            [],
+        )
+        .map_err(|error| format!("遷移 Claude 快取寫入費用欄位失敗: {error}"))?;
+        conn.execute(
+            "DELETE FROM sync_state
+             WHERE filename LIKE 'claude:%'
+                OR filename LIKE 'codex:claude:%'",
+            [],
+        )
+        .map_err(|error| format!("重設 Claude 同步狀態失敗: {error}"))?;
+        conn.execute(
+            "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES (?, 1, 0)",
+            params![CLAUDE_CACHE_WRITE_PRICING_MIGRATION_KEY],
+        )
+        .map_err(|error| format!("記錄 Claude 快取寫入費用遷移失敗: {error}"))?;
+    }
+
     let session_name_migration_done: bool = conn
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = ?)",
@@ -648,6 +744,25 @@ fn normalize_copilot_cli_token_stats(tokens: &mut Option<TokenStats>) {
 fn normalize_copilot_cli_usage_entry(entry: &mut UsageEntry) {
     normalize_copilot_cli_token_stats(&mut entry.tokens);
     normalize_copilot_cli_token_stats(&mut entry.delta_tokens);
+}
+
+fn normalize_legacy_claude_token_stats(tokens: &mut Option<TokenStats>) {
+    let Some(tokens) = tokens else {
+        return;
+    };
+    if tokens.cache_write_5m.is_some() || tokens.cache_write_1h.is_some() {
+        return;
+    }
+
+    let cache_write = tokens.cache_write.unwrap_or(0);
+    tokens.input = tokens.input.saturating_sub(cache_write);
+    tokens.cache_write_5m = Some(cache_write);
+    tokens.cache_write_1h = Some(0);
+}
+
+fn normalize_legacy_claude_usage_entry(entry: &mut UsageEntry) {
+    normalize_legacy_claude_token_stats(&mut entry.tokens);
+    normalize_legacy_claude_token_stats(&mut entry.delta_tokens);
 }
 
 fn get_antigravity_session_name(session_id: &str) -> Option<String> {
@@ -893,10 +1008,10 @@ fn sync_hook_usage_logs(
                     let insert_res = tx.execute(
                         "INSERT OR IGNORE INTO usage_entries (
                             assistant_type, source_kind, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
-                            tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_reasoning, tokens_total,
-                            delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total,
+                            tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_cache_write_5m, tokens_cache_write_1h, tokens_reasoning, tokens_total,
+                            delta_input, delta_output, delta_cache_read, delta_cache_write, delta_cache_write_5m, delta_cache_write_1h, delta_reasoning, delta_total,
                             duration_ms, premium_requests
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         params![
                             assistant_type,
                             source_kind,
@@ -914,12 +1029,16 @@ fn sync_hook_usage_logs(
                             tokens.map(|t| t.output as i64),
                             tokens.and_then(|t| t.cache_read.map(|v| v as i64)),
                             tokens.and_then(|t| t.cache_write.map(|v| v as i64)),
+                            tokens.and_then(|t| t.cache_write_5m.map(|v| v as i64)),
+                            tokens.and_then(|t| t.cache_write_1h.map(|v| v as i64)),
                             tokens.and_then(|t| t.reasoning.map(|v| v as i64)),
                             tokens.map(|t| t.total as i64),
                             delta.map(|t| t.input as i64),
                             delta.map(|t| t.output as i64),
                             delta.and_then(|t| t.cache_read.map(|v| v as i64)),
                             delta.and_then(|t| t.cache_write.map(|v| v as i64)),
+                            delta.and_then(|t| t.cache_write_5m.map(|v| v as i64)),
+                            delta.and_then(|t| t.cache_write_1h.map(|v| v as i64)),
                             delta.and_then(|t| t.reasoning.map(|v| v as i64)),
                             delta.map(|t| t.total as i64),
                             cost.and_then(|c| c.total_api_duration_ms.map(|d| d as i64)),
@@ -983,13 +1102,13 @@ fn insert_vscode_usage_entry(
     tx.execute(
         "INSERT OR REPLACE INTO usage_entries (
             assistant_type, source_kind, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
-            tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_reasoning, tokens_total,
-            delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total,
+            tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_cache_write_5m, tokens_cache_write_1h, tokens_reasoning, tokens_total,
+            delta_input, delta_output, delta_cache_read, delta_cache_write, delta_cache_write_5m, delta_cache_write_1h, delta_reasoning, delta_total,
             duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, reasoning_effort
         ) VALUES (
             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-            ?, ?, ?, ?, ?, ?,
-            ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?, ?, ?,
             ?, ?, ?, ?, ?, ?
         )",
         params![
@@ -1009,12 +1128,16 @@ fn insert_vscode_usage_entry(
             tokens.map(|value| value.output as i64),
             tokens.and_then(|value| value.cache_read.map(|v| v as i64)),
             tokens.and_then(|value| value.cache_write.map(|v| v as i64)),
+            tokens.and_then(|value| value.cache_write_5m.map(|v| v as i64)),
+            tokens.and_then(|value| value.cache_write_1h.map(|v| v as i64)),
             tokens.and_then(|value| value.reasoning.map(|v| v as i64)),
             tokens.map(|value| value.total as i64),
             delta.map(|value| value.input as i64),
             delta.map(|value| value.output as i64),
             delta.and_then(|value| value.cache_read.map(|v| v as i64)),
             delta.and_then(|value| value.cache_write.map(|v| v as i64)),
+            delta.and_then(|value| value.cache_write_5m.map(|v| v as i64)),
+            delta.and_then(|value| value.cache_write_1h.map(|v| v as i64)),
             delta.and_then(|value| value.reasoning.map(|v| v as i64)),
             delta.map(|value| value.total as i64),
             cost.and_then(|value| value.total_duration_ms.or(value.total_api_duration_ms))
@@ -1193,6 +1316,8 @@ fn codex_usage_to_stats(usage: CodexTokenUsage) -> TokenStats {
         output,
         cache_read: Some(cache_read),
         cache_write: Some(cache_write),
+        cache_write_5m: None,
+        cache_write_1h: None,
         reasoning: Some(usage.reasoning_output_tokens),
         total,
     }
@@ -1244,6 +1369,8 @@ fn codex_usage_delta_to_stats(
         output,
         cache_read: Some(cache_read),
         cache_write: Some(cache_write),
+        cache_write_5m: None,
+        cache_write_1h: None,
         reasoning: Some(reasoning_output_tokens),
         total,
     }
@@ -1731,10 +1858,10 @@ fn sync_codex_usage_logs(conn: &mut Connection) -> Result<(), String> {
                 let insert_res = tx.execute(
                     "INSERT INTO usage_entries (
                         assistant_type, source_kind, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
-                        tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_reasoning, tokens_total,
-                        delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total,
+                        tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_cache_write_5m, tokens_cache_write_1h, tokens_reasoning, tokens_total,
+                        delta_input, delta_output, delta_cache_read, delta_cache_write, delta_cache_write_5m, delta_cache_write_1h, delta_reasoning, delta_total,
                         duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, reasoning_effort
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     params![
                         "codex",
                         entry.source_kind.as_deref().unwrap_or(CODEX_OTHER_SOURCE_KIND),
@@ -1752,12 +1879,16 @@ fn sync_codex_usage_logs(conn: &mut Connection) -> Result<(), String> {
                         tokens.map(|t| t.output as i64),
                         tokens.and_then(|t| t.cache_read.map(|v| v as i64)),
                         tokens.and_then(|t| t.cache_write.map(|v| v as i64)),
+                        tokens.and_then(|t| t.cache_write_5m.map(|v| v as i64)),
+                        tokens.and_then(|t| t.cache_write_1h.map(|v| v as i64)),
                         tokens.and_then(|t| t.reasoning.map(|v| v as i64)),
                         tokens.map(|t| t.total as i64),
                         delta.map(|t| t.input as i64),
                         delta.map(|t| t.output as i64),
                         delta.and_then(|t| t.cache_read.map(|v| v as i64)),
                         delta.and_then(|t| t.cache_write.map(|v| v as i64)),
+                        delta.and_then(|t| t.cache_write_5m.map(|v| v as i64)),
+                        delta.and_then(|t| t.cache_write_1h.map(|v| v as i64)),
                         delta.and_then(|t| t.reasoning.map(|v| v as i64)),
                         delta.map(|t| t.total as i64),
                         cost.and_then(|c| c.total_api_duration_ms.map(|d| d as i64)),
@@ -1958,17 +2089,27 @@ fn parse_claude_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String>
             .and_then(|model| model.as_str())
             .map(|model| model.to_string());
 
-        let input = usage
-            .input_tokens
-            .saturating_add(usage.cache_creation_input_tokens);
+        let input = usage.input_tokens;
         let cache_read = usage.cache_read_input_tokens;
+        let reported_cache_write = usage.cache_creation_input_tokens;
+        let explicit_cache_write_5m = usage.cache_creation.ephemeral_5m_input_tokens;
+        let cache_write_1h = usage.cache_creation.ephemeral_1h_input_tokens;
+        let explicit_cache_write = explicit_cache_write_5m.saturating_add(cache_write_1h);
+        let cache_write = reported_cache_write.max(explicit_cache_write);
+        let cache_write_5m = explicit_cache_write_5m
+            .saturating_add(reported_cache_write.saturating_sub(explicit_cache_write));
         let output = usage.output_tokens;
-        let total = input.saturating_add(cache_read).saturating_add(output);
+        let total = input
+            .saturating_add(cache_read)
+            .saturating_add(cache_write)
+            .saturating_add(output);
         let tokens = TokenStats {
             input,
             output,
             cache_read: Some(cache_read),
-            cache_write: Some(usage.cache_creation_input_tokens),
+            cache_write: Some(cache_write),
+            cache_write_5m: Some(cache_write_5m),
+            cache_write_1h: Some(cache_write_1h),
             reasoning: None,
             total,
         };
@@ -2132,10 +2273,10 @@ fn sync_claude_usage_logs(conn: &mut Connection) -> Result<(), String> {
                 let insert_res = tx.execute(
                     "INSERT INTO usage_entries (
                         assistant_type, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
-                        tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_reasoning, tokens_total,
-                        delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total,
+                        tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_cache_write_5m, tokens_cache_write_1h, tokens_reasoning, tokens_total,
+                        delta_input, delta_output, delta_cache_read, delta_cache_write, delta_cache_write_5m, delta_cache_write_1h, delta_reasoning, delta_total,
                         duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, reasoning_effort
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     params![
                         "claude",
                         entry.timestamp,
@@ -2152,12 +2293,16 @@ fn sync_claude_usage_logs(conn: &mut Connection) -> Result<(), String> {
                         tokens.map(|t| t.output as i64),
                         tokens.and_then(|t| t.cache_read.map(|v| v as i64)),
                         tokens.and_then(|t| t.cache_write.map(|v| v as i64)),
+                        tokens.and_then(|t| t.cache_write_5m.map(|v| v as i64)),
+                        tokens.and_then(|t| t.cache_write_1h.map(|v| v as i64)),
                         tokens.and_then(|t| t.reasoning.map(|v| v as i64)),
                         tokens.map(|t| t.total as i64),
                         delta.map(|t| t.input as i64),
                         delta.map(|t| t.output as i64),
                         delta.and_then(|t| t.cache_read.map(|v| v as i64)),
                         delta.and_then(|t| t.cache_write.map(|v| v as i64)),
+                        delta.and_then(|t| t.cache_write_5m.map(|v| v as i64)),
+                        delta.and_then(|t| t.cache_write_1h.map(|v| v as i64)),
                         delta.and_then(|t| t.reasoning.map(|v| v as i64)),
                         delta.map(|t| t.total as i64),
                         cost.and_then(|c| c.total_api_duration_ms.map(|d| d as i64)),
@@ -2366,6 +2511,8 @@ fn parse_cursor_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String>
                 output: output_tokens,
                 cache_read: Some(0),
                 cache_write: Some(0),
+                cache_write_5m: None,
+                cache_write_1h: None,
                 reasoning: None,
                 total: total_tokens,
             };
@@ -2467,10 +2614,10 @@ fn sync_cursor_usage_logs(conn: &mut Connection, cursor_dir: &Path) -> Result<()
                 let insert_res = tx.execute(
                     "INSERT INTO usage_entries (
                         assistant_type, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
-                        tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_reasoning, tokens_total,
-                        delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total,
+                        tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_cache_write_5m, tokens_cache_write_1h, tokens_reasoning, tokens_total,
+                        delta_input, delta_output, delta_cache_read, delta_cache_write, delta_cache_write_5m, delta_cache_write_1h, delta_reasoning, delta_total,
                         duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, reasoning_effort
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     params![
                         "cursor",
                         entry.timestamp,
@@ -2487,12 +2634,16 @@ fn sync_cursor_usage_logs(conn: &mut Connection, cursor_dir: &Path) -> Result<()
                         tokens.map(|t| t.output as i64),
                         tokens.and_then(|t| t.cache_read.map(|v| v as i64)),
                         tokens.and_then(|t| t.cache_write.map(|v| v as i64)),
+                        tokens.and_then(|t| t.cache_write_5m.map(|v| v as i64)),
+                        tokens.and_then(|t| t.cache_write_1h.map(|v| v as i64)),
                         tokens.and_then(|t| t.reasoning.map(|v| v as i64)),
                         tokens.map(|t| t.total as i64),
                         delta.map(|t| t.input as i64),
                         delta.map(|t| t.output as i64),
                         delta.and_then(|t| t.cache_read.map(|v| v as i64)),
                         delta.and_then(|t| t.cache_write.map(|v| v as i64)),
+                        delta.and_then(|t| t.cache_write_5m.map(|v| v as i64)),
+                        delta.and_then(|t| t.cache_write_1h.map(|v| v as i64)),
                         delta.and_then(|t| t.reasoning.map(|v| v as i64)),
                         delta.map(|t| t.total as i64),
                         cost.and_then(|c| c.total_api_duration_ms.map(|d| d as i64)),
@@ -2863,8 +3014,8 @@ pub fn get_usage_entries_by_date(
 ) -> Result<Vec<(UsageDayExportRecord, String)>, String> {
     let mut query = "SELECT 
             timestamp, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
-            tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_reasoning, tokens_total,
-            delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total,
+            tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_cache_write_5m, tokens_cache_write_1h, tokens_reasoning, tokens_total,
+            delta_input, delta_output, delta_cache_read, delta_cache_write, delta_cache_write_5m, delta_cache_write_1h, delta_reasoning, delta_total,
             duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, assistant_type, reasoning_effort, import_source_id, source_kind
          FROM usage_entries WHERE date = ?".to_string();
     let mut params_vec = Vec::new();
@@ -2891,7 +3042,7 @@ pub fn get_usage_entries_by_date(
 
     let mut entries = Vec::new();
     while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-        let ast_type = row.get::<_, String>(26).map_err(|e| e.to_string())?;
+        let ast_type = row.get::<_, String>(30).map_err(|e| e.to_string())?;
         let tokens_input: Option<u64> = row
             .get::<_, Option<i64>>(9)
             .map_err(|e| e.to_string())?
@@ -2908,12 +3059,20 @@ pub fn get_usage_entries_by_date(
             .get::<_, Option<i64>>(12)
             .map_err(|e| e.to_string())?
             .map(|v| v as u64);
-        let tokens_reasoning: Option<u64> = row
+        let tokens_cache_write_5m: Option<u64> = row
             .get::<_, Option<i64>>(13)
             .map_err(|e| e.to_string())?
             .map(|v| v as u64);
-        let tokens_total: Option<u64> = row
+        let tokens_cache_write_1h: Option<u64> = row
             .get::<_, Option<i64>>(14)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let tokens_reasoning: Option<u64> = row
+            .get::<_, Option<i64>>(15)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let tokens_total: Option<u64> = row
+            .get::<_, Option<i64>>(16)
             .map_err(|e| e.to_string())?
             .map(|v| v as u64);
 
@@ -2925,6 +3084,8 @@ pub fn get_usage_entries_by_date(
                 output,
                 cache_read: tokens_cache_read,
                 cache_write: tokens_cache_write,
+                cache_write_5m: tokens_cache_write_5m,
+                cache_write_1h: tokens_cache_write_1h,
                 reasoning: tokens_reasoning,
                 total,
             })
@@ -2933,27 +3094,35 @@ pub fn get_usage_entries_by_date(
         };
 
         let delta_input: Option<u64> = row
-            .get::<_, Option<i64>>(15)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let delta_output: Option<u64> = row
-            .get::<_, Option<i64>>(16)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let delta_cache_read: Option<u64> = row
             .get::<_, Option<i64>>(17)
             .map_err(|e| e.to_string())?
             .map(|v| v as u64);
-        let delta_cache_write: Option<u64> = row
+        let delta_output: Option<u64> = row
             .get::<_, Option<i64>>(18)
             .map_err(|e| e.to_string())?
             .map(|v| v as u64);
-        let delta_reasoning: Option<u64> = row
+        let delta_cache_read: Option<u64> = row
             .get::<_, Option<i64>>(19)
             .map_err(|e| e.to_string())?
             .map(|v| v as u64);
-        let delta_total: Option<u64> = row
+        let delta_cache_write: Option<u64> = row
             .get::<_, Option<i64>>(20)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let delta_cache_write_5m: Option<u64> = row
+            .get::<_, Option<i64>>(21)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let delta_cache_write_1h: Option<u64> = row
+            .get::<_, Option<i64>>(22)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let delta_reasoning: Option<u64> = row
+            .get::<_, Option<i64>>(23)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let delta_total: Option<u64> = row
+            .get::<_, Option<i64>>(24)
             .map_err(|e| e.to_string())?
             .map(|v| v as u64);
 
@@ -2965,6 +3134,8 @@ pub fn get_usage_entries_by_date(
                 output,
                 cache_read: delta_cache_read,
                 cache_write: delta_cache_write,
+                cache_write_5m: delta_cache_write_5m,
+                cache_write_1h: delta_cache_write_1h,
                 reasoning: delta_reasoning,
                 total,
             })
@@ -2973,11 +3144,11 @@ pub fn get_usage_entries_by_date(
         };
 
         let duration_ms: Option<f64> = row
-            .get::<_, Option<i64>>(21)
+            .get::<_, Option<i64>>(25)
             .map_err(|e| e.to_string())?
             .map(|v| v as f64);
         let premium_requests: Option<f64> = row
-            .get::<_, Option<i64>>(22)
+            .get::<_, Option<i64>>(26)
             .map_err(|e| e.to_string())?
             .map(|v| v as f64);
 
@@ -2991,7 +3162,7 @@ pub fn get_usage_entries_by_date(
             None
         };
         let import_source_id = normalize_import_source_id(
-            row.get::<_, Option<String>>(28)
+            row.get::<_, Option<String>>(32)
                 .map_err(|e| e.to_string())?
                 .as_deref(),
         );
@@ -3011,11 +3182,11 @@ pub fn get_usage_entries_by_date(
                 delta_tokens,
                 context: None,
                 cost,
-                source_kind: row.get(29).ok(),
-                parent_session_id: row.get(23).ok(),
-                agent_nickname: row.get(24).ok(),
-                agent_role: row.get(25).ok(),
-                reasoning_effort: row.get(27).ok(),
+                source_kind: row.get(33).ok(),
+                parent_session_id: row.get(27).ok(),
+                agent_nickname: row.get(28).ok(),
+                agent_role: row.get(29).ok(),
+                reasoning_effort: row.get(31).ok(),
             },
             import_source_id,
         };
@@ -3098,6 +3269,8 @@ pub fn import_usage_day_entries(
             .unwrap_or_else(|| "legacy".to_string());
         if assistant == "copilot" && matches!(source_kind.as_str(), "copilot-cli" | "legacy") {
             normalize_copilot_cli_usage_entry(&mut entry);
+        } else if assistant == "claude" {
+            normalize_legacy_claude_usage_entry(&mut entry);
         }
         let source_id = normalized_id
             .unwrap_or_else(|| build_usage_entry_import_source_id(assistant, date, &entry));
@@ -3106,14 +3279,14 @@ pub fn import_usage_day_entries(
             .execute(
                 "INSERT OR IGNORE INTO usage_entries (
                     assistant_type, source_kind, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no,
-                    model, model_id, tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_reasoning, tokens_total,
-                    delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total,
+                    model, model_id, tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_cache_write_5m, tokens_cache_write_1h, tokens_reasoning, tokens_total,
+                    delta_input, delta_output, delta_cache_read, delta_cache_write, delta_cache_write_5m, delta_cache_write_1h, delta_reasoning, delta_total,
                     duration_ms, premium_requests,
                     parent_session_id, agent_nickname, agent_role, reasoning_effort, import_source_id
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?, ?
                 )",
                 rusqlite::params![
@@ -3133,12 +3306,16 @@ pub fn import_usage_day_entries(
                     entry.tokens.as_ref().map(|t| t.output as i64),
                     entry.tokens.as_ref().and_then(|t| t.cache_read.map(|v| v as i64)),
                     entry.tokens.as_ref().and_then(|t| t.cache_write.map(|v| v as i64)),
+                    entry.tokens.as_ref().and_then(|t| t.cache_write_5m.map(|v| v as i64)),
+                    entry.tokens.as_ref().and_then(|t| t.cache_write_1h.map(|v| v as i64)),
                     entry.tokens.as_ref().and_then(|t| t.reasoning.map(|v| v as i64)),
                     entry.tokens.as_ref().map(|t| t.total as i64),
                     entry.delta_tokens.as_ref().map(|t| t.input as i64),
                     entry.delta_tokens.as_ref().map(|t| t.output as i64),
                     entry.delta_tokens.as_ref().and_then(|t| t.cache_read.map(|v| v as i64)),
                     entry.delta_tokens.as_ref().and_then(|t| t.cache_write.map(|v| v as i64)),
+                    entry.delta_tokens.as_ref().and_then(|t| t.cache_write_5m.map(|v| v as i64)),
+                    entry.delta_tokens.as_ref().and_then(|t| t.cache_write_1h.map(|v| v as i64)),
                     entry.delta_tokens.as_ref().and_then(|t| t.reasoning.map(|v| v as i64)),
                     entry.delta_tokens.as_ref().map(|t| t.total as i64),
                     entry.cost.as_ref().and_then(|c| c.total_api_duration_ms).map(|v| v as i64),
@@ -3218,7 +3395,7 @@ pub fn get_session_turns_token_stats(
 ) -> Result<HashMap<u32, (TokenStats, String)>, String> {
     let mut map = HashMap::new();
     let mut stmt = conn.prepare(
-        "SELECT turn_no, delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total, model
+        "SELECT turn_no, delta_input, delta_output, delta_cache_read, delta_cache_write, delta_cache_write_5m, delta_cache_write_1h, delta_reasoning, delta_total, model
          FROM usage_entries WHERE session_id = ? ORDER BY turn_no ASC"
     ).map_err(|e| e.to_string())?;
     let mut rows = stmt.query(params![session_id]).map_err(|e| e.to_string())?;
@@ -3227,7 +3404,7 @@ pub fn get_session_turns_token_stats(
             row.get::<_, i64>(0),
             row.get::<_, Option<i64>>(1),
             row.get::<_, Option<i64>>(2),
-            row.get::<_, Option<i64>>(6),
+            row.get::<_, Option<i64>>(8),
         ) {
             if let (Some(input), Some(output), Some(total)) =
                 (delta_input, delta_output, delta_total)
@@ -3242,13 +3419,23 @@ pub fn get_session_turns_token_stats(
                     .ok()
                     .flatten()
                     .map(|v| v as u64);
-                let reasoning = row
+                let cache_write_5m = row
                     .get::<_, Option<i64>>(5)
                     .ok()
                     .flatten()
                     .map(|v| v as u64);
+                let cache_write_1h = row
+                    .get::<_, Option<i64>>(6)
+                    .ok()
+                    .flatten()
+                    .map(|v| v as u64);
+                let reasoning = row
+                    .get::<_, Option<i64>>(7)
+                    .ok()
+                    .flatten()
+                    .map(|v| v as u64);
                 let model = row
-                    .get::<_, Option<String>>(7)
+                    .get::<_, Option<String>>(9)
                     .unwrap_or(None)
                     .unwrap_or_else(|| "Gemini".to_string());
                 map.insert(
@@ -3259,6 +3446,8 @@ pub fn get_session_turns_token_stats(
                             output: output as u64,
                             cache_read,
                             cache_write,
+                            cache_write_5m,
+                            cache_write_1h,
                             reasoning,
                             total: total as u64,
                         },
@@ -3319,8 +3508,8 @@ pub fn get_usage_entries_by_month(
     let query_month = format!("{}-%", year_month);
     let mut query = "SELECT 
             timestamp, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
-            tokens_input, tokens_output, tokens_cache_read, tokens_reasoning, tokens_total,
-            delta_input, delta_output, delta_cache_read, delta_reasoning, delta_total,
+            tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_cache_write_5m, tokens_cache_write_1h, tokens_reasoning, tokens_total,
+            delta_input, delta_output, delta_cache_read, delta_cache_write, delta_cache_write_5m, delta_cache_write_1h, delta_reasoning, delta_total,
             duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, assistant_type, reasoning_effort,
             date, source_kind
          FROM usage_entries WHERE date LIKE ?".to_string();
@@ -3348,7 +3537,7 @@ pub fn get_usage_entries_by_month(
 
     let mut entries = Vec::new();
     while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-        let ast_type = row.get::<_, String>(24).map_err(|e| e.to_string())?;
+        let ast_type = row.get::<_, String>(30).map_err(|e| e.to_string())?;
         let tokens_input: Option<u64> = row
             .get::<_, Option<i64>>(9)
             .map_err(|e| e.to_string())?
@@ -3361,12 +3550,24 @@ pub fn get_usage_entries_by_month(
             .get::<_, Option<i64>>(11)
             .map_err(|e| e.to_string())?
             .map(|v| v as u64);
-        let tokens_reasoning: Option<u64> = row
+        let tokens_cache_write: Option<u64> = row
             .get::<_, Option<i64>>(12)
             .map_err(|e| e.to_string())?
             .map(|v| v as u64);
-        let tokens_total: Option<u64> = row
+        let tokens_cache_write_5m: Option<u64> = row
             .get::<_, Option<i64>>(13)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let tokens_cache_write_1h: Option<u64> = row
+            .get::<_, Option<i64>>(14)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let tokens_reasoning: Option<u64> = row
+            .get::<_, Option<i64>>(15)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let tokens_total: Option<u64> = row
+            .get::<_, Option<i64>>(16)
             .map_err(|e| e.to_string())?
             .map(|v| v as u64);
 
@@ -3377,7 +3578,9 @@ pub fn get_usage_entries_by_month(
                 input,
                 output,
                 cache_read: tokens_cache_read,
-                cache_write: None,
+                cache_write: tokens_cache_write,
+                cache_write_5m: tokens_cache_write_5m,
+                cache_write_1h: tokens_cache_write_1h,
                 reasoning: tokens_reasoning,
                 total,
             })
@@ -3386,23 +3589,35 @@ pub fn get_usage_entries_by_month(
         };
 
         let delta_input: Option<u64> = row
-            .get::<_, Option<i64>>(14)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let delta_output: Option<u64> = row
-            .get::<_, Option<i64>>(15)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let delta_cache_read: Option<u64> = row
-            .get::<_, Option<i64>>(16)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let delta_reasoning: Option<u64> = row
             .get::<_, Option<i64>>(17)
             .map_err(|e| e.to_string())?
             .map(|v| v as u64);
-        let delta_total: Option<u64> = row
+        let delta_output: Option<u64> = row
             .get::<_, Option<i64>>(18)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let delta_cache_read: Option<u64> = row
+            .get::<_, Option<i64>>(19)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let delta_cache_write: Option<u64> = row
+            .get::<_, Option<i64>>(20)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let delta_cache_write_5m: Option<u64> = row
+            .get::<_, Option<i64>>(21)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let delta_cache_write_1h: Option<u64> = row
+            .get::<_, Option<i64>>(22)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let delta_reasoning: Option<u64> = row
+            .get::<_, Option<i64>>(23)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let delta_total: Option<u64> = row
+            .get::<_, Option<i64>>(24)
             .map_err(|e| e.to_string())?
             .map(|v| v as u64);
 
@@ -3413,7 +3628,9 @@ pub fn get_usage_entries_by_month(
                 input,
                 output,
                 cache_read: delta_cache_read,
-                cache_write: None,
+                cache_write: delta_cache_write,
+                cache_write_5m: delta_cache_write_5m,
+                cache_write_1h: delta_cache_write_1h,
                 reasoning: delta_reasoning,
                 total,
             })
@@ -3422,11 +3639,11 @@ pub fn get_usage_entries_by_month(
         };
 
         let duration_ms: Option<f64> = row
-            .get::<_, Option<i64>>(19)
+            .get::<_, Option<i64>>(25)
             .map_err(|e| e.to_string())?
             .map(|v| v as f64);
         let premium_requests: Option<f64> = row
-            .get::<_, Option<i64>>(20)
+            .get::<_, Option<i64>>(26)
             .map_err(|e| e.to_string())?
             .map(|v| v as f64);
 
@@ -3440,7 +3657,7 @@ pub fn get_usage_entries_by_month(
             None
         };
 
-        let entry_date = row.get::<_, String>(26).map_err(|e| e.to_string())?;
+        let entry_date = row.get::<_, String>(32).map_err(|e| e.to_string())?;
 
         entries.push((
             UsageEntry {
@@ -3457,11 +3674,11 @@ pub fn get_usage_entries_by_month(
                 delta_tokens,
                 context: None,
                 cost,
-                source_kind: row.get(27).ok(),
-                parent_session_id: row.get(21).ok(),
-                agent_nickname: row.get(22).ok(),
-                agent_role: row.get(23).ok(),
-                reasoning_effort: row.get(25).ok(),
+                source_kind: row.get(33).ok(),
+                parent_session_id: row.get(27).ok(),
+                agent_nickname: row.get(28).ok(),
+                agent_role: row.get(29).ok(),
+                reasoning_effort: row.get(31).ok(),
             },
             ast_type,
             entry_date,
@@ -3518,8 +3735,8 @@ pub fn get_usage_entries_by_year(
     let query_year = format!("{}-%", year);
     let mut query = "SELECT 
             timestamp, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
-            tokens_input, tokens_output, tokens_cache_read, tokens_reasoning, tokens_total,
-            delta_input, delta_output, delta_cache_read, delta_reasoning, delta_total,
+            tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_cache_write_5m, tokens_cache_write_1h, tokens_reasoning, tokens_total,
+            delta_input, delta_output, delta_cache_read, delta_cache_write, delta_cache_write_5m, delta_cache_write_1h, delta_reasoning, delta_total,
             duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, assistant_type, reasoning_effort,
             date, source_kind
          FROM usage_entries WHERE date LIKE ?".to_string();
@@ -3547,7 +3764,7 @@ pub fn get_usage_entries_by_year(
 
     let mut entries = Vec::new();
     while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-        let ast_type = row.get::<_, String>(24).map_err(|e| e.to_string())?;
+        let ast_type = row.get::<_, String>(30).map_err(|e| e.to_string())?;
         let tokens_input: Option<u64> = row
             .get::<_, Option<i64>>(9)
             .map_err(|e| e.to_string())?
@@ -3560,12 +3777,24 @@ pub fn get_usage_entries_by_year(
             .get::<_, Option<i64>>(11)
             .map_err(|e| e.to_string())?
             .map(|v| v as u64);
-        let tokens_reasoning: Option<u64> = row
+        let tokens_cache_write: Option<u64> = row
             .get::<_, Option<i64>>(12)
             .map_err(|e| e.to_string())?
             .map(|v| v as u64);
-        let tokens_total: Option<u64> = row
+        let tokens_cache_write_5m: Option<u64> = row
             .get::<_, Option<i64>>(13)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let tokens_cache_write_1h: Option<u64> = row
+            .get::<_, Option<i64>>(14)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let tokens_reasoning: Option<u64> = row
+            .get::<_, Option<i64>>(15)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let tokens_total: Option<u64> = row
+            .get::<_, Option<i64>>(16)
             .map_err(|e| e.to_string())?
             .map(|v| v as u64);
 
@@ -3576,7 +3805,9 @@ pub fn get_usage_entries_by_year(
                 input,
                 output,
                 cache_read: tokens_cache_read,
-                cache_write: None,
+                cache_write: tokens_cache_write,
+                cache_write_5m: tokens_cache_write_5m,
+                cache_write_1h: tokens_cache_write_1h,
                 reasoning: tokens_reasoning,
                 total,
             })
@@ -3585,23 +3816,35 @@ pub fn get_usage_entries_by_year(
         };
 
         let delta_input: Option<u64> = row
-            .get::<_, Option<i64>>(14)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let delta_output: Option<u64> = row
-            .get::<_, Option<i64>>(15)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let delta_cache_read: Option<u64> = row
-            .get::<_, Option<i64>>(16)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let delta_reasoning: Option<u64> = row
             .get::<_, Option<i64>>(17)
             .map_err(|e| e.to_string())?
             .map(|v| v as u64);
-        let delta_total: Option<u64> = row
+        let delta_output: Option<u64> = row
             .get::<_, Option<i64>>(18)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let delta_cache_read: Option<u64> = row
+            .get::<_, Option<i64>>(19)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let delta_cache_write: Option<u64> = row
+            .get::<_, Option<i64>>(20)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let delta_cache_write_5m: Option<u64> = row
+            .get::<_, Option<i64>>(21)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let delta_cache_write_1h: Option<u64> = row
+            .get::<_, Option<i64>>(22)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let delta_reasoning: Option<u64> = row
+            .get::<_, Option<i64>>(23)
+            .map_err(|e| e.to_string())?
+            .map(|v| v as u64);
+        let delta_total: Option<u64> = row
+            .get::<_, Option<i64>>(24)
             .map_err(|e| e.to_string())?
             .map(|v| v as u64);
 
@@ -3612,7 +3855,9 @@ pub fn get_usage_entries_by_year(
                 input,
                 output,
                 cache_read: delta_cache_read,
-                cache_write: None,
+                cache_write: delta_cache_write,
+                cache_write_5m: delta_cache_write_5m,
+                cache_write_1h: delta_cache_write_1h,
                 reasoning: delta_reasoning,
                 total,
             })
@@ -3621,11 +3866,11 @@ pub fn get_usage_entries_by_year(
         };
 
         let duration_ms: Option<f64> = row
-            .get::<_, Option<i64>>(19)
+            .get::<_, Option<i64>>(25)
             .map_err(|e| e.to_string())?
             .map(|v| v as f64);
         let premium_requests: Option<f64> = row
-            .get::<_, Option<i64>>(20)
+            .get::<_, Option<i64>>(26)
             .map_err(|e| e.to_string())?
             .map(|v| v as f64);
 
@@ -3639,7 +3884,7 @@ pub fn get_usage_entries_by_year(
             None
         };
 
-        let entry_date = row.get::<_, String>(26).map_err(|e| e.to_string())?;
+        let entry_date = row.get::<_, String>(32).map_err(|e| e.to_string())?;
 
         entries.push((
             UsageEntry {
@@ -3656,11 +3901,11 @@ pub fn get_usage_entries_by_year(
                 delta_tokens,
                 context: None,
                 cost,
-                source_kind: row.get(27).ok(),
-                parent_session_id: row.get(21).ok(),
-                agent_nickname: row.get(22).ok(),
-                agent_role: row.get(23).ok(),
-                reasoning_effort: row.get(25).ok(),
+                source_kind: row.get(33).ok(),
+                parent_session_id: row.get(27).ok(),
+                agent_nickname: row.get(28).ok(),
+                agent_role: row.get(29).ok(),
+                reasoning_effort: row.get(31).ok(),
             },
             ast_type,
             entry_date,
@@ -3714,6 +3959,8 @@ mod tests {
                     output: 20,
                     cache_read: Some(30),
                     cache_write: Some(10),
+                    cache_write_5m: None,
+                    cache_write_1h: None,
                     reasoning: Some(5),
                     total: 120,
                 }),
@@ -3722,6 +3969,8 @@ mod tests {
                     output: 2,
                     cache_read: Some(3),
                     cache_write: Some(1),
+                    cache_write_5m: None,
+                    cache_write_1h: None,
                     reasoning: Some(1),
                     total: 12,
                 }),
@@ -3843,6 +4092,8 @@ mod tests {
             output: 1_370,
             cache_read: Some(401_024),
             cache_write: Some(0),
+            cache_write_5m: None,
+            cache_write_1h: None,
             reasoning: Some(384),
             total: 444_924,
         });
@@ -3872,6 +4123,8 @@ mod tests {
             output: 1_370,
             cache_read: Some(401_024),
             cache_write: Some(0),
+            cache_write_5m: None,
+            cache_write_1h: None,
             reasoning: Some(384),
             total: 444_924,
         });
@@ -3938,6 +4191,8 @@ mod tests {
             output: 1_370,
             cache_read: Some(401_024),
             cache_write: Some(0),
+            cache_write_5m: None,
+            cache_write_1h: None,
             reasoning: Some(384),
             total: 444_924,
         });
@@ -4003,6 +4258,8 @@ mod tests {
             output: 1_370,
             cache_read: Some(401_024),
             cache_write: Some(0),
+            cache_write_5m: None,
+            cache_write_1h: None,
             reasoning: Some(384),
             total: 444_924,
         });
@@ -4021,6 +4278,236 @@ mod tests {
             )
             .unwrap();
         assert_eq!(inserted, (42_530, 42_530));
+    }
+
+    #[test]
+    fn import_usage_day_entries_normalizes_legacy_claude_cache_writes() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut record = sample_import_record();
+        record.entry.session_id = "imported-legacy-claude-cache".to_string();
+        record.entry.model = Some("claude-fable-5".to_string());
+        record.entry.model_id = Some("claude-fable-5".to_string());
+        record.entry.tokens = Some(TokenStats {
+            input: 110,
+            output: 20,
+            cache_read: Some(30),
+            cache_write: Some(10),
+            cache_write_5m: None,
+            cache_write_1h: None,
+            reasoning: None,
+            total: 160,
+        });
+        record.entry.delta_tokens = Some(TokenStats {
+            input: 11,
+            output: 2,
+            cache_read: Some(3),
+            cache_write: Some(1),
+            cache_write_5m: None,
+            cache_write_1h: None,
+            reasoning: None,
+            total: 16,
+        });
+        record.import_source_id = Some("imported-legacy-claude-cache".to_string());
+
+        import_usage_day_entries(&mut conn, "claude", "2026-07-10", vec![record]).unwrap();
+
+        let inserted: (u64, u64, u64, u64, u64, u64) = conn
+            .query_row(
+                "SELECT tokens_input, tokens_cache_write_5m, tokens_cache_write_1h,
+                        delta_input, delta_cache_write_5m, delta_cache_write_1h
+                 FROM usage_entries
+                 WHERE assistant_type = 'claude'
+                   AND session_id = 'imported-legacy-claude-cache'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(inserted, (100, 10, 0, 10, 1, 0));
+    }
+
+    #[test]
+    fn usage_queries_round_trip_claude_cache_write_ttls() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut record = sample_import_record();
+        record.entry.session_id = "claude-cache-write-ttl".to_string();
+        record.entry.model = Some("claude-fable-5".to_string());
+        record.entry.model_id = Some("claude-fable-5".to_string());
+        record.entry.tokens = Some(TokenStats {
+            input: 100,
+            output: 20,
+            cache_read: Some(30),
+            cache_write: Some(10),
+            cache_write_5m: Some(3),
+            cache_write_1h: Some(7),
+            reasoning: None,
+            total: 160,
+        });
+        record.entry.delta_tokens = Some(TokenStats {
+            input: 10,
+            output: 2,
+            cache_read: Some(3),
+            cache_write: Some(4),
+            cache_write_5m: Some(1),
+            cache_write_1h: Some(3),
+            reasoning: None,
+            total: 19,
+        });
+        record.import_source_id = Some("claude-cache-write-ttl".to_string());
+
+        import_usage_day_entries(&mut conn, "claude", "2026-07-10", vec![record]).unwrap();
+
+        let day_entries = get_usage_entries_by_date(&conn, "2026-07-10", "claude").unwrap();
+        let month_entries = get_usage_entries_by_month(&conn, "2026-07", "claude").unwrap();
+        let year_entries = get_usage_entries_by_year(&conn, "2026", "claude").unwrap();
+        let turn_entries = get_session_turns_token_stats(&conn, "claude-cache-write-ttl").unwrap();
+        let entries = [
+            &day_entries[0].0.entry,
+            &month_entries[0].0,
+            &year_entries[0].0,
+        ];
+
+        for entry in entries {
+            let tokens = entry.tokens.as_ref().unwrap();
+            assert_eq!(tokens.input, 100);
+            assert_eq!(tokens.cache_write, Some(10));
+            assert_eq!(tokens.cache_write_5m, Some(3));
+            assert_eq!(tokens.cache_write_1h, Some(7));
+
+            let delta = entry.delta_tokens.as_ref().unwrap();
+            assert_eq!(delta.input, 10);
+            assert_eq!(delta.cache_write, Some(4));
+            assert_eq!(delta.cache_write_5m, Some(1));
+            assert_eq!(delta.cache_write_1h, Some(3));
+        }
+
+        let turn = &turn_entries.get(&1).unwrap().0;
+        assert_eq!(turn.cache_write, Some(4));
+        assert_eq!(turn.cache_write_5m, Some(1));
+        assert_eq!(turn.cache_write_1h, Some(3));
+    }
+
+    #[test]
+    fn init_db_migrates_legacy_claude_cache_write_pricing_once() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, turn_no,
+                tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_total,
+                delta_input, delta_output, delta_cache_read, delta_cache_write, delta_total
+             ) VALUES (
+                'claude', '2026-07-10T00:00:00Z', '2026-07-10', 'legacy-claude-cache', 1,
+                110, 20, 30, 10, 160,
+                11, 2, 3, 1, 16
+             )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, transcript_path, turn_no,
+                tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_total,
+                delta_input, delta_output, delta_cache_read, delta_cache_write, delta_total
+             ) VALUES (
+                'codex', '2026-07-10T00:01:00Z', '2026-07-10',
+                'legacy-misclassified-claude-cache', '/home/user/.claude/projects/session.jsonl', 1,
+                220, 40, 60, 20, 320,
+                22, 4, 6, 2, 32
+             )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES ('claude:projects/session.jsonl', 100, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES ('codex:claude:projects/session.jsonl', 100, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM sync_state WHERE filename = ?",
+            params![CLAUDE_CACHE_WRITE_PRICING_MIGRATION_KEY],
+        )
+        .unwrap();
+
+        init_db(&conn).unwrap();
+        init_db(&conn).unwrap();
+
+        let migrated: (u64, u64, u64, u64, u64, u64) = conn
+            .query_row(
+                "SELECT tokens_input, tokens_cache_write_5m, tokens_cache_write_1h,
+                        delta_input, delta_cache_write_5m, delta_cache_write_1h
+                 FROM usage_entries
+                 WHERE session_id = 'legacy-claude-cache'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        let claude_sync_state_count: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state
+                 WHERE filename LIKE 'claude:%'
+                    OR filename LIKE 'codex:claude:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let misclassified_migrated: (u64, u64, u64, u64, u64, u64) = conn
+            .query_row(
+                "SELECT tokens_input, tokens_cache_write_5m, tokens_cache_write_1h,
+                        delta_input, delta_cache_write_5m, delta_cache_write_1h
+                 FROM usage_entries
+                 WHERE session_id = 'legacy-misclassified-claude-cache'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        let migration_marker_count: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state WHERE filename = ?",
+                params![CLAUDE_CACHE_WRITE_PRICING_MIGRATION_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(migrated, (100, 10, 0, 10, 1, 0));
+        assert_eq!(misclassified_migrated, (200, 20, 0, 20, 2, 0));
+        assert_eq!(claude_sync_state_count, 0);
+        assert_eq!(migration_marker_count, 1);
     }
 
     #[test]
@@ -4745,8 +5232,8 @@ mod tests {
 
         let content = r#"{"type":"user","sessionId":"session-1","cwd":"/tmp/project","version":"2.1.201","timestamp":"2026-07-04T19:28:48.190Z","uuid":"u1","message":{"role":"user","content":"Build the report"}}
 {"type":"user","sessionId":"session-1","cwd":"/tmp/project","version":"2.1.201","timestamp":"2026-07-04T19:28:49.190Z","uuid":"u2","message":{"role":"user","content":"Use monthly grouping"}}
-{"type":"assistant","sessionId":"session-1","cwd":"/tmp/project","version":"2.1.201","timestamp":"2026-07-04T19:28:51.753Z","uuid":"a1","requestId":"req_1","message":{"id":"msg_1","role":"assistant","model":"claude-haiku-4-5-20251001","content":[{"type":"thinking","thinking":"working"}],"usage":{"input_tokens":10,"cache_creation_input_tokens":3,"cache_read_input_tokens":7,"output_tokens":5}}}
-{"type":"assistant","sessionId":"session-1","cwd":"/tmp/project","version":"2.1.201","timestamp":"2026-07-04T19:28:51.948Z","uuid":"a2","requestId":"req_1","message":{"id":"msg_1","role":"assistant","model":"claude-haiku-4-5-20251001","content":[{"type":"text","text":"Done"}],"usage":{"input_tokens":10,"cache_creation_input_tokens":3,"cache_read_input_tokens":7,"output_tokens":5}}}
+{"type":"assistant","sessionId":"session-1","cwd":"/tmp/project","version":"2.1.201","timestamp":"2026-07-04T19:28:51.753Z","uuid":"a1","requestId":"req_1","message":{"id":"msg_1","role":"assistant","model":"claude-haiku-4-5-20251001","content":[{"type":"thinking","thinking":"working"}],"usage":{"input_tokens":10,"cache_creation_input_tokens":3,"cache_read_input_tokens":7,"output_tokens":5,"cache_creation":{"ephemeral_5m_input_tokens":1,"ephemeral_1h_input_tokens":2}}}}
+{"type":"assistant","sessionId":"session-1","cwd":"/tmp/project","version":"2.1.201","timestamp":"2026-07-04T19:28:51.948Z","uuid":"a2","requestId":"req_1","message":{"id":"msg_1","role":"assistant","model":"claude-haiku-4-5-20251001","content":[{"type":"text","text":"Done"}],"usage":{"input_tokens":10,"cache_creation_input_tokens":3,"cache_read_input_tokens":7,"output_tokens":5,"cache_creation":{"ephemeral_5m_input_tokens":1,"ephemeral_1h_input_tokens":2}}}}
 "#;
 
         fs::write(&path, content).unwrap();
@@ -4762,11 +5249,78 @@ mod tests {
         assert_eq!(entry.model.as_deref(), Some("claude-haiku-4-5-20251001"));
 
         let tokens = entry.tokens.as_ref().unwrap();
-        assert_eq!(tokens.input, 13);
+        assert_eq!(tokens.input, 10);
         assert_eq!(tokens.cache_write, Some(3));
+        assert_eq!(tokens.cache_write_5m, Some(1));
+        assert_eq!(tokens.cache_write_1h, Some(2));
         assert_eq!(tokens.cache_read, Some(7));
         assert_eq!(tokens.output, 5);
         assert_eq!(tokens.total, 25);
+    }
+
+    #[test]
+    fn parse_claude_session_file_defaults_unclassified_cache_writes_to_5m() {
+        let path = temp_jsonl_path("claude-cache-default");
+        let content = r#"{"type":"assistant","sessionId":"session-cache-default","timestamp":"2026-07-04T19:28:51.753Z","uuid":"a1","requestId":"req_1","message":{"id":"msg_1","role":"assistant","model":"claude-haiku-4-5-20251001","content":[{"type":"text","text":"Done"}],"usage":{"input_tokens":10,"cache_creation_input_tokens":3,"cache_read_input_tokens":7,"output_tokens":5}}}
+"#;
+
+        fs::write(&path, content).unwrap();
+        let entries = parse_claude_session_file(&path).unwrap();
+        let _ = fs::remove_file(&path);
+
+        let tokens = entries[0].tokens.as_ref().unwrap();
+        assert_eq!(tokens.input, 10);
+        assert_eq!(tokens.cache_write, Some(3));
+        assert_eq!(tokens.cache_write_5m, Some(3));
+        assert_eq!(tokens.cache_write_1h, Some(0));
+        assert_eq!(tokens.total, 25);
+    }
+
+    #[test]
+    fn sync_claude_usage_logs_writes_cache_write_ttls() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_claude_dir = std::env::var("CLAUDE_DIR").ok();
+        let claude_dir = temp_jsonl_path("claude-cache-sync").with_extension("");
+        let projects_dir = claude_dir.join("projects/test-project");
+        fs::create_dir_all(&projects_dir).unwrap();
+        let session_path = projects_dir.join("session-cache-sync.jsonl");
+        let content = r#"{"type":"assistant","sessionId":"session-cache-sync","timestamp":"2026-07-04T19:28:51.753Z","uuid":"a1","requestId":"req_1","message":{"id":"msg_1","role":"assistant","model":"claude-haiku-4-5-20251001","content":[{"type":"text","text":"Done"}],"usage":{"input_tokens":10,"cache_creation_input_tokens":3,"cache_read_input_tokens":7,"output_tokens":5,"cache_creation":{"ephemeral_5m_input_tokens":1,"ephemeral_1h_input_tokens":2}}}}
+"#;
+        fs::write(&session_path, content).unwrap();
+        std::env::set_var("CLAUDE_DIR", &claude_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        sync_claude_usage_logs(&mut conn).unwrap();
+
+        let stored: (u64, u64, u64, u64, u64, u64) = conn
+            .query_row(
+                "SELECT tokens_input, tokens_cache_write_5m, tokens_cache_write_1h,
+                        delta_input, delta_cache_write_5m, delta_cache_write_1h
+                 FROM usage_entries
+                 WHERE assistant_type = 'claude'
+                   AND session_id = 'session-cache-sync'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(stored, (10, 1, 2, 10, 1, 2));
+
+        if let Some(value) = old_claude_dir {
+            std::env::set_var("CLAUDE_DIR", value);
+        } else {
+            std::env::remove_var("CLAUDE_DIR");
+        }
+        fs::remove_dir_all(claude_dir).unwrap();
     }
 
     #[test]

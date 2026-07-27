@@ -501,6 +501,8 @@ fn token_stats(request: &ChatRequest) -> Option<TokenStats> {
         output,
         cache_read: None,
         cache_write: None,
+        cache_write_5m: None,
+        cache_write_1h: None,
         reasoning: None,
         total: input.saturating_add(output),
     })
