@@ -2871,6 +2871,7 @@ fn sync_cursor_model_signatures(
     drop(source_conn);
 
     if reset_cache || max_rowid > start_rowid {
+        let has_mapping_changes = !mappings.is_empty();
         let tx = conn
             .transaction()
             .map_err(|error| format!("啟動 Cursor 模型簽章同步失敗: {error}"))?;
@@ -2880,6 +2881,16 @@ fn sync_cursor_model_signatures(
                 params![source_id],
             )
             .map_err(|error| format!("重設 Cursor 模型簽章快取失敗: {error}"))?;
+            tx.execute(
+                "UPDATE usage_entries
+                 SET model = 'Unknown Model', model_id = 'Unknown Model'
+                 WHERE assistant_type = 'cursor'
+                   AND model_signature IS NOT NULL",
+                [],
+            )
+            .map_err(|error| format!("清除過期 Cursor 模型歸因失敗: {error}"))?;
+            tx.execute("DELETE FROM sync_state WHERE filename LIKE 'cursor:%'", [])
+                .map_err(|error| format!("重設 Cursor 逐字稿同步狀態失敗: {error}"))?;
         }
         for (signature, model) in mappings {
             tx.execute(
@@ -2896,45 +2907,47 @@ fn sync_cursor_model_signatures(
             )
             .map_err(|error| format!("寫入 Cursor 模型簽章快取失敗: {error}"))?;
         }
-        tx.execute(
-            "UPDATE usage_entries
-             SET model = 'Unknown Model', model_id = 'Unknown Model'
-             WHERE assistant_type = 'cursor'
-               AND model_signature IS NOT NULL
-               AND EXISTS (
-                    SELECT 1 FROM cursor_model_signatures signatures
-                    WHERE signatures.source_id = ?
-                      AND signatures.signature = usage_entries.model_signature
-                      AND signatures.is_ambiguous = 1
-               )",
-            params![source_id],
-        )
-        .map_err(|error| format!("清除歧義 Cursor 模型歸因失敗: {error}"))?;
-        tx.execute(
-            "UPDATE usage_entries
-             SET model = (
-                    SELECT signatures.model FROM cursor_model_signatures signatures
-                    WHERE signatures.source_id = ?
-                      AND signatures.signature = usage_entries.model_signature
-                      AND signatures.is_ambiguous = 0
-                 ),
-                 model_id = (
-                    SELECT signatures.model FROM cursor_model_signatures signatures
-                    WHERE signatures.source_id = ?
-                      AND signatures.signature = usage_entries.model_signature
-                      AND signatures.is_ambiguous = 0
-                 )
-             WHERE assistant_type = 'cursor'
-               AND model_signature IS NOT NULL
-               AND EXISTS (
-                    SELECT 1 FROM cursor_model_signatures signatures
-                    WHERE signatures.source_id = ?
-                      AND signatures.signature = usage_entries.model_signature
-                      AND signatures.is_ambiguous = 0
-               )",
-            params![source_id, source_id, source_id],
-        )
-        .map_err(|error| format!("回填 Cursor 模型歸因失敗: {error}"))?;
+        if reset_cache || has_mapping_changes {
+            tx.execute(
+                "UPDATE usage_entries
+                 SET model = 'Unknown Model', model_id = 'Unknown Model'
+                 WHERE assistant_type = 'cursor'
+                   AND model_signature IS NOT NULL
+                   AND EXISTS (
+                        SELECT 1 FROM cursor_model_signatures signatures
+                        WHERE signatures.source_id = ?
+                          AND signatures.signature = usage_entries.model_signature
+                          AND signatures.is_ambiguous = 1
+                   )",
+                params![source_id],
+            )
+            .map_err(|error| format!("清除歧義 Cursor 模型歸因失敗: {error}"))?;
+            tx.execute(
+                "UPDATE usage_entries
+                 SET model = (
+                        SELECT signatures.model FROM cursor_model_signatures signatures
+                        WHERE signatures.source_id = ?
+                          AND signatures.signature = usage_entries.model_signature
+                          AND signatures.is_ambiguous = 0
+                     ),
+                     model_id = (
+                        SELECT signatures.model FROM cursor_model_signatures signatures
+                        WHERE signatures.source_id = ?
+                          AND signatures.signature = usage_entries.model_signature
+                          AND signatures.is_ambiguous = 0
+                     )
+                 WHERE assistant_type = 'cursor'
+                   AND model_signature IS NOT NULL
+                   AND EXISTS (
+                        SELECT 1 FROM cursor_model_signatures signatures
+                        WHERE signatures.source_id = ?
+                          AND signatures.signature = usage_entries.model_signature
+                          AND signatures.is_ambiguous = 0
+                   )",
+                params![source_id, source_id, source_id],
+            )
+            .map_err(|error| format!("回填 Cursor 模型歸因失敗: {error}"))?;
+        }
 
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -3076,6 +3089,7 @@ fn sync_cursor_session_metadata(
     drop(source_conn);
 
     if reset_cache || max_rowid > start_rowid {
+        let has_metadata_changes = !metadata_rows.is_empty();
         let tx = conn
             .transaction()
             .map_err(|error| format!("啟動 Cursor Session 中繼資料同步失敗: {error}"))?;
@@ -3085,6 +3099,8 @@ fn sync_cursor_session_metadata(
                 params![source_id],
             )
             .map_err(|error| format!("重設 Cursor Session 中繼資料快取失敗: {error}"))?;
+            tx.execute("DELETE FROM sync_state WHERE filename LIKE 'cursor:%'", [])
+                .map_err(|error| format!("重設 Cursor 逐字稿同步狀態失敗: {error}"))?;
         }
         for (session_id, metadata) in metadata_rows {
             tx.execute(
@@ -3098,50 +3114,52 @@ fn sync_cursor_session_metadata(
             )
             .map_err(|error| format!("寫入 Cursor Session 中繼資料快取失敗: {error}"))?;
         }
-        tx.execute(
-            "UPDATE usage_entries
-             SET cwd = (
-                    SELECT metadata.cwd FROM cursor_session_metadata metadata
-                    WHERE metadata.source_id = ?
-                      AND metadata.session_id = usage_entries.session_id
-                 )
-             WHERE assistant_type = 'cursor'
-               AND EXISTS (
-                    SELECT 1 FROM cursor_session_metadata metadata
-                    WHERE metadata.source_id = ?
-                      AND metadata.session_id = usage_entries.session_id
-                      AND metadata.cwd IS NOT NULL
-                      AND metadata.cwd != ''
-               )",
-            params![source_id, source_id],
-        )
-        .map_err(|error| format!("回填 Cursor 工作路徑失敗: {error}"))?;
-        tx.execute(
-            "UPDATE usage_entries
-             SET source_kind = CASE (
-                    SELECT metadata.mode FROM cursor_session_metadata metadata
-                    WHERE metadata.source_id = ?
-                      AND metadata.session_id = usage_entries.session_id
-                 )
-                    WHEN 'agent' THEN ?
-                    WHEN 'ide' THEN ?
-                    ELSE source_kind
-                 END
-             WHERE assistant_type = 'cursor'
-               AND EXISTS (
-                    SELECT 1 FROM cursor_session_metadata metadata
-                    WHERE metadata.source_id = ?
-                      AND metadata.session_id = usage_entries.session_id
-                      AND metadata.mode IN ('agent', 'ide')
-               )",
-            params![
-                source_id,
-                CURSOR_AGENT_SOURCE_KIND,
-                CURSOR_IDE_SOURCE_KIND,
-                source_id
-            ],
-        )
-        .map_err(|error| format!("回填 Cursor Session 模式失敗: {error}"))?;
+        if reset_cache || has_metadata_changes {
+            tx.execute(
+                "UPDATE usage_entries
+                 SET cwd = (
+                        SELECT metadata.cwd FROM cursor_session_metadata metadata
+                        WHERE metadata.source_id = ?
+                          AND metadata.session_id = usage_entries.session_id
+                     )
+                 WHERE assistant_type = 'cursor'
+                   AND EXISTS (
+                        SELECT 1 FROM cursor_session_metadata metadata
+                        WHERE metadata.source_id = ?
+                          AND metadata.session_id = usage_entries.session_id
+                          AND metadata.cwd IS NOT NULL
+                          AND metadata.cwd != ''
+                   )",
+                params![source_id, source_id],
+            )
+            .map_err(|error| format!("回填 Cursor 工作路徑失敗: {error}"))?;
+            tx.execute(
+                "UPDATE usage_entries
+                 SET source_kind = CASE (
+                        SELECT metadata.mode FROM cursor_session_metadata metadata
+                        WHERE metadata.source_id = ?
+                          AND metadata.session_id = usage_entries.session_id
+                     )
+                        WHEN 'agent' THEN ?
+                        WHEN 'ide' THEN ?
+                        ELSE source_kind
+                     END
+                 WHERE assistant_type = 'cursor'
+                   AND EXISTS (
+                        SELECT 1 FROM cursor_session_metadata metadata
+                        WHERE metadata.source_id = ?
+                          AND metadata.session_id = usage_entries.session_id
+                          AND metadata.mode IN ('agent', 'ide')
+                   )",
+                params![
+                    source_id,
+                    CURSOR_AGENT_SOURCE_KIND,
+                    CURSOR_IDE_SOURCE_KIND,
+                    source_id
+                ],
+            )
+            .map_err(|error| format!("回填 Cursor Session 模式失敗: {error}"))?;
+        }
 
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -6866,6 +6884,40 @@ mod tests {
             )
             .unwrap();
 
+        let state_conn = Connection::open(&state_db_path).unwrap();
+        state_conn.execute("DELETE FROM cursorDiskKV", []).unwrap();
+        state_conn
+            .execute(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+                params![
+                    "composerData:session-model",
+                    r#"{
+                        "composerId": "session-model",
+                        "workspaceIdentifier": {
+                            "uri": {
+                                "fsPath": "/tmp/replaced-project"
+                            }
+                        },
+                        "unifiedMode": "agent",
+                        "isAgentic": true
+                    }"#
+                ],
+            )
+            .unwrap();
+        drop(state_conn);
+        sync_cursor_usage_logs(&mut conn, &root).unwrap();
+        let reset_state: (String, String, String, u64) = conn
+            .query_row(
+                "SELECT usage.model, usage.cwd, usage.source_kind,
+                        (SELECT COUNT(*) FROM cursor_model_signatures)
+                 FROM usage_entries usage
+                 WHERE usage.assistant_type = 'cursor'
+                   AND usage.session_id = 'session-model'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+
         if let Some(value) = old_state_db {
             std::env::set_var("CURSOR_STATE_DB", value);
         } else {
@@ -6883,6 +6935,15 @@ mod tests {
         assert_eq!(matched_model, "composer-2.5");
         assert_eq!(ambiguous_model, "Unknown Model");
         assert!(is_ambiguous);
+        assert_eq!(
+            reset_state,
+            (
+                "Unknown Model".to_string(),
+                "/tmp/replaced-project".to_string(),
+                CURSOR_AGENT_SOURCE_KIND.to_string(),
+                0
+            )
+        );
     }
 
     #[test]
