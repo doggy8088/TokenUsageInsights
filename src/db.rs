@@ -3108,8 +3108,8 @@ fn sync_cursor_session_metadata(
                     source_id, session_id, cwd, mode
                  ) VALUES (?, ?, ?, ?)
                  ON CONFLICT(source_id, session_id) DO UPDATE SET
-                    cwd = excluded.cwd,
-                    mode = excluded.mode",
+                    cwd = COALESCE(excluded.cwd, cursor_session_metadata.cwd),
+                    mode = COALESCE(excluded.mode, cursor_session_metadata.mode)",
                 params![source_id, session_id, metadata.cwd, metadata.mode],
             )
             .map_err(|error| format!("寫入 Cursor Session 中繼資料快取失敗: {error}"))?;
@@ -6851,6 +6851,63 @@ mod tests {
             .execute(
                 "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
                 params![
+                    "composerData:session-model",
+                    r#"{
+                        "composerId": "session-model",
+                        "unifiedMode": "agent",
+                        "isAgentic": true
+                    }"#
+                ],
+            )
+            .unwrap();
+        drop(state_conn);
+        sync_cursor_usage_logs(&mut conn, &root).unwrap();
+        let mode_only_update: (String, String) = conn
+            .query_row(
+                "SELECT cwd, source_kind
+                 FROM usage_entries
+                 WHERE assistant_type = 'cursor'
+                   AND session_id = 'session-model'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        let state_conn = Connection::open(&state_db_path).unwrap();
+        state_conn
+            .execute(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+                params![
+                    "composerData:session-model",
+                    r#"{
+                        "composerId": "session-model",
+                        "workspaceIdentifier": {
+                            "uri": {
+                                "fsPath": "/tmp/updated-project"
+                            }
+                        }
+                    }"#
+                ],
+            )
+            .unwrap();
+        drop(state_conn);
+        sync_cursor_usage_logs(&mut conn, &root).unwrap();
+        let cwd_only_update: (String, String) = conn
+            .query_row(
+                "SELECT cwd, source_kind
+                 FROM usage_entries
+                 WHERE assistant_type = 'cursor'
+                   AND session_id = 'session-model'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        let state_conn = Connection::open(&state_db_path).unwrap();
+        state_conn
+            .execute(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+                params![
                     "agentKv:blob:ambiguous-plain-text-model",
                     r#"{
                         "role": "assistant",
@@ -6935,6 +6992,20 @@ mod tests {
         assert_eq!(matched_model, "composer-2.5");
         assert_eq!(ambiguous_model, "Unknown Model");
         assert!(is_ambiguous);
+        assert_eq!(
+            mode_only_update,
+            (
+                "/tmp/project".to_string(),
+                CURSOR_AGENT_SOURCE_KIND.to_string()
+            )
+        );
+        assert_eq!(
+            cwd_only_update,
+            (
+                "/tmp/updated-project".to_string(),
+                CURSOR_AGENT_SOURCE_KIND.to_string()
+            )
+        );
         assert_eq!(
             reset_state,
             (
