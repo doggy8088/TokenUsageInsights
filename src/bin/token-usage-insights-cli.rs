@@ -41,7 +41,7 @@ const HELP_TEXT: &str = r#"Token 使用量 CLI 匯入 / 匯出工具
 
 注意:
   - 若未指定 export 的 --out，會直接輸出到 stdout
-  - import 檔案若含 assistant，必須與 --agent 完全一致，否則阻止匯入
+  - import 檔案若含 assistant，必須與 --agent 正規化後一致，否則阻止匯入
   - import 會以 `assistant_type + import_source_id` 做資料去重，重複匯入只會插入一次
   - 每次 import 都會建立可追蹤、可由看板撤銷的匯入批次
 "#;

@@ -1663,7 +1663,7 @@ function updateUsageImportValidation() {
   const confirmButton = document.getElementById('confirm-usage-import-btn');
   const targetAssistant = normalizeAssistant(targetSelect?.value);
 
-  if (!pendingUsageImport || !targetAssistant) {
+  if (!pendingUsageImport || !isSupportedAssistant(targetAssistant)) {
     if (validation) {
       validation.className = 'usage-import-validation';
       validation.textContent = t('import_select_target_required');
