@@ -23,6 +23,12 @@ struct UsageDayExportResponse {
 #[derive(Deserialize)]
 pub struct UsageDayImportRequest {
     #[serde(default)]
+    pub assistant: Option<String>,
+    #[serde(default)]
+    pub confirmed_assistant: Option<String>,
+    #[serde(default)]
+    pub source_file_name: Option<String>,
+    #[serde(default)]
     pub date: Option<String>,
     #[serde(default)]
     pub records: Vec<UsageDayExportRecord>,
@@ -237,6 +243,39 @@ fn normalize_import_payload_date(
     Err("日期格式不正確".to_string())
 }
 
+fn validate_import_assistant(
+    route_assistant: &str,
+    payload_assistant: Option<&str>,
+    confirmed_assistant: Option<&str>,
+) -> Result<Option<String>, String> {
+    let confirmed_assistant = confirmed_assistant
+        .map(normalize_assistant_name)
+        .filter(|assistant| is_supported_assistant(assistant))
+        .ok_or_else(|| "匯入前必須明確確認目標助理類型".to_string())?;
+    if confirmed_assistant != route_assistant {
+        return Err(format!(
+            "已確認的目標助理 {confirmed_assistant} 與 API 路徑 {route_assistant} 不一致"
+        ));
+    }
+
+    let Some(payload_assistant) = payload_assistant else {
+        return Ok(None);
+    };
+    if payload_assistant.trim().is_empty() {
+        return Err("匯入檔案的 assistant 欄位不可為空".to_string());
+    }
+    let payload_assistant = normalize_assistant_name(payload_assistant);
+    if !is_supported_assistant(&payload_assistant) {
+        return Err(format!("匯入檔案包含不支援的助理類型：{payload_assistant}"));
+    }
+    if payload_assistant != route_assistant {
+        return Err(format!(
+            "匯入檔案屬於 {payload_assistant}，不得匯入至 {route_assistant}"
+        ));
+    }
+    Ok(Some(payload_assistant))
+}
+
 pub async fn export_usage_day(
     Path((assistant, date)): Path<(String, String)>,
 ) -> impl IntoResponse {
@@ -315,6 +354,21 @@ pub async fn import_usage_day(
             .into_response();
     }
 
+    let source_assistant = match validate_import_assistant(
+        &assistant,
+        payload.assistant.as_deref(),
+        payload.confirmed_assistant.as_deref(),
+    ) {
+        Ok(value) => value,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": err })),
+            )
+                .into_response();
+        }
+    };
+
     let import_date = match normalize_import_payload_date(&date, payload.date) {
         Ok(v) => v,
         Err(err) => {
@@ -337,10 +391,19 @@ pub async fn import_usage_day(
     let assistant_clone = assistant.clone();
     let import_date_clone = import_date.clone();
     let records = payload.records;
+    let source_file_name = payload.source_file_name;
     let import_res = tokio::task::spawn_blocking(move || {
         let mut conn = db::get_db_conn()?;
-        let summary =
-            db::import_usage_day_entries(&mut conn, &assistant_clone, &import_date_clone, records)?;
+        let summary = db::import_usage_day_entries(
+            &mut conn,
+            &assistant_clone,
+            &import_date_clone,
+            records,
+            db::UsageImportMetadata {
+                source_assistant,
+                source_file_name,
+            },
+        )?;
         Ok::<crate::db::UsageDayImportSummary, String>(summary)
     })
     .await
@@ -359,5 +422,112 @@ pub async fn import_usage_day(
             };
             (status, Json(serde_json::json!({ "error": err }))).into_response()
         }
+    }
+}
+
+pub async fn get_usage_import_batches(Path(assistant): Path<String>) -> impl IntoResponse {
+    let assistant = normalize_assistant_name(&assistant);
+    if !is_supported_assistant(&assistant) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "不支援的助理類型" })),
+        )
+            .into_response();
+    }
+
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = db::get_db_conn()?;
+        db::list_usage_import_batches(&conn, &assistant, 50)
+    })
+    .await
+    .unwrap_or_else(|_| Err("匯入紀錄查詢任務執行失敗".to_string()));
+
+    match result {
+        Ok(batches) => (StatusCode::OK, Json(batches)).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": error })),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn rollback_usage_import_batch(
+    Path((assistant, batch_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let assistant = normalize_assistant_name(&assistant);
+    if !is_supported_assistant(&assistant) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "不支援的助理類型" })),
+        )
+            .into_response();
+    }
+    if batch_id.is_empty()
+        || batch_id.len() > 128
+        || !batch_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-')
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "匯入批次 ID 格式不正確" })),
+        )
+            .into_response();
+    }
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut conn = db::get_db_conn()?;
+        db::rollback_usage_import_batch(&mut conn, &assistant, &batch_id)
+    })
+    .await
+    .unwrap_or_else(|_| Err("撤銷匯入任務執行失敗".to_string()));
+
+    match result {
+        Ok(summary) => (StatusCode::OK, Json(summary)).into_response(),
+        Err(error) => {
+            let status = if error.contains("找不到") {
+                StatusCode::NOT_FOUND
+            } else if error.contains("已撤銷") {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status, Json(serde_json::json!({ "error": error }))).into_response()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_import_assistant;
+
+    #[test]
+    fn import_requires_explicit_matching_target_confirmation() {
+        let missing = validate_import_assistant("codex", Some("codex"), None).unwrap_err();
+        assert_eq!(missing, "匯入前必須明確確認目標助理類型");
+
+        let mismatch =
+            validate_import_assistant("codex", Some("codex"), Some("copilot")).unwrap_err();
+        assert!(mismatch.contains("與 API 路徑 codex 不一致"));
+    }
+
+    #[test]
+    fn import_rejects_payload_assistant_mismatch() {
+        let error = validate_import_assistant("antigravity", Some("codex"), Some("antigravity"))
+            .unwrap_err();
+        assert_eq!(error, "匯入檔案屬於 codex，不得匯入至 antigravity");
+    }
+
+    #[test]
+    fn import_accepts_matching_alias_and_legacy_payload_without_assistant() {
+        assert_eq!(
+            validate_import_assistant("claude", Some("claude-code"), Some("claude")).unwrap(),
+            Some("claude".to_string())
+        );
+        assert_eq!(
+            validate_import_assistant("cursor", None, Some("cursor")).unwrap(),
+            None
+        );
     }
 }

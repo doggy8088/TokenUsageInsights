@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -68,6 +69,34 @@ pub struct UsageDayImportSummary {
     pub total: usize,
     pub imported: usize,
     pub skipped_duplicates: usize,
+    pub batch_id: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct UsageImportMetadata {
+    pub source_assistant: Option<String>,
+    pub source_file_name: Option<String>,
+}
+
+#[derive(Serialize, Debug, Clone)]
+pub struct UsageImportBatch {
+    pub id: String,
+    pub assistant: String,
+    pub source_assistant: Option<String>,
+    pub source_file_name: Option<String>,
+    pub date: String,
+    pub total: usize,
+    pub imported: usize,
+    pub skipped_duplicates: usize,
+    pub created_at: i64,
+    pub rolled_back_at: Option<i64>,
+    pub removed_records: usize,
+}
+
+#[derive(Serialize, Debug, Clone)]
+pub struct UsageImportRollbackSummary {
+    pub batch_id: String,
+    pub removed_records: usize,
 }
 
 // Claude Code helper structs
@@ -110,6 +139,7 @@ const COPILOT_SOURCE_KIND_MIGRATION_KEY: &str = "migration:copilot_source_kind_v
 const VSCODE_EMPTY_SESSION_MIGRATION_KEY: &str = "migration:vscode_empty_sessions_v1";
 const COPILOT_CACHED_INPUT_MIGRATION_KEY: &str = "migration:copilot_cached_input_v1";
 const SESSION_NAME_SELECTION_MIGRATION_KEY: &str = "migration:session_name_selection_v1";
+static IMPORT_BATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Default)]
 enum InitialUserPromptState {
@@ -181,6 +211,31 @@ fn hash_fnv1a_64(input: &str) -> u64 {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     hash
+}
+
+fn unix_timestamp_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+fn new_import_batch_id() -> String {
+    let timestamp = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let counter = IMPORT_BATCH_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("import-{timestamp:x}-{counter:x}")
+}
+
+fn normalize_import_metadata_value(raw: Option<String>, max_chars: usize) -> Option<String> {
+    let value = raw?.trim().chars().take(max_chars).collect::<String>();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
 }
 
 fn normalize_import_source_id(raw: Option<&str>) -> Option<String> {
@@ -425,6 +480,10 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
         [],
     );
     let _ = conn.execute(
+        "ALTER TABLE usage_entries ADD COLUMN import_batch_id TEXT",
+        [],
+    );
+    let _ = conn.execute(
         "ALTER TABLE usage_entries ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'legacy'",
         [],
     );
@@ -473,6 +532,37 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
         "CREATE UNIQUE INDEX IF NOT EXISTS uidx_assistant_import_source_id ON usage_entries(assistant_type, import_source_id) WHERE import_source_id IS NOT NULL",
         [],
     );
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_usage_import_batch
+         ON usage_entries(assistant_type, import_batch_id)
+         WHERE import_batch_id IS NOT NULL",
+        [],
+    )
+    .map_err(|e| format!("建立匯入批次索引 idx_usage_import_batch 失敗: {e}"))?;
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS import_batches (
+            id TEXT PRIMARY KEY,
+            assistant_type TEXT NOT NULL,
+            source_assistant TEXT,
+            source_file_name TEXT,
+            import_date TEXT NOT NULL,
+            total_records INTEGER NOT NULL,
+            imported_records INTEGER NOT NULL,
+            skipped_duplicates INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            rolled_back_at INTEGER,
+            removed_records INTEGER NOT NULL DEFAULT 0
+        )",
+        [],
+    )
+    .map_err(|e| format!("建立 import_batches 表失敗: {e}"))?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_import_batches_assistant_created
+         ON import_batches(assistant_type, created_at DESC)",
+        [],
+    )
+    .map_err(|e| format!("建立匯入批次查詢索引失敗: {e}"))?;
 
     // Sync state tracking table
     conn.execute(
@@ -3068,18 +3158,39 @@ pub fn import_usage_day_entries(
     assistant: &str,
     date: &str,
     records: Vec<UsageDayExportRecord>,
+    metadata: UsageImportMetadata,
 ) -> Result<UsageDayImportSummary, String> {
     let total = records.len();
     if total == 0 {
         return Err("匯入資料為空".to_string());
     }
 
+    let batch_id = new_import_batch_id();
+    let created_at = unix_timestamp_secs();
+    let source_assistant = normalize_import_metadata_value(metadata.source_assistant, 64);
+    let source_file_name = normalize_import_metadata_value(metadata.source_file_name, 255);
     let mut inserted = 0usize;
     let mut skipped_duplicates = 0usize;
 
     let tx = conn
         .transaction()
         .map_err(|e| format!("建立匯入交易失敗: {}", e))?;
+    tx.execute(
+        "INSERT INTO import_batches (
+            id, assistant_type, source_assistant, source_file_name, import_date,
+            total_records, imported_records, skipped_duplicates, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?)",
+        params![
+            batch_id,
+            assistant,
+            source_assistant,
+            source_file_name,
+            date,
+            total as i64,
+            created_at,
+        ],
+    )
+    .map_err(|e| format!("建立匯入批次失敗: {e}"))?;
 
     for record in records {
         let mut entry = record.entry;
@@ -3109,12 +3220,13 @@ pub fn import_usage_day_entries(
                     model, model_id, tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_reasoning, tokens_total,
                     delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total,
                     duration_ms, premium_requests,
-                    parent_session_id, agent_nickname, agent_role, reasoning_effort, import_source_id
+                    parent_session_id, agent_nickname, agent_role, reasoning_effort,
+                    import_source_id, import_batch_id
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?
                 )",
                 rusqlite::params![
                     assistant,
@@ -3148,6 +3260,7 @@ pub fn import_usage_day_entries(
                     entry.agent_role,
                     entry.reasoning_effort,
                     source_id,
+                    batch_id,
                 ],
             )
             .map_err(|e| format!("匯入資料寫入失敗: {}", e))?;
@@ -3159,6 +3272,13 @@ pub fn import_usage_day_entries(
         }
     }
 
+    tx.execute(
+        "UPDATE import_batches
+         SET imported_records = ?, skipped_duplicates = ?
+         WHERE id = ?",
+        params![inserted as i64, skipped_duplicates as i64, batch_id],
+    )
+    .map_err(|e| format!("更新匯入批次結果失敗: {e}"))?;
     tx.commit()
         .map_err(|e| format!("提交匯入結果失敗: {}", e))?;
 
@@ -3167,6 +3287,98 @@ pub fn import_usage_day_entries(
         total,
         imported: inserted,
         skipped_duplicates,
+        batch_id,
+    })
+}
+
+pub fn list_usage_import_batches(
+    conn: &Connection,
+    assistant: &str,
+    limit: usize,
+) -> Result<Vec<UsageImportBatch>, String> {
+    let limit = limit.clamp(1, 100) as i64;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, assistant_type, source_assistant, source_file_name, import_date,
+                    total_records, imported_records, skipped_duplicates, created_at,
+                    rolled_back_at, removed_records
+             FROM import_batches
+             WHERE assistant_type = ?
+             ORDER BY created_at DESC, id DESC
+             LIMIT ?",
+        )
+        .map_err(|e| format!("準備匯入批次查詢失敗: {e}"))?;
+    let rows = stmt
+        .query_map(params![assistant, limit], |row| {
+            Ok(UsageImportBatch {
+                id: row.get(0)?,
+                assistant: row.get(1)?,
+                source_assistant: row.get(2)?,
+                source_file_name: row.get(3)?,
+                date: row.get(4)?,
+                total: row.get::<_, i64>(5)? as usize,
+                imported: row.get::<_, i64>(6)? as usize,
+                skipped_duplicates: row.get::<_, i64>(7)? as usize,
+                created_at: row.get(8)?,
+                rolled_back_at: row.get(9)?,
+                removed_records: row.get::<_, i64>(10)? as usize,
+            })
+        })
+        .map_err(|e| format!("查詢匯入批次失敗: {e}"))?;
+
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("讀取匯入批次失敗: {e}"))
+}
+
+pub fn rollback_usage_import_batch(
+    conn: &mut Connection,
+    assistant: &str,
+    batch_id: &str,
+) -> Result<UsageImportRollbackSummary, String> {
+    let tx = conn
+        .transaction()
+        .map_err(|e| format!("建立撤銷交易失敗: {e}"))?;
+    let rolled_back_at = match tx.query_row(
+        "SELECT rolled_back_at
+         FROM import_batches
+         WHERE id = ? AND assistant_type = ?",
+        params![batch_id, assistant],
+        |row| row.get::<_, Option<i64>>(0),
+    ) {
+        Ok(value) => value,
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            return Err("找不到指定的匯入批次".to_string());
+        }
+        Err(error) => return Err(format!("查詢匯入批次失敗: {error}")),
+    };
+    if rolled_back_at.is_some() {
+        return Err("指定的匯入批次已撤銷".to_string());
+    }
+
+    let removed_records = tx
+        .execute(
+            "DELETE FROM usage_entries
+             WHERE assistant_type = ? AND import_batch_id = ?",
+            params![assistant, batch_id],
+        )
+        .map_err(|e| format!("刪除匯入資料失敗: {e}"))?;
+    tx.execute(
+        "UPDATE import_batches
+         SET rolled_back_at = ?, removed_records = ?
+         WHERE id = ? AND assistant_type = ?",
+        params![
+            unix_timestamp_secs(),
+            removed_records as i64,
+            batch_id,
+            assistant
+        ],
+    )
+    .map_err(|e| format!("更新匯入批次狀態失敗: {e}"))?;
+    tx.commit().map_err(|e| format!("提交撤銷結果失敗: {e}"))?;
+
+    Ok(UsageImportRollbackSummary {
+        batch_id: batch_id.to_string(),
+        removed_records,
     })
 }
 
@@ -3970,14 +4182,25 @@ mod tests {
         init_db(&conn).unwrap();
         let record = sample_import_record();
 
-        let first =
-            import_usage_day_entries(&mut conn, "codex", "2026-07-10", vec![record.clone()])
-                .unwrap();
+        let first = import_usage_day_entries(
+            &mut conn,
+            "codex",
+            "2026-07-10",
+            vec![record.clone()],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
         assert_eq!(first.imported, 1);
         assert_eq!(first.skipped_duplicates, 0);
 
-        let second =
-            import_usage_day_entries(&mut conn, "codex", "2026-07-10", vec![record]).unwrap();
+        let second = import_usage_day_entries(
+            &mut conn,
+            "codex",
+            "2026-07-10",
+            vec![record],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
         assert_eq!(second.imported, 0);
         assert_eq!(second.skipped_duplicates, 1);
 
@@ -3989,6 +4212,69 @@ mod tests {
             )
             .unwrap();
         assert_eq!(imported_rows, 1);
+    }
+
+    #[test]
+    fn import_batches_track_source_and_rollback_only_imported_rows() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, turn_no
+             ) VALUES (
+                'codex', '2026-07-10T00:00:00Z', '2026-07-10', 'native-session', 1
+             )",
+            [],
+        )
+        .unwrap();
+        let record = sample_import_record();
+        let summary = import_usage_day_entries(
+            &mut conn,
+            "codex",
+            "2026-07-10",
+            vec![record],
+            UsageImportMetadata {
+                source_assistant: Some("codex".to_string()),
+                source_file_name: Some("token-usage-codex.json".to_string()),
+            },
+        )
+        .unwrap();
+
+        let batches = list_usage_import_batches(&conn, "codex", 50).unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].id, summary.batch_id);
+        assert_eq!(batches[0].source_assistant.as_deref(), Some("codex"));
+        assert_eq!(
+            batches[0].source_file_name.as_deref(),
+            Some("token-usage-codex.json")
+        );
+        assert_eq!(batches[0].imported, 1);
+        assert_eq!(batches[0].rolled_back_at, None);
+
+        let rollback = rollback_usage_import_batch(&mut conn, "codex", &summary.batch_id).unwrap();
+        assert_eq!(rollback.removed_records, 1);
+        let remaining_native_rows: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries WHERE session_id = 'native-session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let remaining_imported_rows: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries WHERE import_batch_id = ?",
+                params![summary.batch_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining_native_rows, 1);
+        assert_eq!(remaining_imported_rows, 0);
+
+        let batches = list_usage_import_batches(&conn, "codex", 50).unwrap();
+        assert!(batches[0].rolled_back_at.is_some());
+        assert_eq!(batches[0].removed_records, 1);
+        let error = rollback_usage_import_batch(&mut conn, "codex", &summary.batch_id).unwrap_err();
+        assert_eq!(error, "指定的匯入批次已撤銷");
     }
 
     #[test]
@@ -4009,7 +4295,14 @@ mod tests {
         record.entry.delta_tokens = record.entry.tokens.clone();
         record.import_source_id = Some("imported-copilot-cache".to_string());
 
-        import_usage_day_entries(&mut conn, "copilot", "2026-07-10", vec![record]).unwrap();
+        import_usage_day_entries(
+            &mut conn,
+            "copilot",
+            "2026-07-10",
+            vec![record],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
 
         let inserted: (u64, u64) = conn
             .query_row(

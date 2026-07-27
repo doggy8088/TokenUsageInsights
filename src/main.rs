@@ -1,7 +1,7 @@
 use axum::{
     extract::DefaultBodyLimit,
     http::{header::CONTENT_TYPE, Method},
-    routing::{get, post},
+    routing::{delete, get, post},
     Router,
 };
 use std::{
@@ -66,7 +66,7 @@ fn build_cors_layer() -> CorsLayer {
 
     CorsLayer::new()
         .allow_origin(allowed_origins)
-        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
         .allow_headers([CONTENT_TYPE])
 }
 
@@ -146,6 +146,11 @@ async fn main() {
         )
         .route("/api/:assistant/usage/:date/export", get(export_usage_day))
         .route("/api/:assistant/usage/:date/import", import_usage_route())
+        .route("/api/:assistant/imports", get(get_usage_import_batches))
+        .route(
+            "/api/:assistant/imports/:batch_id",
+            delete(rollback_usage_import_batch),
+        )
         .route(
             "/api/:assistant/session/:session_id",
             get(get_session_details),

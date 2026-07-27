@@ -341,6 +341,16 @@
             <span class="sr-only" data-i18n="btn_import_day">匯入</span>
           </button>
           <input id="usage-day-import-input" type="file" accept="application/json,.json" style="display: none;" />
+          <button id="btn-import-history" class="icon-btn has-tooltip" data-i18n-title="btn_import_history_title" title="匯入紀錄與撤銷" aria-label="匯入紀錄與撤銷">
+            <span class="control-svg-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M3 12a9 9 0 1 0 3-6.7" />
+                <path d="M3 4v6h6" />
+                <path d="M12 7v5l3 2" />
+              </svg>
+            </span>
+            <span class="sr-only" data-i18n="btn_import_history">匯入紀錄</span>
+          </button>
           <button id="lang-toggle-btn" class="flag-lang-btn has-tooltip" title="切換語言" aria-label="切換語言">
             <span id="lang-toggle-icon" class="control-svg-icon" aria-hidden="true">
             </span>
@@ -1098,10 +1108,73 @@ cd TokenUsageInsights</code></pre>
     </div>
   </div>
 
+  <div class="modal-overlay" id="usage-import-modal" role="dialog" aria-modal="true" aria-labelledby="usage-import-modal-title">
+    <div class="modal-content usage-import-modal-content">
+      <div class="modal-header">
+        <div class="modal-title-group">
+          <h2 id="usage-import-modal-title" data-i18n="import_confirm_title">確認匯入目標</h2>
+        </div>
+        <button class="close-btn" id="close-usage-import-modal-btn" data-i18n-aria-label="close" aria-label="關閉"><span class="icon-glyph icon-close" aria-hidden="true"></span></button>
+      </div>
+      <div class="modal-body">
+        <p class="modal-text" data-i18n="import_confirm_intro">請核對檔案來源並明確選擇目標 Agent。來源與目標不一致時，系統會阻止匯入。</p>
+        <div class="usage-import-summary" aria-live="polite">
+          <div class="usage-import-summary-item">
+            <span data-i18n="import_source_file">檔案</span>
+            <strong id="usage-import-file-name">—</strong>
+          </div>
+          <div class="usage-import-summary-item">
+            <span data-i18n="import_source_assistant">檔案來源 Agent</span>
+            <strong id="usage-import-source-assistant">—</strong>
+          </div>
+          <div class="usage-import-summary-item">
+            <span data-i18n="import_date">資料日期</span>
+            <strong id="usage-import-date">—</strong>
+          </div>
+          <div class="usage-import-summary-item">
+            <span data-i18n="import_record_count">資料筆數</span>
+            <strong id="usage-import-record-count">0</strong>
+          </div>
+        </div>
+        <label class="usage-import-target-field" for="usage-import-target-assistant">
+          <span data-i18n="import_target_assistant">匯入目標 Agent</span>
+          <select id="usage-import-target-assistant" class="premium-select">
+            <option value="" data-i18n="import_target_placeholder">請明確選擇目標 Agent</option>
+            <option value="antigravity">Antigravity CLI</option>
+            <option value="copilot">GitHub Copilot</option>
+            <option value="codex">Codex</option>
+            <option value="claude">Claude Code</option>
+            <option value="cursor">Cursor</option>
+          </select>
+        </label>
+        <div id="usage-import-validation" class="usage-import-validation" role="status"></div>
+        <div class="usage-import-actions">
+          <button type="button" id="cancel-usage-import-btn" class="secondary-btn" data-i18n="cancel">取消</button>
+          <button type="button" id="confirm-usage-import-btn" class="primary-btn" data-i18n="import_confirm_button" disabled>確認匯入</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-overlay" id="usage-import-history-modal" role="dialog" aria-modal="true" aria-labelledby="usage-import-history-title">
+    <div class="modal-content usage-import-history-content">
+      <div class="modal-header">
+        <div class="modal-title-group">
+          <h2 id="usage-import-history-title" data-i18n="import_history_title">匯入紀錄與撤銷</h2>
+        </div>
+        <button class="close-btn" id="close-usage-import-history-btn" data-i18n-aria-label="close" aria-label="關閉"><span class="icon-glyph icon-close" aria-hidden="true"></span></button>
+      </div>
+      <div class="modal-body">
+        <p id="usage-import-history-description" class="modal-text"></p>
+        <div id="usage-import-history-list" class="usage-import-history-list" aria-live="polite"></div>
+      </div>
+    </div>
+  </div>
+
   <!-- Sidebar Overlay for mobile -->
   <div class="sidebar-overlay" id="sidebar-overlay"></div>
 
   <!-- Frontend Javascript logic -->
-  <script type="module" src="/static/app.js?v=42"></script>
+  <script type="module" src="/static/app.js?v=43"></script>
 </body>
 </html>

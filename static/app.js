@@ -1,4 +1,4 @@
-import i18n from './i18n.js?v=29';
+import i18n from './i18n.js?v=30';
 import {
   aggregateDailyTokenCandles,
   calculateCandleViewport,
@@ -13,6 +13,8 @@ import { compareSessionRows } from './session-utils.js?v=1';
 // Globals
 let tokenChartInstance = null;
 let monthlyChartInstance = null;
+let pendingUsageImport = null;
+let importHistoryAssistant = null;
 
 const chartPalette = {
   tokenFill: 'rgba(47, 184, 197, 0.24)',
@@ -430,6 +432,11 @@ function updateLanguageUI() {
     if (el.hasAttribute('aria-label')) {
       el.setAttribute('aria-label', label);
     }
+  });
+
+  document.querySelectorAll('[data-i18n-aria-label]').forEach(el => {
+    const key = el.getAttribute('data-i18n-aria-label');
+    el.setAttribute('aria-label', t(key));
   });
 
   document.querySelectorAll('[data-i18n-placeholder]').forEach(el => {
@@ -1022,6 +1029,50 @@ function initApp() {
     });
   }
 
+  const usageImportModal = document.getElementById('usage-import-modal');
+  const closeUsageImportModalBtn = document.getElementById('close-usage-import-modal-btn');
+  const cancelUsageImportBtn = document.getElementById('cancel-usage-import-btn');
+  const confirmUsageImportBtn = document.getElementById('confirm-usage-import-btn');
+  const usageImportTarget = document.getElementById('usage-import-target-assistant');
+  if (usageImportTarget) {
+    usageImportTarget.addEventListener('change', updateUsageImportValidation);
+  }
+  if (confirmUsageImportBtn) {
+    confirmUsageImportBtn.addEventListener('click', executePendingUsageImport);
+  }
+  [closeUsageImportModalBtn, cancelUsageImportBtn].forEach((button) => {
+    if (button) button.addEventListener('click', closeUsageImportModal);
+  });
+  if (usageImportModal) {
+    usageImportModal.addEventListener('click', (event) => {
+      if (event.target === usageImportModal) closeUsageImportModal();
+    });
+  }
+
+  const btnImportHistory = document.getElementById('btn-import-history');
+  const importHistoryModal = document.getElementById('usage-import-history-modal');
+  const closeImportHistoryBtn = document.getElementById('close-usage-import-history-btn');
+  if (btnImportHistory) {
+    btnImportHistory.addEventListener('click', openUsageImportHistory);
+  }
+  if (closeImportHistoryBtn) {
+    closeImportHistoryBtn.addEventListener('click', closeUsageImportHistory);
+  }
+  if (importHistoryModal) {
+    importHistoryModal.addEventListener('click', (event) => {
+      if (event.target === importHistoryModal) closeUsageImportHistory();
+    });
+  }
+  const importHistoryList = document.getElementById('usage-import-history-list');
+  if (importHistoryList) {
+    importHistoryList.addEventListener('click', handleImportHistoryAction);
+  }
+  document.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape') return;
+    closeUsageImportModal();
+    closeUsageImportHistory();
+  });
+
   // 監聽 Live 重新整理切換
   liveToggle.addEventListener('change', (e) => {
     toggleLiveRefresh(e.target.checked);
@@ -1520,9 +1571,6 @@ async function importUsageDayFromFile(file) {
     return;
   }
 
-  const importBtn = document.getElementById('btn-import-usage-day');
-  if (importBtn) importBtn.classList.add('loading');
-
   try {
     const rawText = await file.text();
     let payload = null;
@@ -1542,15 +1590,154 @@ async function importUsageDayFromFile(file) {
       return;
     }
     const records = Array.isArray(payload?.records) ? payload.records : [];
+    if (records.length === 0) {
+      showNotification(t('import_failed').replace('{msg}', t('import_empty_records')), 'error');
+      return;
+    }
 
-    const res = await fetch(`/api/${currentAssistant}/usage/${targetDate}/import`, {
+    let sourceAssistant = null;
+    if (
+      Object.prototype.hasOwnProperty.call(payload || {}, 'assistant')
+      && payload.assistant !== null
+      && (typeof payload.assistant !== 'string' || !payload.assistant.trim())
+    ) {
+      showNotification(
+        t('import_failed').replace('{msg}', t('import_invalid_source')),
+        'error'
+      );
+      return;
+    }
+    if (typeof payload?.assistant === 'string' && payload.assistant.trim()) {
+      sourceAssistant = normalizeAssistant(payload.assistant);
+      if (!isSupportedAssistant(sourceAssistant)) {
+        showNotification(
+          t('import_failed').replace(
+            '{msg}',
+            t('import_unsupported_source').replace('{assistant}', sourceAssistant)
+          ),
+          'error'
+        );
+        return;
+      }
+    }
+
+    pendingUsageImport = {
+      fileName: file.name || t('import_unknown_file'),
+      records,
+      sourceAssistant,
+      targetDate,
+    };
+    const sourceAssistantElement = document.getElementById('usage-import-source-assistant');
+    const fileNameElement = document.getElementById('usage-import-file-name');
+    const dateElement = document.getElementById('usage-import-date');
+    const recordCountElement = document.getElementById('usage-import-record-count');
+    const targetSelect = document.getElementById('usage-import-target-assistant');
+    if (sourceAssistantElement) {
+      sourceAssistantElement.textContent = sourceAssistant
+        ? getAssistantMeta(sourceAssistant).label
+        : t('import_unknown_source');
+    }
+    if (fileNameElement) fileNameElement.textContent = pendingUsageImport.fileName;
+    if (dateElement) dateElement.textContent = targetDate;
+    if (recordCountElement) recordCountElement.textContent = String(records.length);
+    if (targetSelect) targetSelect.value = '';
+    updateUsageImportValidation();
+    document.getElementById('usage-import-modal')?.classList.add('active');
+    targetSelect?.focus();
+  } catch (err) {
+    console.error('Import preparation failed:', err);
+    showNotification(t('import_failed').replace('{msg}', err.message || String(err)), 'error');
+  }
+}
+
+function closeUsageImportModal() {
+  document.getElementById('usage-import-modal')?.classList.remove('active');
+  pendingUsageImport = null;
+  const targetSelect = document.getElementById('usage-import-target-assistant');
+  if (targetSelect) targetSelect.value = '';
+}
+
+function updateUsageImportValidation() {
+  const targetSelect = document.getElementById('usage-import-target-assistant');
+  const validation = document.getElementById('usage-import-validation');
+  const confirmButton = document.getElementById('confirm-usage-import-btn');
+  const targetAssistant = normalizeAssistant(targetSelect?.value);
+
+  if (!pendingUsageImport || !targetAssistant) {
+    if (validation) {
+      validation.className = 'usage-import-validation';
+      validation.textContent = t('import_select_target_required');
+    }
+    if (confirmButton) confirmButton.disabled = true;
+    return false;
+  }
+
+  if (
+    pendingUsageImport.sourceAssistant
+    && pendingUsageImport.sourceAssistant !== targetAssistant
+  ) {
+    if (validation) {
+      validation.className = 'usage-import-validation is-error';
+      validation.textContent = t('import_target_mismatch')
+        .replace('{source}', getAssistantMeta(pendingUsageImport.sourceAssistant).label)
+        .replace('{target}', getAssistantMeta(targetAssistant).label);
+    }
+    if (confirmButton) confirmButton.disabled = true;
+    return false;
+  }
+
+  if (validation) {
+    validation.className = 'usage-import-validation is-valid';
+    validation.textContent = pendingUsageImport.sourceAssistant
+      ? t('import_target_verified').replace('{target}', getAssistantMeta(targetAssistant).label)
+      : t('import_legacy_target_verified').replace('{target}', getAssistantMeta(targetAssistant).label);
+  }
+  if (confirmButton) confirmButton.disabled = false;
+  return true;
+}
+
+function activateAssistantWithoutReload(assistant) {
+  const normalizedAssistant = normalizeAssistant(assistant);
+  document.querySelectorAll('.assistant-badge-btn').forEach((button) => {
+    button.classList.toggle(
+      'active',
+      normalizeAssistant(button.getAttribute('data-value')) === normalizedAssistant
+    );
+  });
+  currentAssistant = normalizedAssistant;
+  setCookie('selected_agent', currentAssistant);
+  updateUrlParams();
+  updateLanguageUI();
+  fetchPricingRules();
+}
+
+async function executePendingUsageImport() {
+  if (!pendingUsageImport || !updateUsageImportValidation()) return;
+
+  const pendingImport = pendingUsageImport;
+  const targetAssistant = normalizeAssistant(
+    document.getElementById('usage-import-target-assistant')?.value
+  );
+  const importBtn = document.getElementById('btn-import-usage-day');
+  const confirmButton = document.getElementById('confirm-usage-import-btn');
+  if (importBtn) importBtn.classList.add('loading');
+  if (confirmButton) {
+    confirmButton.classList.add('loading');
+    confirmButton.disabled = true;
+  }
+
+  try {
+    const res = await fetch(`/api/${targetAssistant}/usage/${pendingImport.targetDate}/import`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        date: targetDate,
-        records,
+        assistant: pendingImport.sourceAssistant,
+        confirmed_assistant: targetAssistant,
+        source_file_name: pendingImport.fileName,
+        date: pendingImport.targetDate,
+        records: pendingImport.records,
       }),
     });
 
@@ -1564,30 +1751,171 @@ async function importUsageDayFromFile(file) {
     }
 
     const imported = summary && typeof summary.imported === 'number' ? summary.imported : 0;
-    const total = summary && typeof summary.total === 'number' ? summary.total : records.length;
+    const total = summary && typeof summary.total === 'number'
+      ? summary.total
+      : pendingImport.records.length;
     const skipped = summary && typeof summary.skipped_duplicates === 'number' ? summary.skipped_duplicates : 0;
     let msg = t('usage_import_success')
       .replace('{imported}', String(imported))
       .replace('{total}', String(total));
     if (skipped > 0) {
-      msg = `${msg}，${t('usage_import_skipped').replace('{skipped}', String(skipped))}`;
+      msg = `${msg}; ${t('usage_import_skipped').replace('{skipped}', String(skipped))}`;
     }
     showNotification(msg, 'success');
+    document.getElementById('usage-import-modal')?.classList.remove('active');
+    pendingUsageImport = null;
 
+    if (currentAssistant !== targetAssistant) {
+      activateAssistantWithoutReload(targetAssistant);
+    }
     const dateSelect = document.getElementById('date-select');
     if (dateSelect) {
-      dateSelect.value = targetDate;
+      dateSelect.value = pendingImport.targetDate;
     }
-    await fetchDates(targetDate, true);
+    await fetchDates(pendingImport.targetDate, true);
+    await fetchMonths();
+    await fetchYears();
     if (activeTab !== 'daily') {
       switchTab('daily');
     }
-    await loadUsageData(targetDate);
+    await loadUsageData(pendingImport.targetDate);
   } catch (err) {
     console.error('Import failed:', err);
     showNotification(t('import_failed').replace('{msg}', err.message || String(err)), 'error');
   } finally {
     if (importBtn) importBtn.classList.remove('loading');
+    if (confirmButton) confirmButton.classList.remove('loading');
+    if (pendingUsageImport) updateUsageImportValidation();
+  }
+}
+
+function closeUsageImportHistory() {
+  document.getElementById('usage-import-history-modal')?.classList.remove('active');
+  importHistoryAssistant = null;
+}
+
+async function openUsageImportHistory() {
+  importHistoryAssistant = currentAssistant;
+  const modal = document.getElementById('usage-import-history-modal');
+  const description = document.getElementById('usage-import-history-description');
+  if (description) {
+    description.textContent = t('import_history_description')
+      .replace('{assistant}', getAssistantMeta(importHistoryAssistant).label);
+  }
+  modal?.classList.add('active');
+  await loadUsageImportHistory(importHistoryAssistant);
+}
+
+async function loadUsageImportHistory(assistant) {
+  const list = document.getElementById('usage-import-history-list');
+  if (!list) return;
+  list.innerHTML = `<div class="usage-import-history-empty">${escapeHtml(t('import_history_loading'))}</div>`;
+
+  try {
+    const response = await fetch(`/api/${assistant}/imports`);
+    const batches = await response.json().catch(() => null);
+    if (!response.ok) {
+      const error = batches?.error || `${response.status} ${response.statusText}`;
+      throw new Error(error);
+    }
+    renderUsageImportHistory(Array.isArray(batches) ? batches : [], assistant);
+  } catch (error) {
+    list.innerHTML = `<div class="usage-import-history-empty">${escapeHtml(
+      t('import_history_failed').replace('{msg}', error.message || String(error))
+    )}</div>`;
+  }
+}
+
+function renderUsageImportHistory(batches, assistant) {
+  const list = document.getElementById('usage-import-history-list');
+  if (!list) return;
+  if (batches.length === 0) {
+    list.innerHTML = `<div class="usage-import-history-empty">${escapeHtml(t('import_history_empty'))}</div>`;
+    return;
+  }
+
+  list.innerHTML = batches.map((batch) => {
+    const rolledBack = batch?.rolled_back_at != null;
+    const fileName = batch?.source_file_name || t('import_unknown_file');
+    const sourceAssistant = isSupportedAssistant(batch?.source_assistant)
+      ? getAssistantMeta(batch.source_assistant).label
+      : t('import_unknown_source');
+    const createdAt = Number.isFinite(batch?.created_at)
+      ? new Date(batch.created_at * 1000).toLocaleString(currentLang)
+      : '—';
+    const status = rolledBack ? t('import_status_rolled_back') : t('import_status_active');
+    const action = rolledBack || Number(batch?.imported || 0) === 0
+      ? ''
+      : `<button type="button" class="import-rollback-btn" data-batch-id="${escapeHtml(String(batch.id || ''))}" data-assistant="${escapeHtml(assistant)}">${escapeHtml(t('import_rollback_button'))}</button>`;
+    return `
+      <article class="usage-import-history-item">
+        <div class="usage-import-history-main">
+          <div class="usage-import-history-heading">
+            <strong title="${escapeHtml(fileName)}">${escapeHtml(fileName)}</strong>
+            <span class="usage-import-status${rolledBack ? ' is-rolled-back' : ''}">${escapeHtml(status)}</span>
+          </div>
+          <div class="usage-import-history-meta">
+            ${escapeHtml(sourceAssistant)} · ${escapeHtml(String(batch?.date || '—'))} ·
+            ${escapeHtml(t('import_history_counts')
+              .replace('{imported}', String(batch?.imported ?? 0))
+              .replace('{total}', String(batch?.total ?? 0))
+              .replace('{skipped}', String(batch?.skipped_duplicates ?? 0)))}<br>
+            ${escapeHtml(createdAt)}
+            ${rolledBack ? ` · ${escapeHtml(t('import_removed_records').replace('{count}', String(batch?.removed_records ?? 0)))}` : ''}
+          </div>
+        </div>
+        ${action}
+      </article>
+    `;
+  }).join('');
+}
+
+async function handleImportHistoryAction(event) {
+  const button = event.target.closest('.import-rollback-btn');
+  if (!button) return;
+  if (button.dataset.confirmed !== 'true') {
+    button.dataset.confirmed = 'true';
+    button.textContent = t('import_rollback_confirm_button');
+    return;
+  }
+
+  const batchId = button.dataset.batchId;
+  const assistant = normalizeAssistant(button.dataset.assistant);
+  if (!batchId || !isSupportedAssistant(assistant)) return;
+  button.disabled = true;
+  button.classList.add('loading');
+
+  try {
+    const response = await fetch(`/api/${assistant}/imports/${encodeURIComponent(batchId)}`, {
+      method: 'DELETE',
+    });
+    const result = await response.json().catch(() => null);
+    if (!response.ok) {
+      throw new Error(result?.error || `${response.status} ${response.statusText}`);
+    }
+    showNotification(
+      t('import_rollback_success').replace(
+        '{count}',
+        String(result?.removed_records ?? 0)
+      ),
+      'success'
+    );
+    await loadUsageImportHistory(assistant);
+    if (currentAssistant === assistant) {
+      await fetchDates(null, true);
+      await fetchMonths();
+      await fetchYears();
+      if (activeTab === 'daily') await reloadDailyData();
+      if (activeTab === 'monthly') await reloadMonthlyData();
+      if (activeTab === 'yearly') await reloadYearlyData();
+    }
+  } catch (error) {
+    showNotification(
+      t('import_rollback_failed').replace('{msg}', error.message || String(error)),
+      'error'
+    );
+    button.disabled = false;
+    button.classList.remove('loading');
   }
 }
 

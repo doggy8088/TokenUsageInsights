@@ -41,7 +41,9 @@ const HELP_TEXT: &str = r#"Token 使用量 CLI 匯入 / 匯出工具
 
 注意:
   - 若未指定 export 的 --out，會直接輸出到 stdout
+  - import 檔案若含 assistant，必須與 --agent 完全一致，否則阻止匯入
   - import 會以 `assistant_type + import_source_id` 做資料去重，重複匯入只會插入一次
+  - 每次 import 都會建立可追蹤、可由看板撤銷的匯入批次
 "#;
 
 #[derive(Serialize)]
@@ -291,14 +293,14 @@ fn run_import(args: &[String]) -> i32 {
         }
     };
 
-    if let Some(payload_assistant) = payload.assistant {
-        let normalized_payload_assistant = normalize_assistant_name(&payload_assistant);
-        if normalized_payload_assistant != assistant {
-            eprintln!(
-                "警告：檔案內 assistant={normalized_payload_assistant}，但目前指定為 {assistant}，將以 CLI 指定值匯入。"
-            );
-        }
-    }
+    let source_assistant =
+        match validate_import_source_assistant(&assistant, payload.assistant.as_deref()) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!("{error}");
+                return 2;
+            }
+        };
 
     if payload.records.is_empty() {
         eprintln!("匯入檔案沒有 records");
@@ -323,6 +325,13 @@ fn run_import(args: &[String]) -> i32 {
         &assistant,
         &imported_from,
         payload.records,
+        db::UsageImportMetadata {
+            source_assistant,
+            source_file_name: file_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_string),
+        },
     ) {
         Ok(v) => v,
         Err(err) => {
@@ -407,6 +416,22 @@ fn normalize_assistant_name(assistant: &str) -> String {
     }
 }
 
+fn validate_import_source_assistant(
+    target_assistant: &str,
+    payload_assistant: Option<&str>,
+) -> Result<Option<String>, String> {
+    let Some(payload_assistant) = payload_assistant else {
+        return Ok(None);
+    };
+    let payload_assistant = normalize_assistant_name(payload_assistant);
+    if payload_assistant != target_assistant {
+        return Err(format!(
+            "匯入已取消：檔案內 assistant={payload_assistant}，但 --agent 指定為 {target_assistant}。"
+        ));
+    }
+    Ok(Some(payload_assistant))
+}
+
 fn is_supported_assistant(assistant: &str) -> bool {
     matches!(
         normalize_assistant_name(assistant).as_str(),
@@ -471,4 +496,29 @@ fn print_import_help() {
 
 fn has_help(args: &[String]) -> bool {
     args.iter().any(|arg| arg == "--help" || arg == "-h")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_import_source_assistant;
+
+    #[test]
+    fn import_source_assistant_must_match_cli_target() {
+        let error = validate_import_source_assistant("antigravity", Some("codex")).unwrap_err();
+        assert!(error.contains("匯入已取消"));
+        assert!(error.contains("assistant=codex"));
+        assert!(error.contains("--agent 指定為 antigravity"));
+    }
+
+    #[test]
+    fn import_source_assistant_accepts_alias_and_legacy_file() {
+        assert_eq!(
+            validate_import_source_assistant("claude", Some("claude-code")).unwrap(),
+            Some("claude".to_string())
+        );
+        assert_eq!(
+            validate_import_source_assistant("codex", None).unwrap(),
+            None
+        );
+    }
 }
