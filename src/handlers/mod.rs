@@ -113,7 +113,10 @@ fn record_usage(
     ) {
         Ok(cost) => cost,
         Err(error) => {
-            eprintln!("⚠️ 計算成本失敗: {}", error);
+            eprintln!(
+                "計算成本失敗: session_id={} turn_no={} model={}: {}",
+                entry.session_id, entry.turn_no, model_label, error
+            );
             0.0
         }
     };
