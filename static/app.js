@@ -1,4 +1,4 @@
-import i18n from './i18n.js?v=30';
+import i18n from './i18n.js?v=31';
 import {
   aggregateDailyTokenCandles,
   calculateCandleViewport,
@@ -3606,6 +3606,10 @@ function renderSessionTable(sessions) {
       sourceBadge = '<span class="badge source-badge" title="Codex Desktop">Desktop</span>';
     } else if (s.source_kind === 'codex-cli') {
       sourceBadge = '<span class="badge source-badge" title="Codex CLI">CLI</span>';
+    } else if (s.source_kind === 'cursor-agent') {
+      sourceBadge = `<span class="badge source-badge" title="${escapeHtml(t('source_cursor_agent_title'))}">${escapeHtml(t('source_cursor_agent'))}</span>`;
+    } else if (s.source_kind === 'cursor-ide') {
+      sourceBadge = `<span class="badge source-badge" title="${escapeHtml(t('source_cursor_ide_title'))}">${escapeHtml(t('source_cursor_ide'))}</span>`;
     }
 
     const astColumn = (currentAssistant === 'all' || currentAssistant.includes(',')) ? `<td>${assistantBadge}</td>` : '';
@@ -5861,7 +5865,19 @@ function toggleEmptyState(showEmpty) {
 }
 
 // 點擊月度彙整圖表跳轉到每日即時
+function isValidDateKey(date) {
+  if (typeof date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    return false;
+  }
+  const parsed = new Date(`${date}T00:00:00Z`);
+  return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === date;
+}
+
 function switchToDailyDate(date) {
+  if (!isValidDateKey(date)) {
+    console.warn('Ignored invalid daily date:', date);
+    return;
+  }
   const dateSelect = document.getElementById('date-select');
   if (!dateSelect) return;
 

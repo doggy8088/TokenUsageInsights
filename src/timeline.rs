@@ -1351,7 +1351,7 @@ pub fn parse_cursor_timeline(
     timeline: &mut Vec<TimelineItem>,
     metadata: &mut HashMap<String, serde_json::Value>,
 ) {
-    let mut current_model = "Cursor Agent".to_string();
+    let mut current_model = "Unknown Model".to_string();
     let mut user_turn_no = 0u32;
     let mut agent_turn_no = 0u32;
 

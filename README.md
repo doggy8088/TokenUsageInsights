@@ -74,6 +74,7 @@ Windows 預設使用下列原生路徑：
 - 依 `pricing.csv` 進行本地估算費用
 - Session 數、請求次數與 API 耗時統計
 - 模型使用量排名
+- Cursor 可由本機 `state.vscdb` 的 `agentKv` 記錄歸因至具體模型；無法唯一比對時保留為 `Unknown Model`
 - 專案工作目錄統計
 - 可排序的 Session 清單
 
@@ -361,6 +362,7 @@ cargo build --release --bin token-usage-insights-cli
 | `CODEX_DIR` | `~/.codex` | Codex Desktop 與 Codex CLI 共用資料目錄 |
 | `CLAUDE_DIR` | `~/.claude` | Claude Code 資料目錄 |
 | `CURSOR_DIR` | `~/.cursor` | Cursor 資料目錄 |
+| `CURSOR_STATE_DB` | 依平台自動偵測 | Cursor `User/globalStorage/state.vscdb` 路徑，用於唯讀取得 `agentKv` 模型資訊 |
 | `CORS_ALLOWED_ORIGINS` | `http://localhost:<PORT>,http://127.0.0.1:<PORT>` | 允許的 CORS 來源，逗號分隔 |
 
 > **預設綁定 `0.0.0.0`，同一區網內的其他裝置可能連線到看板。只需在本機瀏覽時，請將 `HOST` 設為 `127.0.0.1`。**
