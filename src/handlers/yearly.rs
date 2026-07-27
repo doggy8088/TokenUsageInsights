@@ -122,6 +122,7 @@ pub async fn get_yearly_details(
         let mut m_output = 0;
         let mut m_reasoning = 0;
         let mut m_cache_read = 0;
+        let mut m_cache_write = 0;
         let mut m_cost_usd = 0.0;
         let mut m_sessions = HashSet::new();
 
@@ -140,6 +141,7 @@ pub async fn get_yearly_details(
             m_input += session_usage.usage.input_tokens;
             m_output += session_usage.usage.output_tokens;
             m_cache_read += session_usage.usage.cache_read_tokens;
+            m_cache_write += session_usage.usage.cache_write_tokens;
             m_reasoning += session_usage.usage.reasoning_tokens;
             m_cost_usd += session_usage.usage.cost_usd;
         }
@@ -148,6 +150,7 @@ pub async fn get_yearly_details(
         yearly_summary.total_input_tokens += m_input;
         yearly_summary.total_output_tokens += m_output;
         yearly_summary.total_cache_read_tokens += m_cache_read;
+        yearly_summary.total_cache_write_tokens += m_cache_write;
         yearly_summary.total_reasoning_tokens += m_reasoning;
         yearly_summary.total_cost_usd += m_cost_usd;
 

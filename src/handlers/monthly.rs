@@ -117,6 +117,7 @@ pub async fn get_monthly_details(
         let mut day_output = 0;
         let mut day_reasoning = 0;
         let mut day_cache_read = 0;
+        let mut day_cache_write = 0;
         let mut day_cost_usd = 0.0;
         let mut day_sessions = HashSet::new();
 
@@ -135,6 +136,7 @@ pub async fn get_monthly_details(
             day_input += session_usage.usage.input_tokens;
             day_output += session_usage.usage.output_tokens;
             day_cache_read += session_usage.usage.cache_read_tokens;
+            day_cache_write += session_usage.usage.cache_write_tokens;
             day_reasoning += session_usage.usage.reasoning_tokens;
             day_cost_usd += session_usage.usage.cost_usd;
         }
@@ -143,6 +145,7 @@ pub async fn get_monthly_details(
         monthly_summary.total_input_tokens += day_input;
         monthly_summary.total_output_tokens += day_output;
         monthly_summary.total_cache_read_tokens += day_cache_read;
+        monthly_summary.total_cache_write_tokens += day_cache_write;
         monthly_summary.total_reasoning_tokens += day_reasoning;
         monthly_summary.total_cost_usd += day_cost_usd;
 

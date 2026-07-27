@@ -114,6 +114,8 @@ pub fn calculate_cost(
     input: u64,
     output: u64,
     cache_read: u64,
+    cache_write_5m: u64,
+    cache_write_1h: u64,
 ) -> Result<f64, String> {
     let (m_base, _) = parse_threshold_rule(model_name);
     if m_base.is_empty() {
@@ -123,7 +125,18 @@ pub fn calculate_cost(
         ));
     }
 
-    let total_context = input + cache_read + output;
+    let is_claude_model = rules.iter().any(|rule| {
+        let (rule_base, _) = parse_threshold_rule(&rule.model_name);
+        !rule_base.is_empty()
+            && (rule_base == m_base || m_base.contains(&rule_base) || rule_base.contains(&m_base))
+            && rule.model_name.to_ascii_lowercase().contains("claude")
+    });
+    let (priced_cache_write_5m, priced_cache_write_1h) = if is_claude_model {
+        (cache_write_5m, cache_write_1h)
+    } else {
+        (0, 0)
+    };
+    let total_context = input + cache_read + priced_cache_write_5m + priced_cache_write_1h + output;
     let is_long_context = total_context > 272_000;
 
     // 1. First attempt: exact base name match
@@ -174,8 +187,12 @@ pub fn calculate_cost(
     if let Some(r) = rule {
         let input_cost = (input as f64 / 1_000_000.0) * r.input_price;
         let cache_cost = (cache_read as f64 / 1_000_000.0) * r.cache_input_price;
+        let cache_write_5m_cost =
+            (priced_cache_write_5m as f64 / 1_000_000.0) * r.input_price * 1.25;
+        let cache_write_1h_cost =
+            (priced_cache_write_1h as f64 / 1_000_000.0) * r.input_price * 2.0;
         let output_cost = (output as f64 / 1_000_000.0) * r.output_price;
-        Ok(input_cost + cache_cost + output_cost)
+        Ok(input_cost + cache_cost + cache_write_5m_cost + cache_write_1h_cost + output_cost)
     } else {
         Err(format!("找不到可用的模型價格規則：{}", model_name))
     }
@@ -187,8 +204,10 @@ pub fn calculate_usage_cost(
     input: u64,
     output: u64,
     cache_read: u64,
+    cache_write_5m: u64,
+    cache_write_1h: u64,
 ) -> Result<f64, String> {
-    if input == 0 && output == 0 && cache_read == 0 {
+    if input == 0 && output == 0 && cache_read == 0 && cache_write_5m == 0 && cache_write_1h == 0 {
         return Ok(0.0);
     }
 
@@ -196,7 +215,15 @@ pub fn calculate_usage_cost(
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .ok_or_else(|| "缺少模型名稱，無法估算成本".to_string())?;
-    calculate_cost(rules, model_name, input, output, cache_read)
+    calculate_cost(
+        rules,
+        model_name,
+        input,
+        output,
+        cache_read,
+        cache_write_5m,
+        cache_write_1h,
+    )
 }
 
 #[cfg(test)]
@@ -205,13 +232,13 @@ mod tests {
 
     #[test]
     fn zero_token_usage_without_model_costs_zero() {
-        let cost = calculate_usage_cost(&[], None, 0, 0, 0).unwrap();
+        let cost = calculate_usage_cost(&[], None, 0, 0, 0, 0, 0).unwrap();
         assert_eq!(cost, 0.0);
     }
 
     #[test]
     fn token_usage_without_model_reports_missing_metadata() {
-        let error = calculate_usage_cost(&[], None, 10, 2, 3).unwrap_err();
+        let error = calculate_usage_cost(&[], None, 10, 2, 3, 0, 0).unwrap_err();
         assert_eq!(error, "缺少模型名稱，無法估算成本");
     }
 
@@ -230,6 +257,8 @@ mod tests {
             42_530,
             1_370,
             401_024,
+            0,
+            0,
         )
         .unwrap();
 
@@ -246,14 +275,67 @@ mod tests {
             "claude-opus-5-1m · high",
             "opus-5",
         ] {
-            let cost =
-                calculate_usage_cost(&rules, Some(model_name), 1_000_000, 1_000_000, 1_000_000)
-                    .unwrap();
+            let cost = calculate_usage_cost(
+                &rules,
+                Some(model_name),
+                1_000_000,
+                1_000_000,
+                1_000_000,
+                0,
+                0,
+            )
+            .unwrap();
 
             assert!(
                 (cost - 30.5).abs() < 1e-9,
                 "unexpected Opus 5 cost for {model_name}: {cost}"
             );
         }
+    }
+
+    #[test]
+    fn cache_writes_use_official_ttl_multipliers() {
+        let rules = [PricingRule {
+            model_name: "Claude Fable 5".to_string(),
+            input_price: 10.0,
+            cache_input_price: 1.0,
+            output_price: 50.0,
+        }];
+
+        let cost = calculate_usage_cost(
+            &rules,
+            Some("claude-fable-5"),
+            1_000_000,
+            1_000_000,
+            1_000_000,
+            1_000_000,
+            1_000_000,
+        )
+        .unwrap();
+
+        assert!((cost - 93.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cache_write_ttl_fields_do_not_change_non_claude_cost() {
+        let rules = [PricingRule {
+            model_name: "GPT-5".to_string(),
+            input_price: 2.0,
+            cache_input_price: 0.2,
+            output_price: 8.0,
+        }];
+
+        let cost = calculate_usage_cost(
+            &rules,
+            Some("gpt-5"),
+            1_000_000,
+            1_000_000,
+            1_000_000,
+            1_000_000,
+            1_000_000,
+        )
+        .unwrap();
+
+        assert!((cost - 10.2).abs() < 1e-9);
     }
 }

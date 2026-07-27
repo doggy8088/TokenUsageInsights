@@ -38,6 +38,8 @@ pub(crate) struct UsageAggregation {
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
+    pub cache_write_5m_tokens: u64,
+    pub cache_write_1h_tokens: u64,
     pub reasoning_tokens: u64,
     pub cost_usd: f64,
 }
@@ -70,7 +72,17 @@ fn add_tokens(aggregation: &mut UsageAggregation, tokens: &TokenStats) {
     aggregation.output_tokens += tokens.output;
     aggregation.cache_read_tokens += tokens.cache_read.unwrap_or(0);
     aggregation.cache_write_tokens += tokens.cache_write.unwrap_or(0);
+    let (cache_write_5m, cache_write_1h) = cache_write_breakdown(tokens);
+    aggregation.cache_write_5m_tokens += cache_write_5m;
+    aggregation.cache_write_1h_tokens += cache_write_1h;
     aggregation.reasoning_tokens += tokens.reasoning.unwrap_or(0);
+}
+
+fn cache_write_breakdown(tokens: &TokenStats) -> (u64, u64) {
+    (
+        tokens.cache_write_5m.unwrap_or(0),
+        tokens.cache_write_1h.unwrap_or(0),
+    )
 }
 
 fn entry_model(entry: &UsageEntry) -> Option<&str> {
@@ -89,12 +101,15 @@ fn record_usage(
 ) {
     let model = entry_model(entry);
     let model_label = model.unwrap_or("Unknown Model");
+    let (cache_write_5m, cache_write_1h) = cache_write_breakdown(tokens);
     let cost_usd = match calculate_usage_cost(
         pricing_rules,
         model,
         tokens.input,
         tokens.output,
         tokens.cache_read.unwrap_or(0),
+        cache_write_5m,
+        cache_write_1h,
     ) {
         Ok(cost) => cost,
         Err(error) => {
@@ -352,6 +367,8 @@ mod tests {
             output,
             cache_read: Some(cache_read),
             cache_write: Some(0),
+            cache_write_5m: None,
+            cache_write_1h: None,
             reasoning: None,
             total: input + output + cache_read,
         }
@@ -449,6 +466,70 @@ mod tests {
         assert!((result.usage.cost_usd - 1.6).abs() < 1e-9);
         assert_eq!(result.display_model, "claude-opus-4-8");
         assert_eq!(result.models.len(), 1);
+    }
+
+    #[test]
+    fn session_cost_uses_cache_write_ttl_breakdown() {
+        let rules = [PricingRule {
+            model_name: "claude-fable-5".to_string(),
+            input_price: 10.0,
+            cache_input_price: 1.0,
+            output_price: 50.0,
+        }];
+        let entries = vec![usage_entry(
+            1,
+            "claude-fable-5",
+            TokenStats {
+                input: 1_000_000,
+                output: 1_000_000,
+                cache_read: Some(1_000_000),
+                cache_write: Some(2_500_000),
+                cache_write_5m: Some(1_500_000),
+                cache_write_1h: Some(1_000_000),
+                reasoning: None,
+                total: 5_500_000,
+            },
+            true,
+        )];
+
+        let result = summarize_session_usage(&rules, &entries);
+
+        assert_eq!(result.usage.cache_write_tokens, 2_500_000);
+        assert_eq!(result.usage.cache_write_5m_tokens, 1_500_000);
+        assert_eq!(result.usage.cache_write_1h_tokens, 1_000_000);
+        assert!((result.usage.cost_usd - 99.75).abs() < 1e-9);
+    }
+
+    #[test]
+    fn unclassified_cache_writes_do_not_use_anthropic_ttl_pricing() {
+        let rules = [PricingRule {
+            model_name: "gpt-test".to_string(),
+            input_price: 10.0,
+            cache_input_price: 1.0,
+            output_price: 50.0,
+        }];
+        let entries = vec![usage_entry(
+            1,
+            "gpt-test",
+            TokenStats {
+                input: 1_000_000,
+                output: 0,
+                cache_read: Some(0),
+                cache_write: Some(1_000_000),
+                cache_write_5m: None,
+                cache_write_1h: None,
+                reasoning: None,
+                total: 2_000_000,
+            },
+            true,
+        )];
+
+        let result = summarize_session_usage(&rules, &entries);
+
+        assert_eq!(result.usage.cache_write_tokens, 1_000_000);
+        assert_eq!(result.usage.cache_write_5m_tokens, 0);
+        assert_eq!(result.usage.cache_write_1h_tokens, 0);
+        assert!((result.usage.cost_usd - 10.0).abs() < 1e-9);
     }
 
     #[tokio::test]
