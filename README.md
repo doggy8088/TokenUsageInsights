@@ -317,6 +317,7 @@ cargo build --release --bin token-usage-insights-cli
 | `CODEX_DIR` | `~/.codex` | Codex CLI 資料目錄 |
 | `CLAUDE_DIR` | `~/.claude` | Claude Code 資料目錄 |
 | `CURSOR_DIR` | `~/.cursor` | Cursor 資料目錄 |
+| `CURSOR_STATE_DB` | Cursor 平台設定目錄下的 `User/globalStorage/state.vscdb` | Cursor Agent 模型中繼資料庫；通常不需手動設定 |
 | `CORS_ALLOWED_ORIGINS` | `http://localhost:<PORT>,http://127.0.0.1:<PORT>` | 允許的 CORS 來源，逗號分隔 |
 
 範例：

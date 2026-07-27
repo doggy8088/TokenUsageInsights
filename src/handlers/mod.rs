@@ -28,6 +28,58 @@ pub fn is_supported_assistant(assistant: &str) -> bool {
     )
 }
 
+pub fn select_session_model(entries: &[UsageEntry]) -> String {
+    entries
+        .iter()
+        .rev()
+        .filter_map(|entry| entry.model.as_deref())
+        .find(|model| {
+            let normalized = model.trim().to_ascii_lowercase();
+            !normalized.is_empty()
+                && normalized != "cursor agent"
+                && normalized != "cursor ide"
+                && normalized != "unknown model"
+        })
+        .map(str::to_string)
+        .unwrap_or_else(|| "Unknown Model".to_string())
+}
+
+pub fn select_session_mode(assistant_type: &str, entries: &[UsageEntry]) -> Option<String> {
+    if normalize_assistant_name(assistant_type) != "cursor" {
+        return None;
+    }
+
+    let has_ide_source = entries.iter().any(|entry| {
+        entry
+            .transcript_path
+            .as_deref()
+            .map(|path| path.replace('\\', "/").contains("/ide-transcripts/"))
+            .unwrap_or(false)
+            || entry
+                .model
+                .as_deref()
+                .map(|model| model.eq_ignore_ascii_case("Cursor IDE"))
+                .unwrap_or(false)
+    });
+    if has_ide_source {
+        return Some("ide".to_string());
+    }
+
+    let has_agent_source = entries.iter().any(|entry| {
+        entry
+            .transcript_path
+            .as_deref()
+            .map(|path| path.replace('\\', "/").contains("/agent-transcripts/"))
+            .unwrap_or(false)
+            || entry
+                .model
+                .as_deref()
+                .map(|model| model.eq_ignore_ascii_case("Cursor Agent"))
+                .unwrap_or(false)
+    });
+    has_agent_source.then(|| "agent".to_string())
+}
+
 #[derive(Serialize)]
 pub struct DateListResponse {
     pub dates: Vec<String>,
@@ -81,6 +133,7 @@ pub struct SessionSummary {
     pub assistant_type: String,
     pub cwd: String,
     pub model: String,
+    pub mode: Option<String>,
     pub total_tokens: u64,
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
@@ -134,6 +187,24 @@ pub struct MonthlyModelSummary {
     pub total_output_tokens: u64,
     pub total_cache_read_tokens: u64,
     pub cost_usd: f64,
+    pub sessions: Vec<ModelSessionDetail>,
+}
+
+#[derive(Serialize, Clone)]
+pub struct ModelSessionDetail {
+    pub session_id: String,
+    pub session_name: String,
+    pub assistant_type: String,
+    pub date: String,
+    pub timestamp: String,
+    pub cwd: String,
+    pub mode: Option<String>,
+    pub total_tokens: u64,
+    pub total_input_tokens: u64,
+    pub total_output_tokens: u64,
+    pub total_cache_read_tokens: u64,
+    pub total_reasoning_tokens: u64,
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Serialize, Default, Clone)]
@@ -186,7 +257,8 @@ pub struct YearListResponse {
 
 #[cfg(test)]
 mod tests {
-    use crate::db;
+    use super::{select_session_mode, select_session_model};
+    use crate::db::{self, UsageEntry};
     use std::env;
     use std::fs;
     use std::sync::OnceLock;
@@ -196,6 +268,44 @@ mod tests {
 
     async fn lock_test_env() -> MutexGuard<'static, ()> {
         TEST_ENV_LOCK.get_or_init(|| Mutex::new(())).lock().await
+    }
+
+    fn usage_entry_with_model(model: &str) -> UsageEntry {
+        UsageEntry {
+            timestamp: "2026-07-24 12:00:00".to_string(),
+            session_id: "cursor-session".to_string(),
+            session_name: None,
+            transcript_path: Some(
+                "/tmp/.cursor/projects/demo/agent-transcripts/session.jsonl".to_string(),
+            ),
+            cwd: None,
+            version: None,
+            turn_no: 1,
+            model: Some(model.to_string()),
+            model_id: Some(model.to_string()),
+            tokens: None,
+            delta_tokens: None,
+            context: None,
+            cost: None,
+            parent_session_id: None,
+            agent_nickname: None,
+            agent_role: None,
+            reasoning_effort: None,
+        }
+    }
+
+    #[test]
+    fn cursor_session_model_prefers_latest_concrete_model() {
+        let entries = vec![
+            usage_entry_with_model("composer-2.5"),
+            usage_entry_with_model("Cursor Agent"),
+        ];
+
+        assert_eq!(select_session_model(&entries), "composer-2.5");
+        assert_eq!(
+            select_session_mode("cursor", &entries).as_deref(),
+            Some("agent")
+        );
     }
 
     #[tokio::test]

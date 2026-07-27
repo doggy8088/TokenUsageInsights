@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
@@ -97,6 +97,9 @@ struct CodexTokenUsage {
 }
 
 const CODEX_PARSER_MIGRATION_KEY: &str = "migration:codex_session_identity_v6";
+const CURSOR_MODEL_SIGNATURE_MIGRATION_KEY: &str = "migration:cursor_model_signature_v1";
+const CURSOR_CACHE_TOKENS_UNKNOWN_MIGRATION_KEY: &str =
+    "migration:cursor_cache_tokens_unknown_v1";
 
 fn hash_fnv1a_64(input: &str) -> u64 {
     let mut hash: u64 = 0xcbf29ce484222325;
@@ -131,11 +134,7 @@ fn build_import_token_signature(tokens: &Option<TokenStats>) -> String {
     }
 }
 
-fn build_usage_entry_import_source_id(
-    assistant: &str,
-    date: &str,
-    entry: &UsageEntry,
-) -> String {
+fn build_usage_entry_import_source_id(assistant: &str, date: &str, entry: &UsageEntry) -> String {
     let signature = format!(
         "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
         assistant,
@@ -143,14 +142,14 @@ fn build_usage_entry_import_source_id(
         entry.timestamp,
         entry.session_id,
         entry.turn_no,
-        entry.model.clone().unwrap_or_else(|| "".to_string()),
-        entry.model_id.clone().unwrap_or_else(|| "".to_string()),
-        entry.version.clone().unwrap_or_else(|| "".to_string()),
-        entry.cwd.clone().unwrap_or_else(|| "".to_string()),
-        entry.transcript_path.clone().unwrap_or_else(|| "".to_string()),
-        entry.parent_session_id.clone().unwrap_or_else(|| "".to_string()),
-        entry.agent_nickname.clone().unwrap_or_else(|| "".to_string()),
-        entry.agent_role.clone().unwrap_or_else(|| "".to_string()),
+        entry.model.clone().unwrap_or_default(),
+        entry.model_id.clone().unwrap_or_default(),
+        entry.version.clone().unwrap_or_default(),
+        entry.cwd.clone().unwrap_or_default(),
+        entry.transcript_path.clone().unwrap_or_default(),
+        entry.parent_session_id.clone().unwrap_or_default(),
+        entry.agent_nickname.clone().unwrap_or_default(),
+        entry.agent_role.clone().unwrap_or_default(),
         build_import_token_signature(&entry.tokens),
         build_import_token_signature(&entry.delta_tokens)
     );
@@ -217,6 +216,20 @@ pub fn get_cursor_dir() -> PathBuf {
     dirs::home_dir()
         .map(|h| h.join(".cursor"))
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+pub fn get_cursor_state_db_path() -> PathBuf {
+    if let Some(path) = crate::paths::env_path("CURSOR_STATE_DB") {
+        return path;
+    }
+    dirs::config_dir()
+        .map(|dir| {
+            dir.join("Cursor")
+                .join("User")
+                .join("globalStorage")
+                .join("state.vscdb")
+        })
+        .unwrap_or_else(|| get_cursor_dir().join("state.vscdb"))
 }
 
 fn move_file_with_copy_fallback(source: &Path, destination: &Path) -> Result<(), String> {
@@ -303,6 +316,7 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
             turn_no INTEGER NOT NULL,
             model TEXT,
             model_id TEXT,
+            model_signature TEXT,
             
             -- Token Statistics
             tokens_input INTEGER,
@@ -351,6 +365,10 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
         "ALTER TABLE usage_entries ADD COLUMN import_source_id TEXT",
         [],
     );
+    let _ = conn.execute(
+        "ALTER TABLE usage_entries ADD COLUMN model_signature TEXT",
+        [],
+    );
 
     // Unique index on assistant, session, and turn
     conn.execute(
@@ -377,6 +395,10 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
         "CREATE UNIQUE INDEX IF NOT EXISTS uidx_assistant_import_source_id ON usage_entries(assistant_type, import_source_id) WHERE import_source_id IS NOT NULL",
         [],
     );
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_cursor_model_signature ON usage_entries(model_signature) WHERE assistant_type = 'cursor' AND model_signature IS NOT NULL",
+        [],
+    );
 
     // Sync state tracking table
     conn.execute(
@@ -388,6 +410,30 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
         [],
     )
     .map_err(|e| format!("建立 sync_state 表失敗: {}", e))?;
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS cursor_model_signatures (
+            source_id TEXT NOT NULL,
+            signature TEXT NOT NULL,
+            model TEXT NOT NULL,
+            is_ambiguous INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (source_id, signature)
+        )",
+        [],
+    )
+    .map_err(|e| format!("建立 cursor_model_signatures 表失敗: {}", e))?;
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS cursor_session_metadata (
+            source_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            cwd TEXT,
+            mode TEXT,
+            PRIMARY KEY (source_id, session_id)
+        )",
+        [],
+    )
+    .map_err(|e| format!("建立 cursor_session_metadata 表失敗: {}", e))?;
 
     Ok(())
 }
@@ -1618,7 +1664,539 @@ fn cursor_content_to_text(content: &serde_json::Value) -> String {
     parts.join(" ")
 }
 
-fn parse_cursor_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String> {
+fn cursor_tool_signature(
+    content: &serde_json::Value,
+    tool_type: &str,
+    name_field: &str,
+    args_field: &str,
+) -> Option<String> {
+    let mut calls = Vec::new();
+    for item in content.as_array()? {
+        if item.get("type").and_then(|value| value.as_str()) != Some(tool_type) {
+            continue;
+        }
+        let Some(name) = item.get(name_field).and_then(|value| value.as_str()) else {
+            continue;
+        };
+        calls.push(serde_json::json!([
+            name,
+            item.get(args_field)
+                .cloned()
+                .unwrap_or(serde_json::Value::Null)
+        ]));
+    }
+    if calls.is_empty() {
+        return None;
+    }
+    let serialized = serde_json::to_string(&calls).ok()?;
+    Some(format!(
+        "{:016x}",
+        hash_fnv1a_64(&format!("cursor-tool-v1:{serialized}"))
+    ))
+}
+
+fn cursor_transcript_tool_signature(content: &serde_json::Value) -> Option<String> {
+    cursor_tool_signature(content, "tool_use", "name", "input")
+}
+
+fn parse_cursor_agent_kv_model_signature(raw: &[u8]) -> Option<(String, String)> {
+    let event: serde_json::Value = serde_json::from_slice(raw).ok()?;
+    if event.get("role").and_then(|value| value.as_str()) != Some("assistant") {
+        return None;
+    }
+    let content = event.get("content")?;
+    let mut models = HashSet::new();
+    for item in content.as_array()? {
+        let Some(model) = item
+            .get("providerOptions")
+            .and_then(|value| value.get("cursor"))
+            .and_then(|value| value.get("modelName"))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && value.len() <= 200)
+        else {
+            continue;
+        };
+        models.insert(model.to_string());
+    }
+    if models.len() != 1 {
+        return None;
+    }
+    let signature = cursor_tool_signature(content, "tool-call", "toolName", "args")?;
+    Some((signature, models.into_iter().next()?))
+}
+
+fn cursor_model_source_id(path: &Path) -> String {
+    let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let normalized = resolved.to_string_lossy().replace('\\', "/");
+    #[cfg(windows)]
+    let normalized = normalized.to_lowercase();
+    format!("{:016x}", hash_fnv1a_64(&normalized))
+}
+
+fn run_cursor_model_signature_migration(conn: &mut Connection) -> Result<(), String> {
+    let already_applied: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = ?)",
+            params![CURSOR_MODEL_SIGNATURE_MIGRATION_KEY],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    if already_applied {
+        return Ok(());
+    }
+
+    let tx = conn
+        .transaction()
+        .map_err(|error| format!("啟動 Cursor 模型簽章遷移失敗: {error}"))?;
+    tx.execute("DELETE FROM sync_state WHERE filename LIKE 'cursor:%'", [])
+        .map_err(|error| format!("重設 Cursor transcript 同步狀態失敗: {error}"))?;
+    tx.execute(
+        "INSERT INTO sync_state (filename, last_synced_size, last_synced_time)
+         VALUES (?, 1, 0)",
+        params![CURSOR_MODEL_SIGNATURE_MIGRATION_KEY],
+    )
+    .map_err(|error| format!("記錄 Cursor 模型簽章遷移失敗: {error}"))?;
+    tx.commit()
+        .map_err(|error| format!("提交 Cursor 模型簽章遷移失敗: {error}"))
+}
+
+fn run_cursor_cache_tokens_unknown_migration(conn: &mut Connection) -> Result<(), String> {
+    let already_applied: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = ?)",
+            params![CURSOR_CACHE_TOKENS_UNKNOWN_MIGRATION_KEY],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    if already_applied {
+        return Ok(());
+    }
+
+    let tx = conn
+        .transaction()
+        .map_err(|error| format!("啟動 Cursor 快取 Token 遷移失敗: {error}"))?;
+    tx.execute(
+        "UPDATE usage_entries
+         SET tokens_cache_read = NULL,
+             tokens_cache_write = NULL,
+             delta_cache_read = NULL,
+             delta_cache_write = NULL
+         WHERE assistant_type = 'cursor'",
+        [],
+    )
+    .map_err(|error| format!("將 Cursor 快取 Token 標記為未知失敗: {error}"))?;
+    tx.execute(
+        "INSERT INTO sync_state (filename, last_synced_size, last_synced_time)
+         VALUES (?, 1, 0)",
+        params![CURSOR_CACHE_TOKENS_UNKNOWN_MIGRATION_KEY],
+    )
+    .map_err(|error| format!("記錄 Cursor 快取 Token 遷移失敗: {error}"))?;
+    tx.commit()
+        .map_err(|error| format!("提交 Cursor 快取 Token 遷移失敗: {error}"))
+}
+
+fn sync_cursor_model_signatures(
+    conn: &mut Connection,
+    state_db_path: &Path,
+) -> Result<String, String> {
+    let source_id = cursor_model_source_id(state_db_path);
+    let state_key = format!("cursor-agent-kv:v1:{source_id}");
+    let source_conn = Connection::open_with_flags(
+        state_db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| format!("無法唯讀開啟 Cursor state.vscdb: {error}"))?;
+    source_conn
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(|error| format!("設定 Cursor state.vscdb busy timeout 失敗: {error}"))?;
+
+    let has_cursor_disk_kv: bool = source_conn
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'cursorDiskKV'
+            )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("檢查 Cursor cursorDiskKV 表失敗: {error}"))?;
+    if !has_cursor_disk_kv {
+        return Err("Cursor state.vscdb 缺少 cursorDiskKV 表".to_string());
+    }
+
+    let max_rowid: i64 = source_conn
+        .query_row(
+            "SELECT COALESCE(MAX(rowid), 0) FROM cursorDiskKV",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("讀取 Cursor cursorDiskKV 最大 rowid 失敗: {error}"))?;
+    let stored_rowid: i64 = conn
+        .query_row(
+            "SELECT last_synced_size FROM sync_state WHERE filename = ?",
+            params![state_key],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let reset_cache = max_rowid < stored_rowid;
+    let start_rowid = if reset_cache { 0 } else { stored_rowid };
+
+    let mut mappings = Vec::new();
+    if max_rowid > start_rowid {
+        let mut statement = source_conn
+            .prepare(
+                "SELECT CAST(value AS BLOB)
+                 FROM cursorDiskKV
+                 WHERE rowid > ? AND rowid <= ?
+                   AND key >= 'agentKv:blob:' AND key < 'agentKv:blob;'
+                   AND instr(CAST(value AS TEXT), '\"modelName\"') > 0
+                 ORDER BY rowid",
+            )
+            .map_err(|error| format!("準備 Cursor agentKv 查詢失敗: {error}"))?;
+        let mut rows = statement
+            .query(params![start_rowid, max_rowid])
+            .map_err(|error| format!("查詢 Cursor agentKv 失敗: {error}"))?;
+        while let Some(row) = rows
+            .next()
+            .map_err(|error| format!("讀取 Cursor agentKv 記錄失敗: {error}"))?
+        {
+            let raw: Vec<u8> = match row.get(0) {
+                Ok(raw) => raw,
+                Err(_) => continue,
+            };
+            if let Some(mapping) = parse_cursor_agent_kv_model_signature(&raw) {
+                mappings.push(mapping);
+            }
+        }
+    }
+    drop(source_conn);
+
+    if reset_cache || max_rowid > start_rowid {
+        let tx = conn
+            .transaction()
+            .map_err(|error| format!("啟動 Cursor 模型簽章同步失敗: {error}"))?;
+        if reset_cache {
+            tx.execute(
+                "DELETE FROM cursor_model_signatures WHERE source_id = ?",
+                params![source_id],
+            )
+            .map_err(|error| format!("重設 Cursor 模型簽章快取失敗: {error}"))?;
+        }
+        for (signature, model) in mappings {
+            tx.execute(
+                "INSERT INTO cursor_model_signatures (
+                    source_id, signature, model, is_ambiguous
+                 ) VALUES (?, ?, ?, 0)
+                 ON CONFLICT(source_id, signature) DO UPDATE SET
+                    is_ambiguous = CASE
+                        WHEN cursor_model_signatures.model = excluded.model
+                        THEN cursor_model_signatures.is_ambiguous
+                        ELSE 1
+                    END",
+                params![source_id, signature, model],
+            )
+            .map_err(|error| format!("寫入 Cursor 模型簽章快取失敗: {error}"))?;
+        }
+
+        tx.execute(
+            "UPDATE usage_entries
+             SET model = 'Unknown Model', model_id = 'Unknown Model'
+             WHERE assistant_type = 'cursor'
+               AND model_signature IS NOT NULL
+               AND EXISTS (
+                    SELECT 1 FROM cursor_model_signatures signatures
+                    WHERE signatures.source_id = ?
+                      AND signatures.signature = usage_entries.model_signature
+                      AND signatures.is_ambiguous = 1
+               )",
+            params![source_id],
+        )
+        .map_err(|error| format!("清除歧義 Cursor 模型歸因失敗: {error}"))?;
+        tx.execute(
+            "UPDATE usage_entries
+             SET model = (
+                    SELECT signatures.model FROM cursor_model_signatures signatures
+                    WHERE signatures.source_id = ?
+                      AND signatures.signature = usage_entries.model_signature
+                      AND signatures.is_ambiguous = 0
+                 ),
+                 model_id = (
+                    SELECT signatures.model FROM cursor_model_signatures signatures
+                    WHERE signatures.source_id = ?
+                      AND signatures.signature = usage_entries.model_signature
+                      AND signatures.is_ambiguous = 0
+                 )
+             WHERE assistant_type = 'cursor'
+               AND model_signature IS NOT NULL
+               AND EXISTS (
+                    SELECT 1 FROM cursor_model_signatures signatures
+                    WHERE signatures.source_id = ?
+                      AND signatures.signature = usage_entries.model_signature
+                      AND signatures.is_ambiguous = 0
+               )",
+            params![source_id, source_id, source_id],
+        )
+        .map_err(|error| format!("回填 Cursor 模型歸因失敗: {error}"))?;
+
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        tx.execute(
+            "INSERT OR REPLACE INTO sync_state (
+                filename, last_synced_size, last_synced_time
+             ) VALUES (?, ?, ?)",
+            params![state_key, max_rowid, now],
+        )
+        .map_err(|error| format!("更新 Cursor agentKv 同步狀態失敗: {error}"))?;
+        tx.commit()
+            .map_err(|error| format!("提交 Cursor 模型簽章同步失敗: {error}"))?;
+    }
+
+    Ok(source_id)
+}
+
+fn load_cursor_model_signatures(
+    conn: &Connection,
+    source_id: &str,
+) -> Result<HashMap<String, String>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT signature, model FROM cursor_model_signatures
+             WHERE source_id = ? AND is_ambiguous = 0",
+        )
+        .map_err(|error| format!("準備讀取 Cursor 模型簽章快取失敗: {error}"))?;
+    let rows = statement
+        .query_map(params![source_id], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|error| format!("讀取 Cursor 模型簽章快取失敗: {error}"))?;
+    let mut mappings = HashMap::new();
+    for row in rows {
+        let (signature, model) =
+            row.map_err(|error| format!("解析 Cursor 模型簽章快取失敗: {error}"))?;
+        mappings.insert(signature, model);
+    }
+    Ok(mappings)
+}
+
+#[derive(Clone, Debug, Default)]
+struct CursorSessionMetadata {
+    cwd: Option<String>,
+    mode: Option<String>,
+}
+
+fn parse_cursor_session_metadata(key: &str, raw: &[u8]) -> Option<(String, CursorSessionMetadata)> {
+    let value: serde_json::Value = serde_json::from_slice(raw).ok()?;
+    let session_id = value
+        .get("composerId")
+        .and_then(|item| item.as_str())
+        .or_else(|| key.strip_prefix("composerData:"))
+        .map(str::trim)
+        .filter(|item| !item.is_empty() && item.len() <= 200)?
+        .to_string();
+    let cwd = value
+        .pointer("/workspaceIdentifier/uri/fsPath")
+        .or_else(|| value.pointer("/workspaceIdentifier/fsPath"))
+        .or_else(|| value.pointer("/workspaceIdentifier/uri/path"))
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .filter(|item| !item.is_empty() && item.len() <= 4096)
+        .map(str::to_string);
+    let unified_mode = value
+        .get("unifiedMode")
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .filter(|item| !item.is_empty());
+    let mode = unified_mode
+        .map(|item| {
+            if item.eq_ignore_ascii_case("agent") {
+                "agent"
+            } else {
+                "ide"
+            }
+        })
+        .or_else(|| {
+            value
+                .get("isAgentic")
+                .and_then(|item| item.as_bool())
+                .map(|is_agentic| if is_agentic { "agent" } else { "ide" })
+        })
+        .map(str::to_string);
+
+    if cwd.is_none() && mode.is_none() {
+        return None;
+    }
+    Some((session_id, CursorSessionMetadata { cwd, mode }))
+}
+
+fn sync_cursor_session_metadata(
+    conn: &mut Connection,
+    state_db_path: &Path,
+) -> Result<String, String> {
+    let source_id = cursor_model_source_id(state_db_path);
+    let state_key = format!("cursor-composer-data:v1:{source_id}");
+    let source_conn = Connection::open_with_flags(
+        state_db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| format!("無法唯讀開啟 Cursor state.vscdb: {error}"))?;
+    source_conn
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(|error| format!("設定 Cursor state.vscdb busy timeout 失敗: {error}"))?;
+
+    let max_rowid: i64 = source_conn
+        .query_row(
+            "SELECT COALESCE(MAX(rowid), 0) FROM cursorDiskKV",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("讀取 Cursor cursorDiskKV 最大 rowid 失敗: {error}"))?;
+    let stored_rowid: i64 = conn
+        .query_row(
+            "SELECT last_synced_size FROM sync_state WHERE filename = ?",
+            params![state_key],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let reset_cache = max_rowid < stored_rowid;
+    let start_rowid = if reset_cache { 0 } else { stored_rowid };
+
+    let mut metadata_rows = Vec::new();
+    if max_rowid > start_rowid {
+        let mut statement = source_conn
+            .prepare(
+                "SELECT key, CAST(value AS BLOB)
+                 FROM cursorDiskKV
+                 WHERE rowid > ? AND rowid <= ?
+                   AND key >= 'composerData:' AND key < 'composerData;'
+                 ORDER BY rowid",
+            )
+            .map_err(|error| format!("準備 Cursor composerData 查詢失敗: {error}"))?;
+        let mut rows = statement
+            .query(params![start_rowid, max_rowid])
+            .map_err(|error| format!("查詢 Cursor composerData 失敗: {error}"))?;
+        while let Some(row) = rows
+            .next()
+            .map_err(|error| format!("讀取 Cursor composerData 記錄失敗: {error}"))?
+        {
+            let key: String = match row.get(0) {
+                Ok(key) => key,
+                Err(_) => continue,
+            };
+            let raw: Vec<u8> = match row.get(1) {
+                Ok(raw) => raw,
+                Err(_) => continue,
+            };
+            if let Some(metadata) = parse_cursor_session_metadata(&key, &raw) {
+                metadata_rows.push(metadata);
+            }
+        }
+    }
+    drop(source_conn);
+
+    if reset_cache || max_rowid > start_rowid {
+        let tx = conn
+            .transaction()
+            .map_err(|error| format!("啟動 Cursor Session metadata 同步失敗: {error}"))?;
+        if reset_cache {
+            tx.execute(
+                "DELETE FROM cursor_session_metadata WHERE source_id = ?",
+                params![source_id],
+            )
+            .map_err(|error| format!("重設 Cursor Session metadata 快取失敗: {error}"))?;
+        }
+        for (session_id, metadata) in metadata_rows {
+            tx.execute(
+                "INSERT INTO cursor_session_metadata (
+                    source_id, session_id, cwd, mode
+                 ) VALUES (?, ?, ?, ?)
+                 ON CONFLICT(source_id, session_id) DO UPDATE SET
+                    cwd = COALESCE(NULLIF(excluded.cwd, ''), cursor_session_metadata.cwd),
+                    mode = COALESCE(NULLIF(excluded.mode, ''), cursor_session_metadata.mode)",
+                params![source_id, session_id, metadata.cwd, metadata.mode],
+            )
+            .map_err(|error| format!("寫入 Cursor Session metadata 快取失敗: {error}"))?;
+        }
+
+        tx.execute(
+            "UPDATE usage_entries
+             SET cwd = (
+                    SELECT metadata.cwd FROM cursor_session_metadata metadata
+                    WHERE metadata.source_id = ?
+                      AND metadata.session_id = usage_entries.session_id
+                      AND metadata.cwd IS NOT NULL
+                      AND metadata.cwd != ''
+                 )
+             WHERE assistant_type = 'cursor'
+               AND EXISTS (
+                    SELECT 1 FROM cursor_session_metadata metadata
+                    WHERE metadata.source_id = ?
+                      AND metadata.session_id = usage_entries.session_id
+                      AND metadata.cwd IS NOT NULL
+                      AND metadata.cwd != ''
+               )",
+            params![source_id, source_id],
+        )
+        .map_err(|error| format!("回填 Cursor 工作路徑失敗: {error}"))?;
+
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        tx.execute(
+            "INSERT OR REPLACE INTO sync_state (
+                filename, last_synced_size, last_synced_time
+             ) VALUES (?, ?, ?)",
+            params![state_key, max_rowid, now],
+        )
+        .map_err(|error| format!("更新 Cursor composerData 同步狀態失敗: {error}"))?;
+        tx.commit()
+            .map_err(|error| format!("提交 Cursor Session metadata 同步失敗: {error}"))?;
+    }
+
+    Ok(source_id)
+}
+
+fn load_cursor_session_metadata(
+    conn: &Connection,
+    source_id: &str,
+) -> Result<HashMap<String, CursorSessionMetadata>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT session_id, cwd, mode FROM cursor_session_metadata
+             WHERE source_id = ?",
+        )
+        .map_err(|error| format!("準備讀取 Cursor Session metadata 快取失敗: {error}"))?;
+    let rows = statement
+        .query_map(params![source_id], |row| {
+            Ok((
+                row.get(0)?,
+                CursorSessionMetadata {
+                    cwd: row.get(1)?,
+                    mode: row.get(2)?,
+                },
+            ))
+        })
+        .map_err(|error| format!("讀取 Cursor Session metadata 快取失敗: {error}"))?;
+    let mut mappings = HashMap::new();
+    for row in rows {
+        let (session_id, metadata) =
+            row.map_err(|error| format!("解析 Cursor Session metadata 快取失敗: {error}"))?;
+        mappings.insert(session_id, metadata);
+    }
+    Ok(mappings)
+}
+
+struct CursorParsedEntry {
+    entry: UsageEntry,
+    model_signature: Option<String>,
+}
+
+fn parse_cursor_session_file(
+    filepath: &Path,
+    model_mappings: &HashMap<String, String>,
+    session_metadata: &HashMap<String, CursorSessionMetadata>,
+) -> Result<Vec<CursorParsedEntry>, String> {
     let file = File::open(filepath).map_err(|e| format!("無法開啟檔案: {}", e))?;
     let reader = BufReader::new(file);
     let fallback_session_id = filepath
@@ -1626,12 +2204,17 @@ fn parse_cursor_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String>
         .and_then(|stem| stem.to_str())
         .unwrap_or("unknown-session")
         .to_string();
+    let session_cwd = session_metadata
+        .get(&fallback_session_id)
+        .and_then(|metadata| metadata.cwd.clone());
 
     let mut session_name: Option<String> = None;
     let mut results = Vec::new();
 
     let mut current_timestamp = String::new();
     let mut current_prompt = String::new();
+    let mut current_model = "Unknown Model".to_string();
+    let mut current_model_signature: Option<String> = None;
 
     for line_res in reader.lines() {
         let line = match line_res {
@@ -1646,6 +2229,8 @@ fn parse_cursor_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String>
         let role = event.get("role").and_then(|r| r.as_str()).unwrap_or("");
 
         if role == "user" {
+            current_model = "Unknown Model".to_string();
+            current_model_signature = None;
             let content_val = event.get("message").and_then(|m| m.get("content"));
             let text = cursor_content_to_text(content_val.unwrap_or(&serde_json::Value::Null));
 
@@ -1677,6 +2262,15 @@ fn parse_cursor_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String>
             let content_val = event.get("message").and_then(|m| m.get("content"));
             let reply_text =
                 cursor_content_to_text(content_val.unwrap_or(&serde_json::Value::Null));
+            if let Some(signature) =
+                cursor_transcript_tool_signature(content_val.unwrap_or(&serde_json::Value::Null))
+            {
+                current_model = model_mappings
+                    .get(&signature)
+                    .cloned()
+                    .unwrap_or_else(|| "Unknown Model".to_string());
+                current_model_signature = Some(signature);
+            }
 
             if current_timestamp.is_empty() {
                 if let Ok(metadata) = filepath.metadata() {
@@ -1697,32 +2291,37 @@ fn parse_cursor_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String>
             let tokens = TokenStats {
                 input: input_tokens,
                 output: output_tokens,
-                cache_read: Some(0),
-                cache_write: Some(0),
+                // Cursor's local transcript records do not expose cache token counts.
+                // Keep these unknown instead of reporting a measured zero.
+                cache_read: None,
+                cache_write: None,
                 reasoning: None,
                 total: total_tokens,
             };
 
-            results.push(UsageEntry {
-                timestamp: current_timestamp.clone(),
-                session_id: fallback_session_id.clone(),
-                session_name: session_name
-                    .clone()
-                    .or_else(|| Some(fallback_session_id.clone())),
-                transcript_path: Some(filepath.to_string_lossy().into_owned()),
-                cwd: None,
-                version: None,
-                turn_no: (results.len() + 1) as u32,
-                model: Some("Cursor Agent".to_string()),
-                model_id: Some("Cursor Agent".to_string()),
-                tokens: Some(tokens.clone()),
-                delta_tokens: Some(tokens),
-                context: None,
-                cost: None,
-                parent_session_id: None,
-                agent_nickname: None,
-                agent_role: None,
-                reasoning_effort: None,
+            results.push(CursorParsedEntry {
+                entry: UsageEntry {
+                    timestamp: current_timestamp.clone(),
+                    session_id: fallback_session_id.clone(),
+                    session_name: session_name
+                        .clone()
+                        .or_else(|| Some(fallback_session_id.clone())),
+                    transcript_path: Some(filepath.to_string_lossy().into_owned()),
+                    cwd: session_cwd.clone(),
+                    version: None,
+                    turn_no: (results.len() + 1) as u32,
+                    model: Some(current_model.clone()),
+                    model_id: Some(current_model.clone()),
+                    tokens: Some(tokens.clone()),
+                    delta_tokens: Some(tokens),
+                    context: None,
+                    cost: None,
+                    parent_session_id: None,
+                    agent_nickname: None,
+                    agent_role: None,
+                    reasoning_effort: None,
+                },
+                model_signature: current_model_signature.clone(),
             });
         }
     }
@@ -1735,6 +2334,32 @@ fn sync_cursor_usage_logs(conn: &mut Connection, cursor_dir: &Path) -> Result<()
     if !projects_dir.exists() {
         return Ok(());
     }
+
+    run_cursor_model_signature_migration(conn)?;
+    run_cursor_cache_tokens_unknown_migration(conn)?;
+    let state_db_path = get_cursor_state_db_path();
+    let source_id = if state_db_path.exists() {
+        let source_id = cursor_model_source_id(&state_db_path);
+        if let Err(error) = sync_cursor_model_signatures(conn, &state_db_path) {
+            eprintln!("同步 Cursor agentKv 模型資訊失敗: {error}");
+        }
+        if let Err(error) = sync_cursor_session_metadata(conn, &state_db_path) {
+            eprintln!("同步 Cursor composerData Session metadata 失敗: {error}");
+        }
+        Some(source_id)
+    } else {
+        None
+    };
+    let model_mappings = if let Some(source_id) = source_id.as_deref() {
+        load_cursor_model_signatures(conn, source_id)?
+    } else {
+        HashMap::new()
+    };
+    let session_metadata = if let Some(source_id) = source_id.as_deref() {
+        load_cursor_session_metadata(conn, source_id)?
+    } else {
+        HashMap::new()
+    };
 
     let files = find_cursor_session_files(&projects_dir);
 
@@ -1761,13 +2386,14 @@ fn sync_cursor_usage_logs(conn: &mut Connection, cursor_dir: &Path) -> Result<()
         let current_size = metadata.len();
 
         if current_size != last_synced_size {
-            let parsed_entries = match parse_cursor_session_file(&filepath) {
-                Ok(entries) => entries,
-                Err(e) => {
-                    eprintln!("解析 Cursor 會話檔案 {:?} 失敗: {}", filepath, e);
-                    continue;
-                }
-            };
+            let parsed_entries =
+                match parse_cursor_session_file(&filepath, &model_mappings, &session_metadata) {
+                    Ok(entries) => entries,
+                    Err(e) => {
+                        eprintln!("解析 Cursor 會話檔案 {:?} 失敗: {}", filepath, e);
+                        continue;
+                    }
+                };
 
             let tx = conn
                 .transaction()
@@ -1775,7 +2401,7 @@ fn sync_cursor_usage_logs(conn: &mut Connection, cursor_dir: &Path) -> Result<()
 
             let session_ids: HashSet<String> = parsed_entries
                 .iter()
-                .map(|entry| entry.session_id.clone())
+                .map(|parsed| parsed.entry.session_id.clone())
                 .collect();
             for session_id in session_ids {
                 let delete_res = tx.execute(
@@ -1790,18 +2416,19 @@ fn sync_cursor_usage_logs(conn: &mut Connection, cursor_dir: &Path) -> Result<()
             }
 
             let mut success = true;
-            for entry in &parsed_entries {
+            for parsed in &parsed_entries {
+                let entry = &parsed.entry;
                 let tokens = entry.tokens.as_ref();
                 let delta = entry.delta_tokens.as_ref();
                 let cost = entry.cost.as_ref();
 
                 let insert_res = tx.execute(
                     "INSERT INTO usage_entries (
-                        assistant_type, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
+                        assistant_type, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id, model_signature,
                         tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_reasoning, tokens_total,
                         delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total,
                         duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, reasoning_effort
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     params![
                         "cursor",
                         entry.timestamp,
@@ -1814,6 +2441,7 @@ fn sync_cursor_usage_logs(conn: &mut Connection, cursor_dir: &Path) -> Result<()
                         entry.turn_no as i64,
                         entry.model.as_deref(),
                         entry.model_id.as_deref(),
+                        parsed.model_signature.as_deref(),
                         tokens.map(|t| t.input as i64),
                         tokens.map(|t| t.output as i64),
                         tokens.and_then(|t| t.cache_read.map(|v| v as i64)),
@@ -2297,8 +2925,11 @@ pub fn get_usage_entries_by_date(
         };
 
         if record.import_source_id.is_none() {
-            record.import_source_id =
-                Some(build_usage_entry_import_source_id(assistant, date, &record.entry));
+            record.import_source_id = Some(build_usage_entry_import_source_id(
+                assistant,
+                date,
+                &record.entry,
+            ));
         }
 
         entries.push((record, ast_type));
@@ -2309,7 +2940,7 @@ pub fn get_usage_entries_by_date(
 fn entry_date_from_timestamp(timestamp: &str) -> Option<&str> {
     let trimmed = timestamp.trim();
     trimmed
-        .split(|c| c == 'T' || c == ' ')
+        .split(['T', ' '])
         .next()
         .filter(|date_part| date_part.len() == 10)
 }
@@ -2324,7 +2955,11 @@ pub fn export_usage_day_entries(
 
     for (mut record, _assistant_type) in rows {
         if record.import_source_id.is_none() {
-            record.import_source_id = Some(build_usage_entry_import_source_id(assistant, date, &record.entry));
+            record.import_source_id = Some(build_usage_entry_import_source_id(
+                assistant,
+                date,
+                &record.entry,
+            ));
         }
         records.push(record);
     }
@@ -2361,9 +2996,8 @@ pub fn import_usage_day_entries(
             ));
         }
 
-        let source_id = normalized_id.unwrap_or_else(|| {
-            build_usage_entry_import_source_id(assistant, date, &entry)
-        });
+        let source_id = normalized_id
+            .unwrap_or_else(|| build_usage_entry_import_source_id(assistant, date, &entry));
 
         let imported = tx
             .execute(
@@ -2391,18 +3025,18 @@ pub fn import_usage_day_entries(
                     entry.turn_no as i64,
                     entry.model,
                     entry.model_id,
-                    entry.tokens.as_ref().and_then(|t| Some(t.input as i64)),
-                    entry.tokens.as_ref().and_then(|t| Some(t.output as i64)),
+                    entry.tokens.as_ref().map(|t| t.input as i64),
+                    entry.tokens.as_ref().map(|t| t.output as i64),
                     entry.tokens.as_ref().and_then(|t| t.cache_read.map(|v| v as i64)),
                     entry.tokens.as_ref().and_then(|t| t.cache_write.map(|v| v as i64)),
                     entry.tokens.as_ref().and_then(|t| t.reasoning.map(|v| v as i64)),
-                    entry.tokens.as_ref().and_then(|t| Some(t.total as i64)),
-                    entry.delta_tokens.as_ref().and_then(|t| Some(t.input as i64)),
-                    entry.delta_tokens.as_ref().and_then(|t| Some(t.output as i64)),
+                    entry.tokens.as_ref().map(|t| t.total as i64),
+                    entry.delta_tokens.as_ref().map(|t| t.input as i64),
+                    entry.delta_tokens.as_ref().map(|t| t.output as i64),
                     entry.delta_tokens.as_ref().and_then(|t| t.cache_read.map(|v| v as i64)),
                     entry.delta_tokens.as_ref().and_then(|t| t.cache_write.map(|v| v as i64)),
                     entry.delta_tokens.as_ref().and_then(|t| t.reasoning.map(|v| v as i64)),
-                    entry.delta_tokens.as_ref().and_then(|t| Some(t.total as i64)),
+                    entry.delta_tokens.as_ref().map(|t| t.total as i64),
                     entry.cost.as_ref().and_then(|c| c.total_api_duration_ms).map(|v| v as i64),
                     entry.cost.as_ref().and_then(|c| c.total_premium_requests).map(|v| v as i64),
                     entry.parent_session_id,
@@ -3001,13 +3635,9 @@ mod tests {
         init_db(&conn).unwrap();
         let record = sample_import_record();
 
-        let first = import_usage_day_entries(
-            &mut conn,
-            "codex",
-            "2026-07-10",
-            vec![record.clone()],
-        )
-        .unwrap();
+        let first =
+            import_usage_day_entries(&mut conn, "codex", "2026-07-10", vec![record.clone()])
+                .unwrap();
         assert_eq!(first.imported, 1);
         assert_eq!(first.skipped_duplicates, 0);
 
@@ -3392,6 +4022,205 @@ mod tests {
         let ts = "Wednesday, Jul 8, 2026, 2:24 AM (UTC+8)";
         let parsed = parse_cursor_timestamp(ts);
         assert_eq!(parsed, "2026-07-08T02:24:00+08:00");
+    }
+
+    #[test]
+    fn cursor_cache_token_migration_marks_legacy_zeros_unknown() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, turn_no,
+                tokens_cache_read, tokens_cache_write, delta_cache_read, delta_cache_write
+             ) VALUES ('cursor', '2026-07-24T00:00:00Z', '2026-07-24',
+                'cursor-session', 1, 0, 0, 0, 0)",
+            [],
+        )
+        .unwrap();
+
+        run_cursor_cache_tokens_unknown_migration(&mut conn).unwrap();
+        run_cursor_cache_tokens_unknown_migration(&mut conn).unwrap();
+
+        let values: (Option<u64>, Option<u64>, Option<u64>, Option<u64>) = conn
+            .query_row(
+                "SELECT tokens_cache_read, tokens_cache_write,
+                        delta_cache_read, delta_cache_write
+                 FROM usage_entries WHERE session_id = 'cursor-session'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        let migration_count: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state WHERE filename = ?",
+                params![CURSOR_CACHE_TOKENS_UNKNOWN_MIGRATION_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(values, (None, None, None, None));
+        assert_eq!(migration_count, 1);
+    }
+
+    #[test]
+    fn cursor_sync_uses_agent_kv_model_for_matching_tool_call() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_state_db = std::env::var("CURSOR_STATE_DB").ok();
+        let unique = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "cursor-agent-kv-sync-{}-{}",
+            std::process::id(),
+            unique
+        ));
+        let transcript_dir = root
+            .join("projects")
+            .join("workspace")
+            .join("agent-transcripts")
+            .join("session-model");
+        fs::create_dir_all(&transcript_dir).unwrap();
+        let transcript_path = transcript_dir.join("session-model.jsonl");
+        fs::write(
+            &transcript_path,
+            concat!(
+                "{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"",
+                "<timestamp>Friday, Jul 24, 2026, 9:00 AM (UTC+8)</timestamp>",
+                "<user_query>Inspect the project</user_query>\"}]}}\n",
+                "{\"role\":\"assistant\",\"message\":{\"content\":[",
+                "{\"type\":\"text\",\"text\":\"Running\"},",
+                "{\"type\":\"tool_use\",\"name\":\"Shell\",\"input\":{",
+                "\"command\":\"echo hi\",\"block_until_ms\":120000}}",
+                "]}}\n"
+            ),
+        )
+        .unwrap();
+
+        let state_db_path = root.join("state.vscdb");
+        let state_conn = Connection::open(&state_db_path).unwrap();
+        state_conn
+            .execute(
+                "CREATE TABLE cursorDiskKV (
+                    key TEXT UNIQUE ON CONFLICT REPLACE,
+                    value BLOB
+                )",
+                [],
+            )
+            .unwrap();
+        state_conn
+            .execute(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+                params![
+                    "composerData:session-model",
+                    concat!(
+                        "{\"composerId\":\"session-model\",",
+                        "\"workspaceIdentifier\":{\"uri\":{\"fsPath\":\"/tmp/project\"}},",
+                        "\"unifiedMode\":\"agent\",\"isAgentic\":true}"
+                    )
+                ],
+            )
+            .unwrap();
+        drop(state_conn);
+        std::env::set_var("CURSOR_STATE_DB", &state_db_path);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        sync_cursor_usage_logs(&mut conn, &root).unwrap();
+        let default_model: String = conn
+            .query_row(
+                "SELECT model FROM usage_entries
+                 WHERE assistant_type = 'cursor' AND session_id = 'session-model'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let default_cwd: String = conn
+            .query_row(
+                "SELECT cwd FROM usage_entries
+                 WHERE assistant_type = 'cursor' AND session_id = 'session-model'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let (default_cache_read, default_cache_write): (Option<u64>, Option<u64>) = conn
+            .query_row(
+                "SELECT tokens_cache_read, tokens_cache_write FROM usage_entries
+                 WHERE assistant_type = 'cursor' AND session_id = 'session-model'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        let state_conn = Connection::open(&state_db_path).unwrap();
+        state_conn
+            .execute(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+                params![
+                    "agentKv:blob:model-message",
+                    concat!(
+                        "{\"role\":\"assistant\",\"content\":[",
+                        "{\"type\":\"text\",\"data\":\"Running\",",
+                        "\"providerOptions\":{\"cursor\":{\"modelName\":\"composer-2.5\"}}},",
+                        "{\"type\":\"tool-call\",\"toolCallId\":\"tool_1\",",
+                        "\"toolName\":\"Shell\",\"args\":{",
+                        "\"block_until_ms\":120000,\"command\":\"echo hi\"}}",
+                        "],\"id\":\"message_1\"}"
+                    )
+                ],
+            )
+            .unwrap();
+        drop(state_conn);
+        sync_cursor_usage_logs(&mut conn, &root).unwrap();
+        let matched_model: String = conn
+            .query_row(
+                "SELECT model FROM usage_entries
+                 WHERE assistant_type = 'cursor' AND session_id = 'session-model'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        let state_conn = Connection::open(&state_db_path).unwrap();
+        state_conn
+            .execute(
+                "INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)",
+                params![
+                    "agentKv:blob:ambiguous-model-message",
+                    concat!(
+                        "{\"role\":\"assistant\",\"content\":[",
+                        "{\"type\":\"text\",\"data\":\"Running\",",
+                        "\"providerOptions\":{\"cursor\":{\"modelName\":",
+                        "\"cursor-grok-4.5-high-fast\"}}},",
+                        "{\"type\":\"tool-call\",\"toolCallId\":\"tool_2\",",
+                        "\"toolName\":\"Shell\",\"args\":{",
+                        "\"block_until_ms\":120000,\"command\":\"echo hi\"}}",
+                        "],\"id\":\"message_2\"}"
+                    )
+                ],
+            )
+            .unwrap();
+        drop(state_conn);
+        sync_cursor_usage_logs(&mut conn, &root).unwrap();
+        let ambiguous_model: String = conn
+            .query_row(
+                "SELECT model FROM usage_entries
+                 WHERE assistant_type = 'cursor' AND session_id = 'session-model'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        if let Some(value) = old_state_db {
+            std::env::set_var("CURSOR_STATE_DB", value);
+        } else {
+            std::env::remove_var("CURSOR_STATE_DB");
+        }
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(default_model, "Unknown Model");
+        assert_eq!(default_cwd, "/tmp/project");
+        assert_eq!(default_cache_read, None);
+        assert_eq!(default_cache_write, None);
+        assert_eq!(matched_model, "composer-2.5");
+        assert_eq!(ambiguous_model, "Unknown Model");
     }
 
     #[test]

@@ -1,4 +1,4 @@
-import i18n from './i18n.js?v=16';
+import i18n from './i18n.js?v=20';
 
 // Globals
 let tokenChartInstance = null;
@@ -105,6 +105,26 @@ function getAssistantMeta(rawValue) {
     badgeStyle: 'display: inline-flex; align-items: center;',
     senderName: 'AGENT',
   };
+}
+
+function getDisplayModel(rawModel) {
+  const model = String(rawModel || '').trim();
+  const normalized = model.toLowerCase();
+  if (!model || normalized === 'cursor agent' || normalized === 'cursor ide' || normalized === 'unknown model') {
+    return t('unknown_model');
+  }
+  return model;
+}
+
+function getModeBadgeHtml(rawMode) {
+  const mode = String(rawMode || '').trim().toLowerCase();
+  if (mode === 'agent') {
+    return `<span class="badge mode-badge mode-badge-agent">${escapeHtml(t('mode_agent'))}</span>`;
+  }
+  if (mode === 'ide') {
+    return `<span class="badge mode-badge mode-badge-ide">${escapeHtml(t('mode_ide'))}</span>`;
+  }
+  return '';
 }
 
 function getAssistantLogoHtml(rawValue, className = 'badge-logo') {
@@ -240,6 +260,33 @@ function t(key) {
     return i18n[currentLang][prefix + key] || i18n[currentLang][key] || i18n['zh-TW'][prefix + key] || i18n['zh-TW'][key] || key;
   }
   return i18n[currentLang][key] || i18n['zh-TW'][key] || key;
+}
+
+function isCacheMetricAvailable(rawAssistant = currentAssistant) {
+  return normalizeAssistant(rawAssistant) !== 'cursor';
+}
+
+function setCacheMetricElement(element, value, rawAssistant = currentAssistant) {
+  if (!element) return;
+  const isAvailable = isCacheMetricAvailable(rawAssistant);
+  element.textContent = isAvailable
+    ? formatToken(value || 0)
+    : t('cache_unavailable_value');
+  element.classList.toggle('cache-unavailable', !isAvailable);
+  if (isAvailable) {
+    element.removeAttribute('title');
+    element.removeAttribute('aria-label');
+  } else {
+    element.title = t('cache_unavailable_detail');
+    element.setAttribute('aria-label', t('cache_unavailable_detail'));
+  }
+}
+
+function cacheMetricCellHtml(value, rawAssistant = currentAssistant) {
+  if (isCacheMetricAvailable(rawAssistant)) {
+    return formatToken(value || 0);
+  }
+  return `<span class="cache-unavailable" title="${escapeHtml(t('cache_unavailable_detail'))}">${escapeHtml(t('cache_unavailable_value'))}</span>`;
 }
 
 function iconMarkup(name, extraClass = '') {
@@ -1655,7 +1702,15 @@ function renderDashboard(data) {
   // 2. 更新側邊欄指標卡片
   document.getElementById('mini-sessions').textContent = summary.total_sessions;
   document.getElementById('mini-tokens').textContent = formatToken(summary.total_tokens);
-  document.getElementById('mini-cache').textContent = `${t('cache_read_label')}: ${formatToken(summary.total_cache_read_tokens)}`;
+  const miniCache = document.getElementById('mini-cache');
+  if (miniCache) {
+    const cacheText = isCacheMetricAvailable()
+      ? formatToken(summary.total_cache_read_tokens)
+      : t('cache_unavailable_short');
+    miniCache.textContent = `${t('cache_read_label')}: ${cacheText}`;
+    miniCache.classList.toggle('cache-unavailable', !isCacheMetricAvailable());
+    miniCache.title = isCacheMetricAvailable() ? '' : t('cache_unavailable_detail');
+  }
   document.getElementById('mini-cost').textContent = formatCost(summary.total_cost_usd || 0);
   document.getElementById('mini-duration').textContent = formatDuration(summary.total_duration_ms);
   document.getElementById('mini-requests').textContent = summary.total_requests;
@@ -1672,7 +1727,7 @@ function renderDashboard(data) {
   if (!isMulti) {
     document.getElementById('stat-total-tokens').textContent = formatToken(summary.total_tokens);
     document.getElementById('stat-input-tokens').textContent = formatToken(combinedInputTokens);
-    document.getElementById('stat-cache-read-tokens').textContent = formatToken(cacheReadTokens);
+    setCacheMetricElement(document.getElementById('stat-cache-read-tokens'), cacheReadTokens);
     document.getElementById('stat-output-tokens').textContent = formatToken(summary.total_output_tokens);
     document.getElementById('stat-total-cost').textContent = formatCost(summary.total_cost_usd || 0);
   } else {
@@ -1695,32 +1750,40 @@ function renderDashboard(data) {
   const reasoningPercent = calculatePercentage(reasoningTokens, summary.total_tokens);
 
   if (statInputLabel) {
-    const inputTooltip = t('input_tokens_percentage_formula')
-      .replace('{input}', formatNumber(rawInputTokens))
-      .replace('{cacheRead}', formatNumber(cacheReadTokens))
-      .replace('{netInput}', formatNumber(netInputTokens))
-      .replace('{reasoning}', formatNumber(reasoningTokens))
-      .replace('{combined}', formatNumber(combinedInputTokens))
-      .replace('{total}', formatNumber(summary.total_tokens || 0))
-      .replace('{percent}', inputPercent);
+    const inputTooltip = isCacheMetricAvailable()
+      ? t('input_tokens_percentage_formula')
+        .replace('{input}', formatNumber(rawInputTokens))
+        .replace('{cacheRead}', formatNumber(cacheReadTokens))
+        .replace('{netInput}', formatNumber(netInputTokens))
+        .replace('{reasoning}', formatNumber(reasoningTokens))
+        .replace('{combined}', formatNumber(combinedInputTokens))
+        .replace('{total}', formatNumber(summary.total_tokens || 0))
+        .replace('{percent}', inputPercent)
+      : t('cursor_input_tokens_detail');
     statInputLabel.textContent = `${t('input_tokens_label')} (${inputPercent})`;
     statInputLabel.title = inputTooltip;
     statInputLabel.setAttribute('aria-label', inputTooltip);
   }
   if (statInputTokens) {
-    const inputValueTooltip = t('reasoning_tokens_value_tooltip')
-      .replace('{netInput}', formatToken(netInputTokens))
-      .replace('{reasoning}', formatToken(reasoningTokens))
-      .replace('{percent}', reasoningPercent);
+    const inputValueTooltip = isCacheMetricAvailable()
+      ? t('reasoning_tokens_value_tooltip')
+        .replace('{netInput}', formatToken(netInputTokens))
+        .replace('{reasoning}', formatToken(reasoningTokens))
+        .replace('{percent}', reasoningPercent)
+      : t('cursor_input_tokens_detail');
     statInputTokens.title = inputValueTooltip;
     statInputTokens.setAttribute('aria-label', `${formatToken(combinedInputTokens)}; ${inputValueTooltip}`);
   }
   if (statCacheReadLabel) {
-    const cacheReadTooltip = t('cache_read_percentage_formula')
-      .replace('{cacheRead}', formatNumber(cacheReadTokens))
-      .replace('{total}', formatNumber(summary.total_tokens || 0))
-      .replace('{percent}', cacheReadPercent);
-    statCacheReadLabel.textContent = `${t('chart_cache_label')} (${cacheReadPercent})`;
+    const cacheReadTooltip = isCacheMetricAvailable()
+      ? t('cache_read_percentage_formula')
+        .replace('{cacheRead}', formatNumber(cacheReadTokens))
+        .replace('{total}', formatNumber(summary.total_tokens || 0))
+        .replace('{percent}', cacheReadPercent)
+      : t('cache_unavailable_detail');
+    statCacheReadLabel.textContent = isCacheMetricAvailable()
+      ? `${t('chart_cache_label')} (${cacheReadPercent})`
+      : t('chart_cache_label');
     statCacheReadLabel.title = cacheReadTooltip;
     statCacheReadLabel.setAttribute('aria-label', cacheReadTooltip);
   }
@@ -1744,12 +1807,21 @@ function renderDashboard(data) {
     }
     if (statCacheWrite) {
       const cacheWriteTokens = summary.total_cache_write_tokens || 0;
-      if (cacheWriteTokens > 0) {
+      if (!isCacheMetricAvailable()) {
         statCacheWrite.classList.remove('hidden');
+        statCacheWrite.classList.add('cache-unavailable');
+        statCacheWrite.textContent = t('cache_unavailable_short');
+        statCacheWrite.title = t('cache_unavailable_detail');
+      } else if (cacheWriteTokens > 0) {
+        statCacheWrite.classList.remove('hidden');
+        statCacheWrite.classList.remove('cache-unavailable');
         statCacheWrite.textContent = `${t('cache_write_label')}: ${formatToken(cacheWriteTokens)}`;
+        statCacheWrite.removeAttribute('title');
       } else {
         statCacheWrite.classList.add('hidden');
+        statCacheWrite.classList.remove('cache-unavailable');
         statCacheWrite.textContent = '';
+        statCacheWrite.removeAttribute('title');
       }
     }
   }
@@ -1767,6 +1839,12 @@ function renderDashboard(data) {
 // =========================================================================
 function renderChart(sessions) {
   const canvas = document.getElementById('tokenChart');
+  const cacheAvailable = isCacheMetricAvailable();
+  const chartTitle = canvas?.closest('.chart-container')?.querySelector('h3');
+  if (chartTitle) {
+    chartTitle.textContent = t(cacheAvailable ? 'chart_daily_title' : 'chart_daily_title_cache_unavailable');
+    chartTitle.title = cacheAvailable ? '' : t('cache_unavailable_detail');
+  }
 
   // 只取前 15 個 Session 來畫，避免過於擁擠
   const sortedSessions = [...sessions].sort((a, b) => a.timestamp.localeCompare(b.timestamp));
@@ -1780,7 +1858,9 @@ function renderChart(sessions) {
   });
 
   const tokenData = displaySessions.map(s => s.total_tokens);
-  const cacheData = displaySessions.map(s => s.total_cache_read_tokens || 0);
+  const cacheData = displaySessions.map(s => (
+    isCacheMetricAvailable(s.assistant_type) ? (s.total_cache_read_tokens || 0) : null
+  ));
   const maxTurnData = displaySessions.map(s => s.max_turn_no);
 
   // 若圖表已存在，則動態更新數據以達到平滑變動效果
@@ -1788,6 +1868,7 @@ function renderChart(sessions) {
     tokenChartInstance.data.labels = labels;
     tokenChartInstance.data.datasets[0].label = t('chart_token_label');
     tokenChartInstance.data.datasets[1].label = t('chart_cache_label');
+    tokenChartInstance.data.datasets[1].hidden = !cacheAvailable;
     tokenChartInstance.data.datasets[2].label = t('chart_turn_label');
     tokenChartInstance.data.datasets[0].data = tokenData;
     tokenChartInstance.data.datasets[1].data = cacheData;
@@ -1821,6 +1902,7 @@ function renderChart(sessions) {
         {
           label: t('chart_cache_label'),
           data: cacheData,
+          hidden: !cacheAvailable,
           backgroundColor: chartPalette.cacheFill,
           borderColor: chartPalette.cacheStroke,
           borderWidth: 1.5,
@@ -1851,7 +1933,20 @@ function renderChart(sessions) {
           const index = elements[0].index;
           const session = currentChartSessions[index];
           if (session) {
-            openSessionTimeline(session.session_id, session.session_name, session.total_tokens, session.total_cache_read_tokens);
+            openSessionTimeline(
+              session.session_id,
+              session.session_name,
+              session.total_tokens,
+              session.total_cache_read_tokens,
+              session.total_input_tokens,
+              session.total_output_tokens,
+              session.total_reasoning_tokens,
+              session.cwd,
+              session.model,
+              session.assistant_type,
+              session.agent_nickname,
+              session.agent_role
+            );
           }
         }
       },
@@ -1864,7 +1959,8 @@ function renderChart(sessions) {
             color: '#f3f4f6',
             font: {
               family: chartFontFamily
-            }
+            },
+            filter: (legendItem, chartData) => !chartData.datasets[legendItem.datasetIndex].hidden
           }
         },
         tooltip: {
@@ -2195,15 +2291,16 @@ function renderSessionTable(sessions) {
       ${astColumn}
       <td class="model-column">
         <div class="model-cell-content">
-          <span class="badge highlight">${escapeHtml(s.model)}</span>
-          ${s.reasoning_effort ? `<span class="badge" style="background: rgba(127, 142, 163, 0.15); color: #aeb9c8; font-size: 11px; font-weight: 600;">${escapeHtml(s.reasoning_effort)}</span>` : ''}
+          <span class="badge model-badge" title="${escapeHtml(getDisplayModel(s.model))}">${escapeHtml(getDisplayModel(s.model))}</span>
+          ${s.reasoning_effort ? `<span class="badge reasoning-effort-badge">${escapeHtml(s.reasoning_effort)}</span>` : ''}
+          ${getModeBadgeHtml(s.mode)}
         </div>
       </td>
       <td><span class="badge">${s.max_turn_no}</span></td>
       <td style="color: var(--text-secondary);">${formatToken(s.total_input_tokens || 0)}</td>
       <td style="color: var(--text-secondary);">${formatToken(s.total_output_tokens || 0)}</td>
       <td style="color: #aeb9c8;">${formatToken(s.total_reasoning_tokens || 0)}</td>
-      <td style="color: #34d399;">${formatToken(s.total_cache_read_tokens || 0)}</td>
+      <td style="color: #34d399;">${cacheMetricCellHtml(s.total_cache_read_tokens, s.assistant_type)}</td>
       <td style="font-weight: 700; color: #fbbf24;">${formatToken(s.total_tokens)}</td>
       <td style="font-weight: 700; color: var(--accent-cyan);">${formatCost(s.cost_usd || 0)}</td>
       <td>${formatDuration(s.duration_ms)}</td>
@@ -2290,7 +2387,7 @@ async function openSessionTimeline(sessionId, sessionName, totalTokens, cacheRea
     metaEffort.style.display = 'none';
   }
   document.getElementById('meta-tokens').textContent = formatToken(totalTokens || 0);
-  document.getElementById('meta-cache').textContent = formatToken(cacheReadTokens || 0);
+  setCacheMetricElement(document.getElementById('meta-cache'), cacheReadTokens, currentSessionAssistantType);
   document.getElementById('meta-compaction').textContent = '-';
   document.getElementById('meta-input').textContent = formatToken(inputTokens || 0);
   document.getElementById('meta-output').textContent = formatToken(outputTokens || 0);
@@ -2401,7 +2498,7 @@ function renderTimeline(data) {
   const finalReasoning = metadata.total_reasoning_tokens || currentSessionReasoningTokens || 0;
 
   document.getElementById('meta-tokens').textContent = formatToken(finalTotal);
-  document.getElementById('meta-cache').textContent = formatToken(finalCache);
+  setCacheMetricElement(document.getElementById('meta-cache'), finalCache, currentSessionAssistantType);
   document.getElementById('meta-compaction').textContent = metadata.compaction_count || 0;
   document.getElementById('meta-input').textContent = formatToken(finalInput);
   document.getElementById('meta-output').textContent = formatToken(finalOutput);
@@ -3035,6 +3132,7 @@ function renderYearlyDashboard(data) {
   // 2. 更新指標卡片
   const activeAgents = getActiveAgents();
   const isMulti = activeAgents.length > 1;
+  const cacheAvailable = isCacheMetricAvailable();
   const yearlyInputTokens = getNetInputTokens(summary.total_input_tokens, summary.total_cache_read_tokens);
 
   if (!isMulti) {
@@ -3087,7 +3185,11 @@ function renderYearlyDashboard(data) {
   } else {
     if (statCacheRead) {
       statCacheRead.classList.remove('hidden');
-      statCacheRead.textContent = `${t('cache_read_label')}: ${formatToken(summary.total_cache_read_tokens)} (${calculatePercentage(summary.total_cache_read_tokens, summary.total_tokens)})`;
+      statCacheRead.classList.toggle('cache-unavailable', !cacheAvailable);
+      statCacheRead.textContent = cacheAvailable
+        ? `${t('cache_read_label')}: ${formatToken(summary.total_cache_read_tokens)} (${calculatePercentage(summary.total_cache_read_tokens, summary.total_tokens)})`
+        : `${t('cache_read_label')}: ${t('cache_unavailable_short')}`;
+      statCacheRead.title = cacheAvailable ? '' : t('cache_unavailable_detail');
     }
     if (statInputPct) {
       statInputPct.classList.remove('hidden');
@@ -3145,16 +3247,20 @@ function renderYearlyChart(monthlyBreakdown) {
   currentYearlyChartData = [...monthlyBreakdown];
   const canvas = document.getElementById('yearlyTokenChart');
   if (!canvas) return;
+  const cacheAvailable = isCacheMetricAvailable();
 
   const labels = monthlyBreakdown.map(entry => entry.month);
   const tokenData = monthlyBreakdown.map(entry => entry.total_tokens);
-  const cacheData = monthlyBreakdown.map(entry => entry.total_cache_read_tokens || 0);
+  const cacheData = monthlyBreakdown.map(entry => (
+    cacheAvailable ? (entry.total_cache_read_tokens || 0) : null
+  ));
   const sessionData = monthlyBreakdown.map(entry => entry.sessions_count);
 
   if (yearlyChartInstance) {
     yearlyChartInstance.data.labels = labels;
     yearlyChartInstance.data.datasets[0].label = t('chart_yearly_token_label');
     yearlyChartInstance.data.datasets[1].label = t('chart_cache_label');
+    yearlyChartInstance.data.datasets[1].hidden = !cacheAvailable;
     yearlyChartInstance.data.datasets[2].label = t('chart_yearly_session_label');
     yearlyChartInstance.data.datasets[0].data = tokenData;
     yearlyChartInstance.data.datasets[1].data = cacheData;
@@ -3188,6 +3294,7 @@ function renderYearlyChart(monthlyBreakdown) {
         {
           label: t('chart_cache_label'),
           data: cacheData,
+          hidden: !cacheAvailable,
           backgroundColor: chartPalette.cacheFill,
           borderColor: chartPalette.cacheStroke,
           borderWidth: 1.5,
@@ -3237,7 +3344,8 @@ function renderYearlyChart(monthlyBreakdown) {
           position: 'top',
           labels: {
             color: '#94a3b8',
-            font: { family: chartFontFamily, size: 12 }
+            font: { family: chartFontFamily, size: 12 },
+            filter: (legendItem, chartData) => !chartData.datasets[legendItem.datasetIndex].hidden
           }
         },
         tooltip: {
@@ -3348,6 +3456,138 @@ function renderYearlyProjectsTable(projects) {
 // =========================================================================
 // 渲染年度模型佔比列表 Table
 // =========================================================================
+function groupModelSessionsByDate(sessions) {
+  const groups = new Map();
+  sessions.forEach((session, index) => {
+    const date = session.date || String(session.timestamp || '').slice(0, 10) || t('unknown_date');
+    if (!groups.has(date)) {
+      groups.set(date, []);
+    }
+    groups.get(date).push({ ...session, sourceIndex: index });
+  });
+  return Array.from(groups.entries()).sort(([dateA], [dateB]) => dateB.localeCompare(dateA));
+}
+
+function renderModelSessionDrilldown(model) {
+  const sessions = Array.isArray(model.sessions) ? model.sessions : [];
+  if (sessions.length === 0) {
+    return `<div class="model-session-empty">${escapeHtml(t('model_sessions_unavailable'))}</div>`;
+  }
+
+  const dateGroups = groupModelSessionsByDate(sessions);
+  const summary = t('model_sessions_summary')
+    .replace('{sessions}', String(sessions.length))
+    .replace('{dates}', String(dateGroups.length));
+
+  return `
+    <div class="model-session-drilldown">
+      <div class="model-session-summary">${escapeHtml(summary)}</div>
+      <div class="model-date-groups">
+        ${dateGroups.map(([date, dateSessions]) => {
+          const dateTokens = dateSessions.reduce((total, session) => total + (session.total_tokens || 0), 0);
+          return `
+            <section class="model-date-group">
+              <div class="model-date-header">
+                <button type="button" class="model-date-button" data-date="${escapeHtml(date)}" title="${escapeHtml(t('view_date'))}">
+                  ${escapeHtml(date)}
+                </button>
+                <span>${dateSessions.length} Sessions</span>
+                <span>${formatToken(dateTokens)} Token</span>
+              </div>
+              <div class="model-session-list">
+                ${dateSessions.map(session => `
+                  <button type="button" class="model-session-link" data-session-index="${session.sourceIndex}" title="${escapeHtml(t('open_session'))}">
+                    <span class="model-session-primary">
+                      <span class="model-session-name">${escapeHtml(session.session_name || session.session_id)}</span>
+                      <span class="model-session-cwd">${escapeHtml(session.cwd || t('unknown_cwd'))}</span>
+                    </span>
+                    <span class="model-session-time">${escapeHtml(formatLocalTime(session.timestamp, true))}</span>
+                    <span class="model-session-tokens">${formatToken(session.total_tokens || 0)}</span>
+                  </button>
+                `).join('')}
+              </div>
+            </section>
+          `;
+        }).join('')}
+      </div>
+    </div>
+  `;
+}
+
+function appendModelSummaryRows(tbody, models) {
+  models.forEach((model, index) => {
+    const summaryRow = document.createElement('tr');
+    summaryRow.className = 'model-summary-row';
+    const detailsId = `${tbody.id}-details-${index}`;
+    summaryRow.innerHTML = `
+      <td style="text-align: center;"><span class="badge ${index < 3 ? 'highlight' : ''}">${index + 1}</span></td>
+      <td>
+        <button type="button" class="model-drilldown-toggle" aria-expanded="false" aria-controls="${detailsId}" title="${escapeHtml(t('model_drilldown_hint'))}">
+          <span class="model-drilldown-chevron" aria-hidden="true">›</span>
+          <span class="badge model-badge">${escapeHtml(getDisplayModel(model.model))}</span>
+        </button>
+      </td>
+      <td><span class="badge">${model.sessions_count} Sessions</span></td>
+      <td style="font-weight: 700; color: var(--accent-purple);">
+        ${formatToken(model.total_tokens)}
+        ${model.total_cache_read_tokens ? `<div style="font-size: 0.72rem; font-weight: normal; color: #a5b4fc; margin-top: 3px;" title="${t('chart_cache_label')}">${t('cache_prefix')}${formatToken(model.total_cache_read_tokens)}</div>` : ''}
+      </td>
+      <td style="font-weight: 700; color: var(--neon-gold);">${formatCost(model.cost_usd || 0)}</td>
+    `;
+
+    const detailsRow = document.createElement('tr');
+    detailsRow.id = detailsId;
+    detailsRow.className = 'model-details-row';
+    detailsRow.hidden = true;
+    detailsRow.innerHTML = `<td colspan="5">${renderModelSessionDrilldown(model)}</td>`;
+
+    const toggle = summaryRow.querySelector('.model-drilldown-toggle');
+    toggle.addEventListener('click', () => {
+      const shouldOpen = toggle.getAttribute('aria-expanded') !== 'true';
+      tbody.querySelectorAll('.model-summary-row.is-expanded').forEach(row => {
+        row.classList.remove('is-expanded');
+        row.querySelector('.model-drilldown-toggle')?.setAttribute('aria-expanded', 'false');
+      });
+      tbody.querySelectorAll('.model-details-row').forEach(row => {
+        row.hidden = true;
+      });
+      if (shouldOpen) {
+        summaryRow.classList.add('is-expanded');
+        toggle.setAttribute('aria-expanded', 'true');
+        detailsRow.hidden = false;
+      }
+    });
+
+    detailsRow.querySelectorAll('.model-date-button').forEach(button => {
+      button.addEventListener('click', () => switchToDailyDate(button.dataset.date));
+    });
+    detailsRow.querySelectorAll('.model-session-link').forEach(button => {
+      button.addEventListener('click', () => {
+        const session = model.sessions[Number(button.dataset.sessionIndex)];
+        if (!session) return;
+        openSessionTimeline(
+          session.session_id,
+          session.session_name,
+          session.total_tokens,
+          session.total_cache_read_tokens,
+          session.total_input_tokens,
+          session.total_output_tokens,
+          session.total_reasoning_tokens,
+          session.cwd,
+          model.model,
+          session.assistant_type,
+          null,
+          null,
+          session.reasoning_effort
+        );
+      });
+    });
+
+    tbody.appendChild(summaryRow);
+    tbody.appendChild(detailsRow);
+  });
+}
+
 function renderYearlyModelsTable(models) {
   const tbody = document.getElementById('yearly-models-body');
   if (!tbody) return;
@@ -3358,22 +3598,7 @@ function renderYearlyModelsTable(models) {
     return;
   }
 
-  models.forEach((m, idx) => {
-    const tr = document.createElement('tr');
-    tr.style.cursor = 'default';
-
-    tr.innerHTML = `
-      <td style="text-align: center;"><span class="badge ${idx < 3 ? 'highlight' : ''}">${idx + 1}</span></td>
-      <td><span class="badge highlight">${escapeHtml(m.model)}</span></td>
-      <td><span class="badge">${m.sessions_count} Sessions</span></td>
-      <td style="font-weight: 700; color: var(--accent-purple);">
-        ${formatToken(m.total_tokens)}
-        ${m.total_cache_read_tokens ? `<div style="font-size: 0.72rem; font-weight: normal; color: #a5b4fc; margin-top: 3px;" title="${t('chart_cache_label')}">${t('cache_prefix')}${formatToken(m.total_cache_read_tokens)}</div>` : ''}
-      </td>
-      <td style="font-weight: 700; color: var(--neon-gold);">${formatCost(m.cost_usd || 0)}</td>
-    `;
-    tbody.appendChild(tr);
-  });
+  appendModelSummaryRows(tbody, models);
 }
 
 // =========================================================================
@@ -3403,7 +3628,7 @@ function renderYearlyMonthlySummaryTable(monthlyBreakdown) {
       <td style="color: var(--text-secondary);">${formatToken(entry.total_input_tokens || 0)}</td>
       <td style="color: var(--text-secondary);">${formatToken(entry.total_output_tokens || 0)}</td>
       <td style="color: #aeb9c8;">${formatToken(entry.total_reasoning_tokens || 0)}</td>
-      <td style="color: #34d399;">${formatToken(entry.total_cache_read_tokens || 0)}</td>
+      <td style="color: #34d399;">${cacheMetricCellHtml(entry.total_cache_read_tokens)}</td>
       <td style="font-weight: 700; color: #fbbf24;">${formatToken(entry.total_tokens)}</td>
       <td style="font-weight: 700; color: var(--neon-gold);">${formatCost(entry.cost_usd || 0)}</td>
     `;
@@ -3548,12 +3773,16 @@ function renderMonthlyDashboard(data) {
   // 2. 更新指標卡片
   const activeAgents = getActiveAgents();
   const isMulti = activeAgents.length > 1;
+  const cacheAvailable = isCacheMetricAvailable();
   const monthlyInputTokens = getNetInputTokens(summary.total_input_tokens, summary.total_cache_read_tokens);
 
   if (!isMulti) {
     document.getElementById('monthly-stat-total-tokens').textContent = formatToken(summary.total_tokens);
     document.getElementById('monthly-stat-input-tokens').textContent = formatToken(monthlyInputTokens);
-    document.getElementById('monthly-stat-cache-input-tokens').textContent = formatToken(summary.total_cache_read_tokens || 0);
+    setCacheMetricElement(
+      document.getElementById('monthly-stat-cache-input-tokens'),
+      summary.total_cache_read_tokens
+    );
     document.getElementById('monthly-stat-output-tokens').textContent = formatToken(summary.total_output_tokens);
     document.getElementById('monthly-stat-total-cost').textContent = formatCost(summary.total_cost_usd || 0);
   } else {
@@ -3584,7 +3813,11 @@ function renderMonthlyDashboard(data) {
     }
     if (statCacheInputPct) {
       statCacheInputPct.classList.remove('hidden');
-      statCacheInputPct.textContent = `${t('ratio_label')}: ${calculatePercentage(summary.total_cache_read_tokens, summary.total_tokens)}`;
+      statCacheInputPct.classList.toggle('cache-unavailable', !cacheAvailable);
+      statCacheInputPct.textContent = cacheAvailable
+        ? `${t('ratio_label')}: ${calculatePercentage(summary.total_cache_read_tokens, summary.total_tokens)}`
+        : t('cache_unavailable_short');
+      statCacheInputPct.title = cacheAvailable ? '' : t('cache_unavailable_detail');
     }
     if (statOutputPct) {
       statOutputPct.classList.remove('hidden');
@@ -3614,11 +3847,14 @@ function renderMonthlyChart(dailyBreakdown) {
   currentMonthlyBreakdown = dailyBreakdown;
   currentMonthlyChartData = [...dailyBreakdown];
   const canvas = document.getElementById('monthlyTokenChart');
+  const cacheAvailable = isCacheMetricAvailable();
 
   // 提取標籤與數據
   const labels = dailyBreakdown.map(entry => entry.date.substring(5)); // 只顯示 MM-DD
   const tokenData = dailyBreakdown.map(entry => entry.total_tokens);
-  const cacheData = dailyBreakdown.map(entry => entry.total_cache_read_tokens || 0);
+  const cacheData = dailyBreakdown.map(entry => (
+    cacheAvailable ? (entry.total_cache_read_tokens || 0) : null
+  ));
   const sessionData = dailyBreakdown.map(entry => entry.total_sessions);
 
   // 若圖表已存在，則動態更新數據以達到平滑變動效果
@@ -3626,6 +3862,7 @@ function renderMonthlyChart(dailyBreakdown) {
     monthlyChartInstance.data.labels = labels;
     monthlyChartInstance.data.datasets[0].label = t('chart_monthly_token_label');
     monthlyChartInstance.data.datasets[1].label = t('chart_cache_label');
+    monthlyChartInstance.data.datasets[1].hidden = !cacheAvailable;
     monthlyChartInstance.data.datasets[2].label = t('chart_monthly_session_label');
     monthlyChartInstance.data.datasets[0].data = tokenData;
     monthlyChartInstance.data.datasets[1].data = cacheData;
@@ -3659,6 +3896,7 @@ function renderMonthlyChart(dailyBreakdown) {
         {
           label: t('chart_cache_label'),
           data: cacheData,
+          hidden: !cacheAvailable,
           backgroundColor: chartPalette.cacheFill,
           borderColor: chartPalette.cacheStroke,
           borderWidth: 1.5,
@@ -3702,7 +3940,8 @@ function renderMonthlyChart(dailyBreakdown) {
             color: '#f3f4f6',
             font: {
               family: chartFontFamily
-            }
+            },
+            filter: (legendItem, chartData) => !chartData.datasets[legendItem.datasetIndex].hidden
           }
         },
         tooltip: {
@@ -3823,22 +4062,7 @@ function renderMonthlyModelsTable(models) {
     return;
   }
 
-  models.forEach((m, idx) => {
-    const tr = document.createElement('tr');
-    tr.style.cursor = 'default';
-
-    tr.innerHTML = `
-      <td style="text-align: center;"><span class="badge ${idx < 3 ? 'highlight' : ''}">${idx + 1}</span></td>
-      <td><span class="badge highlight">${escapeHtml(m.model)}</span></td>
-      <td><span class="badge">${m.sessions_count} Sessions</span></td>
-      <td style="font-weight: 700; color: var(--accent-purple);">
-        ${formatToken(m.total_tokens)}
-        ${m.total_cache_read_tokens ? `<div style="font-size: 0.72rem; font-weight: normal; color: #a5b4fc; margin-top: 3px;" title="${t('chart_cache_label')}">${t('cache_prefix')}${formatToken(m.total_cache_read_tokens)}</div>` : ''}
-      </td>
-      <td style="font-weight: 700; color: var(--neon-gold);">${formatCost(m.cost_usd || 0)}</td>
-    `;
-    tbody.appendChild(tr);
-  });
+  appendModelSummaryRows(tbody, models);
 }
 
 // =========================================================================
@@ -3867,7 +4091,7 @@ function renderMonthlyDailySummaryTable(dailyBreakdown) {
       <td style="color: var(--text-secondary);">${formatToken(entry.total_input_tokens || 0)}</td>
       <td style="color: var(--text-secondary);">${formatToken(entry.total_output_tokens || 0)}</td>
       <td style="color: #aeb9c8;">${formatToken(entry.total_reasoning_tokens || 0)}</td>
-      <td style="color: #34d399;">${formatToken(entry.total_cache_read_tokens || 0)}</td>
+      <td style="color: #34d399;">${cacheMetricCellHtml(entry.total_cache_read_tokens)}</td>
       <td style="font-weight: 700; color: #fbbf24;">${formatToken(entry.total_tokens)}</td>
       <td style="font-weight: 700; color: var(--neon-gold);">${formatCost(entry.cost_usd || 0)}</td>
     `;

@@ -165,6 +165,7 @@ pub async fn get_monthly_details(
                 .get(sid)
                 .cloned()
                 .unwrap_or_else(|| s_entries[0].clone());
+            let session_model = select_session_model(s_entries);
             let final_input = if s_tokens > 0 {
                 s_input
             } else {
@@ -201,10 +202,7 @@ pub async fn get_monthly_details(
 
             let cost_usd = match calculate_cost(
                 &pricing_rules,
-                &last_entry
-                    .model
-                    .clone()
-                    .unwrap_or_else(|| "Unknown Model".to_string()),
+                &session_model,
                 final_input,
                 final_output,
                 final_cache,
@@ -247,6 +245,7 @@ pub async fn get_monthly_details(
     let mut project_map_stats: HashMap<String, (usize, u64, f64)> = HashMap::new();
     // 按模型統計 (Model)
     let mut model_map_stats: HashMap<String, (usize, u64, u64, u64, u64, f64)> = HashMap::new();
+    let mut model_session_details: HashMap<String, Vec<ModelSessionDetail>> = HashMap::new();
     // 按 Agent 類型統計
     let mut agent_map_stats: HashMap<String, AgentBreakdown> = HashMap::new();
 
@@ -255,6 +254,7 @@ pub async fn get_monthly_details(
             .get(session_id)
             .cloned()
             .unwrap_or_else(|| s_entries[0].clone());
+        let session_model = select_session_model(s_entries);
 
         let s_tokens = s_entries
             .iter()
@@ -323,10 +323,7 @@ pub async fn get_monthly_details(
 
         let cost_usd = match calculate_cost(
             &pricing_rules,
-            &last_entry
-                .model
-                .clone()
-                .unwrap_or_else(|| "Unknown Model".to_string()),
+            &session_model,
             final_input,
             final_output,
             final_cache,
@@ -338,16 +335,44 @@ pub async fn get_monthly_details(
             }
         };
 
-        let cwd = last_entry.cwd.unwrap_or_else(|| "Unknown CWD".to_string());
-        let project_stat = project_map_stats.entry(cwd).or_insert((0, 0, 0.0));
+        let cwd = last_entry
+            .cwd
+            .clone()
+            .unwrap_or_else(|| "Unknown CWD".to_string());
+        let project_stat = project_map_stats.entry(cwd.clone()).or_insert((0, 0, 0.0));
         project_stat.0 += 1;
         project_stat.1 += final_total;
         project_stat.2 += cost_usd;
 
-        let model = last_entry
-            .model
-            .unwrap_or_else(|| "Unknown Model".to_string());
-        let model_stat = model_map_stats.entry(model).or_insert((0, 0, 0, 0, 0, 0.0));
+        model_session_details
+            .entry(session_model.clone())
+            .or_default()
+            .push(ModelSessionDetail {
+                session_id: session_id.clone(),
+                session_name: last_entry
+                    .session_name
+                    .clone()
+                    .unwrap_or_else(|| session_id.clone()),
+                assistant_type: ast_type.clone(),
+                date: last_entry
+                    .timestamp
+                    .get(0..10)
+                    .unwrap_or("unknown")
+                    .to_string(),
+                timestamp: last_entry.timestamp.clone(),
+                cwd,
+                mode: select_session_mode(ast_type, s_entries),
+                total_tokens: final_total,
+                total_input_tokens: final_input,
+                total_output_tokens: final_output,
+                total_cache_read_tokens: final_cache,
+                total_reasoning_tokens: final_reasoning,
+                reasoning_effort: last_entry.reasoning_effort.clone(),
+            });
+
+        let model_stat = model_map_stats
+            .entry(session_model)
+            .or_insert((0, 0, 0, 0, 0, 0.0));
         model_stat.0 += 1;
         model_stat.1 += final_total;
         model_stat.2 += final_input;
@@ -389,6 +414,8 @@ pub async fn get_monthly_details(
         ),
     ) in model_map_stats
     {
+        let mut sessions = model_session_details.remove(&model).unwrap_or_default();
+        sessions.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
         model_summaries.push(MonthlyModelSummary {
             model,
             sessions_count,
@@ -397,6 +424,7 @@ pub async fn get_monthly_details(
             total_output_tokens,
             total_cache_read_tokens,
             cost_usd,
+            sessions,
         });
     }
     model_summaries.sort_by_key(|item| std::cmp::Reverse(item.total_tokens));

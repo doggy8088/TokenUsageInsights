@@ -1,22 +1,32 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-`src/` contains the Rust backend: `main.rs` boots the Axum server, `handlers.rs` exposes HTTP endpoints, `db.rs` manages SQLite sync and migrations, and `pricing.rs` / `timeline.rs` handle pricing and session reconstruction. `static/` holds the frontend (`index.html`, `app.js`, `styles.css`) plus image assets. `shell/` contains helper scripts and `systemd` unit templates for the unified dashboard. Runtime pricing data lives in `pricing.csv`.
+
+The Rust 2021 backend lives in `src/`. `main.rs` configures the Axum server, `handlers/` groups daily, monthly, yearly, and miscellaneous API routes, `db.rs` owns SQLite synchronization, and `pricing.rs`, `timeline.rs`, and `paths.rs` contain focused domain logic. The companion CLI is `src/bin/token-usage-insights-cli.rs`. Browser assets are plain HTML, JavaScript, and CSS under `static/`; keep component styles in `static/css/`. Platform installers and smoke tests live in `scripts/`, while status-line collectors and the systemd template live in `shell/`. Update `pricing.csv` when model rates change.
 
 ## Build, Test, and Development Commands
-Use `cargo run` to start the local dashboard on `http://localhost:3003`. Use `cargo build --release` for production builds or before installing the `systemd` service. Run `cargo test` to execute the current Rust test suite. Run `cargo fmt` before committing; use `cargo clippy --all-targets --all-features` for an extra lint pass when touching backend logic. For service installs, render the unit file with `sed "s|<PROJECT_DIR>|$PWD|g" shell/token-usage-insights.service`. On Windows, `scripts\build.ps1` runs `cargo test --release` then `cargo build --release --all-targets` and fails the build if the compiler emits any warning (use `-AllowWarnings` only for local iteration, never for a final build).
 
-**Crucial Rule**: Every build (`cargo build`, `cargo build --release`, `cargo test`, and `scripts\build.ps1`) must complete with zero compiler warnings and zero errors, across every bin target (`token-usage-insights` and `token-usage-insights-cli`), before code is considered done. Treat warnings as build failures: fix them at the source (e.g. remove unused imports/`mut`, or add a narrowly-scoped `#[allow(...)]` with a comment explaining why) rather than suppressing them globally or ignoring them.
+- `make run` starts the dashboard at `http://localhost:3003`; override with `make run PORT=3010`.
+- `make test` runs the Rust test suite.
+- `make lint` formats Rust and runs Clippy across all targets and features.
+- `make all` runs formatting, checks, tests, and a release build.
+- `cargo run --bin token-usage-insights-cli -- --help` exercises the companion CLI.
+- On Windows, `.\scripts\build.ps1` runs locked release tests and builds every target. Use `.\scripts\test-windows.ps1` after collector changes.
+
+CI sets `RUSTFLAGS="-D warnings"`. All binaries, tests, and Clippy checks must finish with zero warnings.
 
 ## Coding Style & Naming Conventions
-Follow standard Rust formatting with 4-space indentation and `snake_case` for functions, modules, and variables. Keep route handlers thin and push data access or parsing into dedicated modules under `src/`. In frontend files, keep plain JavaScript readable and use descriptive camelCase names such as `currentAssistant` and `monthlyChartInstance`. Preserve existing bilingual UI text and avoid renaming assistant identifiers like `antigravity`, `copilot`, or `codex`.
+
+Use standard `rustfmt` output (4-space indentation), `snake_case` for Rust functions/modules, and `PascalCase` for types. Keep route handlers thin; move persistence and parsing into their existing modules. Frontend code uses descriptive `camelCase` names and modular CSS classes. Preserve bilingual UI copy and stable assistant identifiers such as `codex`, `copilot`, and `antigravity`.
 
 ## Testing Guidelines
-The repository currently uses Rust unit/integration-style tests embedded under `#[cfg(test)]`, notably in `src/handlers.rs`. Add new backend tests close to the code they exercise unless a dedicated `tests/` directory becomes necessary. Prefer deterministic fixtures by pointing `INSIGHTS_DIR` to a temporary folder, matching the existing yearly handler test pattern. Run `cargo test` after any API, database, or parsing change.
+
+Tests are colocated in `#[cfg(test)]` modules throughout `src/`, including database, route, path, and payload-limit coverage. Name tests after observable behavior in `snake_case`. Use temporary directories and environment overrides instead of real user data. There is no formal coverage threshold; add regression tests for API, import/export, parsing, migration, and database changes.
 
 ## Commit & Pull Request Guidelines
-Recent history uses short conventional prefixes such as `feat:`, `fix:`, `style:`, and scoped forms like `feat(web):`. Keep commit subjects imperative and specific. PRs should describe the user-visible change, note any schema or env var impact, and include screenshots for `static/` UI changes. Link related issues when applicable and list the verification commands you ran.
-**Crucial Rule**: Do not automatically commit code changes. All code modifications should be left in the working directory (staged or unstaged) for the user to review and commit manually.
 
-## Security & Configuration Tips
-This project is local-first and reads data from `~/.token-usage-insights`, `~/.gemini/antigravity-cli`, `~/.copilot`, `~/.codex`, `~/.claude`, and `~/.cursor` unless overridden by `INSIGHTS_DIR`, `ANTIGRAVITY_DIR`, `COPILOT_DIR`, `CODEX_DIR`, `CLAUDE_DIR`, or `CURSOR_DIR`. Do not commit local database files, session logs, or personal paths captured during testing.
+History follows Conventional Commits: `feat(web): ...`, `fix(import): ...`, `docs(readme): ...`, and `release: ...`. Keep subjects concise and specific. Pull requests should explain user-visible behavior, note schema or configuration impacts, link related issues, list verification commands, and include screenshots for `static/` changes. Do not automatically commit agent-generated changes; leave them for review.
+
+## Security & Configuration
+
+Never commit generated databases, usage logs, credentials, or personal paths. During tests, isolate data with variables such as `INSIGHTS_DIR`, `CODEX_DIR`, or `CURSOR_STATE_DB`. Keep CORS defaults local unless broader origins are explicitly required.

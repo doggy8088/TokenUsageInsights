@@ -354,6 +354,8 @@ pub async fn get_usage_details(
             .get(session_id)
             .cloned()
             .unwrap_or_else(|| s_entries[0].clone());
+        let session_model = select_session_model(s_entries);
+        let session_mode = select_session_mode(ast_type, s_entries);
 
         let session_tokens = s_entries
             .iter()
@@ -449,10 +451,7 @@ pub async fn get_usage_details(
 
         let cost_usd = match calculate_cost(
             &pricing_rules,
-            &last_entry
-                .model
-                .clone()
-                .unwrap_or_else(|| "Unknown Model".to_string()),
+            &session_model,
             total_input_tokens,
             total_output_tokens,
             total_cache_read_tokens,
@@ -472,9 +471,8 @@ pub async fn get_usage_details(
                 .unwrap_or_else(|| "Start Coding Session".to_string()),
             assistant_type: ast_type.clone(),
             cwd: last_entry.cwd.unwrap_or_default(),
-            model: last_entry
-                .model
-                .unwrap_or_else(|| "Unknown Model".to_string()),
+            model: session_model,
+            mode: session_mode,
             total_tokens: if session_tokens > 0 {
                 session_tokens
             } else {
