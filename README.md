@@ -512,6 +512,14 @@ curl -fsSL https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/s
 
 這會下載安裝版並立即啟用 `token-usage-insights.service`，不需要自行建置或修改 systemd 檔案。
 
+### macOS：一行安裝並啟用 launchd LaunchAgent
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.sh | bash -s -- --service
+```
+
+這會將 `com.tokenusageinsights.plist` 安裝到 `~/Library/LaunchAgents/` 並立即載入；標準輸出與錯誤日誌位於 `~/Library/Logs/`。
+
 ### 管理服務
 
 ```bash
@@ -519,6 +527,14 @@ systemctl --user status token-usage-insights.service
 journalctl --user -u token-usage-insights.service -n 50 -f
 systemctl --user restart token-usage-insights.service
 systemctl --user stop token-usage-insights.service
+```
+
+macOS 可使用：
+
+```bash
+launchctl print gui/$(id -u)/com.tokenusageinsights
+launchctl kickstart -k gui/$(id -u)/com.tokenusageinsights
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.tokenusageinsights.plist
 ```
 
 * * *
@@ -537,7 +553,7 @@ Linux / macOS：
 curl -fsSL https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.sh | bash
 ```
 
-Linux 如需同時安裝並啟用 systemd user service：
+Linux（systemd user service）或 macOS（launchd LaunchAgent）如需同時安裝並啟用常駐服務：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.sh | bash -s -- --service
@@ -589,7 +605,7 @@ cd token-usage-insights-<tag>-<target>
 ./install.sh
 ```
 
-Linux 如需安裝並啟用 systemd user service：
+Linux（systemd user service）或 macOS（launchd LaunchAgent）如需安裝並啟用常駐服務：
 
 ```bash
 ./install.sh --service
