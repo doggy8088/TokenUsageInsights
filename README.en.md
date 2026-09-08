@@ -422,7 +422,7 @@ This triggers a full incremental sync of local logs.
 
 **For normal use, use the export and import buttons in the upper-right corner of the dashboard.** The installed version needs only a browser to aggregate data across machines and supports import files up to 200 MB.
 
-The CLI tool is provided only for advanced users who build from source; release packages currently do not include the CLI executable.
+The dashboard and CLI now share the `token-usage-insights` executable. Run it without arguments to start the dashboard, or use `export`, `export-all`, or `import`. The main command and subcommands support `--help` and `-h`. This integration will be included in the next release; older installations need an update or a source build.
 
 `--agent` specifies the assistant (`antigravity` / `copilot` / `codex` / `claude` / `cursor` / `grok` / `pi` / `omp`).
 
@@ -431,24 +431,24 @@ The CLI tool is provided only for advanced users who build from source; release 
 Build it once:
 
 ```bash
-cargo build --release --bin token-usage-insights-cli
+cargo build --release --bin token-usage-insights
 ```
 
 ```bash
 # 匯出日、月或年資料（輸出 JSON，含匯入唯一 id）
-./target/release/token-usage-insights-cli export --agent codex --date 2026-07 --out monthly-codex-2026-07.json
+./target/release/token-usage-insights export --agent codex --date 2026-07 --out monthly-codex-2026-07.json
 ```
 
 ```bash
 # 匯入檔案中的所有資料；每筆資料依 timestamp 決定日期
-./target/release/token-usage-insights-cli import --agent codex --file monthly-codex-2026-07.json
+./target/release/token-usage-insights import --agent codex --file monthly-codex-2026-07.json
 ```
 
 ```bash
 # 取得 CLI usage 說明
-./target/release/token-usage-insights-cli --help
-./target/release/token-usage-insights-cli export --help
-./target/release/token-usage-insights-cli import --help
+./target/release/token-usage-insights --help
+./target/release/token-usage-insights export --help
+./target/release/token-usage-insights import --help
 ```
 
 The data format matches the frontend and contains these fields:

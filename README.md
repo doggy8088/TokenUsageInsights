@@ -422,7 +422,7 @@ GET /api/:assistant/sync
 
 **一般使用請直接使用看板右上角的匯出與匯入按鈕。** 安裝版只需要瀏覽器即可完成跨機器資料彙整，並支援最大 200 MB 的匯入檔案。
 
-CLI 工具僅提供給從原始碼建置的進階使用者；Release 安裝包目前不包含 CLI 執行檔。
+看板與 CLI 已整合為同一個 `token-usage-insights` 執行檔。不帶參數會啟動看板；使用 `export`、`export-all`、`import` 子命令可直接操作使用量資料。主命令與各子命令均支援 `--help`、`-h`。此整合自下一個發行版本起納入安裝包；舊版需更新或從原始碼建置。
 
 `--agent` 會指定助理（`antigravity` / `copilot` / `codex` / `claude` / `cursor` / `grok` / `pi` / `omp`）
 
@@ -431,20 +431,20 @@ CLI 工具僅提供給從原始碼建置的進階使用者；Release 安裝包�
 先建置一次：
 
 ```bash
-cargo build --release --bin token-usage-insights-cli
+cargo build --release --bin token-usage-insights
 ```
 
 ```bash
 # 匯出日、月或年資料（輸出 JSON，含匯入唯一 id）
-./target/release/token-usage-insights-cli export --agent codex --date 2026-07 --out monthly-codex-2026-07.json
+./target/release/token-usage-insights export --agent codex --date 2026-07 --out monthly-codex-2026-07.json
 ```
 
 ```bash
 # 一次匯出所有 Agent、所有日期的使用量記錄
-./target/release/token-usage-insights-cli export-all --out all-usage.json
+./target/release/token-usage-insights export-all --out all-usage.json
 
 # 自動判斷 Agent，匯入完整匯出檔的全部 Agent 與日期
-./target/release/token-usage-insights-cli import --file all-usage.json
+./target/release/token-usage-insights import --file all-usage.json
 ```
 
 `export-all` 不需指定 Agent 或日期；省略 `--out` 時輸出 JSON 到 stdout。匯出涵蓋 SQLite 已收錄的所有使用量記錄，包含原生與匯入資料，保留既有匯出格式的完整欄位及 `import_source_id`。執行前請透過看板完成來源日誌同步；此命令不會自行掃描來源日誌，也不是包含原始對話檔、設定與匯入批次歷程的資料庫備份。
@@ -455,15 +455,15 @@ cargo build --release --bin token-usage-insights-cli
 
 ```bash
 # 匯入檔案中的所有資料；每筆資料依 timestamp 決定日期
-./target/release/token-usage-insights-cli import --file monthly-codex-2026-07.json
+./target/release/token-usage-insights import --file monthly-codex-2026-07.json
 ```
 
 ```bash
 # 取得 CLI usage 說明
-./target/release/token-usage-insights-cli --help
-./target/release/token-usage-insights-cli export --help
-./target/release/token-usage-insights-cli export-all --help
-./target/release/token-usage-insights-cli import --help
+./target/release/token-usage-insights --help
+./target/release/token-usage-insights export --help
+./target/release/token-usage-insights export-all --help
+./target/release/token-usage-insights import --help
 ```
 
 資料格式使用和前端一致，內含欄位：

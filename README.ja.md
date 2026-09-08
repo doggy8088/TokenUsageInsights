@@ -422,7 +422,7 @@ GET /api/:assistant/sync
 
 **通常はダッシュボード右上のエクスポートとインポートボタンを使用してください。** インストール版はブラウザーだけでマシン間のデータを集約でき、最大 200 MB のインポートファイルに対応します。
 
-CLI ツールはソースからビルドする上級者向けです。Release パッケージには現在 CLI 実行ファイルは含まれません。
+ダッシュボードと CLI は `token-usage-insights` に統合されました。引数なしでダッシュボードを起動し、`export`、`export-all`、`import` でデータを操作できます。各コマンドは `--help` と `-h` に対応します。次のリリースから提供されるため、旧版では更新またはソースからのビルドが必要です。
 
 `--agent` はアシスタント（`antigravity` / `copilot` / `codex` / `claude` / `cursor` / `grok` / `pi` / `omp`）を指定します。
 
@@ -431,24 +431,24 @@ CLI ツールはソースからビルドする上級者向けです。Release �
 最初に 1 回ビルドします：
 
 ```bash
-cargo build --release --bin token-usage-insights-cli
+cargo build --release --bin token-usage-insights
 ```
 
 ```bash
 # 匯出日、月或年資料（輸出 JSON，含匯入唯一 id）
-./target/release/token-usage-insights-cli export --agent codex --date 2026-07 --out monthly-codex-2026-07.json
+./target/release/token-usage-insights export --agent codex --date 2026-07 --out monthly-codex-2026-07.json
 ```
 
 ```bash
 # 匯入檔案中的所有資料；每筆資料依 timestamp 決定日期
-./target/release/token-usage-insights-cli import --agent codex --file monthly-codex-2026-07.json
+./target/release/token-usage-insights import --agent codex --file monthly-codex-2026-07.json
 ```
 
 ```bash
 # 取得 CLI usage 說明
-./target/release/token-usage-insights-cli --help
-./target/release/token-usage-insights-cli export --help
-./target/release/token-usage-insights-cli import --help
+./target/release/token-usage-insights --help
+./target/release/token-usage-insights export --help
+./target/release/token-usage-insights import --help
 ```
 
 データ形式はフロントエンドと同じで、次のフィールドを含みます：

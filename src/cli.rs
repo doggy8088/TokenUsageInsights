@@ -1,36 +1,17 @@
+use crate::db;
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
-use std::env;
 use std::fs;
 use std::path::PathBuf;
 
-// `db` and `paths` are the same source files main.rs uses; only a handful of
-// their exports are needed here, so silence dead-code warnings for the rest
-// instead of forking a trimmed-down copy of shared logic.
-#[path = "../db.rs"]
-#[allow(dead_code)]
-mod db;
-#[path = "../grok.rs"]
-#[allow(dead_code)]
-mod grok;
-#[path = "../muse.rs"]
-#[allow(dead_code)]
-mod muse;
-#[path = "../omp.rs"]
-#[allow(dead_code)]
-mod omp;
-#[path = "../paths.rs"]
-#[allow(dead_code)]
-mod paths;
-#[path = "../pi.rs"]
-#[allow(dead_code)]
-mod pi;
-#[path = "../vscode.rs"]
-#[allow(dead_code)]
-mod vscode;
-
 const EXPORT_VERSION: u8 = 1;
-const HELP_TEXT: &str = r#"Token 使用量 CLI 匯入 / 匯出工具
+const HELP_TEXT: &str = r#"Token 戰情室：看板與使用量匯入 / 匯出
+
+用法:
+  token-usage-insights [子命令] [參數]
+  不帶參數時啟動看板；HOST 預設 0.0.0.0，PORT 預設 3003。
+  INSIGHTS_DIR 可指定資料庫目錄。
+  --help, -h         顯示此說明
 
 用途:
   export  匯出指定日、月或年的資料為 JSON（可重複匯入且支援重複資料去重）
@@ -42,15 +23,15 @@ const HELP_TEXT: &str = r#"Token 使用量 CLI 匯入 / 匯出工具
                      亦可使用 claude-code / claude_code / claudecode（會正規化為 claude）
 
 匯出:
-  token-usage-insights-cli export --agent <name> --date YYYY[-MM[-DD]] --out <path>
+  token-usage-insights export --agent <name> --date YYYY[-MM[-DD]] --out <path>
   例如:
-  token-usage-insights-cli export --agent codex --date 2026-07-09 --out daily.json
-  token-usage-insights-cli export-all --out all-usage.json
+  token-usage-insights export --agent codex --date 2026-07-09 --out daily.json
+  token-usage-insights export-all --out all-usage.json
 
 匯入:
-  token-usage-insights-cli import --file <path> [--agent <name>]
+  token-usage-insights import --file <path> [--agent <name>]
   例如:
-  token-usage-insights-cli import --file all-usage.json
+  token-usage-insights import --file all-usage.json
 
 注意:
   - 若未指定 export 的 --out，會直接輸出到 stdout
@@ -176,18 +157,13 @@ struct UsageDayImportPayload {
     records: Vec<db::UsageDayExportRecord>,
 }
 
-fn main() {
-    std::process::exit(run());
-}
-
-fn run() -> i32 {
-    let args: Vec<String> = env::args().collect();
+// None means start the dashboard; commands finish before server initialization.
+pub(crate) fn run(args: &[String]) -> Option<i32> {
     if args.len() < 2 {
-        print_help();
-        return 1;
+        return None;
     }
 
-    match args[1].as_str() {
+    Some(match args[1].as_str() {
         "export" => run_export(&args[2..]),
         "export-all" => run_export_all(&args[2..]),
         "import" => run_import(&args[2..]),
@@ -200,7 +176,7 @@ fn run() -> i32 {
             print_help();
             2
         }
-    }
+    })
 }
 
 fn collect_all_exports(conn: &rusqlite::Connection) -> Result<UsageAllExportPayload, String> {
@@ -243,7 +219,7 @@ fn collect_all_exports(conn: &rusqlite::Connection) -> Result<UsageAllExportPayl
 
 fn run_export_all(args: &[String]) -> i32 {
     if has_help(args) {
-        println!("export-all usage:\n  token-usage-insights-cli export-all [--out <path>]\n\n匯出資料庫已收錄的所有 Agent、所有日期與完整使用量欄位。\n--out <path>  輸出 JSON 檔案；省略時輸出到 stdout。\n不接受 --agent 或 --date 篩選；不會掃描尚未同步的來源日誌。");
+        println!("export-all usage:\n  token-usage-insights export-all [--out <path>]\n\n匯出資料庫已收錄的所有 Agent、所有日期與完整使用量欄位。\n--out <path>  輸出 JSON 檔案；省略時輸出到 stdout。\n不接受 --agent 或 --date 篩選；不會掃描尚未同步的來源日誌。");
         return 0;
     }
     let mut out_path = None;
@@ -628,7 +604,7 @@ fn print_help() {
 fn print_export_help() {
     println!(
         r#"export usage:
-  token-usage-insights-cli export --agent <name> --date YYYY[-MM[-DD]] --out <path>
+  token-usage-insights export --agent <name> --date YYYY[-MM[-DD]] --out <path>
 
 參數:
   --agent <name>    助理名稱（antigravity/copilot/codex/claude/cursor/grok/pi/omp/muse）
@@ -642,7 +618,7 @@ fn print_export_help() {
 fn print_import_help() {
     println!(
         r#"import usage:
-  token-usage-insights-cli import --file <path> [--agent <name>]
+  token-usage-insights import --file <path> [--agent <name>]
 
 參數:
   --agent <name>      選填：篩選 Agent 或指定缺少 assistant 的舊檔案

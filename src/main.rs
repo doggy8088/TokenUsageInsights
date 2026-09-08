@@ -12,6 +12,7 @@ use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 
+mod cli;
 mod db;
 mod grok;
 mod handlers;
@@ -132,6 +133,9 @@ fn spawn_usage_sync_task() {
 
 #[tokio::main]
 async fn main() {
+    if let Some(code) = cli::run(&std::env::args().collect::<Vec<_>>()) {
+        std::process::exit(code);
+    }
     if let Err(error) = initialize_database_schema() {
         eprintln!("❌ 初始化 SQLite 資料庫失敗: {error}");
     }

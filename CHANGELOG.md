@@ -6,6 +6,8 @@
 
 ### 新增與改善
 
+- 將看板與 CLI 整合為單一 `token-usage-insights` 執行檔，無參數時啟動看板，支援 `export`、`export-all`、`import` 子命令，以及主命令與子命令的 `--help`、`-h`。移除獨立 `token-usage-insights-cli` 建置目標；既有指令與自動化腳本需改用 `token-usage-insights`，JSON 格式維持不變。
+
 - 新增 CLI `export-all [--out <path>]`，一次匯出資料庫中所有 Agent、所有日期的使用量記錄，保留既有匯出欄位與去重識別碼，支援檔案與 stdout 輸出。
 - CLI `import --file` 自動依檔案辨識 Agent，一次匯入完整匯出檔的所有 Agent 與日期；`--agent` 改為選填，可用於篩選或補足舊檔的 Agent 資訊。匯入結果改為逐 Agent 的 JSON 陣列，維持既有檔案格式與重複匯入去重行為。
 

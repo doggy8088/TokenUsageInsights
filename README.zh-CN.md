@@ -422,7 +422,7 @@ GET /api/:assistant/sync
 
 **一般使用请直接使用看板右上角的导出与导入按钮。** 安装版只需要浏览器即可完成跨机器数据汇总，并支持最大 200 MB 的导入文件。
 
-CLI 工具仅提供给从源代码构建的高级用户；Release 安装包目前不包含 CLI 可执行文件。
+看板与 CLI 已整合为同一个 `token-usage-insights` 可执行文件。不带参数会启动看板，使用 `export`、`export-all`、`import` 子命令可操作数据；主命令与各子命令均支持 `--help`、`-h`。此整合从下一个发布版本起提供，旧版需要更新或从源代码构建。
 
 `--agent` 用于指定助理（`antigravity` / `copilot` / `codex` / `claude` / `cursor` / `grok` / `pi` / `omp`）。
 
@@ -431,24 +431,24 @@ CLI 工具仅提供给从源代码构建的高级用户；Release 安装包目�
 先构建一次：
 
 ```bash
-cargo build --release --bin token-usage-insights-cli
+cargo build --release --bin token-usage-insights
 ```
 
 ```bash
 # 匯出日、月或年資料（輸出 JSON，含匯入唯一 id）
-./target/release/token-usage-insights-cli export --agent codex --date 2026-07 --out monthly-codex-2026-07.json
+./target/release/token-usage-insights export --agent codex --date 2026-07 --out monthly-codex-2026-07.json
 ```
 
 ```bash
 # 匯入檔案中的所有資料；每筆資料依 timestamp 決定日期
-./target/release/token-usage-insights-cli import --agent codex --file monthly-codex-2026-07.json
+./target/release/token-usage-insights import --agent codex --file monthly-codex-2026-07.json
 ```
 
 ```bash
 # 取得 CLI usage 說明
-./target/release/token-usage-insights-cli --help
-./target/release/token-usage-insights-cli export --help
-./target/release/token-usage-insights-cli import --help
+./target/release/token-usage-insights --help
+./target/release/token-usage-insights export --help
+./target/release/token-usage-insights import --help
 ```
 
 数据格式与前端一致，包含以下字段：
