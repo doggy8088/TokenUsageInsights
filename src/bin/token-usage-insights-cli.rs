@@ -34,6 +34,7 @@ const HELP_TEXT: &str = r#"Token 使用量 CLI 匯入 / 匯出工具
 
 用途:
   export  匯出指定日、月或年的資料為 JSON（可重複匯入且支援重複資料去重）
+  export-all  一次匯出資料庫中所有 Agent、所有日期的使用量記錄
   import  匯入 JSON 檔內的所有資料（每筆資料依 timestamp 決定日期）
 
 共用參數:
@@ -44,6 +45,7 @@ const HELP_TEXT: &str = r#"Token 使用量 CLI 匯入 / 匯出工具
   token-usage-insights-cli export --agent <name> --date YYYY[-MM[-DD]] --out <path>
   例如:
   token-usage-insights-cli export --agent codex --date 2026-07-09 --out daily.json
+  token-usage-insights-cli export-all --out all-usage.json
 
 匯入:
   token-usage-insights-cli import --agent <name> --file <path>
@@ -57,13 +59,47 @@ const HELP_TEXT: &str = r#"Token 使用量 CLI 匯入 / 匯出工具
   - 每次 import 都會建立可追蹤、可由看板撤銷的匯入批次
 "#;
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct UsageDayExportPayload {
     version: u8,
     assistant: String,
     date: String,
     exported_at: String,
     records: Vec<db::UsageDayExportRecord>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct UsageAllExportPayload {
+    version: u8,
+    exported_at: String,
+    exports: Vec<UsageDayExportPayload>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum UsageImportFile {
+    All(UsageAllExportPayload),
+    Single(UsageDayImportPayload),
+}
+
+impl UsageImportFile {
+    fn for_assistant(self, assistant: &str) -> UsageDayImportPayload {
+        match self {
+            Self::Single(payload) => payload,
+            Self::All(payload) => UsageDayImportPayload {
+                version: Some(payload.version),
+                assistant: Some(assistant.to_string()),
+                date: Some("all".to_string()),
+                exported_at: Some(payload.exported_at),
+                records: payload
+                    .exports
+                    .into_iter()
+                    .filter(|group| normalize_assistant_name(&group.assistant) == assistant)
+                    .flat_map(|group| group.records)
+                    .collect(),
+            },
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -97,6 +133,7 @@ fn run() -> i32 {
 
     match args[1].as_str() {
         "export" => run_export(&args[2..]),
+        "export-all" => run_export_all(&args[2..]),
         "import" => run_import(&args[2..]),
         "-h" | "--help" | "help" => {
             print_help();
@@ -106,6 +143,88 @@ fn run() -> i32 {
             eprintln!("未知指令：{}", args[1]);
             print_help();
             2
+        }
+    }
+}
+
+fn collect_all_exports(conn: &rusqlite::Connection) -> Result<UsageAllExportPayload, String> {
+    // A read transaction keeps the group list and records in the same snapshot.
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|err| err.to_string())?;
+    let mut stmt = tx
+        .prepare(
+            "SELECT DISTINCT assistant_type, date FROM usage_entries ORDER BY assistant_type, date",
+        )
+        .map_err(|err| err.to_string())?;
+    let groups = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|err| err.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| err.to_string())?;
+    drop(stmt);
+    let exported_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let mut exports = Vec::with_capacity(groups.len());
+    for (assistant, date) in groups {
+        let records = db::export_usage_day_entries(&tx, &assistant, &date)?;
+        exports.push(UsageDayExportPayload {
+            version: EXPORT_VERSION,
+            assistant,
+            date,
+            exported_at: exported_at.clone(),
+            records,
+        });
+    }
+    tx.commit().map_err(|err| err.to_string())?;
+    Ok(UsageAllExportPayload {
+        version: EXPORT_VERSION,
+        exported_at,
+        exports,
+    })
+}
+
+fn run_export_all(args: &[String]) -> i32 {
+    if has_help(args) {
+        println!("export-all usage:\n  token-usage-insights-cli export-all [--out <path>]\n\n匯出資料庫已收錄的所有 Agent、所有日期與完整使用量欄位。\n--out <path>  輸出 JSON 檔案；省略時輸出到 stdout。\n不接受 --agent 或 --date 篩選；不會掃描尚未同步的來源日誌。");
+        return 0;
+    }
+    let mut out_path = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--out" => out_path = Some(next_flag_value(args, &mut i, "out")),
+            arg => {
+                eprintln!("未知參數: {arg}");
+                return 2;
+            }
+        }
+        i += 1;
+    }
+    let result = (|| -> Result<(), String> {
+        let conn = db::get_db_conn()?;
+        db::init_db(&conn)?;
+        let payload = collect_all_exports(&conn)?;
+        let count: usize = payload
+            .exports
+            .iter()
+            .map(|group| group.records.len())
+            .sum();
+        let json = serde_json::to_string_pretty(&payload).map_err(|err| err.to_string())?;
+        if let Some(out) = out_path {
+            fs::write(&out, json).map_err(|err| format!("寫入檔案失敗 {out}: {err}"))?;
+            println!("已匯出 {count} 筆到 {out}");
+        } else {
+            println!("{json}");
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => 0,
+        Err(err) => {
+            eprintln!("匯出全部資料失敗: {err}");
+            1
         }
     }
 }
@@ -288,8 +407,8 @@ fn run_import(args: &[String]) -> i32 {
         }
     };
 
-    let payload: UsageDayImportPayload = match serde_json::from_str(&input) {
-        Ok(v) => v,
+    let payload = match serde_json::from_str::<UsageImportFile>(&input) {
+        Ok(v) => v.for_assistant(&assistant),
         Err(err) => {
             eprintln!("解析 JSON 失敗: {err}");
             return 1;
@@ -493,6 +612,82 @@ fn has_help(args: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::validate_import_source_assistant;
+
+    #[test]
+    fn export_all_preserves_every_agent_date_and_import_identity() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        super::db::init_db(&conn).unwrap();
+        for agent in [
+            "antigravity",
+            "copilot",
+            "codex",
+            "claude",
+            "cursor",
+            "grok",
+            "pi",
+            "omp",
+            "muse",
+            "future-agent",
+        ] {
+            for date in ["2020-01-01", "2026-09-09"] {
+                conn.execute(
+                    "INSERT INTO usage_entries (assistant_type, date, timestamp, session_id, turn_no, tokens_input, tokens_output, tokens_total, reasoning_effort, import_source_id) VALUES (?1, ?2, ?3, ?4, 1, 11, 22, 33, 'high', ?4)",
+                    rusqlite::params![agent, date, format!("{date}T12:00:00Z"), format!("{agent}-{date}")],
+                ).unwrap();
+            }
+        }
+        let all = super::collect_all_exports(&conn).unwrap();
+        assert_eq!(all.exports.len(), 20);
+        for group in &all.exports {
+            let expected =
+                super::db::export_usage_day_entries(&conn, &group.assistant, &group.date).unwrap();
+            assert_eq!(
+                serde_json::to_value(&group.records).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+        }
+        let json = serde_json::to_string(&all).unwrap();
+        let selected = serde_json::from_str::<super::UsageImportFile>(&json)
+            .unwrap()
+            .for_assistant("codex");
+        assert_eq!(selected.records.len(), 2);
+        assert!(selected
+            .records
+            .iter()
+            .all(|record| record.entry.session_id.starts_with("codex-")));
+        let mut target = rusqlite::Connection::open_in_memory().unwrap();
+        super::db::init_db(&target).unwrap();
+        for expected in [2, 0] {
+            let selected = serde_json::from_str::<super::UsageImportFile>(&json)
+                .unwrap()
+                .for_assistant("codex");
+            let summary = super::db::import_usage_day_entries(
+                &mut target,
+                "codex",
+                "all",
+                selected.records,
+                super::db::UsageImportMetadata::default(),
+            )
+            .unwrap();
+            assert_eq!(summary.imported, expected);
+        }
+    }
+
+    #[test]
+    fn export_all_empty_database_and_legacy_import_are_supported() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        super::db::init_db(&conn).unwrap();
+        assert!(super::collect_all_exports(&conn)
+            .unwrap()
+            .exports
+            .is_empty());
+        let legacy = serde_json::from_str::<super::UsageImportFile>(
+            r#"{"assistant":"claude","records":[]}"#,
+        )
+        .unwrap()
+        .for_assistant("codex");
+        assert!(validate_import_source_assistant("codex", legacy.assistant.as_deref()).is_err());
+    }
 
     #[test]
     fn import_source_assistant_must_match_cli_target() {

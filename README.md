@@ -440,6 +440,18 @@ cargo build --release --bin token-usage-insights-cli
 ```
 
 ```bash
+# 一次匯出所有 Agent、所有日期的使用量記錄
+./target/release/token-usage-insights-cli export-all --out all-usage.json
+
+# 從完整匯出檔匯入指定 Agent 的全部日期
+./target/release/token-usage-insights-cli import --agent codex --file all-usage.json
+```
+
+`export-all` 不需指定 Agent 或日期；省略 `--out` 時輸出 JSON 到 stdout。匯出涵蓋 SQLite 已收錄的所有使用量記錄，包含原生與匯入資料，保留既有匯出格式的完整欄位及 `import_source_id`。執行前請透過看板完成來源日誌同步；此命令不會自行掃描來源日誌，也不是包含原始對話檔、設定與匯入批次歷程的資料庫備份。
+
+完整匯出檔包含 `version`、`exported_at` 與 `exports` 陣列；每個元素都是原有格式的單一 Agent、單日匯出，依 Agent 與日期排序。空資料庫會輸出空的 `exports` 陣列。`import --agent` 只匯入檔內對應 Agent 的記錄，沒有該 Agent 的記錄時回報錯誤。
+
+```bash
 # 匯入檔案中的所有資料；每筆資料依 timestamp 決定日期
 ./target/release/token-usage-insights-cli import --agent codex --file monthly-codex-2026-07.json
 ```
@@ -448,6 +460,7 @@ cargo build --release --bin token-usage-insights-cli
 # 取得 CLI usage 說明
 ./target/release/token-usage-insights-cli --help
 ./target/release/token-usage-insights-cli export --help
+./target/release/token-usage-insights-cli export-all --help
 ./target/release/token-usage-insights-cli import --help
 ```
 
