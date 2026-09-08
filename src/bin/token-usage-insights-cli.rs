@@ -48,13 +48,14 @@ const HELP_TEXT: &str = r#"Token 使用量 CLI 匯入 / 匯出工具
   token-usage-insights-cli export-all --out all-usage.json
 
 匯入:
-  token-usage-insights-cli import --agent <name> --file <path>
+  token-usage-insights-cli import --file <path> [--agent <name>]
   例如:
-  token-usage-insights-cli import --agent codex --file daily.json
+  token-usage-insights-cli import --file all-usage.json
 
 注意:
   - 若未指定 export 的 --out，會直接輸出到 stdout
-  - import 檔案若含 assistant，必須與 --agent 正規化後一致，否則阻止匯入
+  - import 自動依檔案 assistant 判斷 Agent，完整匯出檔會匯入全部 Agent
+  - --agent 僅供篩選完整匯出檔或指定舊檔 Agent；單一 Agent 檔案必須一致
   - import 會以 `assistant_type + import_source_id` 做資料去重，重複匯入只會插入一次
   - 每次 import 都會建立可追蹤、可由看板撤銷的匯入批次
 "#;
@@ -83,6 +84,61 @@ enum UsageImportFile {
 }
 
 impl UsageImportFile {
+    fn into_imports(self, target: Option<&str>) -> Result<Vec<UsageDayImportPayload>, String> {
+        if let Some(target) = target {
+            let payload = self.for_assistant(target);
+            validate_import_source_assistant(target, payload.assistant.as_deref())?;
+            if !is_supported_assistant(target) || payload.records.is_empty() {
+                return Err("不支援的 Agent 或檔案沒有對應記錄".to_string());
+            }
+            return Ok(vec![UsageDayImportPayload {
+                assistant: Some(target.to_string()),
+                ..payload
+            }]);
+        }
+        let payloads = match self {
+            Self::Single(payload) => vec![payload],
+            Self::All(payload) => payload
+                .exports
+                .into_iter()
+                .map(|group| UsageDayImportPayload {
+                    version: Some(group.version),
+                    assistant: Some(group.assistant),
+                    date: Some(group.date),
+                    exported_at: Some(group.exported_at),
+                    records: group.records,
+                })
+                .collect(),
+        };
+        let mut imports = std::collections::BTreeMap::<String, UsageDayImportPayload>::new();
+        for mut payload in payloads {
+            let assistant = payload
+                .assistant
+                .as_deref()
+                .map(normalize_assistant_name)
+                .filter(|name| !name.is_empty())
+                .ok_or("檔案缺少 assistant，無法判斷 Agent；舊版檔案請指定 --agent")?;
+            if !is_supported_assistant(&assistant) {
+                return Err(format!("不支援的助理類型: {assistant}"));
+            }
+            payload.assistant = Some(assistant.clone());
+            if let Some(existing) = imports.get_mut(&assistant) {
+                existing.date = Some("all".to_string());
+                existing.records.extend(payload.records);
+            } else {
+                imports.insert(assistant, payload);
+            }
+        }
+        let imports: Vec<_> = imports
+            .into_values()
+            .filter(|payload| !payload.records.is_empty())
+            .collect();
+        if imports.is_empty() {
+            return Err("匯入檔案沒有 records".to_string());
+        }
+        Ok(imports)
+    }
+
     fn for_assistant(self, assistant: &str) -> UsageDayImportPayload {
         match self {
             Self::Single(payload) => payload,
@@ -373,19 +429,6 @@ fn run_import(args: &[String]) -> i32 {
         i += 1;
     }
 
-    let assistant = match assistant {
-        Some(v) => normalize_assistant_name(&v),
-        None => {
-            eprintln!("缺少 --agent");
-            return 2;
-        }
-    };
-
-    if !is_supported_assistant(&assistant) {
-        eprintln!("不支援的助理類型: {assistant}");
-        return 2;
-    }
-
     let file_path = match file_path {
         Some(v) => PathBuf::from(v),
         None => {
@@ -408,31 +451,21 @@ fn run_import(args: &[String]) -> i32 {
     };
 
     let payload = match serde_json::from_str::<UsageImportFile>(&input) {
-        Ok(v) => v.for_assistant(&assistant),
+        Ok(v) => v,
         Err(err) => {
             eprintln!("解析 JSON 失敗: {err}");
             return 1;
         }
     };
 
-    let imported_from = date
-        .or(payload.date)
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "all".to_string());
-
-    let source_assistant =
-        match validate_import_source_assistant(&assistant, payload.assistant.as_deref()) {
-            Ok(value) => value,
-            Err(error) => {
-                eprintln!("{error}");
-                return 2;
-            }
-        };
-
-    if payload.records.is_empty() {
-        eprintln!("匯入檔案沒有 records");
-        return 2;
-    }
+    let assistant = assistant.as_deref().map(normalize_assistant_name);
+    let imports = match payload.into_imports(assistant.as_deref()) {
+        Ok(imports) => imports,
+        Err(err) => {
+            eprintln!("{err}");
+            return 2;
+        }
+    };
 
     let mut conn = match db::get_db_conn() {
         Ok(conn) => conn,
@@ -447,27 +480,42 @@ fn run_import(args: &[String]) -> i32 {
         return 1;
     }
 
-    let summary = match db::import_usage_day_entries(
-        &mut conn,
-        &assistant,
-        &imported_from,
-        payload.records,
-        db::UsageImportMetadata {
-            source_assistant,
-            source_file_name: file_path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(str::to_string),
-        },
-    ) {
-        Ok(v) => v,
-        Err(err) => {
-            eprintln!("匯入失敗: {err}");
-            return 1;
-        }
-    };
+    let mut summaries = Vec::new();
+    for payload in imports {
+        let assistant = payload
+            .assistant
+            .as_deref()
+            .expect("validated import assistant");
+        let imported_from = date
+            .clone()
+            .or(payload.date)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "all".to_string());
+        let summary = match db::import_usage_day_entries(
+            &mut conn,
+            assistant,
+            &imported_from,
+            payload.records,
+            db::UsageImportMetadata {
+                source_assistant: Some(assistant.to_string()),
+                source_file_name: file_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_string),
+            },
+        ) {
+            Ok(v) => v,
+            Err(err) => {
+                eprintln!(
+                    "匯入 {assistant} 失敗: {err}；先前完成的 Agent 已保留，可重新執行並自動去重"
+                );
+                return 1;
+            }
+        };
+        summaries.push(serde_json::json!({"assistant": assistant, "summary": summary}));
+    }
 
-    match serde_json::to_string_pretty(&summary) {
+    match serde_json::to_string_pretty(&summaries) {
         Ok(out) => println!("{out}"),
         Err(err) => {
             eprintln!("輸出匯入結果失敗: {err}");
@@ -594,13 +642,16 @@ fn print_export_help() {
 fn print_import_help() {
     println!(
         r#"import usage:
-  token-usage-insights-cli import --agent <name> --file <path>
+  token-usage-insights-cli import --file <path> [--agent <name>]
 
 參數:
-  --agent <name>      助理名稱（antigravity/copilot/codex/claude/cursor/grok/pi/omp/muse）
+  --agent <name>      選填：篩選 Agent 或指定缺少 assistant 的舊檔案
   --file <path>       匯入檔案
   --date <label>       相容舊版，僅作為匯入紀錄標籤，不影響資料日期
   --help, -h          顯示此說明
+
+預設依檔案 assistant 自動判斷；完整匯出檔一次匯入所有 Agent。
+各 Agent 分別建立匯入批次；中途失敗時，已完成的批次會保留，重試會自動去重。
 "#
     );
 }
@@ -687,6 +738,46 @@ mod tests {
         .unwrap()
         .for_assistant("codex");
         assert!(validate_import_source_assistant("codex", legacy.assistant.as_deref()).is_err());
+    }
+
+    #[test]
+    fn import_infers_and_groups_agents_and_validates_before_writing() {
+        let record = serde_json::json!({"timestamp":"2026-09-09T00:00:00Z", "session_id":"test", "turn_no":1});
+        let group = |agent: &str| serde_json::json!({"version":1, "exported_at":"now", "assistant":agent, "date":"2026-09-09", "records":[record.clone()]});
+        let file = serde_json::json!({"version":1,"exported_at":"now","exports":[group("codex"),group("claude-code"),group("codex")]});
+        let imports = serde_json::from_value::<super::UsageImportFile>(file)
+            .unwrap()
+            .into_imports(None)
+            .unwrap();
+        assert_eq!(imports.len(), 2);
+        assert_eq!(imports[0].assistant.as_deref(), Some("claude"));
+        assert_eq!(imports[1].records.len(), 2);
+        let single = serde_json::json!({"assistant":"codex", "records":[record.clone()]});
+        assert_eq!(
+            serde_json::from_value::<super::UsageImportFile>(single)
+                .unwrap()
+                .into_imports(None)
+                .unwrap()[0]
+                .assistant
+                .as_deref(),
+            Some("codex")
+        );
+        let legacy = serde_json::json!({"records":[record]});
+        assert!(
+            serde_json::from_value::<super::UsageImportFile>(legacy.clone())
+                .unwrap()
+                .into_imports(None)
+                .is_err()
+        );
+        assert!(serde_json::from_value::<super::UsageImportFile>(legacy)
+            .unwrap()
+            .into_imports(Some("codex"))
+            .is_ok());
+        let invalid = serde_json::json!({"version":1,"exported_at":"now","exports":[group("codex"),group("unknown")]});
+        assert!(serde_json::from_value::<super::UsageImportFile>(invalid)
+            .unwrap()
+            .into_imports(None)
+            .is_err());
     }
 
     #[test]
