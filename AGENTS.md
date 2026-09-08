@@ -1,10 +1,12 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-`src/` contains the Rust backend: `main.rs` dispatches CLI commands or boots the Axum server, `cli.rs` implements import/export commands, `handlers.rs` exposes HTTP endpoints, `db.rs` manages SQLite sync and migrations, and `pricing.rs` / `timeline.rs` handle pricing and session reconstruction. `static/` holds the frontend (`index.html`, `app.js`, `styles.css`) plus image assets. `shell/` contains helper scripts and `systemd` unit templates for the unified dashboard. Runtime pricing data lives in `pricing.csv`.
+`src/` contains the Rust backend: `main.rs` dispatches CLI commands or boots the Axum server, `cli.rs` implements import/export commands, `handlers.rs` exposes HTTP endpoints, `db.rs` manages SQLite sync and migrations, and `pricing.rs` / `timeline.rs` handle pricing and session reconstruction. `static/` holds the dashboard frontend, while `public/` contains the GitHub Pages landing page. `npm/` contains the thin npx wrapper, release downloader, checksum validation, and prepublish checks. `shell/` contains helper scripts and `systemd` unit templates. Runtime pricing data lives in `pricing.csv`.
 
 ## Build, Test, and Development Commands
 Use `cargo run` to start the local dashboard on `http://localhost:3003`. Use `cargo build --release` for production builds or before installing the `systemd` service. Run `cargo test` to execute the current Rust test suite. Run `cargo fmt` before committing; use `cargo clippy --all-targets --all-features` for an extra lint pass when touching backend logic. For service installs, render the unit file with `sed "s|<PROJECT_DIR>|$PWD|g" shell/token-usage-insights.service`. On Windows, `scripts\build.ps1` runs `cargo test --release` then `cargo build --release --all-targets` and fails the build if the compiler emits any warning (use `-AllowWarnings` only for local iteration, never for a final build).
+
+For npm packaging changes, run `npm ci --ignore-scripts`, `npm test`, and `npm pack --dry-run --ignore-scripts`. The publish precheck additionally requires the current commit to have the exact version tag and all matching GitHub Release assets to exist.
 
 **Crucial Rule**: Every build (`cargo build`, `cargo build --release`, `cargo test`, and `scripts\build.ps1`) must complete with zero compiler warnings and zero errors across the unified `token-usage-insights` bin target before code is considered done. Treat warnings as build failures: fix them at the source (e.g. remove unused imports/`mut`, or add a narrowly-scoped `#[allow(...)]` with a comment explaining why) rather than suppressing them globally or ignoring them.
 
@@ -27,6 +29,8 @@ The repository currently uses Rust unit/integration-style tests embedded under `
 Every release must update `CHANGELOG.md` in the same release change before creating the version tag. Move the relevant items from the `Unreleased` / `未發行` section into a version heading with the release date, and derive the entries from both the Git log and the actual diff from the previous tag. Record user-visible additions, changes, fixes, removals, security changes, migrations, environment variable changes, and breaking changes when applicable; do not list a version bump by itself as a product change.
 
 GitHub Release notes must include the real changes for that tag range and a link to the full comparison. Auto-generated download or installation boilerplate is not a substitute for release notes. Keep `CHANGELOG.md`, the GitHub Release notes, `Cargo.toml`, `Cargo.lock`, the release workflow-generated package `VERSION` file, and README version examples synchronized before considering a release complete.
+
+Keep `package.json` and `package-lock.json` synchronized with the Rust package version. After npm Trusted Publishing is enabled, the release workflow must also complete its npm publish and npx smoke-test job before the release is considered complete. Follow `docs/npm-publishing.md` for the initial manual publish and OIDC setup.
 
 ### AI-assisted Release Completion Prompt
 When an AI agent is authorized to publish a version, the release is not complete when the tag is pushed or the GitHub Actions workflow starts. The agent must follow this completion prompt:

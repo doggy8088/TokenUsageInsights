@@ -6,6 +6,11 @@
 
 ### 新增與改善
 
+- 新增官方 npm 套件 `token-usage-insights` 的跨平台 npx 包裝：首次執行時依 Windows x64、Linux x64、Intel Mac 或 Apple Silicon Mac 下載同版本 GitHub Release，強制使用 `SHA256SUMS` 驗證完整壓縮包，再啟動原生 `token-usage-insights`；不依賴 npm 12 預設封鎖的安裝生命週期腳本。
+- Release workflow 新增 npm Trusted Publishing job，使用 GitHub Actions OIDC、Node.js 24 與最新版 npm 發布，不保存長效 npm Token；首次上架前以 Repository variable 保持停用，並加入 npm 套件 CI、版本／tag／Release 資產檢查及發布後 npx 驗證。
+- README 五種語言與 public 網頁新增 `npx --yes token-usage-insights` 啟動方式；public 安裝區加入 npx 分頁、Node.js 版本需求及鍵盤可操作的既有分頁互動。
+- 新增正體中文 npm 首次上架與 Trusted Publishing 維護文件，列出 npm、GitHub Environment、Repository variable 的完整人工設定值、首次手動發布流程及常見錯誤排查。
+
 - 將看板與 CLI 整合為單一 `token-usage-insights` 執行檔，無參數時啟動看板，支援 `export`、`export-all`、`import` 子命令，以及主命令與子命令的 `--help`、`-h`。移除獨立 `token-usage-insights-cli` 建置目標；既有指令與自動化腳本需改用 `token-usage-insights`，JSON 格式維持不變。
 
 - 新增 CLI `export-all [--out <path>]`，一次匯出資料庫中所有 Agent、所有日期的使用量記錄，保留既有匯出欄位與去重識別碼，支援檔案與 stdout 輸出。

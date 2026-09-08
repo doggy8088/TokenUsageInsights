@@ -12,7 +12,15 @@
 
 ## 가장 빠른 시작 방법
 
-### 1. 한 줄로 설치하고 대시보드 시작
+### 1. 한 줄로 대시보드 시작 또는 설치
+
+Node.js 18.18 이상이 설치되어 있다면 전역 npm 명령을 만들지 않고 바로 실행할 수 있습니다.
+
+```bash
+npx --yes token-usage-insights
+```
+
+고정된 시스템 명령으로 설치하려면 플랫폼별 설치 프로그램을 사용하세요.
 
 Linux / macOS:
 
@@ -26,7 +34,7 @@ Windows PowerShell:
 irm https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.ps1 | iex; & "$HOME\bin\token-usage-insights.cmd"
 ```
 
-위 명령은 현재 플랫폼에 맞는 컴파일된 버전을 다운로드하고 설치합니다. Rust, Cargo, WSL 또는 수동 압축 해제가 필요하지 않습니다. 설치가 끝나면 대시보드가 로컬에서 실행됩니다.
+`npx`와 설치 프로그램은 모두 현재 플랫폼에 맞는 컴파일된 버전을 다운로드합니다. Rust, Cargo, WSL 또는 수동 압축 해제가 필요하지 않습니다. 명령이 시작되면 대시보드가 로컬에서 실행됩니다.
 
 열기:
 

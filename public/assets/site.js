@@ -26,8 +26,9 @@ const siteTranslations = {
     session_agents: 'Agent 關係', session_agents_desc: '辨識 Codex subagent 與父 Session。',
     mobile_alt: 'Token 戰情室行動版深色看板', privacy_title: '資料不必離開你的電腦',
     privacy_desc: '核心資料來源是本機日誌、Status Line 收集檔與本機 SQLite。分析與費用估算都在你的電腦上完成。',
-    install_title: '一行安裝，直接開啟', install_desc: '下載目前平台的已編譯版本，不需要先安裝 Rust 或 Cargo。',
-    platform_select: '選擇作業系統', copy_command: '複製指令', launch_after: '安裝完成後開啟',
+    install_title: '一行啟動，直接開啟', install_desc: '使用 npx 或安裝腳本取得目前平台的已編譯版本，不需要 Rust 或 Cargo。',
+    install_npx_note: '已有 Node.js 18.18 以上版本時，建議直接使用 npx；不會建立全域命令。',
+    platform_select: '選擇執行方式', copy_command: '複製指令', launch_after: '指令啟動後開啟',
     license: 'MIT License · Open source', platform_support: 'Windows 10/11、macOS、Linux 與 WSL', copyright: 'Copyright © 2026 Token 戰情室 | Made by',
     course_link: 'AI 寫程式省錢術：從 Token 焦慮到團隊成本治理',
     copy_success: '已複製安裝指令。', copy_button_done: '已複製',
@@ -60,8 +61,9 @@ const siteTranslations = {
     session_agents: 'Agent 关系', session_agents_desc: '识别 Codex subagent 与父 Session。',
     mobile_alt: 'Token 战情室移动版深色看板', privacy_title: '数据无需离开你的电脑',
     privacy_desc: '核心数据来自本地日志、Status Line 收集文件与本地 SQLite。分析与费用估算都在你的电脑上完成。',
-    install_title: '一行安装，立即开启', install_desc: '下载当前平台的编译版本，无需先安装 Rust 或 Cargo。',
-    platform_select: '选择操作系统', copy_command: '复制命令', launch_after: '安装完成后打开',
+    install_title: '一行启动，立即开启', install_desc: '使用 npx 或安装脚本获取当前平台的编译版本，无需 Rust 或 Cargo。',
+    install_npx_note: '已有 Node.js 18.18 或更新版本时，建议直接使用 npx；不会创建全局命令。',
+    platform_select: '选择运行方式', copy_command: '复制命令', launch_after: '命令启动后打开',
     license: 'MIT License · Open source', platform_support: 'Windows 10/11、macOS、Linux 与 WSL', copyright: 'Copyright © 2026 Token 战情室 | Made by',
     course_link: 'AI 编程省钱术：从 Token 焦虑到团队成本治理',
     copy_success: '安装命令已复制。', copy_button_done: '已复制',
@@ -94,8 +96,9 @@ const siteTranslations = {
     session_agents: 'Agent relationships', session_agents_desc: 'Identify Codex subagents and parent Sessions.',
     mobile_alt: 'Token War Room dark mobile dashboard', privacy_title: 'Your data never has to leave your computer',
     privacy_desc: 'The core sources are local logs, Status Line collection files, and local SQLite. Analysis and cost estimates run on your computer.',
-    install_title: 'Install in one line, then open', install_desc: 'Download a compiled build for your platform—no Rust or Cargo setup required.',
-    platform_select: 'Choose an operating system', copy_command: 'Copy command', launch_after: 'Open after installation',
+    install_title: 'Start in one line, then open', install_desc: 'Use npx or an installer to get the compiled build for your platform—no Rust or Cargo required.',
+    install_npx_note: 'If you have Node.js 18.18 or newer, use npx directly; it does not create a global command.',
+    platform_select: 'Choose how to run', copy_command: 'Copy command', launch_after: 'Open after the command starts',
     license: 'MIT License · Open source', platform_support: 'Windows 10/11, macOS, Linux, and WSL', copyright: 'Copyright © 2026 Token War Room | Made by',
     course_link: 'Save money with AI coding: from Token anxiety to team cost governance',
     copy_success: 'Installation command copied.', copy_button_done: 'Copied',
@@ -128,8 +131,9 @@ const siteTranslations = {
     session_agents: 'Agent の関係', session_agents_desc: 'Codex subagent と親 Session を識別します。',
     mobile_alt: 'Token 戦情室のダークモバイルダッシュボード', privacy_title: 'データを PC の外へ出す必要はありません',
     privacy_desc: 'ローカルログ、Status Line、SQLite を使い、分析と費用推定は PC 上で完結します。',
-    install_title: '1 行でインストールして起動', install_desc: 'Rust や Cargo を先に入れず、プラットフォーム用ビルドをダウンロードできます。',
-    platform_select: 'OS を選択', copy_command: 'コマンドをコピー', launch_after: 'インストール後に開く',
+    install_title: '1 行で起動して開く', install_desc: 'npx またはインストーラーでプラットフォーム用ビルドを取得できます。Rust と Cargo は不要です。',
+    install_npx_note: 'Node.js 18.18 以降がある場合は npx を推奨します。グローバルコマンドは作成されません。',
+    platform_select: '実行方法を選択', copy_command: 'コマンドをコピー', launch_after: 'コマンド起動後に開く',
     license: 'MIT License · Open source', platform_support: 'Windows 10/11、macOS、Linux、WSL', copyright: 'Copyright © 2026 Token 戦情室 | Made by',
     course_link: 'AI コーディング節約術：Token 不安からチームのコスト管理へ',
     copy_success: 'インストールコマンドをコピーしました。', copy_button_done: 'コピー済み',
@@ -162,8 +166,9 @@ const siteTranslations = {
     session_agents: 'Agent 관계', session_agents_desc: 'Codex subagent와 부모 Session을 식별합니다.',
     mobile_alt: 'Token 전황실 다크 모바일 대시보드', privacy_title: '데이터가 컴퓨터 밖으로 나갈 필요가 없습니다',
     privacy_desc: '로컬 로그, Status Line 수집 파일, 로컬 SQLite를 사용하며 분석과 비용 추정은 컴퓨터에서 수행됩니다.',
-    install_title: '한 줄 설치 후 바로 실행', install_desc: 'Rust나 Cargo를 먼저 설치하지 않고 플랫폼용 빌드를 다운로드하세요.',
-    platform_select: '운영 체제 선택', copy_command: '명령 복사', launch_after: '설치 후 열기',
+    install_title: '한 줄로 시작하고 바로 열기', install_desc: 'npx 또는 설치 프로그램으로 플랫폼용 빌드를 받을 수 있습니다. Rust와 Cargo는 필요하지 않습니다.',
+    install_npx_note: 'Node.js 18.18 이상이 있다면 npx 사용을 권장합니다. 전역 명령은 생성되지 않습니다.',
+    platform_select: '실행 방법 선택', copy_command: '명령 복사', launch_after: '명령 시작 후 열기',
     license: 'MIT License · Open source', platform_support: 'Windows 10/11, macOS, Linux, WSL', copyright: 'Copyright © 2026 Token 전황실 | Made by',
     course_link: 'AI 코딩 비용 절약: Token 불안에서 팀 비용 관리까지',
     copy_success: '설치 명령을 복사했습니다.', copy_button_done: '복사됨',
@@ -253,6 +258,8 @@ languageSelect?.addEventListener('change', () => {
   currentLocale = localePreference === 'auto' ? detectBrowserLocale() : localePreference;
   localStorage.setItem('site-lang', localePreference);
   applyLocale();
+  const status = document.querySelector('.copy-status');
+  if (status) status.textContent = '';
 });
 
 const tabs = Array.from(document.querySelectorAll('[data-command-tab]'));

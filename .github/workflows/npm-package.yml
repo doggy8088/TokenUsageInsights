@@ -1,0 +1,47 @@
+name: Validate npm package
+
+on:
+  pull_request:
+    paths:
+      - "package.json"
+      - "package-lock.json"
+      - "npm/**"
+      - "tests/npm-package.test.cjs"
+      - ".github/workflows/npm-package.yml"
+      - ".github/workflows/release.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "package.json"
+      - "package-lock.json"
+      - "npm/**"
+      - "tests/npm-package.test.cjs"
+      - ".github/workflows/npm-package.yml"
+      - ".github/workflows/release.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test npm wrapper and package contents
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Install package development dependencies without lifecycle scripts
+        run: npm ci --ignore-scripts
+
+      - name: Test npm wrapper
+        run: npm test
+
+      - name: Inspect npm package contents
+        run: npm pack --dry-run --ignore-scripts

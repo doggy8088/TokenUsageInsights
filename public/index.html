@@ -67,8 +67,8 @@
     </script>
 
     <script>document.documentElement.classList.add('js');</script>
-    <link rel="stylesheet" href="/assets/site.css?v=4">
-    <script src="/assets/site.js?v=4" defer></script>
+    <link rel="stylesheet" href="/assets/site.css?v=5">
+    <script src="/assets/site.js?v=5" defer></script>
   </head>
   <body>
     <a class="skip-link" href="#main-content" data-i18n="skip">跳到主要內容</a>
@@ -282,8 +282,9 @@
       <section class="install-section section" id="install" aria-labelledby="install-title">
         <div class="shell">
           <div class="section-heading install-heading" data-reveal>
-            <h2 id="install-title" data-i18n="install_title">一行安裝，直接開啟</h2>
-            <p data-i18n="install_desc">下載目前平台的已編譯版本，不需要先安裝 Rust 或 Cargo。</p>
+            <h2 id="install-title" data-i18n="install_title">一行啟動，直接開啟</h2>
+            <p data-i18n="install_desc">使用 npx 或安裝腳本取得目前平台的已編譯版本，不需要 Rust 或 Cargo。</p>
+            <p class="install-requirement" data-i18n="install_npx_note">已有 Node.js 18.18 以上版本時，建議直接使用 npx；不會建立全域命令。</p>
           </div>
 
           <div class="install-panel" data-reveal>
@@ -292,9 +293,21 @@
                 class="install-tab is-active"
                 type="button"
                 role="tab"
-                id="tab-unix"
+                id="tab-npx"
                 aria-selected="true"
+                aria-controls="panel-npx"
+                data-command-tab="npx"
+              >
+                npx · Node.js
+              </button>
+              <button
+                class="install-tab"
+                type="button"
+                role="tab"
+                id="tab-unix"
+                aria-selected="false"
                 aria-controls="panel-unix"
+                tabindex="-1"
                 data-command-tab="unix"
               >
                 Linux / macOS
@@ -313,7 +326,11 @@
               </button>
             </div>
 
-            <div class="command-panel" id="panel-unix" role="tabpanel" aria-labelledby="tab-unix" data-command-panel="unix">
+            <div class="command-panel" id="panel-npx" role="tabpanel" aria-labelledby="tab-npx" data-command-panel="npx">
+              <code data-command>npx --yes token-usage-insights</code>
+              <button class="copy-button" type="button" data-copy-command="npx" data-i18n="copy_command">複製指令</button>
+            </div>
+            <div class="command-panel" id="panel-unix" role="tabpanel" aria-labelledby="tab-unix" data-command-panel="unix" hidden>
               <code data-command>curl -fsSL https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.sh | bash &amp;&amp; "$HOME/.local/bin/token-usage-insights"</code>
               <button class="copy-button" type="button" data-copy-command="unix" data-i18n="copy_command">複製指令</button>
             </div>
@@ -332,7 +349,7 @@
           </div>
 
           <div class="launch-note" data-reveal>
-            <span data-i18n="launch_after">安裝完成後開啟</span>
+            <span data-i18n="launch_after">指令啟動後開啟</span>
             <code>http://localhost:3003</code>
           </div>
 

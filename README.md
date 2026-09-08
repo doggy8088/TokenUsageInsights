@@ -12,7 +12,15 @@
 
 ## 最短上手路徑
 
-### 1. 一行安裝並啟動看板
+### 1. 一行啟動或安裝看板
+
+已安裝 Node.js 18.18 或更新版本時，可直接執行，不會建立全域 npm 命令：
+
+```bash
+npx --yes token-usage-insights
+```
+
+若要安裝成固定的系統命令，可使用下列安裝腳本。
 
 Linux / macOS：
 
@@ -26,7 +34,7 @@ Windows PowerShell：
 irm https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.ps1 | iex; & "$HOME\bin\token-usage-insights.cmd"
 ```
 
-上述指令會下載與安裝目前平台的已編譯版本，不需要 Rust、Cargo、WSL 或手動解壓縮。安裝完成後，看板會在本機執行。
+`npx` 與安裝腳本都會下載目前平台的已編譯版本，不需要 Rust、Cargo、WSL 或手動解壓縮。指令執行後，看板會在本機執行。
 
 開啟：
 
@@ -542,6 +550,16 @@ systemctl --user stop token-usage-insights.service
 
 GitHub Release 提供 Linux、macOS 與 Windows 的已編譯可執行檔，安裝與執行都不需要 Rust 或 Cargo。
 
+### 使用 npx 直接執行
+
+電腦已有 Node.js 18.18 或更新版本時，執行以下命令即可下載目前版本並啟動看板：
+
+```bash
+npx --yes token-usage-insights
+```
+
+`npx` 不會建立全域命令；每次都可使用相同命令啟動。若需要固定的 `token-usage-insights` 系統命令、自訂安裝目錄，或安裝 Linux systemd 服務，請改用下一節的安裝腳本。
+
 ### 一行安裝的選用參數
 
 `scripts/get.sh`（Linux / macOS）與 `scripts/get.ps1`（Windows）會自動判斷平台與 CPU 架構、從最新（或指定）Release 下載對應壓縮包、解壓後呼叫套件內的 `install.sh` / `install.ps1`，全程不需要手動下載或解壓：
@@ -642,6 +660,8 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 git tag vX.Y.Z
 git push origin vX.Y.Z
 ```
+
+npm 第一次上架、Trusted Publishing 的必要欄位、GitHub Environment、Repository variable 與後續 OIDC 自動發布流程，請依照 [npm 首次上架與 Trusted Publishing 設定](docs/npm-publishing.md) 操作。
 
 * * *
 

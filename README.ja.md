@@ -12,7 +12,15 @@
 
 ## 最短で始める方法
 
-### 1. 1 行でインストールしてダッシュボードを起動
+### 1. 1 行でダッシュボードを起動またはインストール
+
+Node.js 18.18 以降がインストールされている場合、グローバル npm コマンドを作成せずに直接実行できます：
+
+```bash
+npx --yes token-usage-insights
+```
+
+常設のシステムコマンドとしてインストールする場合は、各プラットフォームのインストーラーを使用します。
 
 Linux / macOS：
 
@@ -26,7 +34,7 @@ Windows PowerShell：
 irm https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.ps1 | iex; & "$HOME\bin\token-usage-insights.cmd"
 ```
 
-上記のコマンドは現在のプラットフォーム用のコンパイル済みバージョンをダウンロードしてインストールします。Rust、Cargo、WSL、手動展開は必要ありません。インストール後、ダッシュボードはローカルで実行されます。
+`npx` とインストーラーはいずれも現在のプラットフォーム用コンパイル済みバージョンをダウンロードします。Rust、Cargo、WSL、手動展開は必要ありません。コマンドの起動後、ダッシュボードはローカルで実行されます。
 
 開く：
 

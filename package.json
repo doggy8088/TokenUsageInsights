@@ -1,0 +1,47 @@
+{
+  "name": "token-usage-insights",
+  "version": "0.8.3",
+  "description": "Local-first AI coding agent token usage dashboard and CLI",
+  "bin": {
+    "token-usage-insights": "npm/cli.cjs"
+  },
+  "scripts": {
+    "test": "node --test tests/npm-package.test.cjs",
+    "check:package": "npm test && npm pack --dry-run --ignore-scripts && node npm/prepublish-check.cjs",
+    "prepublishOnly": "npm run check:package"
+  },
+  "files": [
+    "npm/cli.cjs",
+    "npm/install.cjs",
+    "npm/prepublish-check.cjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18.18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/doggy8088/TokenUsageInsights.git"
+  },
+  "homepage": "https://token.gh.miniasp.com/",
+  "bugs": {
+    "url": "https://github.com/doggy8088/TokenUsageInsights/issues"
+  },
+  "keywords": [
+    "ai",
+    "coding-agent",
+    "token-usage",
+    "codex",
+    "claude-code",
+    "copilot",
+    "rust",
+    "cli"
+  ],
+  "author": "Will and contributors",
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  }
+}

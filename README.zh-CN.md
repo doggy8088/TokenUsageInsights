@@ -12,7 +12,15 @@
 
 ## 最短上手路径
 
-### 1. 一行安装并启动看板
+### 1. 一行启动或安装看板
+
+已安装 Node.js 18.18 或更新版本时，可直接运行，不会创建全局 npm 命令：
+
+```bash
+npx --yes token-usage-insights
+```
+
+如需安装成固定的系统命令，可使用以下安装脚本。
 
 Linux / macOS：
 
@@ -26,7 +34,7 @@ Windows PowerShell：
 irm https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.ps1 | iex; & "$HOME\bin\token-usage-insights.cmd"
 ```
 
-上述命令会下载并安装当前平台的已编译版本，不需要 Rust、Cargo、WSL 或手动解压。安装完成后，看板会在本机运行。
+`npx` 与安装脚本都会下载当前平台的已编译版本，不需要 Rust、Cargo、WSL 或手动解压。命令启动后，看板会在本机运行。
 
 打开：
 

@@ -40,6 +40,7 @@ jobs:
           grep -Fq '<link rel="canonical" href="https://token.gh.miniasp.com/">' public/index.html
           grep -Fq 'application/ld+json' public/index.html
           grep -Fq 'property="og:image"' public/index.html
+          grep -Fq 'npx --yes token-usage-insights' public/index.html
           grep -Fq 'User-agent: *' public/robots.txt
           if grep -RInE 'token-war-room|@token-war-room|Gemini CLI|Windsurf|Qwen Code' public; then
             echo "Found an unsupported or invented product reference." >&2

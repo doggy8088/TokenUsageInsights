@@ -60,6 +60,8 @@ jobs:
           bash -n scripts/install.sh
           bash -n scripts/get.sh
           if command -v pwsh >/dev/null 2>&1; then
+            # This is PowerShell source; Bash must not expand its variables.
+            # shellcheck disable=SC2016
             pwsh -NoProfile -Command '
               $ErrorActionPreference = "Stop"
               foreach ($f in @("scripts/install.ps1", "scripts/get.ps1")) {
@@ -146,6 +148,8 @@ jobs:
             exit 1
           fi
 
+          "${bin_dir}/token-usage-insights" --help | grep -Fq 'export-all'
+
           PORT=39103 INSIGHTS_DIR="$insights_dir" "${bin_dir}/token-usage-insights" &
           server_pid=$!
 
@@ -188,6 +192,10 @@ jobs:
 
           try {
             & (Join-Path $stage 'install.ps1') -InstallDir $installDir -BinDir $binDir -Port 39103
+            $help = & (Join-Path $installDir 'token-usage-insights.exe') --help
+            if ($LASTEXITCODE -ne 0 -or !($help -match 'export-all')) {
+              throw 'Installed Windows release did not expose the unified CLI help.'
+            }
             $process = Start-Process -FilePath (Join-Path $installDir 'token-usage-insights.exe') -WorkingDirectory $env:RUNNER_TEMP -WindowStyle Hidden -PassThru
             try {
               $response = $null
@@ -272,6 +280,12 @@ jobs:
 
           ### 安裝方式
 
+          已安裝 Node.js 18.18 或更新版本時，可直接執行：
+
+          \`\`\`bash
+          npx --yes token-usage-insights
+          \`\`\`
+
           Linux 或 macOS：
 
           \`\`\`bash
@@ -323,3 +337,73 @@ jobs:
               --notes-file release-notes.md \
               --verify-tag
           fi
+
+  publish-npm:
+    name: Publish npm package with trusted publishing
+    if: vars.NPM_TRUSTED_PUBLISHING_ENABLED == 'true' && startsWith(github.ref_name, 'v')
+    runs-on: ubuntu-latest
+    needs: release
+    environment:
+      name: npm
+      url: https://www.npmjs.com/package/token-usage-insights
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TOKEN_USAGE_INSIGHTS_RELEASE_ASSET_RETRIES: "12"
+      TOKEN_USAGE_INSIGHTS_RELEASE_ASSET_RETRY_DELAY_MS: "10000"
+
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js for npm trusted publishing
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Install current npm CLI
+        run: npm install --global npm@latest
+
+      - name: Install package development dependencies without lifecycle scripts
+        run: npm ci --ignore-scripts
+
+      - name: Align npm package version with release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          if [[ "$version" == "$GITHUB_REF_NAME" ]]; then
+            echo "npm publishing requires a v-prefixed release tag." >&2
+            exit 1
+          fi
+          npm version "$version" --no-git-tag-version --allow-same-version
+
+      - name: Publish to npm through OIDC
+        run: npm publish --access public
+
+      - name: Verify the published package through npx
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          test_root="$(mktemp -d)"
+          trap 'rm -rf "$test_root"' EXIT
+          cd "$test_root"
+          for attempt in $(seq 1 12); do
+            if npm exec --yes --package="token-usage-insights@${version}" \
+              -- token-usage-insights --help > npx-output.txt 2>&1 \
+              && grep -Fq 'export-all' npx-output.txt; then
+              cat npx-output.txt
+              exit 0
+            fi
+            cat npx-output.txt
+            if [[ "$attempt" -lt 12 ]]; then
+              echo "npm Registry 尚未提供 v${version}，10 秒後重試（${attempt}/12）。"
+              sleep 10
+            fi
+          done
+          echo "無法透過 npm Registry 執行 token-usage-insights v${version}。" >&2
+          exit 1

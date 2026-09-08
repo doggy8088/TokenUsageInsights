@@ -601,6 +601,13 @@ h3 {
   max-width: 38rem;
 }
 
+.install-heading .install-requirement {
+  margin-top: 12px;
+  color: var(--ink);
+  font-size: 0.88rem;
+  font-weight: 720;
+}
+
 .install-panel {
   margin-top: 48px;
   border: 1px solid var(--ink);

@@ -12,7 +12,15 @@ Language: [繁體中文](README.md) · [简体中文](README.zh-CN.md) · [Engli
 
 ## Quickest path to get started
 
-### 1. Install and start the dashboard with one command
+### 1. Start or install the dashboard with one command
+
+If Node.js 18.18 or newer is installed, run the dashboard directly without creating a global npm command:
+
+```bash
+npx --yes token-usage-insights
+```
+
+To install a persistent system command, use the installer for your platform.
 
 Linux / macOS:
 
@@ -26,7 +34,7 @@ Windows PowerShell:
 irm https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.ps1 | iex; & "$HOME\bin\token-usage-insights.cmd"
 ```
 
-The commands above download and install the compiled version for the current platform. Rust, Cargo, WSL, and manual extraction are not required. After installation, the dashboard runs locally.
+Both `npx` and the installers download the compiled version for the current platform. Rust, Cargo, WSL, and manual extraction are not required. The dashboard runs locally after the command starts.
 
 Open:
 
