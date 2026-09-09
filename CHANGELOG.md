@@ -4,6 +4,12 @@
 
 ## [未發行]
 
+## [0.9.1] - 2026-09-09
+
+### 變更
+
+- 將 npm 套件作者名稱更新為 `Will 保哥`，使套件中繼資料與目前維護者身分一致。
+
 ### 修正
 
 - 補齊五種語系 README 的 Muse Code、Cursor 與 GitHub Copilot App 支援資訊，加入資料來源、零設定使用方式、Cursor 與 Muse Code 說明、Windows 路徑、深層連結、CLI Agent 值、`MUSE_DIR` 與疑難排查命令；並將介面 Agent 數量、語系數量及 v0.9.0 單一執行檔狀態修正為目前實際行為。

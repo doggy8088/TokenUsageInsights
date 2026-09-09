@@ -1,6 +1,6 @@
 {
   "name": "token-usage-insights",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "description": "Local-first AI coding agent token usage dashboard and CLI",
   "bin": {
     "token-usage-insights": "npm/cli.cjs"

@@ -614,7 +614,7 @@ token-usage-insights
 
 | 变量 | 适用平台 | 说明 |
 | --- | --- | --- |
-| `TOKEN_USAGE_INSIGHTS_VERSION` | Linux / macOS / Windows | 指定要安装的 Release tag，例如 `v0.6.2`。默认 `latest` |
+| `TOKEN_USAGE_INSIGHTS_VERSION` | Linux / macOS / Windows | 指定要安装的 Release tag，例如 `v0.9.1`。默认 `latest` |
 | `TOKEN_USAGE_INSIGHTS_INSTALL_DIR` | Linux / macOS | 安装目录，会传递给 `install.sh` |
 | `TOKEN_USAGE_INSIGHTS_BIN_DIR` | Linux / macOS | 可执行文件链接目录，会传递给 `install.sh` |
 
