@@ -4,6 +4,10 @@
 
 ## [未發行]
 
+### 修正
+
+- 補齊五種語系 README 的 Muse Code、Cursor 與 GitHub Copilot App 支援資訊，加入資料來源、零設定使用方式、Cursor 與 Muse Code 說明、Windows 路徑、深層連結、CLI Agent 值、`MUSE_DIR` 與疑難排查命令；並將介面 Agent 數量、語系數量及 v0.9.0 單一執行檔狀態修正為目前實際行為。
+
 ## [0.9.0] - 2026-09-09
 
 ### 新增與改善

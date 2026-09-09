@@ -1,6 +1,6 @@
 # Token 戦情室
 
-**Token 戦情室は、ローカル優先の AI Coding Agent の Token 使用量とセッション復元ダッシュボードです。** Google Antigravity CLI、GitHub Copilot CLI、GitHub Copilot Chat（VS Code）、Codex Desktop、Codex CLI、Claude Code、Grok Build、Pi Coding Agent、OMP のローカル記録を読み取り、日別・月別・年別の Token 消費量、キャッシュ使用量、推論 Token、推定コスト、モデル分布、プロジェクトディレクトリ分布、完全な Session タイムラインをまとめて表示します。
+**Token 戦情室は、ローカル優先の AI Coding Agent の Token 使用量とセッション復元ダッシュボードです。** Google Antigravity CLI、GitHub Copilot CLI、GitHub Copilot App、GitHub Copilot Chat（VS Code）、Codex Desktop、Codex CLI、Claude Code、Cursor、Grok Build、Pi Coding Agent、OMP、Muse Code のローカル記録を読み取り、日別・月別・年別の Token 消費量、キャッシュ使用量、推論 Token、推定コスト、モデル分布、プロジェクトディレクトリ分布、完全な Session タイムラインをまとめて表示します。
 
 このプロジェクトが AI プロバイダー API を代わりに呼び出してデータを取得することはありません。主なデータソースはローカルログ、Status Line コレクターファイル、ローカル SQLite です。
 
@@ -48,14 +48,17 @@ http://localhost:3003
 | --- | --- | --- | --- |
 | Google Antigravity CLI | 必要 | `~/.gemini/antigravity-cli/usage/usage-YYYY-MM-DD.jsonl` | `statusline-token.sh` または Windows の `statusline-token.ps1` で Token データを収集 |
 | GitHub Copilot CLI | 必要 | `~/.copilot/usage/usage-YYYY-MM-DD.jsonl` | `statusline-token.sh` または Windows の `statusline-token.ps1` で Token データを収集 |
+| GitHub Copilot App | 不要 | `~/.copilot/data.db`、`~/.copilot/session-store.db` | デスクトップアプリのローカル SQLite をダッシュボードが直接読み取り |
 | GitHub Copilot Chat（VS Code） | 不要 | VS Code `workspaceStorage/chatSessions` | VS Code Stable と Insiders のローカルチャット Session を直接スキャン |
 | Codex Desktop / CLI | 不要 | `~/.codex/sessions`、`~/.codex/archived_sessions` | Codex のアクティブおよびアーカイブ済みローカル Session を直接スキャン |
 | Claude Code | 不要 | `~/.claude/projects` | Claude Code のローカルプロジェクト Session を直接スキャン |
+| Cursor | 不要 | `~/.cursor/projects` | Cursor のローカル transcript をスキャンし、帰属可能なモデル情報を読み取り専用で取得 |
 | Grok Build | 不要 | `~/.grok/sessions` | Grok Build が自動保存する `updates.jsonl` Session stream を直接スキャン |
 | Pi Coding Agent | 不要 | `~/.pi/agent/sessions` | Pi Coding Agent が自動保存するローカル Session JSONL ファイルを直接スキャン |
 | OMP | 不要 | `~/.omp/agent/sessions` | OMP が自動保存するローカル Session JSONL ファイルを直接スキャン |
+| Muse Code | 不要 | `~/.local/share/muse/sessions` | Muse Code が自動保存するローカル Session JSONL ファイルを直接スキャン |
 
-**VS Code Copilot、Codex Desktop、Codex CLI、Claude Code、Grok Build、Pi Coding Agent、OMP だけを使用する場合は、1 行のインストールコマンドを実行してダッシュボードを開くだけで利用できます。**
+**Copilot App、VS Code Copilot、Codex Desktop、Codex CLI、Claude Code、Cursor、Grok Build、Pi Coding Agent、OMP、Muse Code だけを使用する場合は、1 行のインストールコマンドを実行してダッシュボードを開くだけで利用できます。**
 
 ### Windows ネイティブでの利用
 
@@ -74,6 +77,7 @@ Windows ではデフォルトで次のネイティブパスを使用します：
 | Grok Build | `%USERPROFILE%\.grok` |
 | Pi Coding Agent | `%USERPROFILE%\.pi` |
 | OMP | `%USERPROFILE%\.omp` |
+| Muse Code | `%USERPROFILE%\.local\share\muse` |
 
 ダッシュボードの設定ガイドは Windows で PowerShell のコピー、設定、診断コマンドを表示します。PowerShell collector は .NET JSON とファイル API を使用し、Bash、`jq`、`sed`、`awk` に依存しません。
 
@@ -105,13 +109,13 @@ Windows ではデフォルトで次のネイティブパスを使用します：
 
 ### インターフェース
 
-- 5 種類の CLI バッジを切り替え
+- 9 種類の Coding Agent バッジを切り替え
 - 日別・月別・年別ビュー
 - 日付、月、年のクイック切り替え
 - 5 秒、10 秒、30 秒間隔の自動ライブ更新
 - ローカルログを SQLite に手動同期
 - ダークテーマとライトテーマ
-- 繁体字中国語と英語のインターフェース切り替え
+- 繁体字中国語、簡体字中国語、英語、日本語、韓国語のインターフェース切り替え
 - モデル料金表の表示
 
 * * *
@@ -122,7 +126,7 @@ Windows ではデフォルトで次のネイティブパスを使用します：
 
 | パラメータ | 対象ビュー | 指定できる値 | 説明 |
 | --- | --- | --- | --- |
-| `agent` | すべて | `antigravity`、`copilot`、`codex`、`claude`、`cursor`、`grok`、`pi`、`omp` | 表示する Coding Agent を指定します。`claude-code`、`grok-build`、`pi-coding-agent` などのエイリアスも利用可能です |
+| `agent` | すべて | `antigravity`、`copilot`、`codex`、`claude`、`cursor`、`grok`、`pi`、`omp`、`muse` | 表示する Coding Agent を指定します。`claude-code`、`grok-build`、`pi-coding-agent`、`oh-my-pi`、`muse-code` などのエイリアスも利用可能です |
 | `tab` | すべて | `daily`、`monthly`、`yearly` | 日別（daily）、月別（monthly）、年別（yearly）ビューを指定します |
 | `date` | すべて | `daily`: `YYYY-MM-DD`、`monthly`: `YYYY-MM`、`yearly`: `YYYY` | 表示する日付・月・年を指定します。形式は `tab` に応じて自動的に対応します |
 | `dir` | `daily` | フルパス、`~` で始まるホームディレクトリのパス、または一意のパス末尾（例：`TokenUsageInsights`） | 日別ビューの作業ディレクトリフィルターを指定します。Windows パスは大文字小文字を区別しません。一致するディレクトリがない場合はすべて表示されます |
@@ -343,6 +347,27 @@ $env:VSCODE_USER_DATA_DIR = "C:\path\to\vscode-user-data"; & "$HOME\bin\token-us
 
 * * *
 
+## Cursor の設定
+
+**Cursor に Hook、Status Line、追加の収集スクリプトは必要ありません。** ダッシュボードは次のディレクトリを直接スキャンします：
+
+```text
+~/.cursor/projects
+```
+
+Cursor は会話と Agent の transcript をプロジェクトディレクトリ配下に保存します。ダッシュボードはプラットフォーム既定の `Cursor/User/globalStorage/state.vscdb` も読み取り専用でスキャンし、その `agentKv` 記録から実際のモデルを帰属します。一意に照合できない Session は `Unknown Model` のまま表示されます。
+
+使用方法：
+
+1. Cursor で少なくとも 1 つの会話または Agent Session を作成します。
+2. ダッシュボードを起動または再読み込みします。
+3. 左側で Cursor を選択します。
+4. 右上の同期ボタンをクリックするか、バックグラウンド同期を待ちます。
+
+Cursor のローカルデータには正確な Token 数や公式の請求明細が含まれないため、Token はテキスト内容から推定します。コストは `pricing.csv` に対応するモデルがある場合のみ推定され、公式請求額とは一致しません。デフォルト以外の場所には `CURSOR_DIR` と `CURSOR_STATE_DB` を使用できます。
+
+* * *
+
 ## Grok Build の設定
 
 **Grok Build に Hook、Status Line、追加の収集スクリプトは必要ありません。** ダッシュボードは次のディレクトリを直接スキャンします：
@@ -408,6 +433,27 @@ OMP のコストは、各 Session が各 turn ごとに報告する `usage.cost`
 
 * * *
 
+## Muse Code の設定
+
+**Muse Code に Hook、Status Line、追加の収集スクリプトは必要ありません。** ダッシュボードは次のディレクトリを直接スキャンします：
+
+```text
+~/.local/share/muse/sessions
+```
+
+Muse Code は Session を日付と Session ID ごとの `session.jsonl` として保存します。ダッシュボードはモデル完了イベントを解析し、入力、キャッシュ読み取り、出力、推論 Token を分けて集計するとともに、ユーザープロンプト、ツール手順、Agent 応答のタイムラインを復元します。
+
+使用方法：
+
+1. Muse Code を通常どおり使い、少なくとも 1 つの Session を作成します。
+2. ダッシュボードを起動または再読み込みします。
+3. 左側で Muse Code を選択します。
+4. 右上の同期ボタンをクリックするか、バックグラウンド同期を待ちます。
+
+Muse Code のコストは、Session が報告するモデルと `pricing.csv` から推定します。データがデフォルトの場所にない場合は、`MUSE_DIR` に `sessions` を含む Muse Code データディレクトリを指定します。
+
+* * *
+
 ## ローカルデータの同期方法
 
 サービス起動時にバックエンドがローカル SQLite を初期化し、直ちに 1 回同期します。起動後は 5 秒ごとにバックグラウンド同期も行います。
@@ -430,9 +476,9 @@ GET /api/:assistant/sync
 
 **通常はダッシュボード右上のエクスポートとインポートボタンを使用してください。** インストール版はブラウザーだけでマシン間のデータを集約でき、最大 200 MB のインポートファイルに対応します。
 
-ダッシュボードと CLI は `token-usage-insights` に統合されました。引数なしでダッシュボードを起動し、`export`、`export-all`、`import` でデータを操作できます。各コマンドは `--help` と `-h` に対応します。次のリリースから提供されるため、旧版では更新またはソースからのビルドが必要です。
+v0.9.0 以降、ダッシュボードと CLI は `token-usage-insights` に統合されています。引数なしでダッシュボードを起動し、`export`、`export-all`、`import` でデータを操作できます。各コマンドは `--help` と `-h` に対応します。旧版では更新またはソースからのビルドが必要です。
 
-`--agent` はアシスタント（`antigravity` / `copilot` / `codex` / `claude` / `cursor` / `grok` / `pi` / `omp`）を指定します。
+`--agent` はアシスタント（`antigravity` / `copilot` / `codex` / `claude` / `cursor` / `grok` / `pi` / `omp` / `muse`）を指定します。
 
 ### ソースから CLI を使用
 
@@ -492,6 +538,7 @@ cargo build --release --bin token-usage-insights
 | `GROK_DIR` | `~/.grok` | Grok Build データディレクトリ |
 | `PI_DIR` | `~/.pi` | Pi Coding Agent データディレクトリ |
 | `OMP_DIR` | `~/.omp` | OMP データディレクトリ |
+| `MUSE_DIR` | `~/.local/share/muse` | Muse Code データディレクトリ。`sessions` を含む必要があります |
 | `CORS_ALLOWED_ORIGINS` | `http://localhost:<PORT>,http://127.0.0.1:<PORT>` | カンマ区切りの許可 CORS オリジン |
 
 > **デフォルトのバインド先は `0.0.0.0` で、同じローカルネットワーク上の他のデバイスからダッシュボードに接続できる可能性があります。ローカルだけで閲覧する場合は `HOST` を `127.0.0.1` に設定してください。**
@@ -677,9 +724,15 @@ systemctl --user reset-failed
 ```bash
 ls ~/.gemini/antigravity-cli/usage
 ls ~/.copilot/usage
+ls ~/.copilot/data.db ~/.copilot/session-store.db
 ls ~/.codex/sessions
 ls ~/.codex/archived_sessions
 ls ~/.claude/projects
+ls ~/.cursor/projects
+ls ~/.grok/sessions
+ls ~/.pi/agent/sessions
+ls ~/.omp/agent/sessions
+ls ~/.local/share/muse/sessions
 ```
 
 Antigravity CLI と Copilot CLI では、`settings.json` に `statusLine` が設定され、スクリプトに実行権限があることも確認してください。
@@ -689,9 +742,15 @@ Windows PowerShell ではネイティブデータディレクトリを直接確�
 ```powershell
 Get-ChildItem "$env:USERPROFILE\.gemini\antigravity-cli\usage"
 Get-ChildItem "$env:USERPROFILE\.copilot\usage"
+Get-ChildItem "$env:USERPROFILE\.copilot\data.db", "$env:USERPROFILE\.copilot\session-store.db"
 Get-ChildItem "$env:USERPROFILE\.codex\sessions"
 Get-ChildItem "$env:USERPROFILE\.codex\archived_sessions"
 Get-ChildItem "$env:USERPROFILE\.claude\projects"
+Get-ChildItem "$env:USERPROFILE\.cursor\projects"
+Get-ChildItem "$env:USERPROFILE\.grok\sessions"
+Get-ChildItem "$env:USERPROFILE\.pi\agent\sessions"
+Get-ChildItem "$env:USERPROFILE\.omp\agent\sessions"
+Get-ChildItem "$env:USERPROFILE\.local\share\muse\sessions"
 ```
 
 ### Status Line スクリプトを実行できない

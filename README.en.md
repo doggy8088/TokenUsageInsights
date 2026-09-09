@@ -1,6 +1,6 @@
 # Token War Room
 
-**Token War Room is a local-first dashboard for AI coding-agent token usage and session reconstruction.** It reads local records from Google Antigravity CLI, GitHub Copilot CLI, GitHub Copilot Chat (VS Code), Codex Desktop, Codex CLI, Claude Code, Grok Build, Pi Coding Agent, and OMP, presenting daily, monthly, and yearly token consumption, cache usage, reasoning tokens, estimated costs, model distribution, project-directory distribution, and complete session timelines in one place.
+**Token War Room is a local-first dashboard for AI coding-agent token usage and session reconstruction.** It reads local records from Google Antigravity CLI, GitHub Copilot CLI, GitHub Copilot App, GitHub Copilot Chat (VS Code), Codex Desktop, Codex CLI, Claude Code, Cursor, Grok Build, Pi Coding Agent, OMP, and Muse Code, presenting daily, monthly, and yearly token consumption, cache usage, reasoning tokens, estimated costs, model distribution, project-directory distribution, and complete session timelines in one place.
 
 This project does not call AI provider APIs on your behalf. Its core data sources are local logs, Status Line collector files, and local SQLite.
 
@@ -48,14 +48,17 @@ http://localhost:3003
 | --- | --- | --- | --- |
 | Google Antigravity CLI | Required | `~/.gemini/antigravity-cli/usage/usage-YYYY-MM-DD.jsonl` | Collects token data through `statusline-token.sh` or the Windows `statusline-token.ps1` |
 | GitHub Copilot CLI | Required | `~/.copilot/usage/usage-YYYY-MM-DD.jsonl` | Collects token data through `statusline-token.sh` or the Windows `statusline-token.ps1` |
+| GitHub Copilot App | Not required | `~/.copilot/data.db`, `~/.copilot/session-store.db` | The dashboard reads the desktop app's local SQLite databases directly |
 | GitHub Copilot Chat (VS Code) | Not required | VS Code `workspaceStorage/chatSessions` | The dashboard scans local chat sessions from VS Code Stable and Insiders directly |
 | Codex Desktop / CLI | Not required | `~/.codex/sessions`, `~/.codex/archived_sessions` | The dashboard scans active and archived local Codex sessions directly |
 | Claude Code | Not required | `~/.claude/projects` | The dashboard scans local Claude Code project sessions directly |
+| Cursor | Not required | `~/.cursor/projects` | The dashboard scans local Cursor transcripts and reads attributable model metadata in read-only mode |
 | Grok Build | Not required | `~/.grok/sessions` | The dashboard scans the `updates.jsonl` session streams saved automatically by Grok Build |
 | Pi Coding Agent | Not required | `~/.pi/agent/sessions` | The dashboard scans the local session JSONL files saved automatically by Pi Coding Agent |
 | OMP | Not required | `~/.omp/agent/sessions` | The dashboard scans the local session JSONL files saved automatically by OMP |
+| Muse Code | Not required | `~/.local/share/muse/sessions` | The dashboard scans the local session JSONL files saved automatically by Muse Code |
 
-**If you only use VS Code Copilot, Codex Desktop, Codex CLI, Claude Code, Grok Build, Pi Coding Agent, or OMP, run the one-line installation command and open the dashboard.**
+**If you only use Copilot App, VS Code Copilot, Codex Desktop, Codex CLI, Claude Code, Cursor, Grok Build, Pi Coding Agent, OMP, or Muse Code, run the one-line installation command and open the dashboard.**
 
 ### Native Windows usage
 
@@ -74,6 +77,7 @@ Windows uses the following native paths by default:
 | Grok Build | `%USERPROFILE%\.grok` |
 | Pi Coding Agent | `%USERPROFILE%\.pi` |
 | OMP | `%USERPROFILE%\.omp` |
+| Muse Code | `%USERPROFILE%\.local\share\muse` |
 
 The dashboard's setup guide shows PowerShell copy, configuration, and diagnostic commands on Windows. The PowerShell collector uses .NET JSON and file APIs and does not depend on Bash, `jq`, `sed`, or `awk`.
 
@@ -105,13 +109,13 @@ Drive letters, paths containing spaces or non-ASCII characters, and UNC paths ar
 
 ### Interface
 
-- Switch between five CLI badges
+- Switch between nine coding-agent badges
 - Daily, monthly, and yearly views
 - Quick date, month, and year switching
 - Automatic live refresh every 5, 10, or 30 seconds
 - Manually sync local logs to SQLite
 - Dark and light themes
-- Traditional Chinese and English interface
+- Traditional Chinese, Simplified Chinese, English, Japanese, and Korean interface
 - Model pricing table viewer
 
 * * *
@@ -122,7 +126,7 @@ The dashboard supports URL query parameters for opening a specific state directl
 
 | Parameter | Applies to | Values | Description |
 | --- | --- | --- | --- |
-| `agent` | All views | `antigravity`, `copilot`, `codex`, `claude`, `cursor`, `grok`, `pi`, `omp` | Selects the coding agent to display. Aliases such as `claude-code`, `grok-build`, and `pi-coding-agent` are also supported |
+| `agent` | All views | `antigravity`, `copilot`, `codex`, `claude`, `cursor`, `grok`, `pi`, `omp`, `muse` | Selects the coding agent to display. Aliases such as `claude-code`, `grok-build`, `pi-coding-agent`, `oh-my-pi`, and `muse-code` are also supported |
 | `tab` | All views | `daily`, `monthly`, `yearly` | Selects the daily, monthly, or yearly view |
 | `date` | All views | `daily`: `YYYY-MM-DD`; `monthly`: `YYYY-MM`; `yearly`: `YYYY` | Selects the date, month, or year to display; the format follows `tab` automatically |
 | `dir` | `daily` | Full path, `~`-prefixed home path, or a unique path suffix (e.g. `TokenUsageInsights`) | Filters the daily view by working directory. Windows paths are case-insensitive; if no directory matches, all directories are shown |
@@ -343,6 +347,27 @@ Notes:
 
 * * *
 
+## Cursor setup
+
+**Cursor requires no hooks, a Status Line, or an additional collector script.** The dashboard scans this directory directly:
+
+```text
+~/.cursor/projects
+```
+
+Cursor stores conversation and Agent transcripts under its project directories. The dashboard also scans the platform-default `Cursor/User/globalStorage/state.vscdb` in read-only mode and uses its `agentKv` records to attribute actual models; sessions that cannot be matched uniquely remain `Unknown Model`.
+
+Usage:
+
+1. Create at least one conversation or Agent session in Cursor.
+2. Start or refresh the dashboard.
+3. Select Cursor on the left.
+4. Click the sync button in the upper-right corner, or wait for background sync.
+
+Cursor's local data does not contain exact token counts or official billing details, so tokens are estimated from text content. Costs are estimated only when `pricing.csv` contains the matching model and do not represent the official bill. Use `CURSOR_DIR` and `CURSOR_STATE_DB` for non-default locations.
+
+* * *
+
 ## Grok Build setup
 
 **Grok Build requires no hooks, a Status Line, or an additional collector script.** The dashboard scans this directory directly:
@@ -408,6 +433,27 @@ OMP cost is always read directly from each session's own per-turn `usage.cost` a
 
 * * *
 
+## Muse Code setup
+
+**Muse Code requires no hooks, a Status Line, or an additional collector script.** The dashboard scans this directory directly:
+
+```text
+~/.local/share/muse/sessions
+```
+
+Muse Code stores sessions as `session.jsonl` files grouped by date and session ID. The dashboard parses model-completion events to separate input, cache-read, output, and reasoning tokens, and reconstructs a timeline of user prompts, tool steps, and Agent replies.
+
+Usage:
+
+1. Use Muse Code normally to create at least one session.
+2. Start or refresh the dashboard.
+3. Select Muse Code on the left.
+4. Click the sync button in the upper-right corner, or wait for background sync.
+
+Muse Code costs are estimated from the model reported by the session and `pricing.csv`. If the data is not in the default location, set `MUSE_DIR` to the Muse Code data directory that contains `sessions`.
+
+* * *
+
 ## Local data synchronization
 
 When the service starts, the backend initializes local SQLite and performs an immediate data sync. After startup, it also syncs in the background every 5 seconds.
@@ -430,9 +476,9 @@ This triggers a full incremental sync of local logs.
 
 **For normal use, use the export and import buttons in the upper-right corner of the dashboard.** The installed version needs only a browser to aggregate data across machines and supports import files up to 200 MB.
 
-The dashboard and CLI now share the `token-usage-insights` executable. Run it without arguments to start the dashboard, or use `export`, `export-all`, or `import`. The main command and subcommands support `--help` and `-h`. This integration will be included in the next release; older installations need an update or a source build.
+Starting with v0.9.0, the dashboard and CLI share the `token-usage-insights` executable. Run it without arguments to start the dashboard, or use `export`, `export-all`, or `import`. The main command and subcommands support `--help` and `-h`; older installations need an update or a source build.
 
-`--agent` specifies the assistant (`antigravity` / `copilot` / `codex` / `claude` / `cursor` / `grok` / `pi` / `omp`).
+`--agent` specifies the assistant (`antigravity` / `copilot` / `codex` / `claude` / `cursor` / `grok` / `pi` / `omp` / `muse`).
 
 ### Use the CLI from source
 
@@ -492,6 +538,7 @@ Paths specified by environment variables are authoritative and do not need to be
 | `GROK_DIR` | `~/.grok` | Grok Build data directory |
 | `PI_DIR` | `~/.pi` | Pi Coding Agent data directory |
 | `OMP_DIR` | `~/.omp` | OMP data directory |
+| `MUSE_DIR` | `~/.local/share/muse` | Muse Code data directory; should contain `sessions` |
 | `CORS_ALLOWED_ORIGINS` | `http://localhost:<PORT>,http://127.0.0.1:<PORT>` | Comma-separated allowed CORS origins |
 
 > **The default binding is `0.0.0.0`, so other devices on the same local network may connect to the dashboard. For local-only browsing, set `HOST` to `127.0.0.1`.**
@@ -677,9 +724,15 @@ Check whether the data source exists for each tool:
 ```bash
 ls ~/.gemini/antigravity-cli/usage
 ls ~/.copilot/usage
+ls ~/.copilot/data.db ~/.copilot/session-store.db
 ls ~/.codex/sessions
 ls ~/.codex/archived_sessions
 ls ~/.claude/projects
+ls ~/.cursor/projects
+ls ~/.grok/sessions
+ls ~/.pi/agent/sessions
+ls ~/.omp/agent/sessions
+ls ~/.local/share/muse/sessions
 ```
 
 Antigravity CLI and Copilot CLI also require `settings.json` to define `statusLine` and the scripts to have execute permission.
@@ -689,9 +742,15 @@ On Windows PowerShell, inspect the native data directories directly:
 ```powershell
 Get-ChildItem "$env:USERPROFILE\.gemini\antigravity-cli\usage"
 Get-ChildItem "$env:USERPROFILE\.copilot\usage"
+Get-ChildItem "$env:USERPROFILE\.copilot\data.db", "$env:USERPROFILE\.copilot\session-store.db"
 Get-ChildItem "$env:USERPROFILE\.codex\sessions"
 Get-ChildItem "$env:USERPROFILE\.codex\archived_sessions"
 Get-ChildItem "$env:USERPROFILE\.claude\projects"
+Get-ChildItem "$env:USERPROFILE\.cursor\projects"
+Get-ChildItem "$env:USERPROFILE\.grok\sessions"
+Get-ChildItem "$env:USERPROFILE\.pi\agent\sessions"
+Get-ChildItem "$env:USERPROFILE\.omp\agent\sessions"
+Get-ChildItem "$env:USERPROFILE\.local\share\muse\sessions"
 ```
 
 ### Status Line script cannot run

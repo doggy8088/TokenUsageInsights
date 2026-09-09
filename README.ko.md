@@ -1,6 +1,6 @@
 # Token 전황실
 
-**Token 전황실은 로컬 우선 방식의 AI Coding Agent Token 사용량 및 세션 복원 대시보드입니다.** Google Antigravity CLI, GitHub Copilot CLI, GitHub Copilot Chat(VS Code), Codex Desktop, Codex CLI, Claude Code, Grok Build, Pi Coding Agent, OMP의 로컬 기록을 읽어 일별·월별·연별 Token 소비량, 캐시 사용량, 추론 Token, 예상 비용, 모델 분포, 프로젝트 디렉터리 분포와 전체 Session 타임라인을 한곳에 표시합니다.
+**Token 전황실은 로컬 우선 방식의 AI Coding Agent Token 사용량 및 세션 복원 대시보드입니다.** Google Antigravity CLI, GitHub Copilot CLI, GitHub Copilot App, GitHub Copilot Chat(VS Code), Codex Desktop, Codex CLI, Claude Code, Cursor, Grok Build, Pi Coding Agent, OMP, Muse Code의 로컬 기록을 읽어 일별·월별·연별 Token 소비량, 캐시 사용량, 추론 Token, 예상 비용, 모델 분포, 프로젝트 디렉터리 분포와 전체 Session 타임라인을 한곳에 표시합니다.
 
 이 프로젝트는 AI 공급자 API를 대신 호출하여 데이터를 조회하지 않습니다. 핵심 데이터 원본은 로컬 로그, Status Line 수집 파일, 로컬 SQLite입니다.
 
@@ -48,14 +48,17 @@ http://localhost:3003
 | --- | --- | --- | --- |
 | Google Antigravity CLI | 필요 | `~/.gemini/antigravity-cli/usage/usage-YYYY-MM-DD.jsonl` | `statusline-token.sh` 또는 Windows의 `statusline-token.ps1`로 Token 데이터를 수집 |
 | GitHub Copilot CLI | 필요 | `~/.copilot/usage/usage-YYYY-MM-DD.jsonl` | `statusline-token.sh` 또는 Windows의 `statusline-token.ps1`로 Token 데이터를 수집 |
+| GitHub Copilot App | 불필요 | `~/.copilot/data.db`, `~/.copilot/session-store.db` | 대시보드가 데스크톱 앱의 로컬 SQLite를 직접 읽음 |
 | GitHub Copilot Chat(VS Code) | 불필요 | VS Code `workspaceStorage/chatSessions` | VS Code Stable 및 Insiders의 로컬 채팅 Session을 직접 스캔 |
 | Codex Desktop / CLI | 불필요 | `~/.codex/sessions`, `~/.codex/archived_sessions` | Codex의 활성 및 보관된 로컬 Session 기록을 직접 스캔 |
 | Claude Code | 불필요 | `~/.claude/projects` | Claude Code의 로컬 프로젝트 Session 기록을 직접 스캔 |
+| Cursor | 불필요 | `~/.cursor/projects` | Cursor 로컬 transcript를 스캔하고 귀속 가능한 모델 정보를 읽기 전용으로 조회 |
 | Grok Build | 불필요 | `~/.grok/sessions` | Grok Build가 자동 저장하는 `updates.jsonl` Session stream을 직접 스캔 |
 | Pi Coding Agent | 불필요 | `~/.pi/agent/sessions` | Pi Coding Agent가 자동 저장하는 로컬 Session JSONL 파일을 직접 스캔 |
 | OMP | 불필요 | `~/.omp/agent/sessions` | OMP가 자동 저장하는 로컬 Session JSONL 파일을 직접 스캔 |
+| Muse Code | 불필요 | `~/.local/share/muse/sessions` | Muse Code가 자동 저장하는 로컬 Session JSONL 파일을 직접 스캔 |
 
-**VS Code Copilot, Codex Desktop, Codex CLI, Claude Code, Grok Build, Pi Coding Agent 또는 OMP만 사용하는 경우 한 줄 설치 명령을 실행하고 대시보드를 열기만 하면 됩니다.**
+**Copilot App, VS Code Copilot, Codex Desktop, Codex CLI, Claude Code, Cursor, Grok Build, Pi Coding Agent, OMP 또는 Muse Code만 사용하는 경우 한 줄 설치 명령을 실행하고 대시보드를 열기만 하면 됩니다.**
 
 ### Windows 네이티브 사용
 
@@ -74,6 +77,7 @@ Windows는 기본적으로 다음 네이티브 경로를 사용합니다.
 | Grok Build | `%USERPROFILE%\.grok` |
 | Pi Coding Agent | `%USERPROFILE%\.pi` |
 | OMP | `%USERPROFILE%\.omp` |
+| Muse Code | `%USERPROFILE%\.local\share\muse` |
 
 대시보드의 설정 안내는 Windows에서 PowerShell 복사, 설정 및 진단 명령을 표시합니다. PowerShell collector는 .NET JSON 및 파일 API를 사용하며 Bash, `jq`, `sed`, `awk`에 의존하지 않습니다.
 
@@ -105,13 +109,13 @@ Windows는 기본적으로 다음 네이티브 경로를 사용합니다.
 
 ### 인터페이스
 
-- 5가지 CLI 배지 전환
+- 9가지 Coding Agent 배지 전환
 - 일별·월별·연별 보기
 - 날짜·월·연도 빠른 전환
 - 5초, 10초, 30초 간격의 실시간 자동 새로 고침
 - 로컬 로그를 SQLite에 수동 동기화
 - 어두운 테마와 밝은 테마
-- 번체 중국어 및 영어 인터페이스 전환
+- 번체 중국어, 간체 중국어, 영어, 일본어 및 한국어 인터페이스 전환
 - 모델 가격표 보기
 
 * * *
@@ -122,7 +126,7 @@ Windows는 기본적으로 다음 네이티브 경로를 사용합니다.
 
 | 매개변수 | 적용 보기 | 사용 가능한 값 | 설명 |
 | --- | --- | --- | --- |
-| `agent` | 전체 | `antigravity`, `copilot`, `codex`, `claude`, `cursor`, `grok`, `pi`, `omp` | 표시할 Coding Agent를 지정합니다. `claude-code`, `grok-build`, `pi-coding-agent` 같은 별칭도 지원합니다 |
+| `agent` | 전체 | `antigravity`, `copilot`, `codex`, `claude`, `cursor`, `grok`, `pi`, `omp`, `muse` | 표시할 Coding Agent를 지정합니다. `claude-code`, `grok-build`, `pi-coding-agent`, `oh-my-pi`, `muse-code` 같은 별칭도 지원합니다 |
 | `tab` | 전체 | `daily`, `monthly`, `yearly` | 일별(daily), 월별(monthly), 연별(yearly) 보기를 지정합니다 |
 | `date` | 전체 | `daily`: `YYYY-MM-DD`, `monthly`: `YYYY-MM`, `yearly`: `YYYY` | 표시할 날짜·월·연도를 지정하며, 형식은 `tab`에 따라 자동으로 매핑됩니다 |
 | `dir` | `daily` | 전체 경로, `~`로 시작하는 홈 디렉터리 경로, 또는 고유한 경로 접미사(예: `TokenUsageInsights`) | 일별 보기의 작업 디렉터리 필터를 지정합니다. Windows 경로는 대소문자를 구분하지 않으며, 일치하는 디렉터리가 없으면 전체를 표시합니다 |
@@ -343,6 +347,27 @@ $env:VSCODE_USER_DATA_DIR = "C:\path\to\vscode-user-data"; & "$HOME\bin\token-us
 
 * * *
 
+## Cursor 설정
+
+**Cursor에는 Hook, Status Line 또는 추가 수집 스크립트가 필요하지 않습니다.** 대시보드는 다음 디렉터리를 직접 스캔합니다.
+
+```text
+~/.cursor/projects
+```
+
+Cursor는 대화와 Agent transcript를 프로젝트 디렉터리 아래에 저장합니다. 대시보드는 플랫폼 기본 `Cursor/User/globalStorage/state.vscdb`도 읽기 전용으로 스캔하고 `agentKv` 기록을 사용하여 실제 모델을 귀속합니다. 고유하게 일치하지 않는 Session은 `Unknown Model`로 유지됩니다.
+
+사용 방법:
+
+1. Cursor에서 대화 또는 Agent Session을 하나 이상 만듭니다.
+2. 대시보드를 시작하거나 새로 고칩니다.
+3. 왼쪽에서 Cursor를 선택합니다.
+4. 오른쪽 위 동기화 버튼을 클릭하거나 백그라운드 동기화를 기다립니다.
+
+Cursor의 로컬 데이터에는 정확한 Token 수나 공식 청구 내역이 없으므로 Token은 텍스트 내용에서 추정합니다. 비용은 `pricing.csv`에 일치하는 모델이 있을 때만 추정되며 공식 청구액과 같지 않습니다. 기본 위치가 아닌 경우 `CURSOR_DIR` 및 `CURSOR_STATE_DB`를 사용할 수 있습니다.
+
+* * *
+
 ## Grok Build 설정
 
 **Grok Build에는 Hook, Status Line 또는 추가 수집 스크립트가 필요하지 않습니다.** 대시보드는 다음 디렉터리를 직접 스캔합니다.
@@ -408,6 +433,27 @@ OMP의 비용은 각 Session이 각 turn마다 보고하는 `usage.cost` 및 관
 
 * * *
 
+## Muse Code 설정
+
+**Muse Code에는 Hook, Status Line 또는 추가 수집 스크립트가 필요하지 않습니다.** 대시보드는 다음 디렉터리를 직접 스캔합니다.
+
+```text
+~/.local/share/muse/sessions
+```
+
+Muse Code는 날짜와 Session ID로 구분된 `session.jsonl` 파일에 Session을 저장합니다. 대시보드는 모델 완료 이벤트를 분석하여 입력, 캐시 읽기, 출력, 추론 Token을 분리하고 사용자 프롬프트, 도구 단계 및 Agent 응답 타임라인을 복원합니다.
+
+사용 방법:
+
+1. Muse Code를 평소처럼 사용하여 Session을 하나 이상 만듭니다.
+2. 대시보드를 시작하거나 새로 고칩니다.
+3. 왼쪽에서 Muse Code를 선택합니다.
+4. 오른쪽 위 동기화 버튼을 클릭하거나 백그라운드 동기화를 기다립니다.
+
+Muse Code 비용은 Session이 보고한 모델과 `pricing.csv`를 기준으로 추정합니다. 데이터가 기본 위치에 없다면 `MUSE_DIR`을 `sessions`가 포함된 Muse Code 데이터 디렉터리로 설정합니다.
+
+* * *
+
 ## 로컬 데이터 동기화 방식
 
 서비스가 시작되면 백엔드가 로컬 SQLite를 초기화하고 즉시 한 번 데이터를 동기화합니다. 시작 후에는 5초마다 백그라운드 동기화도 수행합니다.
@@ -430,9 +476,9 @@ GET /api/:assistant/sync
 
 **일반적인 사용에서는 대시보드 오른쪽 위의 내보내기 및 가져오기 버튼을 사용하세요.** 설치 버전은 브라우저만으로 컴퓨터 간 데이터를 집계할 수 있으며 최대 200 MB의 가져오기 파일을 지원합니다.
 
-대시보드와 CLI는 `token-usage-insights` 실행 파일로 통합되었습니다. 인수 없이 실행하면 대시보드가 시작되며, `export`, `export-all`, `import` 하위 명령으로 데이터를 처리합니다. 각 명령은 `--help`와 `-h`를 지원합니다. 다음 릴리스부터 제공되므로 이전 설치는 업데이트하거나 소스에서 빌드해야 합니다.
+v0.9.0부터 대시보드와 CLI는 `token-usage-insights` 실행 파일로 통합되었습니다. 인수 없이 실행하면 대시보드가 시작되며, `export`, `export-all`, `import` 하위 명령으로 데이터를 처리합니다. 각 명령은 `--help`와 `-h`를 지원합니다. 이전 설치는 업데이트하거나 소스에서 빌드해야 합니다.
 
-`--agent`는 어시스턴트(`antigravity` / `copilot` / `codex` / `claude` / `cursor` / `grok` / `pi` / `omp`)를 지정합니다.
+`--agent`는 어시스턴트(`antigravity` / `copilot` / `codex` / `claude` / `cursor` / `grok` / `pi` / `omp` / `muse`)를 지정합니다.
 
 ### 소스에서 CLI 사용
 
@@ -492,6 +538,7 @@ cargo build --release --bin token-usage-insights
 | `GROK_DIR` | `~/.grok` | Grok Build 데이터 디렉터리 |
 | `PI_DIR` | `~/.pi` | Pi Coding Agent 데이터 디렉터리 |
 | `OMP_DIR` | `~/.omp` | OMP 데이터 디렉터리 |
+| `MUSE_DIR` | `~/.local/share/muse` | Muse Code 데이터 디렉터리. `sessions`를 포함해야 함 |
 | `CORS_ALLOWED_ORIGINS` | `http://localhost:<PORT>,http://127.0.0.1:<PORT>` | 쉼표로 구분한 허용 CORS origin |
 
 > **기본 바인딩은 `0.0.0.0`이므로 같은 로컬 네트워크의 다른 장치가 대시보드에 연결할 수 있습니다. 로컬에서만 보려면 `HOST`를 `127.0.0.1`로 설정하세요.**
@@ -677,9 +724,15 @@ systemctl --user reset-failed
 ```bash
 ls ~/.gemini/antigravity-cli/usage
 ls ~/.copilot/usage
+ls ~/.copilot/data.db ~/.copilot/session-store.db
 ls ~/.codex/sessions
 ls ~/.codex/archived_sessions
 ls ~/.claude/projects
+ls ~/.cursor/projects
+ls ~/.grok/sessions
+ls ~/.pi/agent/sessions
+ls ~/.omp/agent/sessions
+ls ~/.local/share/muse/sessions
 ```
 
 Antigravity CLI와 Copilot CLI는 `settings.json`에 `statusLine`이 설정되어 있고 스크립트에 실행 권한이 있는지도 확인해야 합니다.
@@ -689,9 +742,15 @@ Windows PowerShell에서는 네이티브 데이터 디렉터리를 직접 확인
 ```powershell
 Get-ChildItem "$env:USERPROFILE\.gemini\antigravity-cli\usage"
 Get-ChildItem "$env:USERPROFILE\.copilot\usage"
+Get-ChildItem "$env:USERPROFILE\.copilot\data.db", "$env:USERPROFILE\.copilot\session-store.db"
 Get-ChildItem "$env:USERPROFILE\.codex\sessions"
 Get-ChildItem "$env:USERPROFILE\.codex\archived_sessions"
 Get-ChildItem "$env:USERPROFILE\.claude\projects"
+Get-ChildItem "$env:USERPROFILE\.cursor\projects"
+Get-ChildItem "$env:USERPROFILE\.grok\sessions"
+Get-ChildItem "$env:USERPROFILE\.pi\agent\sessions"
+Get-ChildItem "$env:USERPROFILE\.omp\agent\sessions"
+Get-ChildItem "$env:USERPROFILE\.local\share\muse\sessions"
 ```
 
 ### Status Line 스크립트를 실행할 수 없음

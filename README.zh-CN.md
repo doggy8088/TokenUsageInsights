@@ -1,6 +1,6 @@
 # Token 战情室
 
-**Token 战情室是本地优先的 AI Coding Agent Token 使用量与会话还原看板。** 它会读取本机上的 Google Antigravity CLI、GitHub Copilot CLI、GitHub Copilot Chat（VS Code）、Codex Desktop、Codex CLI、Claude Code、Grok Build、Pi Coding Agent 与 OMP 记录，集中呈现每日、月度、年度的 Token 消耗、缓存使用、推理 Token、估算费用、模型分布、项目目录分布与完整 Session 时间轴。
+**Token 战情室是本地优先的 AI Coding Agent Token 使用量与会话还原看板。** 它会读取本机上的 Google Antigravity CLI、GitHub Copilot CLI、GitHub Copilot App、GitHub Copilot Chat（VS Code）、Codex Desktop、Codex CLI、Claude Code、Cursor、Grok Build、Pi Coding Agent、OMP 与 Muse Code 记录，集中呈现每日、月度、年度的 Token 消耗、缓存使用、推理 Token、估算费用、模型分布、项目目录分布与完整 Session 时间轴。
 
 本项目不会代你调用 AI 供应商 API 查询数据；核心数据来源是本地日志、Status Line 收集文件与本地 SQLite。
 
@@ -48,14 +48,17 @@ http://localhost:3003
 | --- | --- | --- | --- |
 | Google Antigravity CLI | 需要 | `~/.gemini/antigravity-cli/usage/usage-YYYY-MM-DD.jsonl` | 通过 `statusline-token.sh` 或 Windows `statusline-token.ps1` 收集 Token 数据 |
 | GitHub Copilot CLI | 需要 | `~/.copilot/usage/usage-YYYY-MM-DD.jsonl` | 通过 `statusline-token.sh` 或 Windows `statusline-token.ps1` 收集 Token 数据 |
+| GitHub Copilot App | 不需要 | `~/.copilot/data.db`、`~/.copilot/session-store.db` | 看板直接读取 Copilot 桌面应用的本地 SQLite |
 | GitHub Copilot Chat（VS Code） | 不需要 | VS Code `workspaceStorage/chatSessions` | 看板直接扫描 VS Code Stable 与 Insiders 的本地聊天 Session |
 | Codex Desktop / CLI | 不需要 | `~/.codex/sessions`、`~/.codex/archived_sessions` | 看板会直接扫描 Codex 活动中与已归档的本地 Session 记录 |
 | Claude Code | 不需要 | `~/.claude/projects` | 看板会直接扫描 Claude Code 的本地项目 Session 记录 |
+| Cursor | 不需要 | `~/.cursor/projects` | 看板会直接扫描 Cursor 本地 transcript，并以只读方式获取可归因的模型信息 |
 | Grok Build | 不需要 | `~/.grok/sessions` | 看板会直接扫描 Grok Build 自动保存的 `updates.jsonl` Session stream |
 | Pi Coding Agent | 不需要 | `~/.pi/agent/sessions` | 看板会直接扫描 Pi Coding Agent 自动保存的本地 Session JSONL 文件 |
 | OMP | 不需要 | `~/.omp/agent/sessions` | 看板会直接扫描 OMP 自动保存的本地 Session JSONL 文件 |
+| Muse Code | 不需要 | `~/.local/share/muse/sessions` | 看板会直接扫描 Muse Code 自动保存的本地 Session JSONL 文件 |
 
-**只使用 VS Code Copilot、Codex Desktop、Codex CLI、Claude Code、Grok Build、Pi Coding Agent 或 OMP 时，执行一行安装命令并打开看板即可。**
+**只使用 Copilot App、VS Code Copilot、Codex Desktop、Codex CLI、Claude Code、Cursor、Grok Build、Pi Coding Agent、OMP 或 Muse Code 时，执行一行安装命令并打开看板即可。**
 
 ### Windows 原生使用
 
@@ -74,6 +77,7 @@ Windows 默认使用以下原生路径：
 | Grok Build | `%USERPROFILE%\.grok` |
 | Pi Coding Agent | `%USERPROFILE%\.pi` |
 | OMP | `%USERPROFILE%\.omp` |
+| Muse Code | `%USERPROFILE%\.local\share\muse` |
 
 看板内的设置指南会在 Windows 显示 PowerShell 复制、设置与诊断命令。PowerShell collector 使用 .NET JSON 与文件 API，不依赖 Bash、`jq`、`sed` 或 `awk`。
 
@@ -105,13 +109,13 @@ Windows 默认使用以下原生路径：
 
 ### 界面操作
 
-- 五种 CLI 徽章切换
+- 九种 Coding Agent 徽章切换
 - 每日、月度、年度视图
 - 日期、月份、年份快速切换
 - 5 秒、10 秒、30 秒实时自动刷新
 - 手动同步本地日志到 SQLite
 - 深色与浅色主题
-- 繁体中文与英文界面切换
+- 繁体中文、简体中文、英文、日文与韩文界面切换
 - 模型费用表查看
 
 * * *
@@ -122,7 +126,7 @@ Windows 默认使用以下原生路径：
 
 | 参数 | 适用视图 | 可用值 | 说明 |
 | --- | --- | --- | --- |
-| `agent` | 全部 | `antigravity`、`copilot`、`codex`、`claude`、`cursor`、`grok`、`pi`、`omp` | 指定要显示的 Coding Agent。另支持 `claude-code`、`grok-build`、`pi-coding-agent` 等别名写法 |
+| `agent` | 全部 | `antigravity`、`copilot`、`codex`、`claude`、`cursor`、`grok`、`pi`、`omp`、`muse` | 指定要显示的 Coding Agent。另支持 `claude-code`、`grok-build`、`pi-coding-agent`、`oh-my-pi`、`muse-code` 等别名写法 |
 | `tab` | 全部 | `daily`、`monthly`、`yearly` | 指定以日（每日）、月（月度）或年（年度）视图显示 |
 | `date` | 全部 | `daily`：`YYYY-MM-DD`；`monthly`：`YYYY-MM`；`yearly`：`YYYY` | 指定要显示的日期、月份或年份，格式会依 `tab` 自动对应 |
 | `dir` | `daily` | 完整路径、`~` 开头的家目录路径，或唯一的路径后缀（如 `TokenUsageInsights`） | 指定每日视图的工作目录筛选。Windows 路径不区分大小写；找不到匹配目录时会显示全部 |
@@ -343,6 +347,27 @@ $env:VSCODE_USER_DATA_DIR = "C:\path\to\vscode-user-data"; & "$HOME\bin\token-us
 
 * * *
 
+## Cursor 设置
+
+**Cursor 不需要安装 Hook、Status Line 或额外收集脚本。** 看板会直接扫描：
+
+```text
+~/.cursor/projects
+```
+
+Cursor 会将对话与 Agent transcript 保存到项目目录下。看板也会以只读方式扫描平台默认的 `Cursor/User/globalStorage/state.vscdb`，根据其中的 `agentKv` 记录归因实际模型；无法唯一匹配的 Session 会保留为 `Unknown Model`。
+
+使用方式：
+
+1. 先在 Cursor 中创建至少一个对话或 Agent Session。
+2. 启动或刷新本项目看板。
+3. 在左侧选择 Cursor。
+4. 按右上角同步按钮，或等待后台同步。
+
+Cursor 本地数据不包含精确 Token 或官方账单明细，因此 Token 根据文本内容估算；仅当 `pricing.csv` 存在对应模型时才会估算费用，结果不等同于官方账单。非默认数据位置可使用 `CURSOR_DIR` 与 `CURSOR_STATE_DB` 指定。
+
+* * *
+
 ## Grok Build 设置
 
 **Grok Build 不需要安装 Hook、Status Line 或额外收集脚本。** 看板会直接扫描：
@@ -408,6 +433,27 @@ OMP 的成本始终直接读取自 Session 每个 turn 自行报告的 `usage.co
 
 * * *
 
+## Muse Code 设置
+
+**Muse Code 不需要安装 Hook、Status Line 或额外收集脚本。** 看板会直接扫描：
+
+```text
+~/.local/share/muse/sessions
+```
+
+Muse Code 会将 Session 按日期与 Session ID 分层保存为 `session.jsonl`。看板会解析其中的模型完成事件，拆分输入、缓存读取、输出与推理 Token，并还原用户提示词、工具步骤与 Agent 回复时间轴。
+
+使用方式：
+
+1. 先正常使用 Muse Code 创建至少一个 Session。
+2. 启动或刷新本项目看板。
+3. 在左侧选择 Muse Code。
+4. 按右上角同步按钮，或等待后台同步。
+
+Muse Code 的费用会根据 Session 报告的模型与 `pricing.csv` 进行估算。如果数据不在默认位置，可设置 `MUSE_DIR` 指向包含 `sessions` 的 Muse Code 数据目录。
+
+* * *
+
 ## 本地数据同步方式
 
 启动服务时，后端会初始化本地 SQLite 并立即同步一次数据。服务启动后，也会每 5 秒进行一次后台同步。
@@ -430,9 +476,9 @@ GET /api/:assistant/sync
 
 **一般使用请直接使用看板右上角的导出与导入按钮。** 安装版只需要浏览器即可完成跨机器数据汇总，并支持最大 200 MB 的导入文件。
 
-看板与 CLI 已整合为同一个 `token-usage-insights` 可执行文件。不带参数会启动看板，使用 `export`、`export-all`、`import` 子命令可操作数据；主命令与各子命令均支持 `--help`、`-h`。此整合从下一个发布版本起提供，旧版需要更新或从源代码构建。
+从 v0.9.0 起，看板与 CLI 已整合为同一个 `token-usage-insights` 可执行文件。不带参数会启动看板，使用 `export`、`export-all`、`import` 子命令可操作数据；主命令与各子命令均支持 `--help`、`-h`。旧版需要更新或从源代码构建。
 
-`--agent` 用于指定助理（`antigravity` / `copilot` / `codex` / `claude` / `cursor` / `grok` / `pi` / `omp`）。
+`--agent` 用于指定助理（`antigravity` / `copilot` / `codex` / `claude` / `cursor` / `grok` / `pi` / `omp` / `muse`）。
 
 ### 从源代码使用 CLI
 
@@ -492,6 +538,7 @@ cargo build --release --bin token-usage-insights
 | `GROK_DIR` | `~/.grok` | Grok Build 数据目录 |
 | `PI_DIR` | `~/.pi` | Pi Coding Agent 数据目录 |
 | `OMP_DIR` | `~/.omp` | OMP 数据目录 |
+| `MUSE_DIR` | `~/.local/share/muse` | Muse Code 数据目录，应包含 `sessions` |
 | `CORS_ALLOWED_ORIGINS` | `http://localhost:<PORT>,http://127.0.0.1:<PORT>` | 允许的 CORS 来源，以逗号分隔 |
 
 > **默认绑定 `0.0.0.0`，同一局域网内的其他设备可能连接到看板。只需在本机浏览时，请将 `HOST` 设置为 `127.0.0.1`。**
@@ -677,9 +724,15 @@ systemctl --user reset-failed
 ```bash
 ls ~/.gemini/antigravity-cli/usage
 ls ~/.copilot/usage
+ls ~/.copilot/data.db ~/.copilot/session-store.db
 ls ~/.codex/sessions
 ls ~/.codex/archived_sessions
 ls ~/.claude/projects
+ls ~/.cursor/projects
+ls ~/.grok/sessions
+ls ~/.pi/agent/sessions
+ls ~/.omp/agent/sessions
+ls ~/.local/share/muse/sessions
 ```
 
 Antigravity CLI 与 Copilot CLI 还需要确认 `settings.json` 已设置 `statusLine`，且脚本具有执行权限。
@@ -689,9 +742,15 @@ Windows PowerShell 可直接检查原生数据目录：
 ```powershell
 Get-ChildItem "$env:USERPROFILE\.gemini\antigravity-cli\usage"
 Get-ChildItem "$env:USERPROFILE\.copilot\usage"
+Get-ChildItem "$env:USERPROFILE\.copilot\data.db", "$env:USERPROFILE\.copilot\session-store.db"
 Get-ChildItem "$env:USERPROFILE\.codex\sessions"
 Get-ChildItem "$env:USERPROFILE\.codex\archived_sessions"
 Get-ChildItem "$env:USERPROFILE\.claude\projects"
+Get-ChildItem "$env:USERPROFILE\.cursor\projects"
+Get-ChildItem "$env:USERPROFILE\.grok\sessions"
+Get-ChildItem "$env:USERPROFILE\.pi\agent\sessions"
+Get-ChildItem "$env:USERPROFILE\.omp\agent\sessions"
+Get-ChildItem "$env:USERPROFILE\.local\share\muse\sessions"
 ```
 
 ### Status Line 脚本无法执行
