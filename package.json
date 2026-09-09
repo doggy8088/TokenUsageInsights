@@ -38,7 +38,7 @@
     "rust",
     "cli"
   ],
-  "author": "Will and contributors",
+  "author": "Will 保哥",
   "license": "MIT",
   "publishConfig": {
     "access": "public",
