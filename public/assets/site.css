@@ -354,7 +354,11 @@ h3 {
 
 .source-rail {
   display: grid;
-  grid-template-columns: repeat(7, minmax(0, 1fr));
+  margin: 0;
+  padding: 0;
+  border-top: 1px solid var(--line);
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  list-style: none;
 }
 
 .source-item {
@@ -364,10 +368,11 @@ h3 {
   justify-content: center;
   gap: 13px;
   padding: 15px 17px;
+  border-bottom: 1px solid var(--line);
   border-left: 1px solid var(--line);
 }
 
-.source-item:last-child {
+.source-item:nth-child(5n) {
   border-right: 1px solid var(--line);
 }
 
@@ -868,10 +873,14 @@ h3 {
     margin-right: -20px;
     padding-right: 20px;
     overflow-x: auto;
-    grid-template-columns: repeat(7, minmax(150px, 1fr));
+    grid-template-columns: repeat(10, minmax(150px, 1fr));
     overscroll-behavior-inline: contain;
     scroll-snap-type: inline mandatory;
     scrollbar-width: thin;
+  }
+
+  .source-item:nth-child(5n):not(:last-child) {
+    border-right: 0;
   }
 
   .source-item {

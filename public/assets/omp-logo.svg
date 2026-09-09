@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" role="img" aria-labelledby="ompLogoTitle">
+  <title id="ompLogoTitle">OMP</title>
+  <rect width="24" height="24" rx="6" fill="#0D9488"/>
+  <path d="M6.25 12a3.75 3.75 0 1 0 7.5 0 3.75 3.75 0 1 0-7.5 0Z" stroke="#F2FFFD" stroke-width="1.8"/>
+  <path d="M13.8 15.75v-7.5l2.65 3.45 2.75-3.45v7.5" stroke="#CCFBF1" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
