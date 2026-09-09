@@ -613,6 +613,83 @@ mod tests {
     }
 
     #[test]
+    fn gpt_reserve_matches_gpt_5_6_luna_packaged_pricing() {
+        let rules = load_pricing_rules();
+
+        // gpt-reserve is an alias of gpt-5.6-luna: input 1.00, cache read 0.10, output 6.00
+        let luna = calculate_usage_cost(
+            &rules,
+            Some("gpt-5.6-luna"),
+            1_000_000,
+            1_000_000,
+            1_000_000,
+            0,
+            0,
+        )
+        .expect("gpt-5.6-luna should have a pricing rule");
+
+        for model_name in ["gpt-reserve", "GPT-Reserve", "gpt-reserve · high"] {
+            let cost = calculate_usage_cost(
+                &rules,
+                Some(model_name),
+                1_000_000,
+                1_000_000,
+                1_000_000,
+                0,
+                0,
+            )
+            .unwrap_or_else(|error| panic!("{model_name} should have a pricing rule: {error}"));
+
+            assert!(
+                (cost - luna).abs() < 1e-9,
+                "unexpected gpt-reserve cost for {model_name}: {cost}"
+            );
+        }
+
+        // Regression test for session 01a074ab-f530-7cf1-b65f-d2e52a330258 turn 951
+        let turn_951_cost =
+            calculate_usage_cost(&rules, Some("gpt-reserve"), 1_021, 1_388, 197_760, 0, 0)
+                .expect("gpt-reserve turn 951 cost should calculate successfully");
+        let expected_turn_951 = (1_021.0 / 1_000_000.0) * 1.00
+            + (197_760.0 / 1_000_000.0) * 0.10
+            + (1_388.0 / 1_000_000.0) * 6.00;
+        assert!((turn_951_cost - expected_turn_951).abs() < 1e-9);
+    }
+
+    #[test]
+    fn mai_code_1_1_flash_resolves_pricing_from_csv() {
+        let rules = load_pricing_rules();
+
+        for model_name in [
+            "mai-code-1.1-flash",
+            "MAI-Code-1.1-Flash",
+            "mai-code-1.1-flash-picker · medium",
+        ] {
+            let cost = calculate_usage_cost(
+                &rules,
+                Some(model_name),
+                1_000_000,
+                1_000_000,
+                1_000_000,
+                0,
+                0,
+            )
+            .unwrap_or_else(|error| panic!("{model_name} should have a pricing rule: {error}"));
+
+            // input 0.75 + cache read 0.075 + output 4.50 = 5.325
+            assert!(
+                (cost - 5.325).abs() < 1e-9,
+                "unexpected MAI-Code-1.1-Flash cost for {model_name}: {cost}"
+            );
+        }
+
+        // The 1.1 rule must not shadow the 1.0 rule (or vice versa).
+        let flash_1 =
+            calculate_usage_cost(&rules, Some("mai-code-1-flash"), 1_000_000, 0, 0, 0, 0).unwrap();
+        assert!((flash_1 - 0.75).abs() < 1e-9);
+    }
+
+    #[test]
     fn gemini_3_8_flash_thinking_levels_use_packaged_pricing() {
         let rules = load_pricing_rules();
 
