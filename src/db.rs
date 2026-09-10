@@ -150,7 +150,7 @@ struct CodexTokenUsage {
     total_tokens: u64,
 }
 
-const CODEX_PARSER_MIGRATION_KEY: &str = "migration:codex_session_identity_v6";
+const CODEX_PARSER_MIGRATION_KEY: &str = "migration:codex_session_identity_v7";
 const CODEX_SOURCE_KIND_MIGRATION_KEY: &str = "migration:codex_source_kind_v1";
 const CODEX_CLI_SOURCE_KIND: &str = "codex-cli";
 const CODEX_DESKTOP_SOURCE_KIND: &str = "codex-desktop";
@@ -1909,6 +1909,21 @@ fn parse_codex_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String> 
     }
 
     let session_name = session_name_selector.into_name();
+    let completed_task_duration_ms = events
+        .iter()
+        .filter_map(|event| {
+            if event.get("type").and_then(|value| value.as_str()) != Some("event_msg") {
+                return None;
+            }
+            let payload = event.get("payload")?;
+            if payload.get("type").and_then(|value| value.as_str()) != Some("task_complete") {
+                return None;
+            }
+            payload.get("duration_ms").and_then(|value| value.as_u64())
+        })
+        .fold(None::<u64>, |total, duration_ms| {
+            Some(total.unwrap_or_default().saturating_add(duration_ms))
+        });
 
     if parent_session_id.as_deref() == Some(session_id.as_str()) {
         parent_session_id = None;
@@ -1988,7 +2003,12 @@ fn parse_codex_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String> 
             tokens: Some(codex_usage_to_stats(total_usage)),
             delta_tokens: Some(delta_tokens),
             context,
-            cost: None,
+            cost: completed_task_duration_ms.map(|duration_ms| CostStats {
+                total_api_duration_ms: Some(duration_ms as f64),
+                total_duration_ms: None,
+                total_premium_requests: None,
+                reported_cost_usd: None,
+            }),
             source_kind: Some(source_kind.clone()),
             source_dir_key: None,
             parent_session_id: parent_session_id.clone(),
@@ -9000,6 +9020,34 @@ mod tests {
     }
 
     #[test]
+    fn parse_codex_session_file_sums_completed_task_durations() {
+        let path = temp_jsonl_path("codex-task-duration");
+
+        let content = r#"{"timestamp":"2026-07-07T10:58:17.474Z","type":"session_meta","payload":{"session_id":"session-duration","model":"gpt-5.5"}}
+{"timestamp":"2026-07-07T10:58:18.000Z","type":"event_msg","payload":{"type":"task_started"}}
+{"timestamp":"2026-07-07T10:58:19.000Z","type":"event_msg","payload":{"type":"task_complete","duration_ms":1200}}
+{"timestamp":"2026-07-07T10:58:20.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110},"model_context_window":258400}}}
+{"timestamp":"2026-07-07T10:58:21.000Z","type":"event_msg","payload":{"type":"task_started"}}
+{"timestamp":"2026-07-07T10:58:22.000Z","type":"event_msg","payload":{"type":"task_complete","duration_ms":2300}}
+{"timestamp":"2026-07-07T10:58:23.000Z","type":"event_msg","payload":{"type":"task_started","duration_ms":9000}}
+{"timestamp":"2026-07-07T10:58:24.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":130,"cached_input_tokens":30,"output_tokens":15,"reasoning_output_tokens":7,"total_tokens":145},"model_context_window":258400}}}
+"#;
+
+        fs::write(&path, content).unwrap();
+        let entries = parse_codex_session_file(&path).unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|entry| {
+            entry
+                .cost
+                .as_ref()
+                .and_then(|cost| cost.total_api_duration_ms)
+                == Some(3500.0)
+        }));
+    }
+
+    #[test]
     fn parse_codex_session_file_uses_last_initial_consecutive_user_prompt_as_name() {
         let path = temp_jsonl_path("codex-session-name");
         let content = r#"{"timestamp":"2026-07-16T00:00:00Z","type":"session_meta","payload":{"session_id":"session-name","model":"gpt-5.5"}}
@@ -9185,7 +9233,10 @@ mod tests {
 
         let content = r#"{"timestamp":"2026-07-07T10:58:17.474Z","type":"session_meta","payload":{"session_id":"session-sync","cwd":"/tmp/project","cli_version":"0.142.5","model":"gpt-5.5"}}
 {"timestamp":"2026-07-07T10:58:26.197Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110},"last_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110},"model_context_window":258400}}}
+{"timestamp":"2026-07-07T10:58:30.197Z","type":"event_msg","payload":{"type":"task_complete","duration_ms":1200}}
 {"timestamp":"2026-07-07T10:59:26.197Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110},"last_token_usage":{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":19347},"model_context_window":258400}}}
+{"timestamp":"2026-07-07T10:59:30.197Z","type":"event_msg","payload":{"type":"task_complete","duration_ms":2300}}
+{"timestamp":"2026-07-07T10:59:31.197Z","type":"event_msg","payload":{"type":"task_started"}}
 "#;
 
         fs::write(&session_path, content).unwrap();
@@ -9193,6 +9244,36 @@ mod tests {
 
         let mut conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES ('migration:codex_session_identity_v6', 1, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES (?, 1, 0)",
+            params![CODEX_SOURCE_KIND_MIGRATION_KEY],
+        )
+        .unwrap();
+        let state_key = format!(
+            "codex:{}",
+            portable_relative_path(&codex_dir, &session_path)
+        );
+        conn.execute(
+            "INSERT INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES (?, ?, 0)",
+            params![state_key, fs::metadata(&session_path).unwrap().len()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                 assistant_type, timestamp, date, session_id, transcript_path, turn_no
+             ) VALUES ('codex', '2026-07-07T10:58:26.197Z', '2026-07-07',
+                 'session-sync', ?, 1)",
+            params![session_path.to_string_lossy().as_ref()],
+        )
+        .unwrap();
         sync_codex_usage_logs(&mut conn).unwrap();
 
         let total: u64 = conn
@@ -9203,6 +9284,19 @@ mod tests {
             )
             .unwrap();
         assert_eq!(total, 110);
+        let durations: Vec<Option<i64>> = conn
+            .prepare(
+                "SELECT duration_ms
+                 FROM usage_entries
+                 WHERE assistant_type = 'codex' AND session_id = 'session-sync'
+                 ORDER BY turn_no",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(durations, vec![Some(3500), Some(3500)]);
 
         if let Some(value) = old_codex_dir {
             std::env::set_var("CODEX_DIR", value);
