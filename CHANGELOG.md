@@ -4,6 +4,10 @@
 
 ## [未發行]
 
+### 修正
+
+- 修復在 PowerShell 7 (pwsh) 中執行 `npx token-usage-insights` 時，Windows 解壓步驟因 `Expand-Archive` 無法載入 `Microsoft.PowerShell.Archive`（`CouldNotAutoloadMatchingModule`）而安裝失敗的問題。npm 包裝改為優先使用 Windows 內建的 `tar.exe` 解壓 zip，備援改用 .NET `System.IO.Compression.ZipFile` API，並在呼叫 `powershell.exe` 時移除從 pwsh 繼承的 `PSModulePath`，不再依賴 `Microsoft.PowerShell.Archive` 模組。
+
 ## [0.9.2] - 2026-09-10
 
 ### 修正

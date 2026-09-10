@@ -1,12 +1,14 @@
 'use strict';
 
 const assert = require('node:assert/strict');
-const { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } = require('node:fs');
+const { spawnSync } = require('node:child_process');
+const { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } = require('node:fs');
 const { tmpdir } = require('node:os');
 const { join } = require('node:path');
 const test = require('node:test');
 
 const {
+  WINDOWS_ZIP_SCRIPT,
   artifactName,
   cargoTarget,
   checksumForArtifact,
@@ -15,6 +17,7 @@ const {
   releaseBaseUrl,
   sha256,
   verifyChecksum,
+  windowsPowerShellEnvironment,
 } = require('../npm/install.cjs');
 const {
   assertVersionAlignment,
@@ -106,4 +109,82 @@ test('release asset verification reports all failed URLs', async () => {
   }).catch((reason) => reason);
   assert.match(error.message, /v1\.2\.3/);
   assert.equal((error.message.match(/HTTP 404/g) ?? []).length, 5);
+});
+
+test('strips inherited PSModulePath so Windows PowerShell 5.1 uses its own modules', () => {
+  const env = windowsPowerShellEnvironment('C:\\a.zip', 'C:\\out', {
+    PATH: 'x',
+    PSModulePath: 'C:\\Program Files\\PowerShell\\7\\Modules',
+    PsModulePath: 'mixed-case',
+  });
+  assert.equal(env.PATH, 'x');
+  assert.equal(env.TUI_ARCHIVE, 'C:\\a.zip');
+  assert.equal(env.TUI_DESTINATION, 'C:\\out');
+  assert.ok(!Object.keys(env).some((key) => key.toLowerCase() === 'psmodulepath'));
+});
+
+test('Windows zip fallback script does not rely on Microsoft.PowerShell.Archive', () => {
+  assert.doesNotMatch(WINDOWS_ZIP_SCRIPT, /Expand-Archive|Import-Module/);
+  assert.match(WINDOWS_ZIP_SCRIPT, /System\.IO\.Compression\.ZipFile/);
+});
+
+const pwsh = spawnSync('pwsh', ['-NoProfile', '-NonInteractive', '-Command', '$PSVersionTable.PSVersion.Major'], {
+  encoding: 'utf8',
+});
+const hasPwsh = !pwsh.error && pwsh.status === 0;
+
+test('Windows zip fallback script extracts archives and rejects unsafe entries', { skip: !hasPwsh && 'pwsh not installed' }, () => {
+  const directory = mkdtempSync(join(tmpdir(), 'tui-zip-'));
+  try {
+    const source = join(directory, 'src', 'token-usage-insights-v1.2.3-x86_64-pc-windows-msvc');
+    mkdirSync(join(source, 'static'), { recursive: true });
+    writeFileSync(join(source, 'token-usage-insights.exe'), 'bin');
+    writeFileSync(join(source, 'static', 'app.css'), 'css');
+    writeFileSync(join(source, 'pricing.csv'), 'pricing');
+    const archive = join(directory, 'release.zip');
+    const zip = spawnSync(
+      'pwsh',
+      ['-NoProfile', '-NonInteractive', '-Command', 'Compress-Archive -Path $env:SRC -DestinationPath $env:ZIP'],
+      { env: { ...process.env, SRC: join(directory, 'src', '*'), ZIP: archive }, encoding: 'utf8' },
+    );
+    assert.equal(zip.status, 0, zip.stderr);
+
+    const destination = join(directory, 'out');
+    mkdirSync(destination);
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const result = spawnSync('pwsh', ['-NoProfile', '-NonInteractive', '-Command', WINDOWS_ZIP_SCRIPT], {
+        env: windowsPowerShellEnvironment(archive, destination),
+        encoding: 'utf8',
+      });
+      assert.equal(result.status, 0, result.stderr);
+    }
+    const root = findReleaseRoot(destination, 'token-usage-insights.exe');
+    assert.equal(readFileSync(join(root, 'static', 'app.css'), 'utf8'), 'css');
+
+    const unsafe = join(directory, 'unsafe.zip');
+    const forge = spawnSync(
+      'pwsh',
+      [
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        [
+          'Add-Type -AssemblyName System.IO.Compression.FileSystem',
+          '$zip = [System.IO.Compression.ZipFile]::Open($env:ZIP, [System.IO.Compression.ZipArchiveMode]::Create)',
+          "$entry = $zip.CreateEntry('../escaped.txt')",
+          '$stream = $entry.Open(); $stream.WriteByte(65); $stream.Dispose(); $zip.Dispose()',
+        ].join('\n'),
+      ],
+      { env: { ...process.env, ZIP: unsafe }, encoding: 'utf8' },
+    );
+    assert.equal(forge.status, 0, forge.stderr);
+    const rejected = spawnSync('pwsh', ['-NoProfile', '-NonInteractive', '-Command', WINDOWS_ZIP_SCRIPT], {
+      env: windowsPowerShellEnvironment(unsafe, destination),
+      encoding: 'utf8',
+    });
+    assert.notEqual(rejected.status, 0);
+    assert.ok(!existsSync(join(directory, 'escaped.txt')));
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
