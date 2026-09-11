@@ -616,8 +616,9 @@ $InstallDir = $null
 $Task = Get-ScheduledTask -TaskName "TokenUsageInsights" -ErrorAction SilentlyContinue
 if ($Task -and $Task.Actions) {
     foreach ($Action in @($Task.Actions)) {
-        if ($Action.Arguments -match '(?i)-InstallDir\s+"([^"]+)"') {
-            $InstallDir = [Environment]::ExpandEnvironmentVariables($Matches[1])
+        if ($Action.Arguments -match '(?i)-InstallDir(?:\s+|:)(?:"([^"]+)"|(\S+))') {
+            $DetectedInstallDir = if ($Matches[1]) { $Matches[1] } else { $Matches[2] }
+            $InstallDir = [Environment]::ExpandEnvironmentVariables($DetectedInstallDir)
             break
         }
     }
@@ -630,8 +631,9 @@ if (-not $InstallDir) {
     if (Test-Path $StartupShortcut) {
         $WshShell = New-Object -ComObject WScript.Shell
         $Shortcut = $WshShell.CreateShortcut($StartupShortcut)
-        if ($Shortcut.Arguments -match '(?i)-InstallDir\s+"([^"]+)"') {
-            $InstallDir = [Environment]::ExpandEnvironmentVariables($Matches[1])
+        if ($Shortcut.Arguments -match '(?i)-InstallDir(?:\s+|:)(?:"([^"]+)"|(\S+))') {
+            $DetectedInstallDir = if ($Matches[1]) { $Matches[1] } else { $Matches[2] }
+            $InstallDir = [Environment]::ExpandEnvironmentVariables($DetectedInstallDir)
         } elseif ($Shortcut.WorkingDirectory) {
             $InstallDir = $Shortcut.WorkingDirectory
         }
