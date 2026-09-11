@@ -141,6 +141,9 @@ async fn main() {
         eprintln!("❌ 初始化 SQLite 資料庫失敗: {error}");
     }
 
+    // 在伺服器綁定與接受請求前執行啟動自動更新檢查，避免並行請求發生靜態檔案鎖定或 404
+    updater::check_and_auto_update_on_launch().await;
+
     let static_dir = get_static_dir();
     println!("📂 正在服務靜態檔案，目錄來源: {:?}", static_dir);
 
@@ -223,9 +226,6 @@ async fn main() {
 
     // HTTP 先開始監聽；可能耗時的遷移與 transcript 同步在 blocking thread 執行。
     spawn_usage_sync_task();
-    tokio::spawn(async {
-        updater::check_and_auto_update_on_launch().await;
-    });
     axum::serve(listener, app).await.unwrap();
 }
 

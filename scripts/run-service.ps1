@@ -15,6 +15,7 @@ $InstallDir = [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($
 
 $env:PORT = "$Port"
 $env:HOST = "$HostAddress"
+$env:TOKEN_USAGE_INSIGHTS_SERVICE = "1"
 
 $Exe = Join-Path $InstallDir "$AppName.exe"
 if (!(Test-Path $Exe)) {
@@ -171,7 +172,8 @@ while ($true) {
         }
     }
 
-    if ($restartForLogRotation) {
+    # Exit code 75 indicates the process completed an auto-update and requested the runner to restart it
+    if ($restartForLogRotation -or $Process.ExitCode -eq 75) {
         continue
     }
 

@@ -76,6 +76,8 @@ for file in pricing.csv README.md LICENSE VERSION; do
   fi
 done
 
+printf "token-usage-insights:installed" > "${install_dir}/.install_marker"
+
 ln -sfn "${install_dir}/${app_name}" "${bin_dir}/${app_name}"
 
 if [[ "$install_service" == true ]]; then

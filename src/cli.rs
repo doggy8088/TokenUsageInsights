@@ -558,7 +558,12 @@ async fn run_update_cli(args: &[String]) -> i32 {
                 force = true;
             }
             "-v" | "--target-version" => {
-                target_version = Some(next_flag_value(args, &mut i, "target-version"));
+                let val = next_flag_value(args, &mut i, "target-version");
+                if val.starts_with('-') {
+                    eprintln!("缺少 --target-version 的值");
+                    return 2;
+                }
+                target_version = Some(val);
             }
             arg => {
                 eprintln!("未知參數: {arg}");
@@ -587,7 +592,7 @@ async fn run_update_cli(args: &[String]) -> i32 {
 fn next_flag_value(args: &[String], i: &mut usize, flag: &str) -> String {
     match args.get(*i + 1) {
         Some(value) => {
-            if value.starts_with('-') {
+            if value.starts_with("--") {
                 eprintln!("缺少 --{flag} 的值");
                 std::process::exit(2);
             }

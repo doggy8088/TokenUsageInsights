@@ -12,7 +12,7 @@ const GITHUB_REPO: &str = "TokenUsageInsights";
 const APP_NAME: &str = "token-usage-insights";
 const USER_AGENT: &str = "token-usage-insights-updater";
 const DEFAULT_UPDATE_INTERVAL_HOURS: i64 = 24;
-const STARTUP_CHECK_TIMEOUT_SECS: u64 = 4;
+const STARTUP_CHECK_TIMEOUT_SECS: u64 = 2;
 const LAST_CHECK_KEY: &str = "last_update_check_at";
 
 #[derive(Debug, Clone, Default)]
@@ -80,26 +80,26 @@ pub fn current_target_triple() -> Option<&'static str> {
     }
 }
 
-pub fn standard_install_dir() -> PathBuf {
+pub fn standard_install_dir() -> Option<PathBuf> {
     if let Some(custom) = crate::paths::env_path("TOKEN_USAGE_INSIGHTS_INSTALL_DIR") {
-        return custom;
+        return Some(custom);
     }
 
     #[cfg(windows)]
     {
         if let Some(local_app_data) = dirs::data_local_dir() {
-            return local_app_data.join("TokenUsageInsights");
+            return Some(local_app_data.join("TokenUsageInsights"));
         }
     }
 
     #[cfg(not(windows))]
     {
         if let Some(home) = dirs::home_dir() {
-            return home.join(".local").join("share").join(APP_NAME);
+            return Some(home.join(".local").join("share").join(APP_NAME));
         }
     }
 
-    PathBuf::from(".")
+    None
 }
 
 pub fn detect_environment() -> EnvironmentKind {
@@ -128,14 +128,30 @@ pub fn detect_environment() -> EnvironmentKind {
     }
 
     // 3. 檢查標準安裝目錄（包含以 TOKEN_USAGE_INSIGHTS_INSTALL_DIR 明確指定的路徑）
-    let std_dir = standard_install_dir();
-    let canonical_std_dir = fs::canonicalize(&std_dir).unwrap_or(std_dir);
-    if let Ok(canonical_exe_dir) = fs::canonicalize(exe_dir) {
-        if canonical_exe_dir == canonical_std_dir {
-            return EnvironmentKind::StandardInstalled {
-                install_dir: canonical_std_dir,
-                exe_path,
-            };
+    if let Some(std_dir) = standard_install_dir() {
+        let canonical_std_dir = fs::canonicalize(&std_dir).unwrap_or(std_dir);
+        if let Ok(canonical_exe_dir) = fs::canonicalize(exe_dir) {
+            if canonical_exe_dir == canonical_std_dir {
+                return EnvironmentKind::StandardInstalled {
+                    install_dir: canonical_std_dir,
+                    exe_path,
+                };
+            }
+        }
+    }
+
+    // 4. 檢查安裝標記檔（由 install.sh 或 install.ps1 寫入的自訂安裝目錄）
+    let marker_path = exe_dir.join(".install_marker");
+    if marker_path.is_file() {
+        if let Ok(content) = fs::read_to_string(&marker_path) {
+            if content.trim() == "token-usage-insights:installed" {
+                let install_dir =
+                    fs::canonicalize(exe_dir).unwrap_or_else(|_| exe_dir.to_path_buf());
+                return EnvironmentKind::StandardInstalled {
+                    install_dir,
+                    exe_path,
+                };
+            }
         }
     }
 
@@ -344,7 +360,9 @@ struct TempDirGuard {
 
 impl TempDirGuard {
     fn new(path: PathBuf) -> Result<Self, String> {
-        let _ = fs::remove_dir_all(&path);
+        if path.exists() {
+            fs::remove_dir_all(&path).map_err(|e| format!("清除舊暫存目錄失敗 ({path:?}): {e}"))?;
+        }
         fs::create_dir_all(&path).map_err(|e| format!("建立暫存目錄失敗: {e}"))?;
         Ok(Self { path })
     }
@@ -413,15 +431,26 @@ const MANAGED_ITEMS: &[&str] = &[
     "VERSION",
     "README.md",
     "LICENSE",
+    ".install_marker",
 ];
 
 fn backup_installation(install_dir: &Path, backup_dir: &Path) -> Result<(), String> {
     if backup_dir.exists() {
-        let err = format!(
-            "偵測到先前更新留存的備份目錄 {:?}；為保護先前版本，已停止更新。請手動還原或移除該備份目錄後再試。",
-            backup_dir
-        );
-        return Err(err);
+        if backup_dir.join(".rollback_failed").exists() {
+            let err = format!(
+                "偵測到先前更新回滾失敗留存的救援備份目錄 {:?}；為保護先前版本，已停止更新。請手動還原或確認安全後再試。",
+                backup_dir
+            );
+            return Err(err);
+        } else if let Err(e) = fs::remove_dir_all(backup_dir) {
+            let fallback = install_dir.join(format!(".backup-stale-{}", Utc::now().timestamp()));
+            if let Err(re) = fs::rename(backup_dir, &fallback) {
+                let err = format!(
+                    "無法清理先前殘留之備份目錄 ({backup_dir:?}): {e}; 嘗試重新命名亦失敗: {re}"
+                );
+                return Err(err);
+            }
+        }
     }
     fs::create_dir_all(backup_dir).map_err(|e| format!("建立備份目錄失敗: {e}"))?;
 
@@ -467,21 +496,13 @@ fn restore_from_backup(backup_dir: &Path, install_dir: &Path) -> Result<(), Stri
         if !original_items.contains(item) {
             let path = install_dir.join(item);
             if path.is_dir() {
-                if let Err(e) = fs::remove_dir_all(&path) {
-                    log_update(
-                        "WARN",
-                        "ROLLBACK",
-                        &format!("清理新增目錄失敗 {path:?}: {e}"),
-                    );
+                if path.exists() {
+                    fs::remove_dir_all(&path)
+                        .map_err(|e| format!("回滾清理新增目錄失敗 {path:?}: {e}"))?;
                 }
             } else if path.is_file() {
-                if let Err(e) = fs::remove_file(&path) {
-                    log_update(
-                        "WARN",
-                        "ROLLBACK",
-                        &format!("清理新增檔案失敗 {path:?}: {e}"),
-                    );
-                }
+                fs::remove_file(&path)
+                    .map_err(|e| format!("回滾清理新增檔案失敗 {path:?}: {e}"))?;
             }
         }
     }
@@ -743,8 +764,8 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), String> {
     // 取得安裝目錄之獨占鎖
     let _lock = UpdateLock::try_acquire(&install_dir)?;
 
-    // 使用 TempDirGuard 確保異常離開時自動清理暫存
-    let update_tmp_dir = crate::db::get_insights_dir().join(".update-tmp");
+    // 使用 TempDirGuard 確保異常離開時自動清理暫存（置於 install_dir 底下確保受獨占鎖保護）
+    let update_tmp_dir = install_dir.join(".update-tmp");
     let tmp_guard = TempDirGuard::new(update_tmp_dir)?;
 
     println!("⬇️ 正在下載發行包: {archive_name} ...");
@@ -821,9 +842,37 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), String> {
         }
     };
 
-    println!("💾 正在備份現有安裝...");
+    let exec_name = if cfg!(windows) {
+        format!("{APP_NAME}.exe")
+    } else {
+        APP_NAME.to_string()
+    };
+
+    // 驗證解壓後的發行包是否包含所有必要資源，避免不完整安裝造成混合版本
+    for required in [&exec_name, "static", "pricing.csv", "VERSION"] {
+        if !release_root.join(required).exists() {
+            let err = format!("解壓發行包缺少必要資源: {required}");
+            log_update("ERROR", "VERIFY", &err);
+            return Err(err);
+        }
+    }
+
     let backup_dir = install_dir.join(".backup");
-    if let Err(e) = backup_installation(&install_dir, &backup_dir) {
+    apply_installation_with_rollback(&release_root, &install_dir, &backup_dir)?;
+
+    println!("🎉 成功更新至版本 {remote_version}！");
+    log_update("INFO", "INSTALL", &format!("成功更新至 {remote_version}"));
+
+    Ok(())
+}
+
+pub(crate) fn apply_installation_with_rollback(
+    release_root: &Path,
+    install_dir: &Path,
+    backup_dir: &Path,
+) -> Result<(), String> {
+    println!("💾 正在備份現有安裝...");
+    if let Err(e) = backup_installation(install_dir, backup_dir) {
         log_update("ERROR", "BACKUP", &e);
         return Err(e);
     }
@@ -906,6 +955,7 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), String> {
             "LICENSE",
             "install.sh",
             "install.ps1",
+            ".install_marker",
         ] {
             let src = release_root.join(file);
             let dst = install_dir.join(file);
@@ -920,7 +970,8 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), String> {
     if let Err(err) = install_result {
         eprintln!("❌ 安裝失敗，正在自動回滾: {err}");
         log_update("ERROR", "INSTALL", &format!("安裝失敗: {err}，開始回滾"));
-        if let Err(rollback_err) = restore_from_backup(&backup_dir, &install_dir) {
+        if let Err(rollback_err) = restore_from_backup(backup_dir, install_dir) {
+            let _ = fs::write(backup_dir.join(".rollback_failed"), &rollback_err);
             eprintln!(
                 "❌ 自動回滾失敗: {rollback_err}；請保留備份目錄 {:?} 進行手動還原",
                 backup_dir
@@ -932,15 +983,20 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), String> {
         } else {
             println!("✅ 已成功回滾至先前版本。");
             log_update("INFO", "ROLLBACK", "回滾成功");
-            let _ = fs::remove_dir_all(&backup_dir);
+            let _ = fs::remove_dir_all(backup_dir);
         }
         return Err(err);
     }
 
-    let _ = fs::remove_dir_all(&backup_dir);
-
-    println!("🎉 成功更新至版本 {remote_version}！");
-    log_update("INFO", "INSTALL", &format!("成功更新至 {remote_version}"));
+    if backup_dir.exists() {
+        if let Err(e) = fs::remove_dir_all(backup_dir) {
+            log_update("WARN", "CLEANUP", &format!("清理備份目錄失敗: {e}"));
+            let _ = fs::remove_file(backup_dir.join(".manifest"));
+            let fallback_backup =
+                install_dir.join(format!(".backup-old-{}", Utc::now().timestamp()));
+            let _ = fs::rename(backup_dir, &fallback_backup);
+        }
+    }
 
     Ok(())
 }
@@ -971,10 +1027,15 @@ pub async fn check_and_auto_update_on_launch() {
     // 3. 判斷環境
     let env_kind = detect_environment();
     if matches!(env_kind, EnvironmentKind::Npm { .. }) {
-        // npm 環境：快速檢查是否有新版，若有僅在終端機提示
-        if let Ok(release) = fetch_release(None, 2).await {
+        // npm 環境：快速檢查是否有新版，若有僅在終端機提示並記錄
+        if let Ok(release) = fetch_release_with_logging(None, STARTUP_CHECK_TIMEOUT_SECS).await {
             let current_version = env!("CARGO_PKG_VERSION");
             if is_newer_version(&release.tag_name, current_version) {
+                log_update(
+                    "INFO",
+                    "STARTUP_CHECK",
+                    &format!("npm 環境偵測到新版本 {}", release.tag_name),
+                );
                 println!(
                     "💡 發現新版本 {}！您可以執行 npx token-usage-insights@latest 啟動最新版本。",
                     release.tag_name
@@ -1010,15 +1071,9 @@ pub async fn check_and_auto_update_on_launch() {
         }
     }
 
-    // 5. 快速檢查（設定超時，不阻礙伺服器啟動）
-    let release = match fetch_release(None, STARTUP_CHECK_TIMEOUT_SECS).await {
-        Ok(r) => {
-            if let Ok(conn) = crate::db::get_db_conn() {
-                let now_str = Utc::now().to_rfc3339();
-                let _ = crate::db::set_system_metadata(&conn, LAST_CHECK_KEY, &now_str);
-            }
-            r
-        }
+    // 5. 快速檢查（設定超時 STARTUP_CHECK_TIMEOUT_SECS 秒，不阻礙伺服器啟動）
+    let release = match fetch_release_with_logging(None, STARTUP_CHECK_TIMEOUT_SECS).await {
+        Ok(r) => r,
         Err(e) => {
             log_update("WARN", "STARTUP_CHECK", &format!("啟動更新檢查略過: {e}"));
             return;
@@ -1027,6 +1082,11 @@ pub async fn check_and_auto_update_on_launch() {
 
     let current_version = env!("CARGO_PKG_VERSION");
     if !is_newer_version(&release.tag_name, current_version) {
+        // 沒有新版本：成功確認當前已是最新，記錄本次檢查時間
+        if let Ok(conn) = crate::db::get_db_conn() {
+            let now_str = Utc::now().to_rfc3339();
+            let _ = crate::db::set_system_metadata(&conn, LAST_CHECK_KEY, &now_str);
+        }
         return;
     }
 
@@ -1052,6 +1112,12 @@ pub async fn check_and_auto_update_on_launch() {
         return;
     }
 
+    // 更新成功後記錄最後檢查時間
+    if let Ok(conn) = crate::db::get_db_conn() {
+        let now_str = Utc::now().to_rfc3339();
+        let _ = crate::db::set_system_metadata(&conn, LAST_CHECK_KEY, &now_str);
+    }
+
     println!("🔄 更新完成，正在自動重啟 Token 戰情室...");
     log_update("INFO", "STARTUP_RESTART", "更新完成，重啟進程");
 
@@ -1070,15 +1136,27 @@ pub async fn check_and_auto_update_on_launch() {
 
     #[cfg(windows)]
     {
-        let current_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from(&args[0]));
-        let mut cmd = std::process::Command::new(current_exe);
-        if args.len() > 1 {
-            cmd.args(&args[1..]);
-        }
-        cmd.env("_TOKEN_USAGE_INSIGHTS_RESTARTED", "1");
-        match cmd.spawn() {
-            Ok(_) => std::process::exit(0),
-            Err(err) => eprintln!("❌ 自動重啟進程失敗: {err}"),
+        if std::env::var("TOKEN_USAGE_INSIGHTS_SERVICE").is_ok() {
+            log_update(
+                "INFO",
+                "STARTUP_RESTART",
+                "以退出碼 75 請求 Windows 服務管理器重啟新版程序",
+            );
+            std::process::exit(75);
+        } else {
+            let current_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from(&args[0]));
+            let mut cmd = std::process::Command::new(current_exe);
+            if args.len() > 1 {
+                cmd.args(&args[1..]);
+            }
+            cmd.env("_TOKEN_USAGE_INSIGHTS_RESTARTED", "1");
+            match cmd.status() {
+                Ok(status) => std::process::exit(status.code().unwrap_or(0)),
+                Err(err) => {
+                    eprintln!("❌ 自動重啟進程失敗: {err}");
+                    log_update("ERROR", "STARTUP_RESTART", &format!("重啟進程失敗: {err}"));
+                }
+            }
         }
     }
 }
@@ -1236,8 +1314,13 @@ update_check_interval: 5 # check every 5 days
         assert!(backup_dir.join("static").join("index.html").exists());
         assert!(backup_dir.join(".manifest").exists());
 
-        // Re-run backup should fail because backup_dir already exists
+        // Re-run backup with .rollback_failed should fail to protect failed rollback state
+        fs::write(backup_dir.join(".rollback_failed"), "failed rollback").unwrap();
         assert!(backup_installation(&install_dir, &backup_dir).is_err());
+        fs::remove_file(backup_dir.join(".rollback_failed")).unwrap();
+
+        // Stale backup without .rollback_failed can be safely refreshed
+        assert!(backup_installation(&install_dir, &backup_dir).is_ok());
 
         // Corrupt install_dir and simulate adding a new file not present in original backup
         fs::write(install_dir.join("VERSION"), "corrupted").unwrap();
@@ -1277,6 +1360,103 @@ update_check_interval: 5 # check every 5 days
         assert!(lock3.is_ok());
 
         drop(lock3);
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn apply_installation_with_rollback_success_and_restore_on_error() {
+        let temp = std::env::temp_dir().join(format!(
+            "test-install-orchestration-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let install_dir = temp.join("install");
+        let release_root = temp.join("release");
+        let bad_release = temp.join("bad_release");
+        let backup_dir = install_dir.join(".backup");
+
+        fs::create_dir_all(&install_dir).unwrap();
+        fs::create_dir_all(&release_root).unwrap();
+        fs::create_dir_all(&bad_release).unwrap();
+
+        let exec_name = if cfg!(windows) {
+            format!("{APP_NAME}.exe")
+        } else {
+            APP_NAME.to_string()
+        };
+
+        // Existing installation v0.9.5
+        fs::write(install_dir.join(&exec_name), "old binary").unwrap();
+        fs::write(install_dir.join("VERSION"), "v0.9.5").unwrap();
+        fs::write(install_dir.join("pricing.csv"), "old pricing").unwrap();
+        fs::create_dir_all(install_dir.join("static")).unwrap();
+        fs::write(install_dir.join("static").join("index.html"), "old html").unwrap();
+
+        // Valid new release v0.9.6
+        fs::write(release_root.join(&exec_name), "new binary").unwrap();
+        fs::write(release_root.join("VERSION"), "v0.9.6").unwrap();
+        fs::write(release_root.join("pricing.csv"), "new pricing").unwrap();
+        fs::create_dir_all(release_root.join("static")).unwrap();
+        fs::write(release_root.join("static").join("index.html"), "new html").unwrap();
+
+        // 1. Success case
+        let result = apply_installation_with_rollback(&release_root, &install_dir, &backup_dir);
+        assert!(
+            result.is_ok(),
+            "apply_installation_with_rollback failed: {:?}",
+            result
+        );
+        assert_eq!(
+            fs::read_to_string(install_dir.join("VERSION")).unwrap(),
+            "v0.9.6"
+        );
+        assert_eq!(
+            fs::read_to_string(install_dir.join("pricing.csv")).unwrap(),
+            "new pricing"
+        );
+        assert_eq!(
+            fs::read_to_string(install_dir.join(&exec_name)).unwrap(),
+            "new binary"
+        );
+        assert!(
+            !backup_dir.exists(),
+            "backup_dir should be removed after success"
+        );
+
+        // 2. Failure case: bad release where the executable is a directory instead of a file
+        // This causes fs::copy(&src_exe, &target_exe) to fail during installation, triggering rollback.
+        fs::create_dir_all(bad_release.join(&exec_name)).unwrap();
+        fs::write(bad_release.join("VERSION"), "v0.9.7-broken").unwrap();
+        fs::create_dir_all(bad_release.join("static")).unwrap();
+        fs::write(bad_release.join("static").join("index.html"), "broken html").unwrap();
+
+        let fail_result = apply_installation_with_rollback(&bad_release, &install_dir, &backup_dir);
+        assert!(
+            fail_result.is_err(),
+            "expected installation to fail with directory as binary"
+        );
+
+        // Verify that rollback restored install_dir to v0.9.6 state
+        assert_eq!(
+            fs::read_to_string(install_dir.join("VERSION")).unwrap(),
+            "v0.9.6"
+        );
+        assert_eq!(
+            fs::read_to_string(install_dir.join("pricing.csv")).unwrap(),
+            "new pricing"
+        );
+        assert_eq!(
+            fs::read_to_string(install_dir.join(&exec_name)).unwrap(),
+            "new binary"
+        );
+        assert_eq!(
+            fs::read_to_string(install_dir.join("static").join("index.html")).unwrap(),
+            "new html"
+        );
+        assert!(
+            !backup_dir.exists(),
+            "backup_dir should be removed after successful rollback"
+        );
+
         let _ = fs::remove_dir_all(&temp);
     }
 }
