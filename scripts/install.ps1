@@ -158,23 +158,22 @@ exit /b %APP_EXIT_CODE%
         }
 
         $StartupShortcut = Get-StartupShortcutPath
-        Remove-Item -Force -Path $StartupShortcut -ErrorAction SilentlyContinue
-
-        $Action = New-ScheduledTaskAction `
-            -Execute "powershell.exe" `
-            -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$RunnerScript`" -InstallDir `"$InstallDir`" -HostAddress `"$HostAddress`" -Port $Port" `
-            -WorkingDirectory $InstallDir
-
-        $Trigger = New-ScheduledTaskTrigger -AtLogOn
-
-        $Settings = New-ScheduledTaskSettingsSet `
-            -AllowStartIfOnBatteries `
-            -DontStopIfGoingOnBatteries `
-            -ExecutionTimeLimit ([TimeSpan]::Zero) `
-            -RestartCount 3 `
-            -RestartInterval (New-TimeSpan -Minutes 1)
 
         try {
+            $Action = New-ScheduledTaskAction `
+                -Execute "powershell.exe" `
+                -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$RunnerScript`" -InstallDir `"$InstallDir`" -HostAddress `"$HostAddress`" -Port $Port" `
+                -WorkingDirectory $InstallDir
+
+            $Trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+
+            $Settings = New-ScheduledTaskSettingsSet `
+                -AllowStartIfOnBatteries `
+                -DontStopIfGoingOnBatteries `
+                -ExecutionTimeLimit ([TimeSpan]::Zero) `
+                -RestartCount 3 `
+                -RestartInterval (New-TimeSpan -Minutes 1)
+
             Register-ScheduledTask `
                 -TaskName $TaskName `
                 -Action $Action `
@@ -185,8 +184,16 @@ exit /b %APP_EXIT_CODE%
 
             Start-ScheduledTask -TaskName $TaskName
             $registeredAsTask = $true
+
+            # Registration in Task Scheduler succeeded; remove any stale Startup folder shortcut
+            # to avoid dual launches on logon.
+            Remove-Item -Force -Path $StartupShortcut -ErrorAction SilentlyContinue
         } catch {
             Write-Warning "Could not register scheduled task: $($_.Exception.Message). Falling back to Startup folder..."
+            try {
+                Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+            } catch {}
+
             $WshShell = New-Object -ComObject WScript.Shell
             $Shortcut = $WshShell.CreateShortcut($StartupShortcut)
             $Shortcut.TargetPath = "powershell.exe"

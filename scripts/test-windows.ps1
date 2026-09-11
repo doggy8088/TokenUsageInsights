@@ -31,6 +31,8 @@ try {
         }
     )
 
+    $psExe = if (Get-Command "powershell.exe" -ErrorAction SilentlyContinue) { "powershell.exe" } else { "pwsh" }
+
     foreach ($case in $cases) {
         [Environment]::SetEnvironmentVariable($case.EnvironmentName, $case.Directory)
         $payload = [ordered]@{
@@ -44,7 +46,7 @@ try {
         $payload[$case.SessionProperty] = "windows-path-test"
         $json = $payload | ConvertTo-Json -Depth 5 -Compress
 
-        $null = $json | powershell.exe -NoProfile -ExecutionPolicy Bypass -File $case.Script
+        $null = $json | & $psExe -NoProfile -ExecutionPolicy Bypass -File $case.Script
         if ($LASTEXITCODE -ne 0) { throw "$($case.Name) collector failed on first invocation." }
         $jsonl = Get-ChildItem -LiteralPath (Join-Path $case.Directory "usage") -Filter "*.jsonl" -File
         Assert-Equal 1 @($jsonl).Count "$($case.Name) should create one JSONL file."
@@ -52,7 +54,7 @@ try {
         Assert-Equal 1 $entries.Count "$($case.Name) should append the first positive delta."
         Assert-Equal 12 $entries[0].delta_tokens.total "$($case.Name) first delta is wrong."
 
-        $null = $json | powershell.exe -NoProfile -ExecutionPolicy Bypass -File $case.Script
+        $null = $json | & $psExe -NoProfile -ExecutionPolicy Bypass -File $case.Script
         if ($LASTEXITCODE -ne 0) { throw "$($case.Name) collector failed on repeat invocation." }
         $entries = @(Get-Content -LiteralPath $jsonl.FullName | ForEach-Object { $_ | ConvertFrom-Json })
         Assert-Equal 1 $entries.Count "$($case.Name) should not append a zero delta."
@@ -61,7 +63,7 @@ try {
         $payload.context_window.total_output_tokens = 4
         $payload.context_window.total_tokens = 24
         $json = $payload | ConvertTo-Json -Depth 5 -Compress
-        $null = $json | powershell.exe -NoProfile -ExecutionPolicy Bypass -File $case.Script
+        $null = $json | & $psExe -NoProfile -ExecutionPolicy Bypass -File $case.Script
         if ($LASTEXITCODE -ne 0) { throw "$($case.Name) collector failed on delta invocation." }
         $entries = @(Get-Content -LiteralPath $jsonl.FullName | ForEach-Object { $_ | ConvertFrom-Json })
         Assert-Equal 2 $entries.Count "$($case.Name) should append the second positive delta."
@@ -99,6 +101,14 @@ try {
     }
     if (-not $installScriptContent.Contains('return "[$HostAddress]"')) {
         throw "install.ps1 should bracket IPv6 dashboard hosts when printing the URL."
+    }
+    if (-not $installScriptContent.Contains('-AtLogOn -User $env:USERNAME')) {
+        throw "install.ps1 should scope the logon trigger to the current user."
+    }
+    $tryIndex = $installScriptContent.IndexOf('try {')
+    $actionIndex = $installScriptContent.IndexOf('$Action = New-ScheduledTaskAction')
+    if ($tryIndex -lt 0 -or $actionIndex -lt 0 -or $tryIndex -ge $actionIndex) {
+        throw "install.ps1 should define scheduled task action inside the guarded try block."
     }
 
     Write-Host "Windows collector smoke tests passed."
