@@ -114,9 +114,12 @@ function Invoke-InstallServiceTest {
     $global:serviceEvents = New-Object System.Collections.Generic.List[string]
     $global:hostMessages = New-Object System.Collections.Generic.List[string]
     $global:runnerProcessAlive = $true
+    $global:otherRunnerProcessAlive = $true
     $global:appProcessAlive = $true
     $global:scheduledTaskTriggerUser = $null
     $runnerCommandLine = "powershell.exe -File `"$installDir\scripts\run-service.ps1`" -InstallDir `"$installDir`""
+    $otherInstallDir = "$installDir-old"
+    $otherRunnerCommandLine = "powershell.exe -File `"$otherInstallDir\scripts\run-service.ps1`" -InstallDir `"$otherInstallDir`""
 
     function Stop-ScheduledTask {
         [CmdletBinding()]
@@ -126,13 +129,22 @@ function Invoke-InstallServiceTest {
     function Get-CimInstance {
         [CmdletBinding()]
         param([string]$ClassName)
+        $processes = @()
         if ($global:runnerProcessAlive) {
-            return [pscustomobject]@{
+            $processes += [pscustomobject]@{
                 Name = "powershell.exe"
                 ProcessId = 111
                 CommandLine = $runnerCommandLine
             }
         }
+        if ($global:otherRunnerProcessAlive) {
+            $processes += [pscustomobject]@{
+                Name = "powershell.exe"
+                ProcessId = 112
+                CommandLine = $otherRunnerCommandLine
+            }
+        }
+        return $processes
     }
     function Get-Process {
         [CmdletBinding()]
@@ -140,6 +152,9 @@ function Invoke-InstallServiceTest {
         if ($PSBoundParameters.ContainsKey("Id")) {
             if (($Id -eq 111) -and $global:runnerProcessAlive) {
                 return [pscustomobject]@{ Id = 111; Name = "powershell" }
+            }
+            if (($Id -eq 112) -and $global:otherRunnerProcessAlive) {
+                return [pscustomobject]@{ Id = 112; Name = "powershell" }
             }
 
             return
@@ -161,6 +176,10 @@ function Invoke-InstallServiceTest {
                 if ($Id -eq 111) {
                     $global:runnerProcessAlive = $false
                     $global:serviceEvents.Add("StopRunner")
+                }
+                if ($Id -eq 112) {
+                    $global:otherRunnerProcessAlive = $false
+                    $global:serviceEvents.Add("StopOtherRunner")
                 }
 
                 return
@@ -278,6 +297,7 @@ function Invoke-InstallServiceTest {
             Events = @($global:serviceEvents)
             Output = @($global:hostMessages)
             TriggerUser = $global:scheduledTaskTriggerUser
+            OtherRunnerStopped = (-not $global:otherRunnerProcessAlive)
         }
     } finally {
         foreach ($functionName in @(
@@ -298,7 +318,7 @@ function Invoke-InstallServiceTest {
         )) {
             Remove-Item "Function:\$functionName" -ErrorAction SilentlyContinue
         }
-        Remove-Variable serviceEvents, hostMessages, runnerProcessAlive, appProcessAlive, scheduledTaskTriggerUser -Scope Global -ErrorAction SilentlyContinue
+        Remove-Variable serviceEvents, hostMessages, runnerProcessAlive, otherRunnerProcessAlive, appProcessAlive, scheduledTaskTriggerUser -Scope Global -ErrorAction SilentlyContinue
         $env:APPDATA = $previousAppData
         $env:USERNAME = $previousUsername
         $env:USERDOMAIN = $previousUserDomain
@@ -393,6 +413,7 @@ try {
     $stopRunnerIndex = $installIpv6Result.Events.IndexOf("StopRunner")
     $stopAppIndex = $installIpv6Result.Events.IndexOf("StopApp")
     Assert-True ($copyIndex -gt $stopRunnerIndex -and $copyIndex -gt $stopAppIndex) "install.ps1 should stop existing service processes before copying files."
+    Assert-Equal $false $installIpv6Result.OtherRunnerStopped "install.ps1 should not stop a different runner whose install path merely shares a prefix."
     Assert-True ($installIpv6Result.Output -contains "  http://[::1]:4010") "install.ps1 should bracket IPv6 dashboard URLs."
     Assert-Equal "test-domain\test-user" $installIpv6Result.TriggerUser "install.ps1 should scope the logon trigger to the current user."
 

@@ -31,6 +31,10 @@ function Stop-ExistingServiceInstance {
         [string]$InstallDir
     )
 
+    $runnerScriptPath = [IO.Path]::GetFullPath((Join-Path $InstallDir "scripts\run-service.ps1"))
+    $quotedRunnerFileArgument = "-File `"$runnerScriptPath`""
+    $unquotedRunnerFileArgument = "-File $runnerScriptPath"
+
     try {
         Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     } catch {}
@@ -38,8 +42,10 @@ function Stop-ExistingServiceInstance {
     $runnerHosts = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
         ($_.Name -in @("powershell.exe", "pwsh.exe")) -and
         $_.CommandLine -and
-        $_.CommandLine.IndexOf("run-service.ps1", [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -and
-        $_.CommandLine.IndexOf($InstallDir, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+        (
+            $_.CommandLine.IndexOf($quotedRunnerFileArgument, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -or
+            $_.CommandLine.IndexOf($unquotedRunnerFileArgument, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+        )
     })
     $runnerHostIds = @($runnerHosts | ForEach-Object { $_.ProcessId })
     foreach ($runnerHost in $runnerHosts) {
