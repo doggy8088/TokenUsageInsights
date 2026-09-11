@@ -86,7 +86,8 @@ function Invoke-InstallServiceTest {
     param(
         [string]$HostAddress,
         [int]$Port,
-        [switch]$FailScheduledTaskAction
+        [switch]$FailScheduledTaskAction,
+        [switch]$WhatIf
     )
 
     $tempRoot = Join-Path $Root ([guid]::NewGuid())
@@ -100,16 +101,18 @@ function Invoke-InstallServiceTest {
     $env:APPDATA = Join-Path $tempRoot "AppData\Roaming"
     $env:USERNAME = "test-user"
     $env:USERDOMAIN = "test-domain"
+    $startupShortcut = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Startup\token-usage-insights.lnk"
 
     New-Item -ItemType Directory -Force -Path (Join-Path $releaseDir "static") | Out-Null
     New-Item -ItemType Directory -Force -Path (Join-Path $releaseDir "shell") | Out-Null
     New-Item -ItemType Directory -Force -Path $scriptDir | Out-Null
-    New-Item -ItemType Directory -Force -Path $env:APPDATA | Out-Null
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $startupShortcut) | Out-Null
 
     Set-Content -LiteralPath (Join-Path $releaseDir "token-usage-insights.exe") -Value "binary"
     Set-Content -LiteralPath (Join-Path $releaseDir "pricing.csv") -Value "model,input,output"
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot "install.ps1") -Destination (Join-Path $scriptDir "install.ps1")
     Set-Content -LiteralPath (Join-Path $scriptDir "run-service.ps1") -Value "Write-Host 'runner'"
+    Set-Content -LiteralPath $startupShortcut -Value "shortcut"
 
     $global:serviceEvents = New-Object System.Collections.Generic.List[string]
     $global:hostMessages = New-Object System.Collections.Generic.List[string]
@@ -291,13 +294,25 @@ function Invoke-InstallServiceTest {
     }
 
     try {
-        & (Join-Path $scriptDir "install.ps1") -InstallDir $installDir -BinDir $binDir -HostAddress $HostAddress -Port $Port -Service
+        $arguments = @{
+            InstallDir = $installDir
+            BinDir = $binDir
+            HostAddress = $HostAddress
+            Port = $Port
+            Service = $true
+        }
+        if ($WhatIf) {
+            $arguments["WhatIf"] = $true
+        }
+
+        & (Join-Path $scriptDir "install.ps1") @arguments
 
         [pscustomobject]@{
             Events = @($global:serviceEvents)
             Output = @($global:hostMessages)
             TriggerUser = $global:scheduledTaskTriggerUser
             OtherRunnerStopped = (-not $global:otherRunnerProcessAlive)
+            StartupShortcutExists = (Test-Path -LiteralPath $startupShortcut)
         }
     } finally {
         foreach ($functionName in @(
@@ -424,6 +439,9 @@ try {
     Assert-True ($installFallbackResult.Events -contains "CreateShortcut") "install.ps1 should create a Startup shortcut when scheduled task registration setup fails."
     Assert-True ($installFallbackResult.Events -contains "StartFallbackProcess") "install.ps1 should start the fallback background runner when scheduled task setup fails."
     Assert-True ($installFallbackResult.Output -contains "  Registered in:   Startup folder") "install.ps1 should report Startup folder registration after falling back."
+
+    $installWhatIfResult = Invoke-InstallServiceTest -HostAddress "127.0.0.1" -Port 3003 -WhatIf
+    Assert-Equal $true $installWhatIfResult.StartupShortcutExists "install.ps1 should not remove an existing Startup shortcut during -WhatIf."
 
     Write-Host "Windows collector smoke tests passed."
 } finally {

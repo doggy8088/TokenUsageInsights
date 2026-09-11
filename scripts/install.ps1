@@ -217,7 +217,9 @@ exit /b %APP_EXIT_CODE%
 
             # Registration in Task Scheduler succeeded; remove any stale Startup folder shortcut
             # to avoid dual launches on logon.
-            Remove-Item -Force -Path $StartupShortcut -ErrorAction SilentlyContinue
+            if ($PSCmdlet.ShouldProcess($StartupShortcut, "Remove stale Startup shortcut")) {
+                Remove-Item -Force -Path $StartupShortcut -ErrorAction SilentlyContinue
+            }
         } catch {
             Write-Warning "Could not register scheduled task: $($_.Exception.Message). Falling back to Startup folder..."
             try {
