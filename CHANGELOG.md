@@ -4,6 +4,16 @@
 
 ## [未發行]
 
+## [0.9.5] - 2026-09-11
+
+### 修正
+
+- 修正 Windows 環境下 Grok 測試因混合路徑分隔符號（`/` 與 `\`）導致 SQLite 記錄比對失敗的問題，將測試中的工作階段目錄拼接全面改為跨平台的 `.join("sessions").join("work").join(...)`。
+
+### 相容性
+
+- 本次僅修正測試案例中的路徑拼接方式，不涉及資料庫結構、環境變數或執行檔行為變更。
+
 ## [0.9.4] - 2026-09-11
 
 ### 新增與改善
@@ -580,7 +590,8 @@
 - 修正行動版側邊欄遮擋、黑畫面、標題擠壓、圖表導覽索引與年度版面問題。
 - 修正並補齊多個 Gemini、Claude、GPT 與 GPT-OSS 模型的定價規則。
 
-[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.9.4...HEAD
+[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.9.5...HEAD
+[0.9.5]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.9.4...v0.9.5
 [0.9.4]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.9.3...v0.9.4
 [0.9.3]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.9.2...v0.9.3
 [0.9.2]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.9.1...v0.9.2

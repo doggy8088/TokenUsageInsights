@@ -734,7 +734,7 @@ token-usage-insights
 
 | 変数 | 対応プラットフォーム | 説明 |
 | --- | --- | --- |
-| `TOKEN_USAGE_INSIGHTS_VERSION` | Linux / macOS / Windows | `v0.9.4` のようなインストール対象の Release tag。デフォルトは `latest` |
+| `TOKEN_USAGE_INSIGHTS_VERSION` | Linux / macOS / Windows | `v0.9.5` のようなインストール対象の Release tag。デフォルトは `latest` |
 | `TOKEN_USAGE_INSIGHTS_INSTALL_DIR` | Linux / macOS | `install.sh` に渡すインストールディレクトリ |
 | `TOKEN_USAGE_INSIGHTS_BIN_DIR` | Linux / macOS | `install.sh` に渡す実行ファイルリンクディレクトリ |
 
