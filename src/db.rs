@@ -891,6 +891,16 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
         [],
     );
 
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS system_metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )",
+        [],
+    )
+    .map_err(|error| format!("建立 system_metadata 表失敗: {error}"))?;
+
     // Before source_kind existed, every Copilot record came from the CLI
     // collector. Classify those historical rows once so the new source-scoped
     // unique index does not duplicate them on the first synchronization.
@@ -1113,6 +1123,30 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
         .map_err(|error| format!("記錄 Grok Build parser migration 失敗: {error}"))?;
     }
 
+    Ok(())
+}
+
+pub fn get_system_metadata(conn: &Connection, key: &str) -> Result<Option<String>, String> {
+    let mut stmt = conn
+        .prepare("SELECT value FROM system_metadata WHERE key = ?1")
+        .map_err(|e| e.to_string())?;
+    let mut rows = stmt.query(params![key]).map_err(|e| e.to_string())?;
+    if let Some(row) = rows.next().map_err(|e| e.to_string())? {
+        let val: String = row.get(0).map_err(|e| e.to_string())?;
+        Ok(Some(val))
+    } else {
+        Ok(None)
+    }
+}
+
+pub fn set_system_metadata(conn: &Connection, key: &str, value: &str) -> Result<(), String> {
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO system_metadata (key, value, updated_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        params![key, value, now],
+    )
+    .map_err(|e| format!("更新 system_metadata 失敗: {e}"))?;
     Ok(())
 }
 

@@ -5,18 +5,33 @@ use std::fs;
 use std::path::PathBuf;
 
 const EXPORT_VERSION: u8 = 1;
-const HELP_TEXT: &str = r#"Token 戰情室：看板與使用量匯入 / 匯出
+const HELP_TEXT: &str = r#"Token 戰情室：看板、使用量匯入 / 匯出與自我更新
 
 用法:
   token-usage-insights [子命令] [參數]
   不帶參數時啟動看板；HOST 預設 0.0.0.0，PORT 預設 3003。
   INSIGHTS_DIR 可指定資料庫目錄。
   --help, -h         顯示此說明
+  --no-auto-update   啟動看板時略過自動更新檢查
 
 用途:
-  export  匯出指定日、月或年的資料為 JSON（可重複匯入且支援重複資料去重）
+  update      更新 Token 戰情室至最新版本
+  export      匯出指定日、月或年的資料為 JSON（可重複匯入且支援重複資料去重）
   export-all  一次匯出資料庫中所有 Agent、所有日期的使用量記錄
-  import  匯入 JSON 檔內的所有資料（每筆資料依 timestamp 決定日期）
+  import      匯入 JSON 檔內的所有資料（每筆資料依 timestamp 決定日期）
+
+更新:
+  token-usage-insights update [參數]
+  例如:
+  token-usage-insights update
+  token-usage-insights update --check
+  token-usage-insights update --force
+  token-usage-insights update --target-version v0.9.6
+
+參數:
+  -c, --check                 僅檢查是否有新版本，不進行下載與安裝
+  -f, --force                 強制重新下載並覆蓋現有安裝（即使已是最新版本）
+  -v, --target-version <TAG>  指定安裝特定版本標籤（例如 v0.9.6）
 
 共用參數:
   --agent <name>      助理名稱: antigravity / copilot / codex / claude / cursor / grok / pi / omp / muse
@@ -158,8 +173,12 @@ struct UsageDayImportPayload {
 }
 
 // None means start the dashboard; commands finish before server initialization.
-pub(crate) fn run(args: &[String]) -> Option<i32> {
+pub(crate) async fn run(args: &[String]) -> Option<i32> {
     if args.len() < 2 {
+        return None;
+    }
+
+    if args[1] == "--no-auto-update" {
         return None;
     }
 
@@ -167,6 +186,7 @@ pub(crate) fn run(args: &[String]) -> Option<i32> {
         "export" => run_export(&args[2..]),
         "export-all" => run_export_all(&args[2..]),
         "import" => run_import(&args[2..]),
+        "update" => run_update_cli(&args[2..]).await,
         "-h" | "--help" | "help" => {
             print_help();
             0
@@ -500,6 +520,63 @@ fn run_import(args: &[String]) -> i32 {
     }
 
     0
+}
+
+fn print_update_help() {
+    println!(
+        r#"update usage:
+  token-usage-insights update [參數]
+
+參數:
+  -c, --check                 僅檢查是否有新版本，不進行下載與安裝
+  -f, --force                 強制重新下載並覆蓋現有安裝（即使已是最新版本）
+  -v, --target-version <TAG>  指定安裝特定版本標籤（例如 v0.9.6）
+  -h, --help                  顯示此說明
+"#
+    );
+}
+
+async fn run_update_cli(args: &[String]) -> i32 {
+    if has_help(args) {
+        print_update_help();
+        return 0;
+    }
+
+    let mut check_only = false;
+    let mut force = false;
+    let mut target_version = None;
+
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-c" | "--check" => {
+                check_only = true;
+            }
+            "-f" | "--force" => {
+                force = true;
+            }
+            "-v" | "--target-version" => {
+                target_version = Some(next_flag_value(args, &mut i, "target-version"));
+            }
+            arg => {
+                eprintln!("未知參數: {arg}");
+                print_update_help();
+                return 2;
+            }
+        }
+        i += 1;
+    }
+
+    let opts = crate::updater::UpdateOptions {
+        check_only,
+        force,
+        target_version,
+    };
+
+    match crate::updater::run_update(opts).await {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
 }
 
 fn next_flag_value(args: &[String], i: &mut usize, flag: &str) -> String {

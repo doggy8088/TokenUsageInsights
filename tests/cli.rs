@@ -10,7 +10,13 @@ fn help_and_invalid_commands_exit_without_initializing_the_server() {
             .unwrap()
             .as_nanos()
     ));
-    for command in [None, Some("export"), Some("export-all"), Some("import")] {
+    for command in [
+        None,
+        Some("export"),
+        Some("export-all"),
+        Some("import"),
+        Some("update"),
+    ] {
         for flag in ["--help", "-h"] {
             let mut process = Command::new(env!("CARGO_BIN_EXE_token-usage-insights"));
             process
@@ -33,6 +39,7 @@ fn help_and_invalid_commands_exit_without_initializing_the_server() {
         vec!["export"],
         vec!["import"],
         vec!["export-all", "--out"],
+        vec!["update", "--unknown"],
     ] {
         let result = Command::new(env!("CARGO_BIN_EXE_token-usage-insights"))
             .env("INSIGHTS_DIR", &missing_dir)
@@ -42,4 +49,13 @@ fn help_and_invalid_commands_exit_without_initializing_the_server() {
         assert_eq!(result.status.code(), Some(2));
         assert!(!missing_dir.exists());
     }
+
+    // In a git repository checkout, `update` should be rejected by safety check
+    let result = Command::new(env!("CARGO_BIN_EXE_token-usage-insights"))
+        .arg("update")
+        .output()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("開發目錄") || stderr.contains("非標準安裝目錄"));
 }

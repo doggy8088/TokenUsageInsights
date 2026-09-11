@@ -22,6 +22,7 @@ mod paths;
 mod pi;
 mod pricing;
 mod timeline;
+mod updater;
 mod vscode;
 
 use handlers::*;
@@ -133,12 +134,14 @@ fn spawn_usage_sync_task() {
 
 #[tokio::main]
 async fn main() {
-    if let Some(code) = cli::run(&std::env::args().collect::<Vec<_>>()) {
+    if let Some(code) = cli::run(&std::env::args().collect::<Vec<_>>()).await {
         std::process::exit(code);
     }
     if let Err(error) = initialize_database_schema() {
         eprintln!("❌ 初始化 SQLite 資料庫失敗: {error}");
     }
+
+    updater::check_and_auto_update_on_launch().await;
 
     let static_dir = get_static_dir();
     println!("📂 正在服務靜態檔案，目錄來源: {:?}", static_dir);
