@@ -11,6 +11,9 @@
   irm https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.ps1 | iex
 
 .EXAMPLE
+  & ([scriptblock]::Create((irm https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.ps1))) -Service
+
+.EXAMPLE
   $script = irm https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.ps1
   Invoke-Expression "& { $script } -InstallDir 'D:\Apps\Token Usage Insights' -Port 3010"
 #>
@@ -19,7 +22,9 @@ param(
     [string]$Version = "latest",
     [string]$InstallDir,
     [string]$BinDir,
-    [int]$Port = 3003
+    [string]$HostAddress,
+    [Nullable[int]]$Port = $null,
+    [switch]$Service
 )
 
 $ErrorActionPreference = "Stop"
@@ -66,9 +71,12 @@ try {
         throw "install.ps1 not found in extracted release: $ExtractedDir"
     }
 
-    $InstallArgs = @{ Port = $Port }
+    $InstallArgs = @{}
     if ($InstallDir) { $InstallArgs["InstallDir"] = $InstallDir }
     if ($BinDir) { $InstallArgs["BinDir"] = $BinDir }
+    if ($HostAddress) { $InstallArgs["HostAddress"] = $HostAddress }
+    if ($null -ne $Port) { $InstallArgs["Port"] = $Port }
+    if ($Service) { $InstallArgs["Service"] = $true }
 
     Write-Host "Installing $Tag ..."
     & $InstallScript @InstallArgs
