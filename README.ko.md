@@ -611,8 +611,29 @@ Windows PowerShell:
 Get-ScheduledTask -TaskName "TokenUsageInsights" -ErrorAction SilentlyContinue
 Get-Process -Name "token-usage-insights" -ErrorAction SilentlyContinue
 
-# 실시간 로그 확인
-Get-Content "$env:LOCALAPPDATA\TokenUsageInsights\logs\token-usage-insights.out.log" -Tail 50 -Wait
+# 실시간 로그 확인(실제 InstallDir 자동 감지)
+$InstallDir = Join-Path $env:LOCALAPPDATA "TokenUsageInsights"
+$Task = Get-ScheduledTask -TaskName "TokenUsageInsights" -ErrorAction SilentlyContinue
+if ($Task -and $Task.Actions) {
+    foreach ($Action in @($Task.Actions)) {
+        if ($Action.Arguments -match '(?i)-InstallDir\s+"([^"]+)"') {
+            $InstallDir = [Environment]::ExpandEnvironmentVariables($Matches[1])
+            break
+        }
+    }
+} else {
+    $StartupShortcut = Join-Path ([Environment]::GetFolderPath('Startup')) "token-usage-insights.lnk"
+    if (!(Test-Path $StartupShortcut)) {
+        $StartupShortcut = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Startup\token-usage-insights.lnk"
+    }
+    if (Test-Path $StartupShortcut) {
+        $Shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut($StartupShortcut)
+        if ($Shortcut.Arguments -match '(?i)-InstallDir\s+"([^"]+)"') {
+            $InstallDir = [Environment]::ExpandEnvironmentVariables($Matches[1])
+        }
+    }
+}
+Get-Content (Join-Path $InstallDir "logs\token-usage-insights.out.log") -Tail 50 -Wait
 
 # 서비스 다시 시작(작업 스케줄러 및 시작프로그램 모드 자동 호환)
 Stop-ScheduledTask -TaskName "TokenUsageInsights" -ErrorAction SilentlyContinue
