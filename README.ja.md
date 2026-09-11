@@ -277,6 +277,8 @@ VS Code Stable と Insiders に対応しています：
 
 既存の `chatSessions` ファイルは完全に取り込み、ファイルサイズまたは更新日時が変わると再同期します。Token フィールドのないチャット Session も表示されますが、Token 数は 0 です。読み取るのはローカルのチャットファイルだけで、クラウド Session、Remote SSH ホスト、`state.vscdb` は含まれません。
 
+**キャッシュ読み取り Token の取得元**：VS Code の `chatSessions` ファイルには、各リクエストの最後のモデル呼び出しの `promptTokens` と累計の `completionTokens` しか記録されず、Prompt Cache のキャッシュ読み取り数は記録されません。そのためダッシュボードは、同じワークスペースディレクトリに Copilot Chat 拡張機能が書き出すデバッグログ `GitHub.copilot-chat/debug-logs/<sessionId>/main.jsonl` も読み取り、そのターンの全モデル呼び出しの `inputTokens`・`outputTokens`・`cachedTokens` を合計して、非キャッシュ入力・キャッシュ読み取り・出力 Token に分解し、コスト推定にもキャッシュ読み取り単価を適用します。このデバッグログは VS Code 設定 `github.copilot.chat.agentDebugLog.fileLogging.enabled` で制御され（一部ユーザーには実験機能として有効化済み）、既定では最新 50 Session 分のみ保持されます。デバッグログのない Session は VS Code 標準の Token フィールドにフォールバックし、キャッシュ読み取りは 0 と表示されます。
+
 VS Code で `--user-data-dir` または Portable Mode を使う場合は、ダッシュボードのカスタムデータルートを指定できます：
 
 macOS / Linux：

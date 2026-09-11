@@ -277,6 +277,8 @@ Usage:
 
 The dashboard fully backfills existing `chatSessions` files and resynchronizes them when file size or modification time changes. Chat sessions without token fields are still shown with a token count of 0. Only local chat files are read; cloud sessions, Remote SSH hosts, and `state.vscdb` are not included.
 
+**Where cache-read tokens come from**: VS Code's `chatSessions` files only persist the `promptTokens` of the last model call in a request plus the accumulated `completionTokens`; they never record prompt-cache reads. The dashboard therefore also reads the Copilot Chat extension debug log written next to them, `GitHub.copilot-chat/debug-logs/<sessionId>/main.jsonl`, sums `inputTokens`, `outputTokens`, and `cachedTokens` across every model call of the turn, and splits the result into non-cached input, cache read, and output tokens so cost estimates use the cache-read rate. The debug log is controlled by the VS Code setting `github.copilot.chat.agentDebugLog.fileLogging.enabled` (already enabled by experiment for some users) and keeps only the 50 most recent sessions by default. Sessions without a debug log fall back to VS Code's own token fields and show 0 cache reads.
+
 If VS Code uses `--user-data-dir` or Portable Mode, specify a custom data root for the dashboard:
 
 macOS / Linux:
