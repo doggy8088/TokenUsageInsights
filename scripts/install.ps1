@@ -69,18 +69,20 @@ function Stop-ExistingServiceInstance {
     }
 
     $deadline = (Get-Date).AddSeconds(15)
-    while (($runnerHostIds | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue }) -and (Get-Date) -lt $deadline) {
+    while (@($runnerHostIds | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue }).Count -gt 0 -and (Get-Date) -lt $deadline) {
         Start-Sleep -Milliseconds 250
     }
-    while (($appProcessIds | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue }) -and (Get-Date) -lt $deadline) {
+    while (@($appProcessIds | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue }).Count -gt 0 -and (Get-Date) -lt $deadline) {
         Start-Sleep -Milliseconds 250
     }
 
-    if ($runnerHostIds | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue }) {
+    $remainingRunnerHostIds = @($runnerHostIds | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
+    if ($remainingRunnerHostIds.Count -gt 0) {
         throw "Failed to stop the existing background runner before reinstalling."
     }
 
-    if ($appProcessIds | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue }) {
+    $remainingAppProcessIds = @($appProcessIds | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
+    if ($remainingAppProcessIds.Count -gt 0) {
         throw "Failed to stop the existing $ProcessName process before reinstalling."
     }
 }
