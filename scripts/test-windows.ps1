@@ -96,6 +96,7 @@ function Invoke-InstallServiceTest {
         [switch]$FailScheduledTaskAction,
         [switch]$FailStartScheduledTask,
         [switch]$TaskTargetsLegacyInstall,
+        [switch]$HasCurrentAndLegacyTask,
         [switch]$RemoveStartupShortcutBeforeInstall,
         [switch]$WhatIf
     )
@@ -139,6 +140,7 @@ function Invoke-InstallServiceTest {
     $runnerCommandLine = "powershell.exe -File `"$installDir\scripts\run-service.ps1`" -InstallDir `"$installDir`""
     $otherInstallDir = "$installDir-old"
     $otherRunnerCommandLine = "powershell.exe -File `"$otherInstallDir\scripts\run-service.ps1`" -InstallDir `"$otherInstallDir`""
+    $currentTaskActionArguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$installDir\scripts\run-service.ps1`" -InstallDir `"$installDir`" -HostAddress `"$HostAddress`" -Port $Port"
     $legacyTaskActionArguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -f:`"$otherInstallDir\scripts\run-service.ps1`" -InstallDir `"$otherInstallDir`" -HostAddress `"127.0.0.1`" -Port 3003"
     $appExecutablePath = "$installDir\token-usage-insights.exe"
     $otherAppExecutablePath = "$otherInstallDir\token-usage-insights.exe"
@@ -263,6 +265,19 @@ function Invoke-InstallServiceTest {
     function Get-ScheduledTask {
         [CmdletBinding()]
         param([string]$TaskName)
+        if ($HasCurrentAndLegacyTask) {
+            if ($TaskName -eq "TokenUsageInsights_test-user") {
+                return [pscustomobject]@{
+                    Actions = @([pscustomobject]@{ Arguments = $currentTaskActionArguments })
+                }
+            }
+            if ($TaskName -eq "TokenUsageInsights") {
+                return [pscustomobject]@{
+                    Actions = @([pscustomobject]@{ Arguments = $legacyTaskActionArguments })
+                }
+            }
+            return $null
+        }
         if ($TaskTargetsLegacyInstall) {
             if ($TaskName -eq "TokenUsageInsights") {
                 return [pscustomobject]@{
@@ -527,6 +542,10 @@ try {
     $installLegacyTaskResult = Invoke-InstallServiceTest -HostAddress "127.0.0.1" -Port 3003 -TaskTargetsLegacyInstall
     Assert-Equal $true $installLegacyTaskResult.OtherRunnerStopped "install.ps1 should stop the runner tied to an existing scheduled task from a previous install directory."
     Assert-Equal $true $installLegacyTaskResult.OtherAppStopped "install.ps1 should stop the executable tied to an existing scheduled task from a previous install directory."
+
+    $installCurrentAndLegacyTaskResult = Invoke-InstallServiceTest -HostAddress "127.0.0.1" -Port 3003 -SeedStartupShortcut:$false -HasCurrentAndLegacyTask
+    Assert-Equal $true $installCurrentAndLegacyTaskResult.OtherRunnerStopped "install.ps1 should stop the runner tied to a legacy scheduled task even when the current user-scoped task also exists."
+    Assert-Equal $true $installCurrentAndLegacyTaskResult.OtherAppStopped "install.ps1 should stop the executable tied to a legacy scheduled task even when the current user-scoped task also exists."
 
     $installCleanResult = Invoke-InstallServiceTest -HostAddress "127.0.0.1" -Port 3003 -ServiceInstall:$false -SeedStartupShortcut:$false
     Assert-Equal $false $installCleanResult.StartupDirectoryExists "install.ps1 should not create the Startup folder during a plain install without -Service."

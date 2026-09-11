@@ -308,7 +308,7 @@ if ($PSCmdlet.ShouldProcess($InstallDir, "Install Token Usage Insights")) {
     $taskNamesToStop = @($TaskName)
     try {
         $existingTask = [bool](Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)
-        if (-not $existingTask) {
+        if ($TaskName -ne "TokenUsageInsights") {
             $legacyTaskName = "TokenUsageInsights"
             $legacyTask = Get-ScheduledTask -TaskName $legacyTaskName -ErrorAction SilentlyContinue
             if ($legacyTask) {
