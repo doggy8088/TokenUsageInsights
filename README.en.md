@@ -607,16 +607,21 @@ launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.tokenusageinsights.pli
 Windows PowerShell:
 
 ```powershell
-# Check status
-Get-ScheduledTask -TaskName "TokenUsageInsights"
+# Check status (Task Scheduler or background process)
+Get-ScheduledTask -TaskName "TokenUsageInsights" -ErrorAction SilentlyContinue
+Get-Process -Name "token-usage-insights" -ErrorAction SilentlyContinue
 
 # View logs
 Get-Content "$env:LOCALAPPDATA\TokenUsageInsights\logs\token-usage-insights.out.log" -Tail 50 -Wait
 
-# Restart service
+# Restart service (compatible with Task Scheduler and Startup folder mode)
 Stop-ScheduledTask -TaskName "TokenUsageInsights" -ErrorAction SilentlyContinue
 Get-Process -Name "token-usage-insights" -ErrorAction SilentlyContinue | Stop-Process -Force
-Start-ScheduledTask -TaskName "TokenUsageInsights"
+if (Get-ScheduledTask -TaskName "TokenUsageInsights" -ErrorAction SilentlyContinue) {
+    Start-ScheduledTask -TaskName "TokenUsageInsights"
+} else {
+    Start-Process powershell.exe "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$env:LOCALAPPDATA\TokenUsageInsights\scripts\run-service.ps1`"" -WindowStyle Hidden
+}
 
 # Stop service
 Stop-ScheduledTask -TaskName "TokenUsageInsights" -ErrorAction SilentlyContinue
@@ -629,6 +634,7 @@ if (!(Test-Path $StartupShortcut)) {
     $StartupShortcut = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Startup\token-usage-insights.lnk"
 }
 Remove-Item $StartupShortcut -Force -ErrorAction SilentlyContinue
+Get-Process -Name "token-usage-insights" -ErrorAction SilentlyContinue | Stop-Process -Force
 ```
 
 * * *

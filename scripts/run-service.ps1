@@ -28,6 +28,21 @@ if (!(Test-Path $LogDir)) {
 $OutLog = Join-Path $LogDir "$AppName.out.log"
 $ErrLog = Join-Path $LogDir "$AppName.err.log"
 
+if (Test-Path $OutLog) {
+    $outItem = Get-Item $OutLog -ErrorAction SilentlyContinue
+    if ($outItem -and $outItem.Length -gt 0) {
+        Add-Content -LiteralPath (Join-Path $LogDir "$AppName.history.out.log") -Value (Get-Content -LiteralPath $OutLog) -ErrorAction SilentlyContinue
+        Move-Item -LiteralPath $OutLog -Destination (Join-Path $LogDir "$AppName.prev.out.log") -Force -ErrorAction SilentlyContinue
+    }
+}
+if (Test-Path $ErrLog) {
+    $errItem = Get-Item $ErrLog -ErrorAction SilentlyContinue
+    if ($errItem -and $errItem.Length -gt 0) {
+        Add-Content -LiteralPath (Join-Path $LogDir "$AppName.history.err.log") -Value (Get-Content -LiteralPath $ErrLog) -ErrorAction SilentlyContinue
+        Move-Item -LiteralPath $ErrLog -Destination (Join-Path $LogDir "$AppName.prev.err.log") -Force -ErrorAction SilentlyContinue
+    }
+}
+
 $Process = Start-Process -FilePath $Exe `
     -WorkingDirectory $InstallDir `
     -WindowStyle Hidden `

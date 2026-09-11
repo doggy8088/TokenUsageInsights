@@ -622,16 +622,21 @@ launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.tokenusageinsights.pli
 Windows PowerShell 可使用：
 
 ```powershell
-# 檢視服務狀態
-Get-ScheduledTask -TaskName "TokenUsageInsights"
+# 檢視服務狀態（工作排程器或背景行程）
+Get-ScheduledTask -TaskName "TokenUsageInsights" -ErrorAction SilentlyContinue
+Get-Process -Name "token-usage-insights" -ErrorAction SilentlyContinue
 
 # 檢視即時日誌
 Get-Content "$env:LOCALAPPDATA\TokenUsageInsights\logs\token-usage-insights.out.log" -Tail 50 -Wait
 
-# 重啟服務
+# 重啟服務（自動相容工作排程器與啟動資料夾模式）
 Stop-ScheduledTask -TaskName "TokenUsageInsights" -ErrorAction SilentlyContinue
 Get-Process -Name "token-usage-insights" -ErrorAction SilentlyContinue | Stop-Process -Force
-Start-ScheduledTask -TaskName "TokenUsageInsights"
+if (Get-ScheduledTask -TaskName "TokenUsageInsights" -ErrorAction SilentlyContinue) {
+    Start-ScheduledTask -TaskName "TokenUsageInsights"
+} else {
+    Start-Process powershell.exe "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$env:LOCALAPPDATA\TokenUsageInsights\scripts\run-service.ps1`"" -WindowStyle Hidden
+}
 
 # 停止服務
 Stop-ScheduledTask -TaskName "TokenUsageInsights" -ErrorAction SilentlyContinue
@@ -644,6 +649,7 @@ if (!(Test-Path $StartupShortcut)) {
     $StartupShortcut = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Startup\token-usage-insights.lnk"
 }
 Remove-Item $StartupShortcut -Force -ErrorAction SilentlyContinue
+Get-Process -Name "token-usage-insights" -ErrorAction SilentlyContinue | Stop-Process -Force
 ```
 
 * * *

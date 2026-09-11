@@ -20,6 +20,9 @@ function Get-StartupShortcutPath {
     if (-not (Test-Path $startupFolder)) {
         $startupFolder = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Startup"
     }
+    if (-not (Test-Path $startupFolder)) {
+        New-Item -ItemType Directory -Force -Path $startupFolder | Out-Null
+    }
 
     Join-Path $startupFolder "$AppName.lnk"
 }
@@ -151,7 +154,13 @@ if ($PSCmdlet.ShouldProcess($InstallDir, "Install Token Usage Insights")) {
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
     New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
 
-    if ($Service) {
+    $existingTask = $false
+    try {
+        $existingTask = [bool](Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)
+    } catch {}
+    $existingShortcut = Test-Path (Get-StartupShortcutPath)
+
+    if ($Service -or $existingTask -or $existingShortcut -or (Get-Process -Name $AppName -ErrorAction SilentlyContinue)) {
         Stop-ExistingServiceInstance -TaskName $TaskName -ProcessName $AppName -InstallDir $InstallDir
     }
 
@@ -265,6 +274,10 @@ exit /b %APP_EXIT_CODE%
                 }
             }
         }
+    } elseif ($existingTask) {
+        try {
+            Start-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        } catch {}
     }
 }
 
