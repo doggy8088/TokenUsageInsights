@@ -76,10 +76,30 @@ try {
     $getCmd = Get-Command (Resolve-Path (Join-Path $PSScriptRoot "get.ps1")).Path
     Assert-Equal $true $getCmd.Parameters.ContainsKey("Service") "get.ps1 should declare -Service."
     Assert-Equal $true $getCmd.Parameters.ContainsKey("HostAddress") "get.ps1 should declare -HostAddress."
+    Assert-Equal ([Nullable[int]].Name) $getCmd.Parameters["Port"].ParameterType.Name "get.ps1 should allow install.ps1 to keep its own PORT default."
 
     $runnerCmd = Get-Command (Resolve-Path (Join-Path $PSScriptRoot "run-service.ps1")).Path
     Assert-Equal $true $runnerCmd.Parameters.ContainsKey("InstallDir") "run-service.ps1 should declare -InstallDir."
     Assert-Equal $true $runnerCmd.Parameters.ContainsKey("HostAddress") "run-service.ps1 should declare -HostAddress."
+
+    $getScriptContent = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot "get.ps1")
+    if (-not $getScriptContent.Contains('if ($null -ne $Port) { $InstallArgs["Port"] = $Port }')) {
+        throw "get.ps1 should only forward -Port when explicitly provided."
+    }
+
+    $installScriptContent = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot "install.ps1")
+    $stopCallIndex = $installScriptContent.IndexOf('Stop-ExistingServiceInstance -TaskName $TaskName -ProcessName $AppName -InstallDir $InstallDir')
+    $copyBinaryIndex = $installScriptContent.IndexOf('Copy-Item -Force $BinarySrc (Join-Path $InstallDir "$AppName.exe")')
+    if ($stopCallIndex -lt 0 -or $copyBinaryIndex -lt 0 -or $stopCallIndex -ge $copyBinaryIndex) {
+        throw "install.ps1 should stop an existing service instance before copying the executable."
+    }
+
+    if (-not $installScriptContent.Contains('[System.Net.IPAddress]::IPv6Any')) {
+        throw "install.ps1 should detect unspecified IPv6 dashboard hosts."
+    }
+    if (-not $installScriptContent.Contains('return "[$HostAddress]"')) {
+        throw "install.ps1 should bracket IPv6 dashboard hosts when printing the URL."
+    }
 
     Write-Host "Windows collector smoke tests passed."
 } finally {

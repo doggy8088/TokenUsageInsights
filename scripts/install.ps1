@@ -15,6 +15,75 @@ $AppName = "token-usage-insights"
 $InstallDir = [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($InstallDir))
 $BinDir = [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($BinDir))
 
+function Get-StartupShortcutPath {
+    $startupFolder = [Environment]::GetFolderPath('Startup')
+    if (-not (Test-Path $startupFolder)) {
+        $startupFolder = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Startup"
+    }
+
+    Join-Path $startupFolder "$AppName.lnk"
+}
+
+function Stop-ExistingServiceInstance {
+    param(
+        [string]$TaskName,
+        [string]$ProcessName,
+        [string]$InstallDir
+    )
+
+    try {
+        Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    } catch {}
+
+    $runnerHosts = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+        ($_.Name -in @("powershell.exe", "pwsh.exe")) -and
+        $_.CommandLine -and
+        $_.CommandLine.IndexOf("run-service.ps1", [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -and
+        $_.CommandLine.IndexOf($InstallDir, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+    })
+    $runnerHostIds = @($runnerHosts | ForEach-Object { $_.ProcessId })
+    foreach ($runnerHost in $runnerHosts) {
+        Stop-Process -Id $runnerHost.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+
+    $runningProcesses = @(Get-Process -Name $ProcessName -ErrorAction SilentlyContinue)
+    if ($runningProcesses.Count -gt 0) {
+        $runningProcesses | Stop-Process -Force -ErrorAction SilentlyContinue
+    }
+
+    $deadline = (Get-Date).AddSeconds(15)
+    while (($runnerHostIds | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue }) -and (Get-Date) -lt $deadline) {
+        Start-Sleep -Milliseconds 250
+    }
+    while ((Get-Process -Name $ProcessName -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) {
+        Start-Sleep -Milliseconds 250
+    }
+
+    if (Get-Process -Name $ProcessName -ErrorAction SilentlyContinue) {
+        throw "Failed to stop the existing $ProcessName process before reinstalling."
+    }
+}
+
+function Get-DashboardDisplayHost {
+    param([string]$HostAddress)
+
+    $parsedIpAddress = $null
+    if ([System.Net.IPAddress]::TryParse($HostAddress, [ref]$parsedIpAddress)) {
+        if (
+            $parsedIpAddress.Equals([System.Net.IPAddress]::Any) -or
+            $parsedIpAddress.Equals([System.Net.IPAddress]::IPv6Any)
+        ) {
+            return "localhost"
+        }
+
+        if ($parsedIpAddress.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6) {
+            return "[$HostAddress]"
+        }
+    }
+
+    return $HostAddress
+}
+
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 if (Test-Path (Join-Path $ScriptDir "$AppName.exe")) {
     $ReleaseDir = $ScriptDir
@@ -39,6 +108,10 @@ $registeredAsTask = $false
 if ($PSCmdlet.ShouldProcess($InstallDir, "Install Token Usage Insights")) {
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
     New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
+
+    if ($Service) {
+        Stop-ExistingServiceInstance -TaskName $TaskName -ProcessName $AppName -InstallDir $InstallDir
+    }
 
     Copy-Item -Force $BinarySrc (Join-Path $InstallDir "$AppName.exe")
 
@@ -80,11 +153,8 @@ exit /b %APP_EXIT_CODE%
             throw "Missing background service runner script: $RunnerScript"
         }
 
-        # Stop existing service or running instances if any
-        try {
-            Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-        } catch {}
-        Get-Process -Name $AppName -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        $StartupShortcut = Get-StartupShortcutPath
+        Remove-Item -Force -Path $StartupShortcut -ErrorAction SilentlyContinue
 
         $Action = New-ScheduledTaskAction `
             -Execute "powershell.exe" `
@@ -113,13 +183,8 @@ exit /b %APP_EXIT_CODE%
             $registeredAsTask = $true
         } catch {
             Write-Warning "Could not register scheduled task: $($_.Exception.Message). Falling back to Startup folder..."
-            $StartupFolder = [Environment]::GetFolderPath('Startup')
-            if (-not (Test-Path $StartupFolder)) {
-                $StartupFolder = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Startup"
-            }
-            $ShortcutPath = Join-Path $StartupFolder "$AppName.lnk"
             $WshShell = New-Object -ComObject WScript.Shell
-            $Shortcut = $WshShell.CreateShortcut($ShortcutPath)
+            $Shortcut = $WshShell.CreateShortcut($StartupShortcut)
             $Shortcut.TargetPath = "powershell.exe"
             $Shortcut.Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$RunnerScript`" -InstallDir `"$InstallDir`" -HostAddress `"$HostAddress`" -Port $Port"
             $Shortcut.WorkingDirectory = $InstallDir
@@ -151,7 +216,7 @@ if ($Service) {
     }
     Write-Host "  Logs directory:  $(Join-Path $InstallDir 'logs')"
     Write-Host ""
-    $displayHost = if ($HostAddress -eq "0.0.0.0") { "localhost" } else { $HostAddress }
+    $displayHost = Get-DashboardDisplayHost -HostAddress $HostAddress
     Write-Host "Dashboard URL:"
     Write-Host "  http://${displayHost}:${Port}"
 } else {

@@ -23,7 +23,7 @@ param(
     [string]$InstallDir,
     [string]$BinDir,
     [string]$HostAddress,
-    [int]$Port = 3003,
+    [Nullable[int]]$Port = $null,
     [switch]$Service
 )
 
@@ -71,10 +71,11 @@ try {
         throw "install.ps1 not found in extracted release: $ExtractedDir"
     }
 
-    $InstallArgs = @{ Port = $Port }
+    $InstallArgs = @{}
     if ($InstallDir) { $InstallArgs["InstallDir"] = $InstallDir }
     if ($BinDir) { $InstallArgs["BinDir"] = $BinDir }
     if ($HostAddress) { $InstallArgs["HostAddress"] = $HostAddress }
+    if ($null -ne $Port) { $InstallArgs["Port"] = $Port }
     if ($Service) { $InstallArgs["Service"] = $true }
 
     Write-Host "Installing $Tag ..."
