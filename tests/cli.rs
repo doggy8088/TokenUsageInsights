@@ -52,14 +52,14 @@ fn help_and_invalid_commands_exit_without_initializing_the_server() {
         assert!(!missing_dir.exists());
     }
 
-    // In a git repository checkout, `update`, `--update`, and `-u` should be rejected by safety check
+    // In a git repository checkout, `update`, `--update`, and `-u` should be rejected by safety check (exit code 2)
     for cmd in ["update", "--update", "-u"] {
         let result = Command::new(env!("CARGO_BIN_EXE_token-usage-insights"))
             .env("INSIGHTS_DIR", &missing_dir)
             .arg(cmd)
             .output()
             .unwrap();
-        assert_eq!(result.status.code(), Some(1));
+        assert_eq!(result.status.code(), Some(2));
         let stderr = String::from_utf8_lossy(&result.stderr);
         assert!(stderr.contains("開發目錄") || stderr.contains("非標準安裝目錄"));
     }

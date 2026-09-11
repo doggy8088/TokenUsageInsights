@@ -501,10 +501,16 @@ cargo build --release --bin token-usage-insights
 ```
 
 ```bash
-# 取得 CLI usage 說明
+# CLI usage 설명 확인
 ./target/release/token-usage-insights --help
+./target/release/token-usage-insights update --help
 ./target/release/token-usage-insights export --help
 ./target/release/token-usage-insights import --help
+
+# 최신 버전으로 자동 업데이트 (--check, --force, --target-version 지원)
+./target/release/token-usage-insights update
+./target/release/token-usage-insights update --check
+./target/release/token-usage-insights update --target-version v0.9.6
 ```
 
 데이터 형식은 프런트엔드와 같으며 다음 필드를 포함합니다.
@@ -528,6 +534,9 @@ cargo build --release --bin token-usage-insights
 | `HOST` | `0.0.0.0` | 대시보드 서비스가 바인딩할 IPv4 또는 IPv6 주소 |
 | `PORT` | `3003` | 대시보드 서비스 포트 |
 | `INSIGHTS_DIR` | Windows: `%LOCALAPPDATA%\TokenUsageInsights`; 기타 플랫폼: `~/.token-usage-insights` | SQLite 데이터베이스 디렉터리 |
+| `TOKEN_USAGE_INSIGHTS_AUTO_UPDATE` | `true` | 서비스 시작 시 자동 업데이트 확인 여부 (`0`, `false`, `no`, `off`로 비활성화) |
+| `TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS` | `24` | 자동 업데이트 확인 주기 (시간 단위, 유효 범위 1 ~ 87600) |
+| `TOKEN_USAGE_INSIGHTS_INSTALL_DIR` | 자동 감지 | 사용자 지정 설치 디렉터리. 업데이트 대상 및 환경 식별에 사용 |
 | `ANTIGRAVITY_DIR` | `~/.gemini/antigravity-cli` | Antigravity CLI 데이터 디렉터리 |
 | `COPILOT_DIR` | `~/.copilot` | Copilot CLI 데이터 디렉터리 |
 | `COPILOT_APP_DIR` | `COPILOT_DIR`과 동일 | Copilot App(데스크톱 앱) 데이터 디렉터리. `data.db` 및 `session-store.db`를 포함해야 함 |
@@ -542,6 +551,18 @@ cargo build --release --bin token-usage-insights
 | `OMP_DIR` | `~/.omp` | OMP 데이터 디렉터리 |
 | `MUSE_DIR` | `~/.local/share/muse` | Muse Code 데이터 디렉터리. `sessions`를 포함해야 함 |
 | `CORS_ALLOWED_ORIGINS` | `http://localhost:<PORT>,http://127.0.0.1:<PORT>` | 쉼표로 구분한 허용 CORS origin |
+
+### 설정 파일 (config.yaml)
+
+환경 변수 및 명령줄 플래그(`--no-auto-update` 등) 외에도 `~/.token-usage-insights/config.yaml`(Windows의 경우 `%LOCALAPPDATA%\TokenUsageInsights\config.yaml`)에서 업데이트 동작을 설정할 수 있습니다:
+
+```yaml
+# ~/.token-usage-insights/config.yaml
+auto_update: true          # 서비스 시작 시 자동으로 업데이트를 확인하고 적용할지 여부 (--no-auto-update 또는 환경 변수로 재정의 가능)
+update_check_interval: 1   # 업데이트 확인 주기 (일 단위)
+```
+
+우선순위: 명령줄 플래그(예: `--no-auto-update`) > 환경 변수(예: `TOKEN_USAGE_INSIGHTS_AUTO_UPDATE`) > `config.yaml` 설정 파일 > 기본값.
 
 > **기본 바인딩은 `0.0.0.0`이므로 같은 로컬 네트워크의 다른 장치가 대시보드에 연결할 수 있습니다. 로컬에서만 보려면 `HOST`를 `127.0.0.1`로 설정하세요.**
 

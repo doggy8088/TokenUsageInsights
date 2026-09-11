@@ -52,6 +52,7 @@ fn is_process_alive(_pid: u32) -> bool {
 
 #[cfg(target_vendor = "apple")]
 fn get_process_exe_path(pid: u32) -> Option<PathBuf> {
+    #[link(name = "proc")]
     extern "C" {
         fn proc_pidpath(
             pid: libc::c_int,
@@ -171,6 +172,92 @@ fn matches_install_dir(exe_path: &Path, install_dir: &Path) -> bool {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn get_process_cmdline(pid: u32) -> Option<Vec<String>> {
+    let content = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let args: Vec<String> = content
+        .split(|&b| b == 0)
+        .filter(|slice| !slice.is_empty())
+        .map(|slice| String::from_utf8_lossy(slice).to_string())
+        .collect();
+    if args.is_empty() {
+        None
+    } else {
+        Some(args)
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn get_process_cmdline(pid: u32) -> Option<Vec<String>> {
+    let output = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.is_empty() {
+        return None;
+    }
+    Some(text.split_whitespace().map(|s| s.to_string()).collect())
+}
+
+#[cfg(windows)]
+fn get_process_cmdline(pid: u32) -> Option<Vec<String>> {
+    let output = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!("(Get-CimInstance Win32_Process -Filter 'ProcessId = {pid}').CommandLine"),
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.is_empty() {
+        return None;
+    }
+    Some(text.split_whitespace().map(|s| s.to_string()).collect())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn get_process_cmdline(_pid: u32) -> Option<Vec<String>> {
+    None
+}
+
+fn is_cli_subcommand(arg: &str) -> bool {
+    let clean = arg.trim_matches('"').trim_matches('\'');
+    matches!(
+        clean,
+        "export"
+            | "export-all"
+            | "import"
+            | "update"
+            | "--update"
+            | "-u"
+            | "completion"
+            | "-h"
+            | "--help"
+            | "help"
+            | "-V"
+            | "--version"
+    )
+}
+
+fn is_dashboard_server_process(pid: u32, server_pids: &std::collections::HashSet<u32>) -> bool {
+    if let Some(cmdline) = get_process_cmdline(pid) {
+        if cmdline.iter().skip(1).any(|arg| is_cli_subcommand(arg)) {
+            return false;
+        }
+        return true;
+    }
+    server_pids.contains(&pid)
+}
+
 pub struct ServerPidGuard {
     paths: Vec<PathBuf>,
 }
@@ -200,6 +287,29 @@ pub fn create_server_pid_guard() -> ServerPidGuard {
     }
 
     ServerPidGuard { paths }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateError {
+    SafeRejection(String),
+    Failure(String),
+}
+
+impl std::fmt::Display for UpdateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UpdateError::SafeRejection(msg) => write!(f, "{msg}"),
+            UpdateError::Failure(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+impl std::error::Error for UpdateError {}
+
+impl From<String> for UpdateError {
+    fn from(s: String) -> Self {
+        UpdateError::Failure(s)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -305,17 +415,7 @@ pub fn detect_environment() -> EnvironmentKind {
         return EnvironmentKind::Npm { exe_path };
     }
 
-    // 2. 檢查是否在 Git 或 Cargo 開發原始碼目錄
-    for ancestor in exe_dir.ancestors() {
-        if ancestor.join(".git").exists() || ancestor.join("Cargo.toml").exists() {
-            return EnvironmentKind::GitOrDev {
-                root: ancestor.to_path_buf(),
-                exe_path,
-            };
-        }
-    }
-
-    // 3. 檢查標準安裝目錄（包含以 TOKEN_USAGE_INSIGHTS_INSTALL_DIR 明確指定的路徑）
+    // 2. 檢查標準安裝目錄（包含以 TOKEN_USAGE_INSIGHTS_INSTALL_DIR 明確指定的路徑）
     if let Some(std_dir) = standard_install_dir() {
         let canonical_std_dir = fs::canonicalize(&std_dir).unwrap_or(std_dir);
         if let Ok(canonical_exe_dir) = fs::canonicalize(exe_dir) {
@@ -328,7 +428,7 @@ pub fn detect_environment() -> EnvironmentKind {
         }
     }
 
-    // 4. 檢查安裝標記檔（由 install.sh 或 install.ps1 寫入的自訂安裝目錄）
+    // 3. 檢查安裝標記檔（由 install.sh 或 install.ps1 寫入的自訂安裝目錄）
     let marker_path = exe_dir.join(".install_marker");
     if let Ok(meta) = fs::symlink_metadata(&marker_path) {
         if meta.is_file() && !meta.file_type().is_symlink() {
@@ -342,6 +442,41 @@ pub fn detect_environment() -> EnvironmentKind {
                     };
                 }
             }
+        }
+    }
+
+    // 4. 兼容舊版既有自訂安裝（在引入 .install_marker 之前建立的安裝目錄）：
+    // 若目錄包含完整必要資產（pricing.csv, VERSION, static/index.html）且非 Cargo target 目錄
+    let has_installed_assets = exe_dir.join("pricing.csv").is_file()
+        && exe_dir.join("VERSION").is_file()
+        && exe_dir.join("static").join("index.html").is_file();
+    let is_cargo_target = exe_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|name| name == "debug" || name == "release")
+        .unwrap_or(false)
+        && exe_dir
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .map(|name| name == "target")
+            .unwrap_or(false);
+
+    if has_installed_assets && !is_cargo_target {
+        let install_dir = fs::canonicalize(exe_dir).unwrap_or_else(|_| exe_dir.to_path_buf());
+        return EnvironmentKind::StandardInstalled {
+            install_dir,
+            exe_path,
+        };
+    }
+
+    // 5. 檢查是否在 Git 或 Cargo 開發原始碼目錄
+    for ancestor in exe_dir.ancestors() {
+        if ancestor.join(".git").exists() || ancestor.join("Cargo.toml").exists() {
+            return EnvironmentKind::GitOrDev {
+                root: ancestor.to_path_buf(),
+                exe_path,
+            };
         }
     }
 
@@ -1265,7 +1400,7 @@ fn print_and_log_check_result(
     }
 }
 
-pub async fn run_update(options: UpdateOptions) -> Result<(), String> {
+pub async fn run_update(options: UpdateOptions) -> Result<(), UpdateError> {
     let env_kind = detect_environment();
 
     match &env_kind {
@@ -1289,7 +1424,9 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), String> {
    npm install -g token-usage-insights@latest"#;
             eprintln!("{msg}");
             log_update("WARN", "CHECK", "略過更新：偵測到 npm / npx 執行環境");
-            return Err("不支援在 npm / npx 環境中直接自我更新".to_string());
+            return Err(UpdateError::SafeRejection(
+                "不支援在 npm / npx 環境中直接自我更新".to_string(),
+            ));
         }
         EnvironmentKind::GitOrDev { root, .. } => {
             if options.check_only {
@@ -1309,7 +1446,9 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), String> {
             );
             eprintln!("{msg}");
             log_update("ERROR", "CHECK", &format!("拒絕更新：開發目錄 {root:?}"));
-            return Err("開發目錄不支援自我更新".to_string());
+            return Err(UpdateError::SafeRejection(
+                "開發目錄不支援自我更新".to_string(),
+            ));
         }
         EnvironmentKind::Other { exe_path } => {
             if options.check_only {
@@ -1333,7 +1472,9 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), String> {
                 "CHECK",
                 &format!("拒絕更新：非標準目錄 {exe_path:?}"),
             );
-            return Err("非標準目錄不支援自我更新".to_string());
+            return Err(UpdateError::SafeRejection(
+                "非標準目錄不支援自我更新".to_string(),
+            ));
         }
         EnvironmentKind::StandardInstalled { .. } => {}
     }
@@ -1349,7 +1490,7 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), String> {
             Ok(l) => l,
             Err(e) => {
                 log_update("ERROR", "LOCK", &e);
-                return Err(e);
+                return Err(e.into());
             }
         })
     } else {
@@ -1422,7 +1563,7 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), String> {
         Ok(g) => g,
         Err(e) => {
             log_update("ERROR", "PREPARE", &e);
-            return Err(e);
+            return Err(e.into());
         }
     };
 
@@ -1440,7 +1581,7 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), String> {
         Ok(h) => h,
         Err(e) => {
             log_update("ERROR", "DOWNLOAD", &e);
-            return Err(e);
+            return Err(e.into());
         }
     };
 
@@ -1452,7 +1593,7 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), String> {
             Ok(t) => t,
             Err(e) => {
                 log_update("ERROR", "DOWNLOAD", &e);
-                return Err(e);
+                return Err(e.into());
             }
         };
 
@@ -1461,7 +1602,7 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), String> {
         None => {
             let err = format!("SHA256SUMS 中未找到 {archive_name} 的校驗碼");
             log_update("ERROR", "VERIFY", &err);
-            return Err(err);
+            return Err(err.into());
         }
     };
 
@@ -1469,7 +1610,7 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), String> {
     if !verify_hash_hex(&actual_hash, &expected_hash) {
         let err = format!("SHA256 校驗失敗！預期 {expected_hash}，實際 {actual_hash}");
         log_update("ERROR", "VERIFY", &err);
-        return Err(err);
+        return Err(err.into());
     }
     println!("✅ SHA256 校驗通過！");
     log_update("INFO", "VERIFY", "SHA256 校驗通過");
@@ -1558,8 +1699,8 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), String> {
 
     match install_task_res {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => return Err(e),
-        Err(join_err) => return Err(format!("安裝任務執行異常: {join_err}")),
+        Ok(Err(e)) => return Err(e.into()),
+        Err(join_err) => return Err(format!("安裝任務執行異常: {join_err}").into()),
     }
 
     let _ = tmp_guard.cleanup();
@@ -1567,8 +1708,9 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), String> {
     Ok(())
 }
 
-fn stop_running_dashboard_instances(install_dir: &Path) -> Result<(), String> {
+fn stop_running_dashboard_instances(install_dir: &Path) -> Result<bool, String> {
     let my_pid = std::process::id();
+    let mut server_pids = std::collections::HashSet::new();
     let mut candidate_pids = std::collections::HashSet::new();
 
     // 1. 從 .server.pid 讀取 PID 作為候選
@@ -1576,6 +1718,7 @@ fn stop_running_dashboard_instances(install_dir: &Path) -> Result<(), String> {
     if let Ok(content) = fs::read_to_string(&pid_file) {
         if let Ok(pid) = content.trim().parse::<u32>() {
             if pid != my_pid {
+                server_pids.insert(pid);
                 candidate_pids.insert(pid);
             }
         }
@@ -1584,21 +1727,24 @@ fn stop_running_dashboard_instances(install_dir: &Path) -> Result<(), String> {
     if let Ok(content) = fs::read_to_string(&insights_pid_file) {
         if let Ok(pid) = content.trim().parse::<u32>() {
             if pid != my_pid {
+                server_pids.insert(pid);
                 candidate_pids.insert(pid);
             }
         }
     }
 
-    // 2. 透過系統進程清單掃描 APP_NAME
+    // 2. 透過系統進程清單掃描 APP_NAME（採 Fail-Closed 原則）
     #[cfg(target_os = "linux")]
     {
-        if let Ok(entries) = fs::read_dir("/proc") {
-            for entry in entries.flatten() {
-                if let Ok(name) = entry.file_name().into_string() {
-                    if let Ok(pid) = name.parse::<u32>() {
-                        if pid != my_pid {
-                            candidate_pids.insert(pid);
-                        }
+        let entries = fs::read_dir("/proc")
+            .map_err(|e| format!("列舉 Linux /proc 進程失敗: {e}；更新中止以確保安全"))?;
+        for entry in entries {
+            let entry =
+                entry.map_err(|e| format!("讀取 /proc 目錄項失敗: {e}；更新中止以確保安全"))?;
+            if let Ok(name) = entry.file_name().into_string() {
+                if let Ok(pid) = name.parse::<u32>() {
+                    if pid != my_pid {
+                        candidate_pids.insert(pid);
                     }
                 }
             }
@@ -1630,6 +1776,9 @@ fn stop_running_dashboard_instances(install_dir: &Path) -> Result<(), String> {
                     .map_err(|pe| {
                         format!("進程列舉失敗 (pgrep: {e}, ps: {pe})；更新中止以確保安全")
                     })?;
+                if !ps_res.status.success() {
+                    return Err("ps 命令執行失敗；更新中止以確保安全".to_string());
+                }
                 let text = String::from_utf8_lossy(&ps_res.stdout);
                 for line in text.lines() {
                     if let Ok(pid) = line.trim().parse::<u32>() {
@@ -1655,6 +1804,13 @@ fn stop_running_dashboard_instances(install_dir: &Path) -> Result<(), String> {
             ])
             .output()
             .map_err(|e| format!("列舉 Windows 進程失敗: {e}"))?;
+        if !output.status.success() {
+            let err_text = String::from_utf8_lossy(&output.stderr);
+            return Err(format!(
+                "tasklist 命令執行失敗 (exit code: {:?}): {err_text}",
+                output.status.code()
+            ));
+        }
         let text = String::from_utf8_lossy(&output.stdout);
         for line in text.lines() {
             let parts: Vec<&str> = line.split(',').collect();
@@ -1669,12 +1825,14 @@ fn stop_running_dashboard_instances(install_dir: &Path) -> Result<(), String> {
         }
     }
 
-    // 3. 嚴格驗證候選 PID：必須為活躍進程且執行檔路徑確認位於 install_dir（Fail-Closed 原則）
+    // 3. 嚴格驗證候選 PID：必須為活躍進程且執行檔路徑確認位於 install_dir，並過濾短暫 CLI 指令進程（Fail-Closed 原則）
     let mut target_pids = std::collections::HashSet::new();
     for pid in candidate_pids {
         if is_process_alive(pid) {
             if let Some(exe_path) = get_process_exe_path(pid) {
-                if matches_install_dir(&exe_path, install_dir) {
+                if matches_install_dir(&exe_path, install_dir)
+                    && is_dashboard_server_process(pid, &server_pids)
+                {
                     target_pids.insert(pid);
                 }
             }
@@ -1684,7 +1842,7 @@ fn stop_running_dashboard_instances(install_dir: &Path) -> Result<(), String> {
     let mut remaining_pids: Vec<u32> = target_pids.into_iter().collect();
     if remaining_pids.is_empty() {
         // 未發現需要停止的其他進程，保留自身進程之 .server.pid
-        return Ok(());
+        return Ok(false);
     }
 
     // 若在 Windows 環境，寫入服務重啟協商標記檔，讓 run-service.ps1 能在新版就緒後重啟
@@ -1777,7 +1935,23 @@ fn stop_running_dashboard_instances(install_dir: &Path) -> Result<(), String> {
     }
 
     log_update("INFO", "STOP_SERVICE", "所有執行中之目標服務進程已安全停止");
-    Ok(())
+    Ok(true)
+}
+
+fn restart_background_dashboard(install_dir: &Path) {
+    let exec_name = if cfg!(windows) {
+        format!("{APP_NAME}.exe")
+    } else {
+        APP_NAME.to_string()
+    };
+    let exe = install_dir.join(exec_name);
+    if exe.exists() {
+        let _ = std::process::Command::new(exe)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
 }
 
 pub(crate) fn apply_installation_with_rollback(
@@ -1785,14 +1959,14 @@ pub(crate) fn apply_installation_with_rollback(
     install_dir: &Path,
     backup_dir: &Path,
 ) -> Result<(), String> {
-    println!("⏸️ 正在協調停止現有執行中之服務...");
-    stop_running_dashboard_instances(install_dir)?;
-
     println!("💾 正在備份現有安裝...");
     if let Err(e) = backup_installation(install_dir, backup_dir) {
         log_update("ERROR", "BACKUP", &e);
         return Err(e);
     }
+
+    println!("⏸️ 正在協調停止現有執行中之服務...");
+    let stopped_dashboard = stop_running_dashboard_instances(install_dir)?;
 
     println!("🚀 正在安裝新版檔案至 {:?} ...", install_dir);
     log_update("INFO", "INSTALL", &format!("開始替換至 {install_dir:?}"));
@@ -1896,11 +2070,14 @@ pub(crate) fn apply_installation_with_rollback(
             }
         }
 
-        // 確保自訂安裝目錄保有安裝標記，避免未來更新無法辨識（使用安全非追蹤符號連結寫入）
+        // 確保自訂安裝目錄保有安裝標記，避免未來更新無法辨識（移除既有符號連結並以原子方式覆寫一般檔案）
         safe_write_file(
             &install_dir.join(".install_marker"),
             b"token-usage-insights:installed",
         )?;
+
+        // 寫入提交標記，證明新版資產已全數寫入成功，救援流程不可回滾
+        safe_write_file(&backup_dir.join(".committed"), b"committed")?;
 
         Ok(())
     })();
@@ -1908,6 +2085,7 @@ pub(crate) fn apply_installation_with_rollback(
     if let Err(err) = install_result {
         eprintln!("❌ 安裝失敗，正在自動回滾: {err}");
         log_update("ERROR", "INSTALL", &format!("安裝失敗: {err}，開始回滾"));
+        let _ = fs::remove_file(install_dir.join(".service_restart_pending"));
         if let Err(rollback_err) = restore_from_backup(backup_dir, install_dir) {
             let _ = fs::write(backup_dir.join(".rollback_failed"), &rollback_err);
             eprintln!(
@@ -1922,6 +2100,9 @@ pub(crate) fn apply_installation_with_rollback(
             println!("✅ 已成功回滾至先前版本。");
             log_update("INFO", "ROLLBACK", "回滾成功");
             let _ = fs::remove_dir_all(backup_dir);
+            if stopped_dashboard {
+                restart_background_dashboard(install_dir);
+            }
         }
         return Err(err);
     }
@@ -2077,6 +2258,22 @@ fn attempt_startup_recovery(install_dir: &Path, args: &[String]) {
         return;
     }
 
+    // 若存在 .committed 標記，代表更新早已成功完成，僅備份目錄在最後刪除時中斷
+    // 此時絕不能回滾新版本，直接清理備份目錄即可
+    if backup_dir.join(".committed").exists() {
+        log_update(
+            "INFO",
+            "STARTUP_RECOVERY",
+            "先前更新已成功提交，清理殘留之備份目錄",
+        );
+        let _ = fs::remove_dir_all(&backup_dir);
+        if backup_dir.exists() {
+            let cleanup_name = format!(".backup-cleaned-{}", Utc::now().timestamp());
+            let _ = fs::rename(&backup_dir, install_dir.join(&cleanup_name));
+        }
+        return;
+    }
+
     if backup_dir.join(".rollback_failed").exists() {
         eprintln!(
             "❌ 偵測到先前更新回滾失敗標記 ({backup_dir:?})；為防止讀取損毀狀態，程序終止。請依備份手動還原。"
@@ -2159,8 +2356,7 @@ fn attempt_startup_recovery(install_dir: &Path, args: &[String]) {
     restart_current_process(args);
 }
 
-pub async fn check_and_auto_update_on_launch() {
-    // 1. 防止循環重啟
+pub async fn perform_startup_recovery() {
     if std::env::var_os("_TOKEN_USAGE_INSIGHTS_RESTARTED").is_some() {
         return;
     }
@@ -2168,7 +2364,6 @@ pub async fn check_and_auto_update_on_launch() {
     let args: Vec<String> = std::env::args().collect();
     let env_kind = detect_environment();
 
-    // 2. 若為標準安裝，無論是否關閉自動更新，都必須優先處理鎖定等待與中斷交易救援還原
     if let EnvironmentKind::StandardInstalled { install_dir, .. } = &env_kind {
         if UpdateLock::is_locked(install_dir) {
             println!("⏳ 偵測到已有更新程序正在進行中，等待更新完成...");
@@ -2193,16 +2388,29 @@ pub async fn check_and_auto_update_on_launch() {
             }
         }
 
-        // 目錄無活躍更新鎖，檢查先前更新之殘留中斷狀態與回滾保護
         attempt_startup_recovery(install_dir, &args);
     }
+}
 
-    // 3. 此時安裝目錄已保證處於一致健全狀態；檢查是否關閉自動更新（命令列旗標 > 環境變數 > config.yaml）
+pub fn spawn_background_auto_update() {
+    tokio::spawn(async {
+        // 延遲 1 秒執行，確保主服務監聽與 TCP 綁定先行就緒，離線或慢速網路零阻塞
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        run_background_auto_update().await;
+    });
+}
+
+async fn run_background_auto_update() {
+    if std::env::var_os("_TOKEN_USAGE_INSIGHTS_RESTARTED").is_some() {
+        return;
+    }
+
+    let args: Vec<String> = std::env::args().collect();
     if is_auto_update_disabled(&args) {
         return;
     }
 
-    // 4. npm 環境處理
+    let env_kind = detect_environment();
     if matches!(env_kind, EnvironmentKind::Npm { .. }) {
         if !is_update_check_interval_elapsed() {
             return;
@@ -2230,18 +2438,13 @@ pub async fn check_and_auto_update_on_launch() {
 
     let install_dir = match &env_kind {
         EnvironmentKind::StandardInstalled { install_dir, .. } => install_dir.clone(),
-        _ => {
-            // 非標準安裝目錄（如 Git 開發目錄）：靜默跳過自動更新
-            return;
-        }
+        _ => return,
     };
 
-    // 5. 檢查更新檢查間隔（優先讀取環境變數，其次 config.yaml，預設 24 小時）
     if !is_update_check_interval_elapsed() {
         return;
     }
 
-    // 6. 快速檢查（設定超時 STARTUP_CHECK_TIMEOUT_SECS 秒，不阻礙伺服器啟動）
     let release = match fetch_release_with_logging(None, STARTUP_CHECK_TIMEOUT_SECS).await {
         Ok(r) => r,
         Err(e) => {
@@ -2252,7 +2455,6 @@ pub async fn check_and_auto_update_on_launch() {
 
     let current_version = env!("CARGO_PKG_VERSION");
     if !is_newer_version(&release.tag_name, current_version) {
-        // 沒有新版本：成功確認當前已是最新，記錄本次檢查時間
         if let Ok(conn) = crate::db::get_db_conn() {
             let now_str = Utc::now().to_rfc3339();
             let _ = crate::db::set_system_metadata(&conn, LAST_CHECK_KEY, &now_str);
@@ -2277,7 +2479,6 @@ pub async fn check_and_auto_update_on_launch() {
         prefetched_release: Some(release.clone()),
     };
 
-    // 執行更新（各網路階段已具備逾時；安裝階段不可中途取消，嚴禁使用可中止的整體 timeout 導致鎖提早釋放）
     let update_result = run_update(update_opts).await;
 
     match update_result {
@@ -2292,7 +2493,8 @@ pub async fn check_and_auto_update_on_launch() {
             restart_current_process(&args);
         }
         Err(e) => {
-            if is_lock_conflict_error(&e) {
+            let err_msg = e.to_string();
+            if is_lock_conflict_error(&err_msg) {
                 println!("⏳ 偵測到已有更新程序正在進行中，等待更新完成...");
                 log_update("INFO", "STARTUP_WAIT", "遇到更新鎖競爭，等待另一程序完成");
                 match wait_for_lock_release(
@@ -2321,8 +2523,12 @@ pub async fn check_and_auto_update_on_launch() {
                 }
             } else {
                 attempt_startup_recovery(&install_dir, &args);
-                eprintln!("⚠️ 自動更新失敗: {e}，將繼續以現有健全版本啟動服務。");
-                log_update("WARN", "STARTUP_UPDATE", &format!("自動更新失敗: {e}"));
+                eprintln!("⚠️ 自動更新失敗: {err_msg}，將繼續以現有健全版本啟動服務。");
+                log_update(
+                    "WARN",
+                    "STARTUP_UPDATE",
+                    &format!("自動更新失敗: {err_msg}"),
+                );
             }
         }
     }
@@ -2790,5 +2996,62 @@ update_check_interval: 5 # check every 5 days
         );
 
         let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn committed_marker_prevents_erroneous_rollback_on_recovery() {
+        let temp = std::env::temp_dir().join(format!(
+            "committed-marker-test-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let install_dir = temp.join("install");
+        let backup_dir = install_dir.join(".backup");
+        fs::create_dir_all(&install_dir).unwrap();
+        fs::create_dir_all(&backup_dir).unwrap();
+
+        fs::write(install_dir.join("VERSION"), "v0.9.6").unwrap();
+        fs::write(backup_dir.join("VERSION"), "v0.9.5").unwrap();
+        fs::write(backup_dir.join(".manifest"), "VERSION").unwrap();
+        fs::write(backup_dir.join(".committed"), "committed").unwrap();
+
+        attempt_startup_recovery(&install_dir, &[]);
+
+        // 因為存在 .committed 標記，新版絕不可被錯誤回滾至舊版 v0.9.5
+        assert_eq!(
+            fs::read_to_string(install_dir.join("VERSION")).unwrap(),
+            "v0.9.6"
+        );
+        assert!(!backup_dir.exists(), ".backup 應在確認已提交後被安全清理");
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn is_cli_subcommand_identifies_cli_commands() {
+        assert!(is_cli_subcommand("export"));
+        assert!(is_cli_subcommand("export-all"));
+        assert!(is_cli_subcommand("import"));
+        assert!(is_cli_subcommand("update"));
+        assert!(is_cli_subcommand("--update"));
+        assert!(is_cli_subcommand("-u"));
+        assert!(is_cli_subcommand("--help"));
+        assert!(is_cli_subcommand("-h"));
+        assert!(is_cli_subcommand("--version"));
+        assert!(is_cli_subcommand("-V"));
+        assert!(is_cli_subcommand("completion"));
+
+        assert!(!is_cli_subcommand("--no-auto-update"));
+        assert!(!is_cli_subcommand("--port"));
+        assert!(!is_cli_subcommand("3003"));
+    }
+
+    #[test]
+    fn update_error_display_and_conversion() {
+        let safe = UpdateError::SafeRejection("測試拒絕".to_string());
+        assert_eq!(safe.to_string(), "測試拒絕");
+
+        let fail: UpdateError = "測試失敗".to_string().into();
+        assert_eq!(fail, UpdateError::Failure("測試失敗".to_string()));
+        assert_eq!(fail.to_string(), "測試失敗");
     }
 }

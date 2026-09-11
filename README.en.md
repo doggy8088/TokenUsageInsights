@@ -501,10 +501,16 @@ cargo build --release --bin token-usage-insights
 ```
 
 ```bash
-# 取得 CLI usage 說明
+# CLI usage help
 ./target/release/token-usage-insights --help
+./target/release/token-usage-insights update --help
 ./target/release/token-usage-insights export --help
 ./target/release/token-usage-insights import --help
+
+# Self-update to the latest release (also supports --check, --force, --target-version)
+./target/release/token-usage-insights update
+./target/release/token-usage-insights update --check
+./target/release/token-usage-insights update --target-version v0.9.6
 ```
 
 The data format matches the frontend and contains these fields:
@@ -528,6 +534,9 @@ Paths specified by environment variables are authoritative and do not need to be
 | `HOST` | `0.0.0.0` | IPv4 or IPv6 address to which the dashboard service binds |
 | `PORT` | `3003` | Dashboard service port |
 | `INSIGHTS_DIR` | Windows: `%LOCALAPPDATA%\TokenUsageInsights`; other platforms: `~/.token-usage-insights` | SQLite database directory |
+| `TOKEN_USAGE_INSIGHTS_AUTO_UPDATE` | `true` | Whether to automatically check for updates on startup (`0`, `false`, `no`, or `off` disables it) |
+| `TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS` | `24` | Auto-update check interval in hours (valid range 1 to 87600) |
+| `TOKEN_USAGE_INSIGHTS_INSTALL_DIR` | Auto-detected | Custom installation directory, used for update targeting and detection |
 | `ANTIGRAVITY_DIR` | `~/.gemini/antigravity-cli` | Antigravity CLI data directory |
 | `COPILOT_DIR` | `~/.copilot` | Copilot CLI data directory |
 | `COPILOT_APP_DIR` | Same as `COPILOT_DIR` | Copilot App (desktop app) data directory; should contain `data.db` and `session-store.db` |
@@ -542,6 +551,18 @@ Paths specified by environment variables are authoritative and do not need to be
 | `OMP_DIR` | `~/.omp` | OMP data directory |
 | `MUSE_DIR` | `~/.local/share/muse` | Muse Code data directory; should contain `sessions` |
 | `CORS_ALLOWED_ORIGINS` | `http://localhost:<PORT>,http://127.0.0.1:<PORT>` | Comma-separated allowed CORS origins |
+
+### Configuration file (config.yaml)
+
+In addition to environment variables and command-line flags (such as `--no-auto-update`), update behavior can also be configured in `~/.token-usage-insights/config.yaml` (`%LOCALAPPDATA%\TokenUsageInsights\config.yaml` on Windows):
+
+```yaml
+# ~/.token-usage-insights/config.yaml
+auto_update: true          # Whether to automatically check and update on service launch (overridden by --no-auto-update or env vars)
+update_check_interval: 1   # Update check interval in days
+```
+
+Precedence: CLI flags (e.g. `--no-auto-update`) > Environment variables (e.g. `TOKEN_USAGE_INSIGHTS_AUTO_UPDATE`) > `config.yaml` > Defaults.
 
 > **The default binding is `0.0.0.0`, so other devices on the same local network may connect to the dashboard. For local-only browsing, set `HOST` to `127.0.0.1`.**
 

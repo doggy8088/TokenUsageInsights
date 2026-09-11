@@ -517,9 +517,15 @@ cargo build --release --bin token-usage-insights
 ```bash
 # 取得 CLI usage 說明
 ./target/release/token-usage-insights --help
+./target/release/token-usage-insights update --help
 ./target/release/token-usage-insights export --help
 ./target/release/token-usage-insights export-all --help
 ./target/release/token-usage-insights import --help
+
+# 自我更新至最新版本（亦支援 --check 僅檢查、--force 強制覆蓋、--target-version 指定版本）
+./target/release/token-usage-insights update
+./target/release/token-usage-insights update --check
+./target/release/token-usage-insights update --target-version v0.9.6
 ```
 
 資料格式使用和前端一致，內含欄位：
@@ -543,6 +549,9 @@ cargo build --release --bin token-usage-insights
 | `HOST` | `0.0.0.0` | 看板服務綁定的 IPv4 或 IPv6 位址 |
 | `PORT` | `3003` | 看板服務埠號 |
 | `INSIGHTS_DIR` | Windows: `%LOCALAPPDATA%\TokenUsageInsights`; 其他平台: `~/.token-usage-insights` | SQLite 資料庫目錄 |
+| `TOKEN_USAGE_INSIGHTS_AUTO_UPDATE` | `true` | 是否在啟動時自動檢查更新（設為 `0`、`false`、`no` 或 `off` 可停用） |
+| `TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS` | `24` | 自動檢查更新的間隔週期（小時，有效範圍 1 至 87600） |
+| `TOKEN_USAGE_INSIGHTS_INSTALL_DIR` | 自動偵測 | 自訂安裝目錄，作為更新目標與環境辨識依據 |
 | `ANTIGRAVITY_DIR` | `~/.gemini/antigravity-cli` | Antigravity CLI 資料目錄 |
 | `COPILOT_DIR` | `~/.copilot` | Copilot CLI 資料目錄 |
 | `COPILOT_APP_DIR` | 同 `COPILOT_DIR` | Copilot App（桌面應用）資料目錄，應包含 `data.db` 與 `session-store.db` |
@@ -557,6 +566,18 @@ cargo build --release --bin token-usage-insights
 | `OMP_DIR` | `~/.omp` | OMP 資料目錄 |
 | `MUSE_DIR` | `~/.local/share/muse` | Muse Code 資料目錄，應包含 `sessions` |
 | `CORS_ALLOWED_ORIGINS` | `http://localhost:<PORT>,http://127.0.0.1:<PORT>` | 允許的 CORS 來源，逗號分隔 |
+
+### 設定檔 (config.yaml)
+
+除了環境變數與命令列旗標（如 `--no-auto-update`）之外，亦可在 `~/.token-usage-insights/config.yaml`（Windows 為 `%LOCALAPPDATA%\TokenUsageInsights\config.yaml`）中設定更新行為：
+
+```yaml
+# ~/.token-usage-insights/config.yaml
+auto_update: true          # 是否在服務啟動時自動檢查並更新（可透過 --no-auto-update 或環境變數覆寫）
+update_check_interval: 1   # 自動檢查更新的間隔週期（天）
+```
+
+優先順序：命令列旗標（如 `--no-auto-update`） > 環境變數（如 `TOKEN_USAGE_INSIGHTS_AUTO_UPDATE`） > `config.yaml` 設定檔 > 預設值。
 
 > **預設綁定 `0.0.0.0`，同一區網內的其他裝置可能連線到看板。只需在本機瀏覽時，請將 `HOST` 設為 `127.0.0.1`。**
 

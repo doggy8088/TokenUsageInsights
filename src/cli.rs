@@ -583,7 +583,8 @@ async fn run_update_cli(args: &[String]) -> i32 {
 
     match crate::updater::run_update(opts).await {
         Ok(()) => 0,
-        Err(err) => {
+        Err(crate::updater::UpdateError::SafeRejection(_)) => 2,
+        Err(crate::updater::UpdateError::Failure(err)) => {
             eprintln!("❌ 更新失敗：{err}");
             1
         }

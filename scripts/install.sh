@@ -76,7 +76,11 @@ for file in pricing.csv README.md LICENSE VERSION; do
   fi
 done
 
-printf "token-usage-insights:installed" > "${install_dir}/.install_marker"
+  marker_path="${install_dir}/.install_marker"
+  marker_tmp="${install_dir}/.install_marker.tmp.$$"
+  rm -f "$marker_path"
+  printf "token-usage-insights:installed" > "$marker_tmp"
+  mv -f "$marker_tmp" "$marker_path"
 
 ln -sfn "${install_dir}/${app_name}" "${bin_dir}/${app_name}"
 

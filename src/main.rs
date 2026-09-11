@@ -141,8 +141,11 @@ async fn main() {
         eprintln!("❌ 初始化 SQLite 資料庫失敗: {error}");
     }
 
-    // 在伺服器綁定與接受請求前執行啟動自動更新檢查，避免並行請求發生靜態檔案鎖定或 404
-    updater::check_and_auto_update_on_launch().await;
+    // 啟動前優先檢查並執行本機交易救援（若先前更新意外中斷）
+    updater::perform_startup_recovery().await;
+
+    // 非同步在背景排程自動更新檢查，絕不延遲 TCP 監聽與服務啟動
+    updater::spawn_background_auto_update();
 
     let static_dir = get_static_dir();
     println!("📂 正在服務靜態檔案，目錄來源: {:?}", static_dir);
