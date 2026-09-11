@@ -16,14 +16,29 @@ $InstallDir = [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($
 $BinDir = [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($BinDir))
 
 function Get-StartupShortcutPath {
+    param([switch]$EnsureDirectory)
+
     $startupFolder = $env:TOKEN_USAGE_INSIGHTS_STARTUP_DIR
     if (-not $startupFolder) {
         $startupFolder = [Environment]::GetFolderPath('Startup')
     }
-    if (-not (Test-Path $startupFolder)) {
-        $startupFolder = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Startup"
+
+    $fallbackStartupFolder = $null
+    if ($env:APPDATA) {
+        $fallbackStartupFolder = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Startup"
     }
-    if (-not (Test-Path $startupFolder)) {
+
+    if (-not $startupFolder) {
+        $startupFolder = $fallbackStartupFolder
+    } elseif (
+        -not (Test-Path $startupFolder) -and
+        $fallbackStartupFolder -and
+        -not $startupFolder.Equals($fallbackStartupFolder, [System.StringComparison]::OrdinalIgnoreCase)
+    ) {
+        $startupFolder = $fallbackStartupFolder
+    }
+
+    if ($EnsureDirectory -and $startupFolder -and -not (Test-Path $startupFolder)) {
         New-Item -ItemType Directory -Force -Path $startupFolder | Out-Null
     }
 
@@ -56,7 +71,7 @@ function Get-RunnerScriptPathFromArguments {
 
 function Stop-ExistingServiceInstance {
     param(
-        [string]$TaskName,
+        [string[]]$TaskNames,
         [string]$ProcessName,
         [string]$InstallDir
     )
@@ -66,12 +81,14 @@ function Stop-ExistingServiceInstance {
     $null = $runnerScriptPaths.Add($runnerScriptPath)
 
     try {
-        $existingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-        if ($existingTask -and $existingTask.Actions) {
-            foreach ($action in @($existingTask.Actions)) {
-                $taskRunnerPath = Get-RunnerScriptPathFromArguments -Arguments $action.Arguments
-                if ($taskRunnerPath) {
-                    $null = $runnerScriptPaths.Add($taskRunnerPath)
+        foreach ($knownTaskName in @($TaskNames | Where-Object { $_ } | Select-Object -Unique)) {
+            $existingTask = Get-ScheduledTask -TaskName $knownTaskName -ErrorAction SilentlyContinue
+            if ($existingTask -and $existingTask.Actions) {
+                foreach ($action in @($existingTask.Actions)) {
+                    $taskRunnerPath = Get-RunnerScriptPathFromArguments -Arguments $action.Arguments
+                    if ($taskRunnerPath) {
+                        $null = $runnerScriptPaths.Add($taskRunnerPath)
+                    }
                 }
             }
         }
@@ -132,7 +149,9 @@ function Stop-ExistingServiceInstance {
     }
 
     try {
-        Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        foreach ($knownTaskName in @($TaskNames | Where-Object { $_ } | Select-Object -Unique)) {
+            Stop-ScheduledTask -TaskName $knownTaskName -ErrorAction SilentlyContinue
+        }
     } catch {}
 
     $runnerHosts = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
@@ -285,16 +304,18 @@ if ($PSCmdlet.ShouldProcess($InstallDir, "Install Token Usage Insights")) {
     New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
 
     $existingTask = $false
+    $legacyTaskName = $null
+    $taskNamesToStop = @($TaskName)
     try {
         $existingTask = [bool](Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)
         if (-not $existingTask) {
-            $legacyTask = Get-ScheduledTask -TaskName "TokenUsageInsights" -ErrorAction SilentlyContinue
+            $legacyTaskName = "TokenUsageInsights"
+            $legacyTask = Get-ScheduledTask -TaskName $legacyTaskName -ErrorAction SilentlyContinue
             if ($legacyTask) {
                 $existingTask = $true
-                try {
-                    Stop-ScheduledTask -TaskName "TokenUsageInsights" -ErrorAction SilentlyContinue
-                    Unregister-ScheduledTask -TaskName "TokenUsageInsights" -Confirm:$false -ErrorAction SilentlyContinue
-                } catch {}
+                $taskNamesToStop += $legacyTaskName
+            } else {
+                $legacyTaskName = $null
             }
         }
     } catch {}
@@ -306,7 +327,13 @@ if ($PSCmdlet.ShouldProcess($InstallDir, "Install Token Usage Insights")) {
     $hadPersistentServiceRegistration = $hadScheduledTaskBeforeStop -or $existingShortcut
 
     if ($Service -or $hadPersistentServiceRegistration) {
-        Stop-ExistingServiceInstance -TaskName $TaskName -ProcessName $AppName -InstallDir $InstallDir
+        Stop-ExistingServiceInstance -TaskNames $taskNamesToStop -ProcessName $AppName -InstallDir $InstallDir
+    }
+
+    if ($legacyTaskName) {
+        try {
+            Unregister-ScheduledTask -TaskName $legacyTaskName -Confirm:$false -ErrorAction SilentlyContinue
+        } catch {}
     }
 
     Copy-Item -Force $BinarySrc (Join-Path $InstallDir "$AppName.exe")
@@ -388,6 +415,7 @@ exit /b %APP_EXIT_CODE%
                 throw "Could not register scheduled task and failed to unregister existing task '$TaskName'. Aborting fallback to prevent duplicate execution."
             }
 
+            $startupShortcutPath = Get-StartupShortcutPath -EnsureDirectory
             Set-StartupShortcutForRunner `
                 -ShortcutPath $startupShortcutPath `
                 -RunnerScript $RunnerScript `
@@ -426,6 +454,7 @@ exit /b %APP_EXIT_CODE%
         $startupShortcutReady = Test-Path $startupShortcutPath
         if ($hadStartupShortcutBeforeStop -and (Test-Path $runnerScript) -and -not $startupShortcutReady) {
             try {
+                $startupShortcutPath = Get-StartupShortcutPath -EnsureDirectory
                 Set-StartupShortcutForRunner `
                     -ShortcutPath $startupShortcutPath `
                     -RunnerScript $runnerScript `

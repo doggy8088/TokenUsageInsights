@@ -50,7 +50,12 @@ $payload | ConvertTo-Json -Compress | Set-Content -LiteralPath '__CAPTURE_PATH__
 
     function Invoke-RestMethod { @{ tag_name = "v-test" } }
     function Invoke-WebRequest {
-        param([string]$Uri, [string]$OutFile)
+        param(
+            [string]$Uri,
+            [string]$OutFile,
+            [switch]$UseBasicParsing,
+            [Parameter(ValueFromRemainingArguments = $true)]$RemainingArgs
+        )
         Set-Content -LiteralPath $OutFile -Value "placeholder"
     }
     function Expand-Archive {
@@ -87,6 +92,7 @@ function Invoke-InstallServiceTest {
         [string]$HostAddress,
         [int]$Port,
         [bool]$ServiceInstall = $true,
+        [bool]$SeedStartupShortcut = $true,
         [switch]$FailScheduledTaskAction,
         [switch]$FailStartScheduledTask,
         [switch]$TaskTargetsLegacyInstall,
@@ -112,13 +118,15 @@ function Invoke-InstallServiceTest {
     New-Item -ItemType Directory -Force -Path (Join-Path $releaseDir "static") | Out-Null
     New-Item -ItemType Directory -Force -Path (Join-Path $releaseDir "shell") | Out-Null
     New-Item -ItemType Directory -Force -Path $scriptDir | Out-Null
-    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $startupShortcut) | Out-Null
 
     Set-Content -LiteralPath (Join-Path $releaseDir "token-usage-insights.exe") -Value "binary"
     Set-Content -LiteralPath (Join-Path $releaseDir "pricing.csv") -Value "model,input,output"
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot "install.ps1") -Destination (Join-Path $scriptDir "install.ps1")
     Set-Content -LiteralPath (Join-Path $scriptDir "run-service.ps1") -Value "Write-Host 'runner'"
-    Set-Content -LiteralPath $startupShortcut -Value "shortcut"
+    if ($SeedStartupShortcut) {
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $startupShortcut) | Out-Null
+        Set-Content -LiteralPath $startupShortcut -Value "shortcut"
+    }
 
     $global:serviceEvents = New-Object System.Collections.Generic.List[string]
     $global:hostMessages = New-Object System.Collections.Generic.List[string]
@@ -256,9 +264,12 @@ function Invoke-InstallServiceTest {
         [CmdletBinding()]
         param([string]$TaskName)
         if ($TaskTargetsLegacyInstall) {
-            return [pscustomobject]@{
-                Actions = @([pscustomobject]@{ Arguments = $legacyTaskActionArguments })
+            if ($TaskName -eq "TokenUsageInsights") {
+                return [pscustomobject]@{
+                    Actions = @([pscustomobject]@{ Arguments = $legacyTaskActionArguments })
+                }
             }
+            return $null
         }
 
         return $null
@@ -379,6 +390,7 @@ function Invoke-InstallServiceTest {
             TriggerUser = $global:scheduledTaskTriggerUser
             OtherRunnerStopped = (-not $global:otherRunnerProcessAlive)
             OtherAppStopped = (-not $global:otherAppProcessAlive)
+            StartupDirectoryExists = (Test-Path -LiteralPath (Split-Path -Parent $startupShortcut))
             StartupShortcutExists = (Test-Path -LiteralPath $startupShortcut)
         }
     } finally {
@@ -515,6 +527,9 @@ try {
     $installLegacyTaskResult = Invoke-InstallServiceTest -HostAddress "127.0.0.1" -Port 3003 -TaskTargetsLegacyInstall
     Assert-Equal $true $installLegacyTaskResult.OtherRunnerStopped "install.ps1 should stop the runner tied to an existing scheduled task from a previous install directory."
     Assert-Equal $true $installLegacyTaskResult.OtherAppStopped "install.ps1 should stop the executable tied to an existing scheduled task from a previous install directory."
+
+    $installCleanResult = Invoke-InstallServiceTest -HostAddress "127.0.0.1" -Port 3003 -ServiceInstall:$false -SeedStartupShortcut:$false
+    Assert-Equal $false $installCleanResult.StartupDirectoryExists "install.ps1 should not create the Startup folder during a plain install without -Service."
 
     $installNonServiceRestartResult = Invoke-InstallServiceTest -HostAddress "127.0.0.1" -Port 3003 -ServiceInstall:$false
     Assert-True ($installNonServiceRestartResult.Events -contains "StartStartupShortcut") "install.ps1 should relaunch the existing Startup shortcut when rerun without -Service."

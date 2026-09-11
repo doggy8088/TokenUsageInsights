@@ -613,6 +613,9 @@ $InstallDir = $null
 $Task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 if (-not $Task) {
     $Task = Get-ScheduledTask -TaskName "TokenUsageInsights" -ErrorAction SilentlyContinue
+    if ($Task) {
+        $TaskName = "TokenUsageInsights"
+    }
 }
 if ($Task -and $Task.Actions) {
     foreach ($Action in @($Task.Actions)) {
