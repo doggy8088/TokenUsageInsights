@@ -121,21 +121,67 @@ fn get_process_exe_path(pid: u32) -> Option<PathBuf> {
 }
 
 #[cfg(windows)]
+type WinHandle = *mut std::ffi::c_void;
+
+#[cfg(windows)]
+const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+#[cfg(windows)]
+const PROCESS_QUERY_INFORMATION: u32 = 0x0400;
+#[cfg(windows)]
+const PROCESS_VM_READ: u32 = 0x0010;
+
+#[cfg(windows)]
+#[repr(C)]
+struct UnicodeString {
+    length: u16,
+    maximum_length: u16,
+    buffer: *mut u16,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct ProcessBasicInformation {
+    exit_status: i32,
+    peb_base_address: *mut std::ffi::c_void,
+    affinity_mask: usize,
+    base_priority: i32,
+    unique_process_id: usize,
+    inherited_from_unique_process_id: usize,
+}
+
+#[cfg(windows)]
+type NtQueryInformationProcessFn = unsafe extern "system" fn(
+    process_handle: WinHandle,
+    process_information_class: u32,
+    process_information: *mut std::ffi::c_void,
+    process_information_length: u32,
+    return_length: *mut u32,
+) -> i32;
+
+#[cfg(windows)]
+extern "system" {
+    fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> WinHandle;
+    fn QueryFullProcessImageNameW(
+        hProcess: WinHandle,
+        dwFlags: u32,
+        lpExeName: *mut u16,
+        lpdwSize: *mut u32,
+    ) -> i32;
+    fn CloseHandle(hObject: WinHandle) -> i32;
+    fn GetModuleHandleA(lpModuleName: *const u8) -> WinHandle;
+    fn GetProcAddress(hModule: WinHandle, lpProcName: *const u8) -> *mut std::ffi::c_void;
+    fn LocalFree(hMem: WinHandle) -> WinHandle;
+}
+
+#[cfg(windows)]
+#[link(name = "shell32")]
+extern "system" {
+    fn CommandLineToArgvW(lpCmdLine: *const u16, pNumArgs: *mut i32) -> *mut *mut u16;
+}
+
+#[cfg(windows)]
 fn get_process_exe_path(pid: u32) -> Option<PathBuf> {
     use std::os::windows::ffi::OsStringExt;
-    type Handle = *mut std::ffi::c_void;
-    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
-
-    extern "system" {
-        fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> Handle;
-        fn QueryFullProcessImageNameW(
-            hProcess: Handle,
-            dwFlags: u32,
-            lpExeName: *mut u16,
-            lpdwSize: *mut u32,
-        ) -> i32;
-        fn CloseHandle(hObject: Handle) -> i32;
-    }
 
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
@@ -205,28 +251,206 @@ fn get_process_cmdline(pid: u32) -> Option<Vec<String>> {
 
 #[cfg(windows)]
 fn get_process_cmdline(pid: u32) -> Option<Vec<String>> {
-    let output = std::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            &format!("(Get-CimInstance Win32_Process -Filter 'ProcessId = {pid}').CommandLine"),
-        ])
+    use std::os::windows::ffi::OsStringExt;
+
+    unsafe {
+        let ntdll = GetModuleHandleA(b"ntdll.dll\0".as_ptr());
+        if ntdll.is_null() {
+            return None;
+        }
+        let func_ptr = GetProcAddress(ntdll, b"NtQueryInformationProcess\0".as_ptr());
+        if func_ptr.is_null() {
+            return None;
+        }
+        let nt_query: NtQueryInformationProcessFn = std::mem::transmute(func_ptr);
+
+        let mut handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            handle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid);
+        }
+        if handle.is_null() {
+            return None;
+        }
+
+        // ProcessCommandLineInformation = 60
+        let mut buf = vec![0u8; 32768];
+        let mut return_len = 0u32;
+        let status = nt_query(
+            handle,
+            60,
+            buf.as_mut_ptr() as *mut std::ffi::c_void,
+            buf.len() as u32,
+            &mut return_len,
+        );
+        CloseHandle(handle);
+
+        if status != 0 {
+            return None;
+        }
+
+        let p_unicode = buf.as_ptr() as *const UnicodeString;
+        let byte_len = (*p_unicode).length as usize;
+        let char_len = byte_len / 2;
+        let str_ptr = (*p_unicode).buffer;
+
+        if str_ptr.is_null() || char_len == 0 {
+            return None;
+        }
+
+        let buf_start = buf.as_ptr() as usize;
+        let buf_end = buf_start + buf.len();
+        let ptr_val = str_ptr as usize;
+        if ptr_val < buf_start || ptr_val + byte_len > buf_end {
+            return None;
+        }
+
+        let mut wide_chars: Vec<u16> = std::slice::from_raw_parts(str_ptr, char_len).to_vec();
+        wide_chars.push(0);
+
+        let mut num_args = 0i32;
+        let argv_ptr = CommandLineToArgvW(wide_chars.as_ptr(), &mut num_args);
+        if argv_ptr.is_null() || num_args <= 0 {
+            return None;
+        }
+
+        let mut args = Vec::new();
+        for i in 0..num_args as usize {
+            let arg_ptr = *argv_ptr.add(i);
+            if !arg_ptr.is_null() {
+                let mut len = 0;
+                while *arg_ptr.add(len) != 0 {
+                    len += 1;
+                }
+                let arg_slice = std::slice::from_raw_parts(arg_ptr, len);
+                let os_str = std::ffi::OsString::from_wide(arg_slice);
+                args.push(os_str.to_string_lossy().to_string());
+            }
+        }
+        LocalFree(argv_ptr as WinHandle);
+
+        if args.is_empty() {
+            None
+        } else {
+            Some(args)
+        }
+    }
+}
+
+#[cfg(windows)]
+fn get_process_ppid(pid: u32) -> Option<u32> {
+    unsafe {
+        let ntdll = GetModuleHandleA(b"ntdll.dll\0".as_ptr());
+        if ntdll.is_null() {
+            return None;
+        }
+        let func_ptr = GetProcAddress(ntdll, b"NtQueryInformationProcess\0".as_ptr());
+        if func_ptr.is_null() {
+            return None;
+        }
+        let nt_query: NtQueryInformationProcessFn = std::mem::transmute(func_ptr);
+
+        let mut handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            handle = OpenProcess(PROCESS_QUERY_INFORMATION, 0, pid);
+        }
+        if handle.is_null() {
+            return None;
+        }
+
+        let mut pbi = std::mem::zeroed::<ProcessBasicInformation>();
+        let mut return_len = 0u32;
+        let status = nt_query(
+            handle,
+            0, // ProcessBasicInformation
+            &mut pbi as *mut _ as *mut std::ffi::c_void,
+            std::mem::size_of::<ProcessBasicInformation>() as u32,
+            &mut return_len,
+        );
+        CloseHandle(handle);
+
+        if status == 0 && pbi.inherited_from_unique_process_id != 0 {
+            Some(pbi.inherited_from_unique_process_id as u32)
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(windows)]
+fn is_process_supervised(pid: u32, install_dir: &Path) -> bool {
+    if let Some(ppid) = get_process_ppid(pid) {
+        if is_process_alive(ppid) {
+            if let Some(parent_exe) = get_process_exe_path(ppid) {
+                let file_name = parent_exe
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                if file_name == "services.exe" {
+                    return true;
+                }
+                if file_name == "powershell.exe" || file_name == "pwsh.exe" {
+                    if let Some(cmd) = get_process_cmdline(ppid) {
+                        if cmd.iter().any(|arg| arg.contains("run-service.ps1")) {
+                            return true;
+                        }
+                    }
+                    if install_dir.join("scripts").join("run-service.ps1").exists() {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn is_process_supervised(pid: u32, _install_dir: &Path) -> bool {
+    if let Ok(env_bytes) = fs::read(format!("/proc/{pid}/environ")) {
+        let env_str = String::from_utf8_lossy(&env_bytes);
+        if env_str.contains("INVOCATION_ID=")
+            || env_str.contains("JOURNAL_STREAM=")
+            || env_str.contains("SYSTEMD_EXEC_PID=")
+        {
+            return true;
+        }
+    }
+    if let Ok(status) = fs::read_to_string(format!("/proc/{pid}/status")) {
+        for line in status.lines() {
+            if line.starts_with("PPid:") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 && parts[1] == "1" {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn is_process_supervised(pid: u32, _install_dir: &Path) -> bool {
+    if let Ok(output) = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "ppid="])
         .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
+    {
+        let ppid = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if ppid == "1" {
+            return true;
+        }
     }
-    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if text.is_empty() {
-        return None;
-    }
-    Some(text.split_whitespace().map(|s| s.to_string()).collect())
+    false
 }
 
 #[cfg(not(any(unix, windows)))]
 fn get_process_cmdline(_pid: u32) -> Option<Vec<String>> {
     None
+}
+
+#[cfg(not(any(unix, windows)))]
+fn is_process_supervised(_pid: u32, _install_dir: &Path) -> bool {
+    false
 }
 
 fn is_cli_subcommand(arg: &str) -> bool {
@@ -1708,18 +1932,25 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), UpdateError> {
     Ok(())
 }
 
-fn stop_running_dashboard_instances(install_dir: &Path) -> Result<bool, String> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StoppedDashboardStatus {
+    pub stopped_any: bool,
+    pub had_supervised: bool,
+    pub had_unsupervised: bool,
+}
+
+fn stop_running_dashboard_instances(install_dir: &Path) -> Result<StoppedDashboardStatus, String> {
     let my_pid = std::process::id();
-    let mut server_pids = std::collections::HashSet::new();
     let mut candidate_pids = std::collections::HashSet::new();
 
     // 1. 從 .server.pid 讀取 PID 作為候選
     let pid_file = install_dir.join(".server.pid");
+    let mut server_pids = std::collections::HashSet::new();
     if let Ok(content) = fs::read_to_string(&pid_file) {
         if let Ok(pid) = content.trim().parse::<u32>() {
             if pid != my_pid {
-                server_pids.insert(pid);
                 candidate_pids.insert(pid);
+                server_pids.insert(pid);
             }
         }
     }
@@ -1727,38 +1958,42 @@ fn stop_running_dashboard_instances(install_dir: &Path) -> Result<bool, String> 
     if let Ok(content) = fs::read_to_string(&insights_pid_file) {
         if let Ok(pid) = content.trim().parse::<u32>() {
             if pid != my_pid {
-                server_pids.insert(pid);
                 candidate_pids.insert(pid);
+                server_pids.insert(pid);
             }
         }
     }
 
-    // 2. 透過系統進程清單掃描 APP_NAME（採 Fail-Closed 原則）
+    // 2. 透過系統進程清單掃描 APP_NAME
     #[cfg(target_os = "linux")]
     {
-        let entries = fs::read_dir("/proc")
-            .map_err(|e| format!("列舉 Linux /proc 進程失敗: {e}；更新中止以確保安全"))?;
-        for entry in entries {
-            let entry =
-                entry.map_err(|e| format!("讀取 /proc 目錄項失敗: {e}；更新中止以確保安全"))?;
-            if let Ok(name) = entry.file_name().into_string() {
-                if let Ok(pid) = name.parse::<u32>() {
-                    if pid != my_pid {
-                        candidate_pids.insert(pid);
+        if let Ok(entries) = fs::read_dir("/proc") {
+            for entry in entries.flatten() {
+                if let Ok(name) = entry.file_name().into_string() {
+                    if let Ok(pid) = name.parse::<u32>() {
+                        if pid != my_pid {
+                            if let Ok(cmdline) = fs::read_to_string(format!("/proc/{pid}/cmdline"))
+                            {
+                                if cmdline.contains(APP_NAME) {
+                                    candidate_pids.insert(pid);
+                                }
+                            }
+                        }
                     }
                 }
             }
+        } else {
+            return Err("無法讀取 /proc 目錄列舉進程；更新中止以確保安全".to_string());
         }
     }
 
     #[cfg(all(unix, not(target_os = "linux")))]
     {
-        let pgrep_res = std::process::Command::new("pgrep")
-            .arg("-f")
-            .arg(APP_NAME)
-            .output();
-        match pgrep_res {
-            Ok(output) => {
+        match std::process::Command::new("pgrep")
+            .args(["-f", APP_NAME])
+            .output()
+        {
+            Ok(output) if output.status.success() => {
                 let text = String::from_utf8_lossy(&output.stdout);
                 for line in text.lines() {
                     if let Ok(pid) = line.trim().parse::<u32>() {
@@ -1768,14 +2003,12 @@ fn stop_running_dashboard_instances(install_dir: &Path) -> Result<bool, String> 
                     }
                 }
             }
-            Err(e) => {
-                // pgrep 啟動失敗時，嘗試 ps 作為回退；若兩者皆失敗則 fail closed
+            _ => {
+                // pgrep 未匹配或失敗時，嘗試 ps 作為回退；若兩者皆失敗則 fail closed
                 let ps_res = std::process::Command::new("ps")
                     .args(["-axo", "pid="])
                     .output()
-                    .map_err(|pe| {
-                        format!("進程列舉失敗 (pgrep: {e}, ps: {pe})；更新中止以確保安全")
-                    })?;
+                    .map_err(|pe| format!("進程列舉失敗 (ps: {pe})；更新中止以確保安全"))?;
                 if !ps_res.status.success() {
                     return Err("ps 命令執行失敗；更新中止以確保安全".to_string());
                 }
@@ -1827,12 +2060,20 @@ fn stop_running_dashboard_instances(install_dir: &Path) -> Result<bool, String> 
 
     // 3. 嚴格驗證候選 PID：必須為活躍進程且執行檔路徑確認位於 install_dir，並過濾短暫 CLI 指令進程（Fail-Closed 原則）
     let mut target_pids = std::collections::HashSet::new();
+    let mut had_supervised = false;
+    let mut had_unsupervised = false;
+
     for pid in candidate_pids {
         if is_process_alive(pid) {
             if let Some(exe_path) = get_process_exe_path(pid) {
                 if matches_install_dir(&exe_path, install_dir)
                     && is_dashboard_server_process(pid, &server_pids)
                 {
+                    if is_process_supervised(pid, install_dir) {
+                        had_supervised = true;
+                    } else {
+                        had_unsupervised = true;
+                    }
                     target_pids.insert(pid);
                 }
             }
@@ -1842,13 +2083,17 @@ fn stop_running_dashboard_instances(install_dir: &Path) -> Result<bool, String> 
     let mut remaining_pids: Vec<u32> = target_pids.into_iter().collect();
     if remaining_pids.is_empty() {
         // 未發現需要停止的其他進程，保留自身進程之 .server.pid
-        return Ok(false);
+        return Ok(StoppedDashboardStatus {
+            stopped_any: false,
+            had_supervised: false,
+            had_unsupervised: false,
+        });
     }
 
-    // 若在 Windows 環境，寫入服務重啟協商標記檔，讓 run-service.ps1 能在新版就緒後重啟
+    // 若在 Windows 環境且有受到 run-service.ps1 監管之服務進程，寫入服務重啟協商標記檔，讓 run-service.ps1 能在新版就緒後重啟
     let restart_pending_file = install_dir.join(".service_restart_pending");
     #[cfg(windows)]
-    {
+    if had_supervised {
         safe_write_file(&restart_pending_file, b"1").map_err(|e| {
             let err = format!("無法寫入服務重啟協商標記檔 ({restart_pending_file:?}): {e}");
             log_update("ERROR", "STOP_SERVICE", &err);
@@ -1935,7 +2180,11 @@ fn stop_running_dashboard_instances(install_dir: &Path) -> Result<bool, String> 
     }
 
     log_update("INFO", "STOP_SERVICE", "所有執行中之目標服務進程已安全停止");
-    Ok(true)
+    Ok(StoppedDashboardStatus {
+        stopped_any: true,
+        had_supervised,
+        had_unsupervised,
+    })
 }
 
 fn restart_background_dashboard(install_dir: &Path) {
@@ -1946,11 +2195,20 @@ fn restart_background_dashboard(install_dir: &Path) {
     };
     let exe = install_dir.join(exec_name);
     if exe.exists() {
-        let _ = std::process::Command::new(exe)
+        let mut cmd = std::process::Command::new(exe);
+        cmd.current_dir(install_dir)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
+            .stderr(std::process::Stdio::null());
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+
+        let _ = cmd.spawn();
     }
 }
 
@@ -1966,7 +2224,7 @@ pub(crate) fn apply_installation_with_rollback(
     }
 
     println!("⏸️ 正在協調停止現有執行中之服務...");
-    let stopped_dashboard = stop_running_dashboard_instances(install_dir)?;
+    let stopped_status = stop_running_dashboard_instances(install_dir)?;
 
     println!("🚀 正在安裝新版檔案至 {:?} ...", install_dir);
     log_update("INFO", "INSTALL", &format!("開始替換至 {install_dir:?}"));
@@ -2085,7 +2343,6 @@ pub(crate) fn apply_installation_with_rollback(
     if let Err(err) = install_result {
         eprintln!("❌ 安裝失敗，正在自動回滾: {err}");
         log_update("ERROR", "INSTALL", &format!("安裝失敗: {err}，開始回滾"));
-        let _ = fs::remove_file(install_dir.join(".service_restart_pending"));
         if let Err(rollback_err) = restore_from_backup(backup_dir, install_dir) {
             let _ = fs::write(backup_dir.join(".rollback_failed"), &rollback_err);
             eprintln!(
@@ -2100,8 +2357,22 @@ pub(crate) fn apply_installation_with_rollback(
             println!("✅ 已成功回滾至先前版本。");
             log_update("INFO", "ROLLBACK", "回滾成功");
             let _ = fs::remove_dir_all(backup_dir);
-            if stopped_dashboard {
-                restart_background_dashboard(install_dir);
+            if stopped_status.stopped_any {
+                if stopped_status.had_supervised {
+                    // 受到 run-service.ps1 或 systemd/launchd 監管的服務：
+                    // 在 Windows 上保留 .service_restart_pending，待更新鎖釋放後由 run-service.ps1 接手重啟；
+                    // 在 Linux/macOS 上由 systemd/launchd 自行重啟，絕不直接生成未監管的 raw process
+                    log_update(
+                        "INFO",
+                        "ROLLBACK",
+                        "回滾完成，保留標記由服務管理器自動重啟監管進程",
+                    );
+                } else if stopped_status.had_unsupervised {
+                    // 先前是由使用者手動以非監管方式啟動的看板進程，重啟還原後的背景看板
+                    let _ = fs::remove_file(install_dir.join(".service_restart_pending"));
+                    restart_background_dashboard(install_dir);
+                    log_update("INFO", "ROLLBACK", "回滾完成，已重新啟動非監管背景看板進程");
+                }
             }
         }
         return Err(err);
@@ -2124,6 +2395,27 @@ pub(crate) fn apply_installation_with_rollback(
                     &format!("備份目錄已安全移至 {fallback_backup:?}"),
                 );
             }
+        }
+    }
+
+    // 更新成功後處理先前停止之服務進程重啟：
+    if stopped_status.stopped_any {
+        if stopped_status.had_supervised {
+            // Windows run-service.ps1 監管中：保留 .service_restart_pending，
+            // 當 run_update 結束釋放 UpdateLock 後，run-service.ps1 會偵測並重啟新版服務；
+            // Linux systemd / macOS launchd 亦由監管者自行重啟
+            println!("🔄 服務管理器將在新版就緒後自動重啟監管進程。");
+            log_update(
+                "INFO",
+                "RESTART",
+                "更新成功，保留標記由服務管理器自動重啟監管進程",
+            );
+        } else if stopped_status.had_unsupervised {
+            // 先前為非監管/直接啟動之看板進程，手動更新完成後自動重啟新版背景看板，避免看板離線
+            let _ = fs::remove_file(install_dir.join(".service_restart_pending"));
+            restart_background_dashboard(install_dir);
+            println!("🔄 已重新啟動 Token 戰情室背景看板服務。");
+            log_update("INFO", "RESTART", "更新成功，已重新啟動非監管背景看板進程");
         }
     }
 
@@ -2243,11 +2535,17 @@ fn is_auto_update_disabled(args: &[String]) -> bool {
         if lower == "0" || lower == "false" || lower == "no" || lower == "off" {
             return true;
         }
-    } else {
-        let (yaml_auto, _) = load_update_config();
-        if yaml_auto == Some(false) {
-            return true;
+        if lower == "1" || lower == "true" || lower == "yes" || lower == "on" {
+            return false;
         }
+    }
+    // CI 環境自動防護：在 CI/自動化環境中預設停用背景自動更新，避免受遠端發行版本干擾
+    if std::env::var("CI").is_ok() || std::env::var("GITHUB_ACTIONS").is_ok() {
+        return true;
+    }
+    let (yaml_auto, _) = load_update_config();
+    if yaml_auto == Some(false) {
+        return true;
     }
     false
 }
@@ -3043,6 +3341,43 @@ update_check_interval: 5 # check every 5 days
         assert!(!is_cli_subcommand("--no-auto-update"));
         assert!(!is_cli_subcommand("--port"));
         assert!(!is_cli_subcommand("3003"));
+    }
+
+    #[test]
+    fn auto_update_disabled_in_ci_and_flags() {
+        assert!(is_auto_update_disabled(&["--no-auto-update".to_string()]));
+        assert!(is_auto_update_disabled(&[
+            "app".to_string(),
+            "--no-auto-update".to_string()
+        ]));
+    }
+
+    #[test]
+    fn stopped_dashboard_status_properties() {
+        let none = StoppedDashboardStatus {
+            stopped_any: false,
+            had_supervised: false,
+            had_unsupervised: false,
+        };
+        assert!(!none.stopped_any);
+
+        let sup = StoppedDashboardStatus {
+            stopped_any: true,
+            had_supervised: true,
+            had_unsupervised: false,
+        };
+        assert!(sup.stopped_any);
+        assert!(sup.had_supervised);
+        assert!(!sup.had_unsupervised);
+
+        let unsup = StoppedDashboardStatus {
+            stopped_any: true,
+            had_supervised: false,
+            had_unsupervised: true,
+        };
+        assert!(unsup.stopped_any);
+        assert!(!unsup.had_supervised);
+        assert!(unsup.had_unsupervised);
     }
 
     #[test]
