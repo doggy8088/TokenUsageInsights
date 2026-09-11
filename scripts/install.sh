@@ -104,6 +104,7 @@ Restart=always
 RestartSec=5
 Environment=PORT=${port}
 Environment=HOST=${host}
+Environment=TOKEN_USAGE_INSIGHTS_INSTALL_DIR=${install_dir}
 
 [Install]
 WantedBy=default.target
@@ -164,6 +165,8 @@ SERVICE
     <string>${host_plist}</string>
     <key>PORT</key>
     <string>${port_plist}</string>
+    <key>TOKEN_USAGE_INSIGHTS_INSTALL_DIR</key>
+    <string>${install_dir_plist}</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>

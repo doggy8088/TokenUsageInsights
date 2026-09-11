@@ -578,6 +578,7 @@ async fn run_update_cli(args: &[String]) -> i32 {
         check_only,
         force,
         target_version,
+        prefetched_release: None,
     };
 
     match crate::updater::run_update(opts).await {

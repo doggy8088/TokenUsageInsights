@@ -13,7 +13,7 @@ const APP_NAME: &str = "token-usage-insights";
 const USER_AGENT: &str = "token-usage-insights-updater";
 const DEFAULT_UPDATE_INTERVAL_HOURS: i64 = 24;
 const STARTUP_CHECK_TIMEOUT_SECS: u64 = 4;
-const STARTUP_AUTO_UPDATE_TOTAL_TIMEOUT_SECS: u64 = 20;
+const STARTUP_AUTO_UPDATE_TOTAL_TIMEOUT_SECS: u64 = 60;
 const LAST_CHECK_KEY: &str = "last_update_check_at";
 const MAX_ARCHIVE_BYTES: usize = 150 * 1024 * 1024; // 150 MB 上限
 const MAX_CHECKSUM_BYTES: usize = 1024 * 1024; // 1 MB 上限
@@ -50,6 +50,7 @@ pub struct UpdateOptions {
     pub check_only: bool,
     pub force: bool,
     pub target_version: Option<String>,
+    pub prefetched_release: Option<GitHubRelease>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -70,13 +71,13 @@ pub enum EnvironmentKind {
     },
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 pub struct GitHubAsset {
     pub name: String,
     pub browser_download_url: String,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 pub struct GitHubRelease {
     pub tag_name: String,
     pub assets: Vec<GitHubAsset>,
@@ -430,9 +431,7 @@ impl UpdateLock {
                 .and_then(|s| s.trim().parse::<u32>().ok())
         });
         if let Some(pid) = recorded_pid {
-            if is_process_alive(pid) {
-                return true;
-            }
+            return is_process_alive(pid);
         }
         if let Ok(metadata) = fs::metadata(&lock_path) {
             if let Ok(modified) = metadata.modified() {
@@ -1016,7 +1015,10 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), String> {
         &format!("開始檢查更新（目前版本 v{current_version}）"),
     );
 
-    let release = fetch_release_with_logging(options.target_version.as_deref(), 15).await?;
+    let release = match options.prefetched_release {
+        Some(r) => r,
+        None => fetch_release_with_logging(options.target_version.as_deref(), 15).await?,
+    };
     let remote_version = release.tag_name.trim();
 
     if options.check_only {
@@ -1193,11 +1195,81 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn stop_running_dashboard_instances(_install_dir: &Path) {
+    let my_pid = std::process::id();
+    if let Ok(output) = std::process::Command::new("pgrep")
+        .arg("-f")
+        .arg(APP_NAME)
+        .output()
+    {
+        let text = String::from_utf8_lossy(&output.stdout);
+        for line in text.lines() {
+            if let Ok(pid) = line.trim().parse::<u32>() {
+                if pid != my_pid {
+                    log_update(
+                        "INFO",
+                        "STOP_SERVICE",
+                        &format!("協調停止執行中之服務進程 (PID {pid})"),
+                    );
+                    unsafe {
+                        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+                    }
+                }
+            }
+        }
+    }
+    std::thread::sleep(Duration::from_millis(500));
+}
+
+#[cfg(windows)]
+fn stop_running_dashboard_instances(_install_dir: &Path) {
+    let my_pid = std::process::id();
+    let exec_name = format!("{APP_NAME}.exe");
+    if let Ok(output) = std::process::Command::new("tasklist")
+        .args([
+            "/FI",
+            &format!("IMAGENAME eq {exec_name}"),
+            "/FO",
+            "CSV",
+            "/NH",
+        ])
+        .output()
+    {
+        let text = String::from_utf8_lossy(&output.stdout);
+        for line in text.lines() {
+            let parts: Vec<&str> = line.split(',').collect();
+            if parts.len() >= 2 {
+                let pid_str = parts[1].trim().trim_matches('"');
+                if let Ok(pid) = pid_str.parse::<u32>() {
+                    if pid != my_pid && is_process_alive(pid) {
+                        log_update(
+                            "INFO",
+                            "STOP_SERVICE",
+                            &format!("協調停止執行中之 Windows 服務進程 (PID {pid})"),
+                        );
+                        let _ = std::process::Command::new("taskkill")
+                            .args(["/PID", &pid.to_string(), "/T", "/F"])
+                            .output();
+                    }
+                }
+            }
+        }
+    }
+    std::thread::sleep(Duration::from_millis(500));
+}
+
+#[cfg(not(any(unix, windows)))]
+fn stop_running_dashboard_instances(_install_dir: &Path) {}
+
 pub(crate) fn apply_installation_with_rollback(
     release_root: &Path,
     install_dir: &Path,
     backup_dir: &Path,
 ) -> Result<(), String> {
+    println!("⏸️ 正在協調停止現有執行中之服務...");
+    stop_running_dashboard_instances(install_dir);
+
     println!("💾 正在備份現有安裝...");
     if let Err(e) = backup_installation(install_dir, backup_dir) {
         log_update("ERROR", "BACKUP", &e);
@@ -1269,12 +1341,18 @@ pub(crate) fn apply_installation_with_rollback(
             let dst = install_dir.join(folder);
             if src.exists() {
                 let staging = install_dir.join(format!(".{folder}-staging-{}", std::process::id()));
-                let _ = fs::remove_dir_all(&staging);
+                if staging.exists() {
+                    fs::remove_dir_all(&staging)
+                        .map_err(|e| format!("清除舊暫存目錄失敗 ({staging:?}): {e}"))?;
+                }
                 copy_dir_recursive(&src, &staging)?;
 
                 if dst.exists() {
                     let old = install_dir.join(format!(".{folder}-old-{}", std::process::id()));
-                    let _ = fs::remove_dir_all(&old);
+                    if old.exists() {
+                        fs::remove_dir_all(&old)
+                            .map_err(|e| format!("清除舊備份目錄失敗 ({old:?}): {e}"))?;
+                    }
                     fs::rename(&dst, &old).map_err(|e| format!("目錄安全換名失敗 {dst:?}: {e}"))?;
                     if let Err(e) = fs::rename(&staging, &dst) {
                         let _ = fs::rename(&old, &dst);
@@ -1303,6 +1381,12 @@ pub(crate) fn apply_installation_with_rollback(
                 fs::copy(&src, &dst).map_err(|e| format!("替換檔案失敗 {file}: {e}"))?;
             }
         }
+
+        // 確保自訂安裝目錄保有安裝標記，避免未來更新無法辨識
+        let _ = fs::write(
+            install_dir.join(".install_marker"),
+            "token-usage-insights:installed",
+        );
 
         Ok(())
     })();
@@ -1333,7 +1417,12 @@ pub(crate) fn apply_installation_with_rollback(
             log_update("WARN", "CLEANUP", &format!("清理備份目錄失敗: {e}"));
             let fallback_backup =
                 install_dir.join(format!(".backup-old-{}", Utc::now().timestamp()));
-            let _ = fs::rename(backup_dir, &fallback_backup);
+            if let Err(re) = fs::rename(backup_dir, &fallback_backup) {
+                log_update("ERROR", "CLEANUP", &format!("備份目錄換名失敗: {re}"));
+                return Err(format!(
+                    "更新已安裝，但備份目錄無法清理或換名 ({backup_dir:?}): {re}；請手動移除以允許後續更新"
+                ));
+            }
         }
     }
 
@@ -1450,27 +1539,15 @@ pub async fn check_and_auto_update_on_launch() {
         return;
     }
 
-    // 2. 檢查是否關閉自動更新（命令列旗標 > 環境變數 > config.yaml）
     let args: Vec<String> = std::env::args().collect();
-    if args.iter().any(|arg| arg == "--no-auto-update") {
-        return;
-    }
-    if let Ok(val) = std::env::var("TOKEN_USAGE_INSIGHTS_AUTO_UPDATE") {
-        let lower = val.trim().to_lowercase();
-        if lower == "0" || lower == "false" || lower == "no" || lower == "off" {
-            return;
-        }
-    } else {
-        let (yaml_auto, _) = load_update_config();
-        if yaml_auto == Some(false) {
-            return;
-        }
-    }
 
-    // 3. 判斷環境
+    // 2. 判斷環境
     let env_kind = detect_environment();
     if matches!(env_kind, EnvironmentKind::Npm { .. }) {
         // npm 環境：套用檢查間隔，若有新版僅提示並記錄本次檢查
+        if args.iter().any(|arg| arg == "--no-auto-update") {
+            return;
+        }
         if !is_update_check_interval_elapsed() {
             return;
         }
@@ -1503,6 +1580,32 @@ pub async fn check_and_auto_update_on_launch() {
         }
     };
 
+    // 3. 檢查先前更新之殘留狀態與回滾保護（在判斷任何略過旗標前執行，確保不載入損毀狀態）
+    let backup_dir = install_dir.join(".backup");
+    if backup_dir.join(".rollback_failed").exists() {
+        eprintln!(
+            "❌ 偵測到先前更新回滾失敗標記 ({backup_dir:?})；為防止讀取損毀檔案，程序終止。請依備份手動還原。"
+        );
+        log_update("ERROR", "STARTUP_FATAL", "先前回滾失敗，程序終止");
+        std::process::exit(1);
+    }
+    if backup_dir.exists() && backup_dir.join(".manifest").exists() {
+        println!("⚠️ 偵測到未完成之中斷更新備份，正在自動救援還原至健全版本...");
+        log_update(
+            "WARN",
+            "STARTUP_RECOVERY",
+            "偵測到中斷更新備份，執行自動救援還原",
+        );
+        if let Err(e) = restore_from_backup(&backup_dir, &install_dir) {
+            eprintln!("❌ 自動救援還原失敗: {e}；程序終止以保護狀態。");
+            log_update("ERROR", "STARTUP_FATAL", &format!("救援還原失敗: {e}"));
+            std::process::exit(1);
+        }
+        let _ = fs::remove_dir_all(&backup_dir);
+        println!("✅ 已成功自動還原至健全版本。");
+        log_update("INFO", "STARTUP_RECOVERY", "自動救援還原成功");
+    }
+
     // 4. 若已有其他更新程序正在進行中，等待其完成並重啟，嚴禁同時啟動伺服器
     if UpdateLock::is_locked(&install_dir) {
         println!("⏳ 偵測到已有更新程序正在進行中，等待更新完成...");
@@ -1514,6 +1617,20 @@ pub async fn check_and_auto_update_on_launch() {
         .await
         {
             Ok(()) => {
+                let backup_dir = install_dir.join(".backup");
+                if backup_dir.join(".rollback_failed").exists() {
+                    eprintln!("❌ 其他程序之更新回滾失敗；程序終止以保護狀態。");
+                    log_update("ERROR", "STARTUP_FATAL", "其他程序回滾失敗，程序終止");
+                    std::process::exit(1);
+                }
+                if backup_dir.exists() && backup_dir.join(".manifest").exists() {
+                    eprintln!("⚠️ 偵測到另一程序更新中斷遺留之備份，進行自動救援還原...");
+                    if let Err(re) = restore_from_backup(&backup_dir, &install_dir) {
+                        eprintln!("❌ 救援還原失敗: {re}；程序終止。");
+                        std::process::exit(1);
+                    }
+                    let _ = fs::remove_dir_all(&backup_dir);
+                }
                 println!("🔄 更新程序已完成，正在重新啟動 Token 戰情室...");
                 log_update("INFO", "STARTUP_RESTART", "其他程序更新完成，重啟進程");
                 restart_current_process(&args);
@@ -1526,12 +1643,29 @@ pub async fn check_and_auto_update_on_launch() {
         }
     }
 
-    // 5. 檢查更新檢查間隔（優先讀取環境變數，其次 config.yaml，預設 24 小時）
+    // 5. 檢查是否關閉自動更新（命令列旗標 > 環境變數 > config.yaml）
+    // 注意：此旗標僅關閉後續的檢查與更新發起，不得繞過上述之更新鎖定與救援協調
+    if args.iter().any(|arg| arg == "--no-auto-update") {
+        return;
+    }
+    if let Ok(val) = std::env::var("TOKEN_USAGE_INSIGHTS_AUTO_UPDATE") {
+        let lower = val.trim().to_lowercase();
+        if lower == "0" || lower == "false" || lower == "no" || lower == "off" {
+            return;
+        }
+    } else {
+        let (yaml_auto, _) = load_update_config();
+        if yaml_auto == Some(false) {
+            return;
+        }
+    }
+
+    // 6. 檢查更新檢查間隔（優先讀取環境變數，其次 config.yaml，預設 24 小時）
     if !is_update_check_interval_elapsed() {
         return;
     }
 
-    // 6. 快速檢查（設定超時 STARTUP_CHECK_TIMEOUT_SECS 秒，不阻礙伺服器啟動）
+    // 7. 快速檢查（設定超時 STARTUP_CHECK_TIMEOUT_SECS 秒，不阻礙伺服器啟動）
     let release = match fetch_release_with_logging(None, STARTUP_CHECK_TIMEOUT_SECS).await {
         Ok(r) => r,
         Err(e) => {
@@ -1564,6 +1698,7 @@ pub async fn check_and_auto_update_on_launch() {
         check_only: false,
         force: false,
         target_version: Some(release.tag_name.clone()),
+        prefetched_release: Some(release.clone()),
     };
 
     // 為自動更新設定整體時間上限，避免慢速網路長時間阻塞伺服器啟動
@@ -1595,6 +1730,20 @@ pub async fn check_and_auto_update_on_launch() {
                 .await
                 {
                     Ok(()) => {
+                        let backup_dir = install_dir.join(".backup");
+                        if backup_dir.join(".rollback_failed").exists() {
+                            eprintln!("❌ 其他程序之更新回滾失敗；程序終止以保護狀態。");
+                            log_update("ERROR", "STARTUP_FATAL", "其他程序回滾失敗，程序終止");
+                            std::process::exit(1);
+                        }
+                        if backup_dir.exists() && backup_dir.join(".manifest").exists() {
+                            eprintln!("⚠️ 偵測到另一程序更新中斷遺留之備份，進行自動救援還原...");
+                            if let Err(re) = restore_from_backup(&backup_dir, &install_dir) {
+                                eprintln!("❌ 救援還原失敗: {re}；程序終止。");
+                                std::process::exit(1);
+                            }
+                            let _ = fs::remove_dir_all(&backup_dir);
+                        }
                         println!("🔄 更新已由另一程序完成，正在重新啟動 Token 戰情室...");
                         log_update("INFO", "STARTUP_RESTART", "另一程序更新完成，重啟進程");
                         restart_current_process(&args);
@@ -1612,7 +1761,25 @@ pub async fn check_and_auto_update_on_launch() {
                     }
                 }
             } else {
-                eprintln!("⚠️ 自動更新失敗: {e}，將繼續以現有版本啟動服務。");
+                let backup_dir = install_dir.join(".backup");
+                if backup_dir.join(".rollback_failed").exists() {
+                    eprintln!(
+                        "❌ 自動更新回滾失敗 ({backup_dir:?})；為防止讀取損毀狀態，程序終止。"
+                    );
+                    log_update("ERROR", "STARTUP_FATAL", "回滾失敗，程序終止");
+                    std::process::exit(1);
+                }
+                if backup_dir.exists() && backup_dir.join(".manifest").exists() {
+                    eprintln!("⚠️ 偵測到更新中斷殘留備份，進行自動救援還原...");
+                    if let Err(re) = restore_from_backup(&backup_dir, &install_dir) {
+                        eprintln!("❌ 還原備份失敗: {re}；程序終止以保護狀態。");
+                        log_update("ERROR", "STARTUP_FATAL", &format!("自動還原失敗: {re}"));
+                        std::process::exit(1);
+                    }
+                    let _ = fs::remove_dir_all(&backup_dir);
+                    println!("✅ 已自備份還原完成。");
+                }
+                eprintln!("⚠️ 自動更新失敗: {e}，將繼續以現有健全版本啟動服務。");
                 log_update("WARN", "STARTUP_UPDATE", &format!("自動更新失敗: {e}"));
             }
         }

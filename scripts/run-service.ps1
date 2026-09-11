@@ -16,6 +16,7 @@ $InstallDir = [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($
 $env:PORT = "$Port"
 $env:HOST = "$HostAddress"
 $env:TOKEN_USAGE_INSIGHTS_SERVICE = "1"
+$env:TOKEN_USAGE_INSIGHTS_INSTALL_DIR = "$InstallDir"
 
 $Exe = Join-Path $InstallDir "$AppName.exe"
 if (!(Test-Path $Exe)) {
