@@ -4,6 +4,19 @@
 
 ## [未發行]
 
+### 修正
+
+- 修復 GitHub Copilot Chat（VS Code）Session 的「快取讀取 Token」永遠顯示 0 的問題（[#41](https://github.com/doggy8088/TokenUsageInsights/issues/41)）。VS Code 的 `chatSessions` 檔案本身不記錄快取讀取數；看板現在會一併讀取 Copilot Chat 擴充功能寫入的 `GitHub.copilot-chat/debug-logs/<sessionId>/main.jsonl`，依 `user_message` 回合加總 `inputTokens`、`outputTokens` 與 `cachedTokens`，並以提示文字與時間戳配對到對應的聊天請求。
+- VS Code Copilot Chat 的同步狀態現在會納入除錯記錄檔的大小與修改時間，確保擴充功能在聊天檔案寫入後數秒才刷寫的除錯記錄能在下一次同步被補上。
+
+### 變更
+
+- 有除錯記錄的 VS Code Copilot Chat 回合，輸入 Token 改為該回合所有模型呼叫的非快取輸入總和（原本只採用最後一次呼叫的 `promptTokens`），輸出 Token 為各呼叫輸出的總和，成本估算因此能依快取讀取費率計價；沒有除錯記錄的回合維持原有行為。
+
+### 相容性
+
+- 無資料庫結構、環境變數或安裝流程變更。既有 VS Code Copilot Chat Session 會在下一次同步時依除錯記錄重新計算 Token。
+
 ## [0.9.3] - 2026-09-10
 
 ### 修正

@@ -277,6 +277,8 @@ VS Code Stable 및 Insiders를 지원합니다.
 
 대시보드는 기존 `chatSessions` 파일을 모두 채우고 파일 크기나 수정 시간이 변경되면 다시 동기화합니다. Token 필드가 없는 채팅 Session도 표시되지만 Token 수는 0입니다. 로컬 채팅 파일만 읽으며 클라우드 Session, Remote SSH 호스트 또는 `state.vscdb`는 포함하지 않습니다.
 
+**캐시 읽기 Token 출처**: VS Code의 `chatSessions` 파일은 각 요청에서 마지막 모델 호출의 `promptTokens`와 누적 `completionTokens`만 기록하며 Prompt Cache 캐시 읽기 수는 기록하지 않습니다. 따라서 대시보드는 같은 워크스페이스 디렉터리에 Copilot Chat 확장이 기록하는 디버그 로그 `GitHub.copilot-chat/debug-logs/<sessionId>/main.jsonl`도 함께 읽어, 해당 턴의 모든 모델 호출의 `inputTokens`, `outputTokens`, `cachedTokens`를 합산한 뒤 비캐시 입력, 캐시 읽기, 출력 Token으로 나누고 비용 추정에도 캐시 읽기 단가를 적용합니다. 이 디버그 로그는 VS Code 설정 `github.copilot.chat.agentDebugLog.fileLogging.enabled`로 제어되며(일부 사용자는 실험 기능으로 이미 활성화됨) 기본적으로 최근 50개 Session만 보존합니다. 디버그 로그가 없는 Session은 VS Code 기본 Token 필드로 대체되며 캐시 읽기는 0으로 표시됩니다.
+
 VS Code에서 `--user-data-dir` 또는 Portable Mode를 사용하는 경우 대시보드의 사용자 지정 데이터 루트를 지정할 수 있습니다.
 
 macOS / Linux:

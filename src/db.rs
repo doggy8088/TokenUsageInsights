@@ -1549,6 +1549,34 @@ fn insert_vscode_usage_entry(
     )
 }
 
+fn file_modified_nanos(metadata: &fs::Metadata) -> i64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|value| value.as_nanos() as i64)
+        .unwrap_or(0)
+}
+
+/// Sync-state signature `(size, mtime)` of a VS Code chat session file.
+///
+/// The Copilot Chat extension flushes its per-session debug log (the only
+/// local source of prompt-cache reads) a few seconds after VS Code finishes
+/// writing the `chatSessions` file. Folding the debug log's size and mtime into
+/// the signature makes a later flush trigger a resync instead of leaving the
+/// session stuck without cache-read tokens.
+fn vscode_sync_signature(filepath: &Path, metadata: &fs::Metadata) -> (u64, i64) {
+    let mut size = metadata.len();
+    let mut modified = file_modified_nanos(metadata);
+    if let Some(debug_metadata) =
+        crate::vscode::debug_log_path(filepath).and_then(|debug_path| fs::metadata(debug_path).ok())
+    {
+        size = size.saturating_add(debug_metadata.len());
+        modified = modified.max(file_modified_nanos(&debug_metadata));
+    }
+    (size, modified)
+}
+
 fn sync_vscode_chat_sessions(conn: &mut Connection) -> Result<(), String> {
     let mut seen_sessions = HashSet::new();
 
@@ -1557,13 +1585,7 @@ fn sync_vscode_chat_sessions(conn: &mut Connection) -> Result<(), String> {
             Ok(metadata) => metadata,
             Err(_) => continue,
         };
-        let current_size = metadata.len();
-        let modified_time = metadata
-            .modified()
-            .ok()
-            .and_then(|value| value.duration_since(SystemTime::UNIX_EPOCH).ok())
-            .map(|value| value.as_nanos() as i64)
-            .unwrap_or(0);
+        let (current_size, modified_time) = vscode_sync_signature(&filepath, &metadata);
         let state_key = format!("vscode:{}", filepath.to_string_lossy());
         let previous_state: Option<(u64, i64)> = conn
             .query_row(
@@ -7703,6 +7725,7 @@ pub fn get_usage_entries_by_year(
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use std::sync::{
         atomic::{AtomicU64, Ordering},
         Mutex,
@@ -7710,6 +7733,49 @@ mod tests {
 
     static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn vscode_sync_signature_includes_debug_log_size_and_mtime() {
+        let root = std::env::temp_dir().join(format!(
+            "tui-vscode-sync-signature-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let workspace = root.join("workspaceStorage").join("ws1");
+        let chat_sessions = workspace.join("chatSessions");
+        fs::create_dir_all(&chat_sessions).unwrap();
+        let session_file = chat_sessions.join("abc.jsonl");
+        fs::write(&session_file, "0123456789").unwrap();
+        let metadata = fs::metadata(&session_file).unwrap();
+
+        // Without a debug log the signature is just the session file itself.
+        let (size, modified) = vscode_sync_signature(&session_file, &metadata);
+        assert_eq!(size, 10);
+        assert_eq!(modified, file_modified_nanos(&metadata));
+
+        // A debug log flushed later grows the size and bumps the mtime, so the
+        // session is picked up by the next sync even though the chat file is
+        // unchanged.
+        let debug_path = crate::vscode::debug_log_path(&session_file).unwrap();
+        fs::create_dir_all(debug_path.parent().unwrap()).unwrap();
+        fs::write(&debug_path, "{}\n{}\n").unwrap();
+        let future = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(4_102_444_800);
+        fs::File::options()
+            .write(true)
+            .open(&debug_path)
+            .unwrap()
+            .set_modified(future)
+            .unwrap();
+        let (size_with_log, modified_with_log) = vscode_sync_signature(&session_file, &metadata);
+        assert_eq!(size_with_log, 10 + 6);
+        assert!(modified_with_log > modified);
+        assert_eq!(
+            modified_with_log,
+            file_modified_nanos(&fs::metadata(&debug_path).unwrap())
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
 
     fn temp_jsonl_path(prefix: &str) -> PathBuf {
         let mut path = std::env::temp_dir();

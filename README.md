@@ -277,6 +277,8 @@ COPILOT_APP_DIR="/path/to/copilot-app-data" token-usage-insights
 
 看板會完整回填現有 `chatSessions` 檔案，也會在檔案大小或修改時間變更時重新同步；沒有 Token 欄位的聊天 Session 仍會顯示，但 Token 數為 0。資料只讀取本機聊天檔案，不包含雲端 Session、Remote SSH 主機或 `state.vscdb`。
 
+**快取讀取 Token 來源**：VS Code 的 `chatSessions` 檔案只記錄每個請求最後一次模型呼叫的 `promptTokens` 與累計的 `completionTokens`，並不記錄 Prompt Cache 的快取讀取數。看板會另外讀取 Copilot Chat 擴充功能在同一個工作區目錄下寫入的除錯記錄 `GitHub.copilot-chat/debug-logs/<sessionId>/main.jsonl`，把該回合所有模型呼叫的 `inputTokens`、`outputTokens` 與 `cachedTokens` 加總後，拆成非快取輸入、快取讀取與輸出 Token，成本估算也會依快取讀取費率計價。此除錯記錄由 VS Code 設定 `github.copilot.chat.agentDebugLog.fileLogging.enabled` 控制（部分使用者已由實驗功能開啟），且預設只保留最近 50 個 Session 的記錄；沒有除錯記錄的 Session 會回退使用 VS Code 內建的 Token 欄位，快取讀取會顯示為 0。
+
 若 VS Code 使用 `--user-data-dir` 或 Portable Mode，可指定看板自訂的資料根目錄：
 
 macOS / Linux：
