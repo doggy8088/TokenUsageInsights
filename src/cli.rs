@@ -15,13 +15,15 @@ const HELP_TEXT: &str = r#"Token 戰情室：看板、使用量匯入 / 匯出�
   --no-auto-update   啟動看板時略過自動更新檢查
 
 用途:
-  update      更新 Token 戰情室至最新版本
+  update      更新 Token 戰情室至最新版本（亦可使用 --update 或 -u）
   export      匯出指定日、月或年的資料為 JSON（可重複匯入且支援重複資料去重）
   export-all  一次匯出資料庫中所有 Agent、所有日期的使用量記錄
   import      匯入 JSON 檔內的所有資料（每筆資料依 timestamp 決定日期）
 
 更新:
   token-usage-insights update [參數]
+  token-usage-insights --update [參數]
+  token-usage-insights -u [參數]
   例如:
   token-usage-insights update
   token-usage-insights update --check
@@ -186,7 +188,7 @@ pub(crate) async fn run(args: &[String]) -> Option<i32> {
         "export" => run_export(&args[2..]),
         "export-all" => run_export_all(&args[2..]),
         "import" => run_import(&args[2..]),
-        "update" => run_update_cli(&args[2..]).await,
+        "update" | "--update" | "-u" => run_update_cli(&args[2..]).await,
         "-h" | "--help" | "help" => {
             print_help();
             0
@@ -575,7 +577,10 @@ async fn run_update_cli(args: &[String]) -> i32 {
 
     match crate::updater::run_update(opts).await {
         Ok(()) => 0,
-        Err(_) => 1,
+        Err(err) => {
+            eprintln!("❌ 更新失敗：{err}");
+            1
+        }
     }
 }
 

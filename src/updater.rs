@@ -102,6 +102,13 @@ pub fn standard_install_dir() -> PathBuf {
     PathBuf::from(".")
 }
 
+fn is_valid_installed_payload(dir: &Path) -> bool {
+    let has_static = dir.join("static").is_dir();
+    let has_pricing = dir.join("pricing.csv").is_file();
+    let has_version = dir.join("VERSION").is_file();
+    has_static && has_pricing && has_version
+}
+
 pub fn detect_environment() -> EnvironmentKind {
     let raw_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from(APP_NAME));
     let exe_path = fs::canonicalize(&raw_exe).unwrap_or(raw_exe);
@@ -117,7 +124,17 @@ pub fn detect_environment() -> EnvironmentKind {
         return EnvironmentKind::Npm { exe_path };
     }
 
-    // 2. 檢查標準安裝目錄
+    // 2. 檢查是否在 Git 或 Cargo 開發原始碼目錄
+    for ancestor in exe_dir.ancestors() {
+        if ancestor.join(".git").exists() || ancestor.join("Cargo.toml").exists() {
+            return EnvironmentKind::GitOrDev {
+                root: ancestor.to_path_buf(),
+                exe_path,
+            };
+        }
+    }
+
+    // 3. 檢查標準安裝目錄
     let std_dir = standard_install_dir();
     let canonical_std_dir = fs::canonicalize(&std_dir).unwrap_or(std_dir);
     if let Ok(canonical_exe_dir) = fs::canonicalize(exe_dir) {
@@ -129,14 +146,12 @@ pub fn detect_environment() -> EnvironmentKind {
         }
     }
 
-    // 3. 檢查是否在 Git 或 Cargo 開發原始碼目錄
-    for ancestor in exe_dir.ancestors() {
-        if ancestor.join(".git").exists() || ancestor.join("Cargo.toml").exists() {
-            return EnvironmentKind::GitOrDev {
-                root: ancestor.to_path_buf(),
-                exe_path,
-            };
-        }
+    // 4. 若當前目錄包含完整的已安裝發行檔結構（例如以自訂目錄透過 --service 部署且無 git/npm），亦認定為已安裝目錄
+    if is_valid_installed_payload(exe_dir) {
+        return EnvironmentKind::StandardInstalled {
+            install_dir: exe_dir.to_path_buf(),
+            exe_path,
+        };
     }
 
     EnvironmentKind::Other { exe_path }
@@ -200,8 +215,13 @@ pub fn parse_checksum(sums_text: &str, target_filename: &str) -> Option<String> 
         let parts: Vec<&str> = trimmed.split_whitespace().collect();
         if parts.len() >= 2 {
             let hash = parts[0].trim().to_lowercase();
-            let file = parts[1].trim_start_matches('*').trim();
-            if file == target_filename && hash.len() == 64 {
+            let raw_file = parts[1].trim_start_matches('*').trim();
+            let file = raw_file.strip_prefix("./").unwrap_or(raw_file);
+            let file_name = Path::new(file)
+                .file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or(file);
+            if (file == target_filename || file_name == target_filename) && hash.len() == 64 {
                 return Some(hash);
             }
         }
@@ -230,6 +250,105 @@ pub fn log_update(level: &str, action: &str, message: &str) {
         .open(&log_path)
     {
         let _ = file.write_all(line.as_bytes());
+    }
+}
+
+/// 讀取 config.yaml 中關於 auto_update 與 update_check_interval 的設定
+pub fn parse_config_yaml(content: &str) -> (Option<bool>, Option<i64>) {
+    let mut auto_update = None;
+    let mut update_check_interval = None;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') || trimmed.is_empty() {
+            continue;
+        }
+        if let Some((key, val)) = trimmed.split_once(':') {
+            let key = key.trim();
+            let val = val.trim().trim_matches('"').trim_matches('\'');
+            if key == "auto_update" {
+                if let Ok(b) = val.parse::<bool>() {
+                    auto_update = Some(b);
+                }
+            } else if key == "update_check_interval" {
+                if let Ok(days) = val.parse::<i64>() {
+                    update_check_interval = Some(days);
+                }
+            }
+        }
+    }
+
+    (auto_update, update_check_interval)
+}
+
+pub fn load_update_config() -> (Option<bool>, Option<i64>) {
+    let candidates = [
+        crate::db::get_insights_dir().join("config.yaml"),
+        PathBuf::from("config.yaml"),
+    ];
+    for path in candidates {
+        if let Ok(content) = fs::read_to_string(&path) {
+            return parse_config_yaml(&content);
+        }
+    }
+    (None, None)
+}
+
+struct UpdateLock {
+    lock_path: PathBuf,
+}
+
+impl UpdateLock {
+    fn try_acquire(install_dir: &Path) -> Result<Self, String> {
+        let lock_path = install_dir.join(".update.lock");
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(mut file) => {
+                let _ = writeln!(file, "pid={}", std::process::id());
+                Ok(Self { lock_path })
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if let Ok(metadata) = fs::metadata(&lock_path) {
+                    if let Ok(modified) = metadata.modified() {
+                        if let Ok(elapsed) = modified.elapsed() {
+                            if elapsed > Duration::from_secs(600) {
+                                let _ = fs::remove_file(&lock_path);
+                                return Self::try_acquire(install_dir);
+                            }
+                        }
+                    }
+                }
+                Err("已有另一個更新程序正在執行中，請稍候再試。".to_string())
+            }
+            Err(e) => Err(format!("無法建立更新鎖 ({lock_path:?}): {e}")),
+        }
+    }
+}
+
+impl Drop for UpdateLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.lock_path);
+    }
+}
+
+struct TempDirGuard {
+    path: PathBuf,
+}
+
+impl TempDirGuard {
+    fn new(path: PathBuf) -> Result<Self, String> {
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).map_err(|e| format!("建立暫存目錄失敗: {e}"))?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
     }
 }
 
@@ -291,6 +410,8 @@ fn backup_installation(install_dir: &Path, backup_dir: &Path) -> Result<(), Stri
         "pricing.csv",
         "shell",
         "scripts",
+        "install.sh",
+        "install.ps1",
         "VERSION",
         "README.md",
         "LICENSE",
@@ -317,11 +438,12 @@ fn restore_from_backup(backup_dir: &Path, install_dir: &Path) -> Result<(), Stri
         let entry = entry.map_err(|e| format!("讀取備份項目失敗: {e}"))?;
         let src = entry.path();
         let dst = install_dir.join(entry.file_name());
-        if entry.file_type().map_err(|e| e.to_string())?.is_dir() {
+        let file_type = entry.file_type().map_err(|e| e.to_string())?;
+        if file_type.is_dir() {
             let _ = fs::remove_dir_all(&dst);
             copy_dir_recursive(&src, &dst)?;
         } else {
-            let _ = fs::copy(&src, &dst);
+            fs::copy(&src, &dst).map_err(|e| format!("還原檔案失敗 {src:?} -> {dst:?}: {e}"))?;
         }
     }
     Ok(())
@@ -416,17 +538,45 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), String> {
             log_update("WARN", "CHECK", "略過更新：偵測到 npm / npx 執行環境");
             return Err("不支援在 npm / npx 環境中直接自我更新".to_string());
         }
-        EnvironmentKind::GitOrDev { root, .. } if !options.force && !options.check_only => {
+        EnvironmentKind::GitOrDev { root, .. } => {
+            if options.check_only {
+                let release = fetch_release(options.target_version.as_deref(), 15).await?;
+                let current_version = env!("CARGO_PKG_VERSION");
+                let remote_version = release.tag_name.trim();
+                let is_newer = is_newer_version(remote_version, current_version);
+                println!("  目前版本: v{current_version}");
+                println!("  最新版本: {remote_version}");
+                if is_newer {
+                    println!("💡 發現新版本！請使用 git pull / cargo build 進行更新。");
+                } else {
+                    println!("✅ 目前已是最新版本。");
+                }
+                return Ok(());
+            }
             let msg = format!(
-                "錯誤：目前執行檔位於開發目錄中 ({root:?})，不支援直接更新。\n請使用 git pull / cargo build，或透過 --force 強制執行。"
+                "錯誤：目前執行檔位於開發目錄中 ({root:?})，不支援直接更新。\n請使用 git pull / cargo build 進行更新。"
             );
             eprintln!("{msg}");
             log_update("ERROR", "CHECK", &format!("拒絕更新：開發目錄 {root:?}"));
             return Err("開發目錄不支援自我更新".to_string());
         }
-        EnvironmentKind::Other { exe_path } if !options.force && !options.check_only => {
+        EnvironmentKind::Other { exe_path } => {
+            if options.check_only {
+                let release = fetch_release(options.target_version.as_deref(), 15).await?;
+                let current_version = env!("CARGO_PKG_VERSION");
+                let remote_version = release.tag_name.trim();
+                let is_newer = is_newer_version(remote_version, current_version);
+                println!("  目前版本: v{current_version}");
+                println!("  最新版本: {remote_version}");
+                if is_newer {
+                    println!("💡 發現新版本！請在標準安裝目錄中執行更新。");
+                } else {
+                    println!("✅ 目前已是最新版本。");
+                }
+                return Ok(());
+            }
             let msg = format!(
-                "錯誤：目前執行檔位於非標準安裝目錄 ({exe_path:?})。\n請在標準安裝目錄中執行，或透過 --force 強制執行。"
+                "錯誤：目前執行檔位於非標準安裝目錄 ({exe_path:?})。\n請在標準安裝目錄中執行更新。"
             );
             eprintln!("{msg}");
             log_update(
@@ -436,8 +586,13 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), String> {
             );
             return Err("非標準目錄不支援自我更新".to_string());
         }
-        _ => {}
+        EnvironmentKind::StandardInstalled { .. } => {}
     }
+
+    let install_dir = match &env_kind {
+        EnvironmentKind::StandardInstalled { install_dir, .. } => install_dir.clone(),
+        _ => unreachable!(),
+    };
 
     let target = current_target_triple().ok_or_else(|| {
         let msg = "目前作業系統或硬體架構不支援預先編譯的二進位發行檔".to_string();
@@ -496,36 +651,41 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), String> {
             err
         })?;
 
-    let install_dir = match &env_kind {
-        EnvironmentKind::StandardInstalled { install_dir, .. } => install_dir.clone(),
-        EnvironmentKind::GitOrDev { root, .. } => root.clone(),
-        EnvironmentKind::Other { exe_path } => exe_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf(),
-        EnvironmentKind::Npm { exe_path } => exe_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf(),
-    };
+    // 取得安裝目錄之獨占鎖
+    let _lock = UpdateLock::try_acquire(&install_dir)?;
 
+    // 使用 TempDirGuard 確保異常離開時自動清理暫存
     let update_tmp_dir = crate::db::get_insights_dir().join(".update-tmp");
-    let _ = fs::remove_dir_all(&update_tmp_dir);
-    fs::create_dir_all(&update_tmp_dir).map_err(|e| format!("建立暫存目錄失敗: {e}"))?;
+    let tmp_guard = TempDirGuard::new(update_tmp_dir)?;
 
     println!("⬇️ 正在下載發行包: {archive_name} ...");
     log_update("INFO", "DOWNLOAD", &format!("開始下載 {archive_name}"));
-    let archive_bytes = download_bytes(&asset.browser_download_url, 60).await?;
+    let archive_bytes = match download_bytes(&asset.browser_download_url, 60).await {
+        Ok(b) => b,
+        Err(e) => {
+            log_update("ERROR", "DOWNLOAD", &e);
+            return Err(e);
+        }
+    };
 
     println!("⬇️ 正在下載校驗檔 SHA256SUMS ...");
-    let sums_bytes = download_bytes(&checksum_asset.browser_download_url, 15).await?;
+    let sums_bytes = match download_bytes(&checksum_asset.browser_download_url, 15).await {
+        Ok(b) => b,
+        Err(e) => {
+            log_update("ERROR", "DOWNLOAD", &e);
+            return Err(e);
+        }
+    };
     let sums_text = String::from_utf8_lossy(&sums_bytes);
 
-    let expected_hash = parse_checksum(&sums_text, &archive_name).ok_or_else(|| {
-        let err = format!("SHA256SUMS 中未找到 {archive_name} 的校驗碼");
-        log_update("ERROR", "VERIFY", &err);
-        err
-    })?;
+    let expected_hash = match parse_checksum(&sums_text, &archive_name) {
+        Some(h) => h,
+        None => {
+            let err = format!("SHA256SUMS 中未找到 {archive_name} 的校驗碼");
+            log_update("ERROR", "VERIFY", &err);
+            return Err(err);
+        }
+    };
 
     println!("🔒 正在驗證 SHA256 校驗碼...");
     if !verify_sha256(&archive_bytes, &expected_hash) {
@@ -537,9 +697,12 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), String> {
     log_update("INFO", "VERIFY", "SHA256 校驗通過");
 
     let is_zip = archive_name.ends_with(".zip");
-    let extract_dir = update_tmp_dir.join("extracted");
+    let extract_dir = tmp_guard.path.join("extracted");
     println!("📦 正在解壓縮檔案...");
-    extract_archive(&archive_bytes, &extract_dir, is_zip)?;
+    if let Err(e) = extract_archive(&archive_bytes, &extract_dir, is_zip) {
+        log_update("ERROR", "EXTRACT", &e);
+        return Err(e);
+    }
 
     // 尋找解壓後的根目錄（可能有一層子目錄）
     let release_root = if extract_dir.join(APP_NAME).exists()
@@ -559,7 +722,14 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), String> {
                 }
             }
         }
-        found.ok_or_else(|| "解壓後的目錄中未找到執行檔".to_string())?
+        match found {
+            Some(dir) => dir,
+            None => {
+                let err = "解壓後的目錄中未找到執行檔".to_string();
+                log_update("ERROR", "EXTRACT", &err);
+                return Err(err);
+            }
+        }
     };
 
     println!("💾 正在備份現有安裝...");
@@ -586,28 +756,47 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), String> {
             return Err(format!("來源缺少可執行檔: {src_exe:?}"));
         }
 
-        #[cfg(windows)]
-        {
-            let old_exe = install_dir.join(format!("{APP_NAME}.exe.old"));
-            let _ = fs::remove_file(&old_exe);
-            if target_exe.exists() {
-                fs::rename(&target_exe, &old_exe)
-                    .map_err(|e| format!("Windows 執行檔換名失敗: {e}"))?;
+        // 跨平台安全替換執行檔（Windows 使用 self_replace 或安全重命名）
+        let current_exe = std::env::current_exe().ok();
+        let is_current_exe = current_exe
+            .as_ref()
+            .and_then(|c| fs::canonicalize(c).ok())
+            .zip(fs::canonicalize(&target_exe).ok())
+            .map(|(a, b)| a == b)
+            .unwrap_or(false);
+
+        if is_current_exe {
+            self_replace::self_replace(&src_exe)
+                .map_err(|e| format!("執行中的程序替換失敗: {e}"))?;
+        } else {
+            #[cfg(windows)]
+            {
+                let old_exe = target_exe.with_extension(format!("old.{}.tmp", std::process::id()));
+                let _ = fs::remove_file(&old_exe);
+                if target_exe.exists() {
+                    fs::rename(&target_exe, &old_exe)
+                        .map_err(|e| format!("Windows 執行檔換名失敗: {e}"))?;
+                }
+                if let Err(e) = fs::copy(&src_exe, &target_exe) {
+                    let _ = fs::rename(&old_exe, &target_exe);
+                    return Err(format!("寫入新執行檔失敗: {e}"));
+                }
+                let _ = fs::remove_file(&old_exe);
             }
-            fs::copy(&src_exe, &target_exe).map_err(|e| format!("寫入新執行檔失敗: {e}"))?;
+
+            #[cfg(not(windows))]
+            {
+                if target_exe.exists() {
+                    let _ = fs::remove_file(&target_exe);
+                }
+                fs::copy(&src_exe, &target_exe).map_err(|e| format!("寫入新執行檔失敗: {e}"))?;
+            }
         }
 
-        #[cfg(not(windows))]
+        #[cfg(unix)]
         {
-            if target_exe.exists() {
-                let _ = fs::remove_file(&target_exe);
-            }
-            fs::copy(&src_exe, &target_exe).map_err(|e| format!("寫入新執行檔失敗: {e}"))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = fs::set_permissions(&target_exe, fs::Permissions::from_mode(0o755));
-            }
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&target_exe, fs::Permissions::from_mode(0o755));
         }
 
         for folder in ["static", "shell", "scripts"] {
@@ -640,14 +829,24 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), String> {
     if let Err(err) = install_result {
         eprintln!("❌ 安裝失敗，正在自動回滾: {err}");
         log_update("ERROR", "INSTALL", &format!("安裝失敗: {err}，開始回滾"));
-        let _ = restore_from_backup(&backup_dir, &install_dir);
-        let _ = fs::remove_dir_all(&backup_dir);
-        let _ = fs::remove_dir_all(&update_tmp_dir);
+        if let Err(rollback_err) = restore_from_backup(&backup_dir, &install_dir) {
+            eprintln!(
+                "❌ 自動回滾失敗: {rollback_err}；請保留備份目錄 {:?} 進行手動還原",
+                backup_dir
+            );
+            log_update("ERROR", "ROLLBACK", &format!("回滾失敗: {rollback_err}"));
+            return Err(format!(
+                "安裝失敗 ({err}) 且回滾失敗 ({rollback_err})；備份已保留於 {backup_dir:?}"
+            ));
+        } else {
+            println!("✅ 已成功回滾至先前版本。");
+            log_update("INFO", "ROLLBACK", "回滾成功");
+            let _ = fs::remove_dir_all(&backup_dir);
+        }
         return Err(err);
     }
 
     let _ = fs::remove_dir_all(&backup_dir);
-    let _ = fs::remove_dir_all(&update_tmp_dir);
 
     println!("🎉 成功更新至版本 {remote_version}！");
     log_update("INFO", "INSTALL", &format!("成功更新至 {remote_version}"));
@@ -661,7 +860,7 @@ pub async fn check_and_auto_update_on_launch() {
         return;
     }
 
-    // 2. 檢查是否關閉自動更新
+    // 2. 檢查是否關閉自動更新（命令列旗標 > 環境變數 > config.yaml）
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|arg| arg == "--no-auto-update") {
         return;
@@ -669,6 +868,11 @@ pub async fn check_and_auto_update_on_launch() {
     if let Ok(val) = std::env::var("TOKEN_USAGE_INSIGHTS_AUTO_UPDATE") {
         let lower = val.trim().to_lowercase();
         if lower == "0" || lower == "false" || lower == "no" || lower == "off" {
+            return;
+        }
+    } else {
+        let (yaml_auto, _) = load_update_config();
+        if yaml_auto == Some(false) {
             return;
         }
     }
@@ -694,11 +898,15 @@ pub async fn check_and_auto_update_on_launch() {
         return;
     }
 
-    // 4. 檢查更新檢查間隔（預設 24 小時）
+    // 4. 檢查更新檢查間隔（優先讀取環境變數，其次 config.yaml，預設 24 小時）
+    let (_, yaml_interval_days) = load_update_config();
+    let default_hours = yaml_interval_days
+        .map(|d| d * 24)
+        .unwrap_or(DEFAULT_UPDATE_INTERVAL_HOURS);
     let interval_hours: i64 = std::env::var("TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_UPDATE_INTERVAL_HOURS);
+        .unwrap_or(default_hours);
 
     if let Ok(conn) = crate::db::get_db_conn() {
         if let Ok(Some(last_check_str)) = crate::db::get_system_metadata(&conn, LAST_CHECK_KEY) {
@@ -801,8 +1009,9 @@ mod tests {
     #[test]
     fn parse_checksum_extracts_correct_hash() {
         let sums = r#"
-4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945  token-usage-insights-v0.9.5-aarch64-apple-darwin.tar.gz
+4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945  ./token-usage-insights-v0.9.5-aarch64-apple-darwin.tar.gz
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 *token-usage-insights-v0.9.5-x86_64-apple-darwin.tar.gz
+a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2  token-usage-insights-v0.9.5-x86_64-pc-windows-msvc.zip
 "#;
         assert_eq!(
             parse_checksum(
@@ -817,6 +1026,13 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 *token-usage-in
                 "token-usage-insights-v0.9.5-x86_64-apple-darwin.tar.gz"
             ),
             Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string())
+        );
+        assert_eq!(
+            parse_checksum(
+                sums,
+                "token-usage-insights-v0.9.5-x86_64-pc-windows-msvc.zip"
+            ),
+            Some("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_string())
         );
         assert_eq!(parse_checksum(sums, "non-existent-file"), None);
     }
@@ -869,5 +1085,88 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 *token-usage-in
             filename,
             "token-usage-insights-v0.9.5-aarch64-apple-darwin.tar.gz"
         );
+    }
+
+    #[test]
+    fn parse_config_yaml_extracts_options() {
+        let yaml = r#"
+# Token 戰情室設定檔
+auto_update: false
+update_check_interval: 3
+"#;
+        let (auto, interval) = parse_config_yaml(yaml);
+        assert_eq!(auto, Some(false));
+        assert_eq!(interval, Some(3));
+
+        let yaml2 = r#"
+auto_update: "true"
+update_check_interval: '7'
+"#;
+        let (auto2, interval2) = parse_config_yaml(yaml2);
+        assert_eq!(auto2, Some(true));
+        assert_eq!(interval2, Some(7));
+    }
+
+    #[test]
+    fn backup_and_restore_cycle() {
+        let temp = std::env::temp_dir().join(format!(
+            "test-backup-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let install_dir = temp.join("install");
+        let backup_dir = temp.join("backup");
+        fs::create_dir_all(&install_dir).unwrap();
+
+        fs::write(install_dir.join("VERSION"), "v0.9.5").unwrap();
+        fs::write(install_dir.join("pricing.csv"), "model,price").unwrap();
+        fs::create_dir_all(install_dir.join("static")).unwrap();
+        fs::write(
+            install_dir.join("static").join("index.html"),
+            "<h1>Test</h1>",
+        )
+        .unwrap();
+
+        // Backup
+        backup_installation(&install_dir, &backup_dir).unwrap();
+        assert!(backup_dir.join("VERSION").exists());
+        assert!(backup_dir.join("pricing.csv").exists());
+        assert!(backup_dir.join("static").join("index.html").exists());
+
+        // Corrupt install_dir
+        fs::write(install_dir.join("VERSION"), "corrupted").unwrap();
+        fs::remove_file(install_dir.join("pricing.csv")).unwrap();
+
+        // Restore
+        restore_from_backup(&backup_dir, &install_dir).unwrap();
+        assert_eq!(
+            fs::read_to_string(install_dir.join("VERSION")).unwrap(),
+            "v0.9.5"
+        );
+        assert!(install_dir.join("pricing.csv").exists());
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn update_lock_prevents_concurrent_access() {
+        let temp = std::env::temp_dir().join(format!(
+            "test-lock-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        fs::create_dir_all(&temp).unwrap();
+
+        let lock1 = UpdateLock::try_acquire(&temp);
+        assert!(lock1.is_ok());
+
+        let lock2 = UpdateLock::try_acquire(&temp);
+        assert!(lock2.is_err());
+
+        drop(lock1);
+
+        let lock3 = UpdateLock::try_acquire(&temp);
+        assert!(lock3.is_ok());
+
+        drop(lock3);
+        let _ = fs::remove_dir_all(&temp);
     }
 }
