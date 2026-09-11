@@ -13,6 +13,299 @@ function Assert-Equal {
     }
 }
 
+function Assert-True {
+    param([bool]$Condition, [string]$Message)
+    if (-not $Condition) {
+        throw $Message
+    }
+}
+
+function Invoke-GetScriptInstallCapture {
+    param([Nullable[int]]$Port = $null)
+
+    $tempRoot = Join-Path $Root ([guid]::NewGuid())
+    $packageRoot = Join-Path $tempRoot "package"
+    $releaseDir = Join-Path $packageRoot "token-usage-insights-v-test-x86_64-pc-windows-msvc"
+    $capturePath = Join-Path $tempRoot "install-args.json"
+    New-Item -ItemType Directory -Force -Path (Join-Path $releaseDir "static") | Out-Null
+
+    Set-Content -LiteralPath (Join-Path $releaseDir "pricing.csv") -Value "model,input,output"
+    $fakeInstallScript = @'
+param(
+    [string]$InstallDir,
+    [string]$BinDir,
+    [string]$HostAddress,
+    [int]$Port,
+    [switch]$Service
+)
+$payload = [ordered]@{
+    Keys = @($PSBoundParameters.Keys | Sort-Object)
+    Port = if ($PSBoundParameters.ContainsKey('Port')) { $Port } else { $null }
+    HostAddress = if ($PSBoundParameters.ContainsKey('HostAddress')) { $HostAddress } else { $null }
+    Service = $PSBoundParameters.ContainsKey('Service')
+}
+$payload | ConvertTo-Json -Compress | Set-Content -LiteralPath '__CAPTURE_PATH__'
+'@.Replace('__CAPTURE_PATH__', $capturePath.Replace("'", "''"))
+    Set-Content -LiteralPath (Join-Path $releaseDir "install.ps1") -Value $fakeInstallScript
+
+    function Invoke-RestMethod { @{ tag_name = "v-test" } }
+    function Invoke-WebRequest {
+        param([string]$Uri, [string]$OutFile)
+        Set-Content -LiteralPath $OutFile -Value "placeholder"
+    }
+    function Expand-Archive {
+        param([string]$Path, [string]$DestinationPath, [switch]$Force)
+        Microsoft.PowerShell.Management\Copy-Item -Recurse -Force $releaseDir (Join-Path $DestinationPath (Split-Path $releaseDir -Leaf))
+    }
+
+    try {
+        $arguments = @{
+            Version = "latest"
+            InstallDir = (Join-Path $tempRoot "install")
+            BinDir = (Join-Path $tempRoot "bin")
+            HostAddress = "127.0.0.1"
+            Service = $true
+        }
+        if ($null -ne $Port) {
+            $arguments["Port"] = $Port
+        }
+
+        & (Join-Path $PSScriptRoot "get.ps1") @arguments
+        Get-Content -Raw -LiteralPath $capturePath | ConvertFrom-Json
+    } finally {
+        Remove-Item Function:\Invoke-RestMethod -ErrorAction SilentlyContinue
+        Remove-Item Function:\Invoke-WebRequest -ErrorAction SilentlyContinue
+        Remove-Item Function:\Expand-Archive -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $tempRoot) {
+            Remove-Item -LiteralPath $tempRoot -Recurse -Force
+        }
+    }
+}
+
+function Invoke-InstallServiceTest {
+    param(
+        [string]$HostAddress,
+        [int]$Port,
+        [switch]$FailScheduledTaskAction
+    )
+
+    $tempRoot = Join-Path $Root ([guid]::NewGuid())
+    $releaseDir = Join-Path $tempRoot "release"
+    $scriptDir = Join-Path $releaseDir "scripts"
+    $installDir = Join-Path $tempRoot "installed"
+    $binDir = Join-Path $tempRoot "bin"
+    $previousAppData = $env:APPDATA
+    $previousUsername = $env:USERNAME
+    $env:APPDATA = Join-Path $tempRoot "AppData\Roaming"
+    $env:USERNAME = "test-user"
+
+    New-Item -ItemType Directory -Force -Path (Join-Path $releaseDir "static") | Out-Null
+    New-Item -ItemType Directory -Force -Path (Join-Path $releaseDir "shell") | Out-Null
+    New-Item -ItemType Directory -Force -Path $scriptDir | Out-Null
+    New-Item -ItemType Directory -Force -Path $env:APPDATA | Out-Null
+
+    Set-Content -LiteralPath (Join-Path $releaseDir "token-usage-insights.exe") -Value "binary"
+    Set-Content -LiteralPath (Join-Path $releaseDir "pricing.csv") -Value "model,input,output"
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot "install.ps1") -Destination (Join-Path $scriptDir "install.ps1")
+    Set-Content -LiteralPath (Join-Path $scriptDir "run-service.ps1") -Value "Write-Host 'runner'"
+
+    $global:serviceEvents = New-Object System.Collections.Generic.List[string]
+    $global:hostMessages = New-Object System.Collections.Generic.List[string]
+    $global:runnerProcessAlive = $true
+    $global:appProcessAlive = $true
+    $global:scheduledTaskTriggerUser = $null
+    $runnerCommandLine = "powershell.exe -File `"$installDir\scripts\run-service.ps1`" -InstallDir `"$installDir`""
+
+    function Stop-ScheduledTask {
+        [CmdletBinding()]
+        param([string]$TaskName)
+        $global:serviceEvents.Add("StopScheduledTask")
+    }
+    function Get-CimInstance {
+        [CmdletBinding()]
+        param([string]$ClassName)
+        if ($global:runnerProcessAlive) {
+            return [pscustomobject]@{
+                Name = "powershell.exe"
+                ProcessId = 111
+                CommandLine = $runnerCommandLine
+            }
+        }
+    }
+    function Get-Process {
+        [CmdletBinding()]
+        param([string]$Name, [int]$Id)
+        if ($PSBoundParameters.ContainsKey("Id")) {
+            if (($Id -eq 111) -and $global:runnerProcessAlive) {
+                return [pscustomobject]@{ Id = 111; Name = "powershell" }
+            }
+
+            return
+        }
+
+        if (($Name -eq "token-usage-insights") -and $global:appProcessAlive) {
+            return [pscustomobject]@{ Id = 222; Name = "token-usage-insights" }
+        }
+    }
+    function Stop-Process {
+        [CmdletBinding()]
+        param(
+            [Parameter(ValueFromPipeline = $true)]$InputObject,
+            [int]$Id,
+            [switch]$Force
+        )
+        process {
+            if ($PSBoundParameters.ContainsKey("Id")) {
+                if ($Id -eq 111) {
+                    $global:runnerProcessAlive = $false
+                    $global:serviceEvents.Add("StopRunner")
+                }
+
+                return
+            }
+
+            if ($InputObject -and $InputObject.Id -eq 222) {
+                $global:appProcessAlive = $false
+                $global:serviceEvents.Add("StopApp")
+            }
+        }
+    }
+    function Copy-Item {
+        [CmdletBinding(DefaultParameterSetName = "Path")]
+        param(
+            [Parameter(Mandatory = $true, Position = 0, ParameterSetName = "Path")]
+            [string]$Path,
+            [Parameter(Mandatory = $true, Position = 1, ParameterSetName = "Path")]
+            [string]$Destination,
+            [Parameter(Mandatory = $true, ParameterSetName = "LiteralPath")]
+            [string]$LiteralPath,
+            [Parameter(Mandatory = $true, ParameterSetName = "LiteralPathDestination")]
+            [string]$LiteralDestination,
+            [switch]$Force,
+            [switch]$Recurse
+        )
+
+        $global:serviceEvents.Add("CopyItem")
+        Microsoft.PowerShell.Management\Copy-Item @PSBoundParameters
+    }
+    function New-ScheduledTaskAction {
+        [CmdletBinding()]
+        param([Parameter(ValueFromRemainingArguments = $true)]$RemainingArgs)
+        if ($FailScheduledTaskAction) {
+            throw "Simulated scheduled task action failure."
+        }
+        @{ Action = "ok" }
+    }
+    function New-ScheduledTaskTrigger {
+        [CmdletBinding()]
+        param(
+            [string]$User,
+            [Parameter(ValueFromRemainingArguments = $true)]$RemainingArgs
+        )
+        $global:scheduledTaskTriggerUser = $User
+        @{ Trigger = "ok" }
+    }
+    function New-ScheduledTaskSettingsSet {
+        [CmdletBinding()]
+        param([Parameter(ValueFromRemainingArguments = $true)]$RemainingArgs)
+        @{ Settings = "ok" }
+    }
+    function Register-ScheduledTask {
+        [CmdletBinding()]
+        param(
+            [string]$TaskName,
+            [Parameter(ValueFromRemainingArguments = $true)]$RemainingArgs
+        )
+        $global:serviceEvents.Add("RegisterScheduledTask")
+    }
+    function Start-ScheduledTask {
+        [CmdletBinding()]
+        param([string]$TaskName)
+        $global:serviceEvents.Add("StartScheduledTask")
+    }
+    function Unregister-ScheduledTask {
+        [CmdletBinding()]
+        param([string]$TaskName, [switch]$Confirm)
+        $global:serviceEvents.Add("UnregisterScheduledTask")
+    }
+    function New-Object {
+        [CmdletBinding()]
+        param([string]$ComObject)
+
+        if ($ComObject -eq "WScript.Shell") {
+            $shell = [pscustomobject]@{}
+            $shell | Add-Member -MemberType ScriptMethod -Name CreateShortcut -Value {
+                param([string]$ShortcutPath)
+                $global:serviceEvents.Add("CreateShortcut")
+                $shortcut = [pscustomobject]@{
+                    TargetPath = $null
+                    Arguments = $null
+                    WorkingDirectory = $null
+                    WindowStyle = $null
+                    Description = $null
+                }
+                $shortcut | Add-Member -MemberType ScriptMethod -Name Save -Value {
+                    $global:serviceEvents.Add("SaveShortcut")
+                }
+                return $shortcut
+            }
+            return $shell
+        }
+
+        throw "Unexpected New-Object mock request: $ComObject"
+    }
+    function Start-Process {
+        [CmdletBinding()]
+        param(
+            [string]$FilePath,
+            [string]$ArgumentList,
+            [string]$WorkingDirectory,
+            [string]$WindowStyle
+        )
+        $global:serviceEvents.Add("StartFallbackProcess")
+    }
+    function Write-Host {
+        param([Parameter(ValueFromRemainingArguments = $true)]$Arguments)
+        $global:hostMessages.Add(($Arguments -join " "))
+    }
+
+    try {
+        & (Join-Path $scriptDir "install.ps1") -InstallDir $installDir -BinDir $binDir -HostAddress $HostAddress -Port $Port -Service
+
+        [pscustomobject]@{
+            Events = @($global:serviceEvents)
+            Output = @($global:hostMessages)
+            TriggerUser = $global:scheduledTaskTriggerUser
+        }
+    } finally {
+        foreach ($functionName in @(
+            "Stop-ScheduledTask",
+            "Get-CimInstance",
+            "Get-Process",
+            "Stop-Process",
+            "Copy-Item",
+            "New-ScheduledTaskAction",
+            "New-ScheduledTaskTrigger",
+            "New-ScheduledTaskSettingsSet",
+            "Register-ScheduledTask",
+            "Start-ScheduledTask",
+            "Unregister-ScheduledTask",
+            "New-Object",
+            "Start-Process",
+            "Write-Host"
+        )) {
+            Remove-Item "Function:\$functionName" -ErrorAction SilentlyContinue
+        }
+        Remove-Variable serviceEvents, hostMessages, runnerProcessAlive, appProcessAlive, scheduledTaskTriggerUser -Scope Global -ErrorAction SilentlyContinue
+        $env:APPDATA = $previousAppData
+        $env:USERNAME = $previousUsername
+
+        if (Test-Path -LiteralPath $tempRoot) {
+            Remove-Item -LiteralPath $tempRoot -Recurse -Force
+        }
+    }
+}
+
 try {
     $cases = @(
         @{
@@ -80,36 +373,33 @@ try {
     Assert-Equal $true $getCmd.Parameters.ContainsKey("HostAddress") "get.ps1 should declare -HostAddress."
     Assert-Equal ([Nullable[int]].Name) $getCmd.Parameters["Port"].ParameterType.Name "get.ps1 should allow install.ps1 to keep its own PORT default."
 
+    $capturedInstallArgs = Invoke-GetScriptInstallCapture
+    Assert-Equal $false $capturedInstallArgs.Keys.Contains("Port") "get.ps1 should not pass -Port when the caller omits it."
+    Assert-Equal "127.0.0.1" $capturedInstallArgs.HostAddress "get.ps1 should forward -HostAddress."
+    Assert-Equal $true $capturedInstallArgs.Service "get.ps1 should forward -Service."
+
+    $capturedInstallArgsWithPort = Invoke-GetScriptInstallCapture -Port 3010
+    Assert-Equal 3010 $capturedInstallArgsWithPort.Port "get.ps1 should forward an explicit -Port value."
+
     $runnerCmd = Get-Command (Resolve-Path (Join-Path $PSScriptRoot "run-service.ps1")).Path
     Assert-Equal $true $runnerCmd.Parameters.ContainsKey("InstallDir") "run-service.ps1 should declare -InstallDir."
     Assert-Equal $true $runnerCmd.Parameters.ContainsKey("HostAddress") "run-service.ps1 should declare -HostAddress."
 
-    $getScriptContent = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot "get.ps1")
-    if (-not $getScriptContent.Contains('if ($null -ne $Port) { $InstallArgs["Port"] = $Port }')) {
-        throw "get.ps1 should only forward -Port when explicitly provided."
-    }
+    $installIpv6Result = Invoke-InstallServiceTest -HostAddress "::1" -Port 4010
+    $copyIndex = $installIpv6Result.Events.IndexOf("CopyItem")
+    $stopRunnerIndex = $installIpv6Result.Events.IndexOf("StopRunner")
+    $stopAppIndex = $installIpv6Result.Events.IndexOf("StopApp")
+    Assert-True ($copyIndex -gt $stopRunnerIndex -and $copyIndex -gt $stopAppIndex) "install.ps1 should stop existing service processes before copying files."
+    Assert-True ($installIpv6Result.Output -contains "  http://[::1]:4010") "install.ps1 should bracket IPv6 dashboard URLs."
+    Assert-Equal "test-user" $installIpv6Result.TriggerUser "install.ps1 should scope the logon trigger to the current user."
 
-    $installScriptContent = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot "install.ps1")
-    $stopCallIndex = $installScriptContent.IndexOf('Stop-ExistingServiceInstance -TaskName $TaskName -ProcessName $AppName -InstallDir $InstallDir')
-    $copyBinaryIndex = $installScriptContent.IndexOf('Copy-Item -Force $BinarySrc (Join-Path $InstallDir "$AppName.exe")')
-    if ($stopCallIndex -lt 0 -or $copyBinaryIndex -lt 0 -or $stopCallIndex -ge $copyBinaryIndex) {
-        throw "install.ps1 should stop an existing service instance before copying the executable."
-    }
+    $installWildcardResult = Invoke-InstallServiceTest -HostAddress "::" -Port 3003
+    Assert-True ($installWildcardResult.Output -contains "  http://localhost:3003") "install.ps1 should print localhost for unspecified IPv6 dashboard URLs."
 
-    if (-not $installScriptContent.Contains('[System.Net.IPAddress]::IPv6Any')) {
-        throw "install.ps1 should detect unspecified IPv6 dashboard hosts."
-    }
-    if (-not $installScriptContent.Contains('return "[$HostAddress]"')) {
-        throw "install.ps1 should bracket IPv6 dashboard hosts when printing the URL."
-    }
-    if (-not $installScriptContent.Contains('-AtLogOn -User $env:USERNAME')) {
-        throw "install.ps1 should scope the logon trigger to the current user."
-    }
-    $tryIndex = $installScriptContent.IndexOf('try {')
-    $actionIndex = $installScriptContent.IndexOf('$Action = New-ScheduledTaskAction')
-    if ($tryIndex -lt 0 -or $actionIndex -lt 0 -or $tryIndex -ge $actionIndex) {
-        throw "install.ps1 should define scheduled task action inside the guarded try block."
-    }
+    $installFallbackResult = Invoke-InstallServiceTest -HostAddress "127.0.0.1" -Port 3003 -FailScheduledTaskAction
+    Assert-True ($installFallbackResult.Events -contains "CreateShortcut") "install.ps1 should create a Startup shortcut when scheduled task registration setup fails."
+    Assert-True ($installFallbackResult.Events -contains "StartFallbackProcess") "install.ps1 should start the fallback background runner when scheduled task setup fails."
+    Assert-True ($installFallbackResult.Output -contains "  Registered in:   Startup folder") "install.ps1 should report Startup folder registration after falling back."
 
     Write-Host "Windows collector smoke tests passed."
 } finally {
