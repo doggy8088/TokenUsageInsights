@@ -173,5 +173,7 @@ claude-opus-4-7-fast,Cursor,1M Tokens,10.00,1.00,50.00,N/A
 claude-opus-4-7,Cursor,1M Tokens,5.00,0.50,25.00,N/A
 claude-opus-4-6,Cursor,1M Tokens,5.00,0.50,25.00,N/A
 claude-opus-4-5,Cursor,1M Tokens,5.00,0.50,25.00,N/A
+muse-spark-1.3,Meta,1M Tokens,1.25,0.15,4.25,N/A
+muse-spark-1.3-contributor,Meta,1M Tokens,0.10,0.002,0.20,N/A
 muse-spark-1.2,Meta,1M Tokens,1.25,0.15,4.25,N/A
 muse-spark-1.2-contributor,Meta,1M Tokens,0.10,0.002,0.20,N/A

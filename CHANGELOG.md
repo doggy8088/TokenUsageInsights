@@ -6,6 +6,7 @@
 
 ### 修正
 
+- 補充 Muse Code 模型 `muse-spark-1.3` 與 `muse-spark-1.3-contributor` 的標準費率規則，修復 Muse 使用量記錄出現 `muse-spark-1.3-contributor` 時因缺少價格條目導致的「找不到可用的模型價格規則」錯誤。費率採 Meta 官方 model-catalog 牌價（標準版 `muse-spark-1.3` 輸入 1.25、快取 0.15、輸出 4.25 美元／每百萬 tokens；貢獻者優惠版 `muse-spark-1.3-contributor` 輸入 0.10、快取 0.002、輸出 0.20 美元）。
 - 修復 GitHub Copilot Chat（VS Code）Session 的「快取讀取 Token」永遠顯示 0 的問題（[#41](https://github.com/doggy8088/TokenUsageInsights/issues/41)）。VS Code 的 `chatSessions` 檔案本身不記錄快取讀取數；看板現在會一併讀取 Copilot Chat 擴充功能寫入的 `GitHub.copilot-chat/debug-logs/<sessionId>/main.jsonl`，依 `user_message` 回合加總 `inputTokens`、`outputTokens` 與 `cachedTokens`，並以提示文字與時間戳配對到對應的聊天請求。
 - VS Code Copilot Chat 的同步狀態現在會納入除錯記錄檔的大小與修改時間，確保擴充功能在聊天檔案寫入後數秒才刷寫的除錯記錄能在下一次同步被補上。
 

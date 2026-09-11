@@ -1066,4 +1066,59 @@ mod tests {
         // input 3.00 + cache read 0.50 + output 15.00 = 18.50
         assert!((fast - 18.5).abs() < 1e-12);
     }
+
+    #[test]
+    fn muse_spark_1_3_and_contributor_resolve_pricing_from_csv() {
+        let rules = load_pricing_rules();
+
+        let standard = calculate_usage_cost(
+            &rules,
+            Some("muse-spark-1.3"),
+            1_000_000,
+            1_000_000,
+            1_000_000,
+            0,
+            0,
+        )
+        .expect("muse-spark-1.3 should have a pricing rule");
+        // input 1.25 + cache read 0.15 + output 4.25 = 5.65
+        assert!((standard - 5.65).abs() < 1e-12);
+
+        let contributor = calculate_usage_cost(
+            &rules,
+            Some("muse-spark-1.3-contributor"),
+            1_000_000,
+            1_000_000,
+            1_000_000,
+            0,
+            0,
+        )
+        .expect("muse-spark-1.3-contributor should have a pricing rule");
+        // input 0.10 + cache read 0.002 + output 0.20 = 0.302
+        assert!((contributor - 0.302).abs() < 1e-12);
+
+        let standard_12 = calculate_usage_cost(
+            &rules,
+            Some("muse-spark-1.2"),
+            1_000_000,
+            1_000_000,
+            1_000_000,
+            0,
+            0,
+        )
+        .expect("muse-spark-1.2 should have a pricing rule");
+        assert!((standard_12 - 5.65).abs() < 1e-12);
+
+        let contributor_12 = calculate_usage_cost(
+            &rules,
+            Some("muse-spark-1.2-contributor"),
+            1_000_000,
+            1_000_000,
+            1_000_000,
+            0,
+            0,
+        )
+        .expect("muse-spark-1.2-contributor should have a pricing rule");
+        assert!((contributor_12 - 0.302).abs() < 1e-12);
+    }
 }
