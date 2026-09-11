@@ -178,5 +178,19 @@ while ($true) {
         continue
     }
 
+    # If an external updater requested this service to stop for an update,
+    # wait for the update to complete and restart the service
+    $restartPendingFile = Join-Path $InstallDir ".service_restart_pending"
+    if (Test-Path $restartPendingFile) {
+        $lockFile = Join-Path $InstallDir ".update.lock"
+        $waitCount = 0
+        while ((Test-Path $lockFile) -and $waitCount -lt 900) {
+            Start-Sleep -Milliseconds 100
+            $waitCount++
+        }
+        Remove-Item -LiteralPath $restartPendingFile -Force -ErrorAction SilentlyContinue
+        continue
+    }
+
     exit $Process.ExitCode
 }
