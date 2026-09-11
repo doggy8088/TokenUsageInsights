@@ -64,7 +64,7 @@ jobs:
             # shellcheck disable=SC2016
             pwsh -NoProfile -Command '
               $ErrorActionPreference = "Stop"
-              foreach ($f in @("scripts/install.ps1", "scripts/get.ps1")) {
+              foreach ($f in @("scripts/install.ps1", "scripts/get.ps1", "scripts/run-service.ps1")) {
                 $errors = $null
                 [void][System.Management.Automation.Language.Parser]::ParseFile($f, [ref]$null, [ref]$errors)
                 if ($errors.Count -gt 0) {

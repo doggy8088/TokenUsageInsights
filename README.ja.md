@@ -569,13 +569,61 @@ curl -fsSL https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/s
 
 これはインストール版をダウンロードして `token-usage-insights.service` を直ちに有効化します。systemd ファイルを自分でビルドまたは編集する必要はありません。
 
+### macOS：1 行で launchd LaunchAgent をインストールして有効化
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.sh | bash -s -- --service
+```
+
+これは `com.tokenusageinsights.plist` を `~/Library/LaunchAgents/` にインストールして直ちにロードします。標準出力とエラーログは `~/Library/Logs/` に出力されます。
+
+### Windows：1 行でバックグラウンド常駐サービス（タスクスケジューラ）をインストールして有効化
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.ps1))) -Service
+```
+
+これは Windows タスクスケジューラ（Task Scheduler）に `TokenUsageInsights` タスクを登録して直ちに起動します。ユーザーログイン時に自動的にバックグラウンドで実行され、ログは `%LOCALAPPDATA%\TokenUsageInsights\logs\` に出力されます。
+
 ### サービスを管理
+
+Linux：
 
 ```bash
 systemctl --user status token-usage-insights.service
 journalctl --user -u token-usage-insights.service -n 50 -f
 systemctl --user restart token-usage-insights.service
 systemctl --user stop token-usage-insights.service
+```
+
+macOS：
+
+```bash
+launchctl print gui/$(id -u)/com.tokenusageinsights
+launchctl kickstart -k gui/$(id -u)/com.tokenusageinsights
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.tokenusageinsights.plist
+```
+
+Windows PowerShell：
+
+```powershell
+# サービス状態を確認
+Get-ScheduledTask -TaskName "TokenUsageInsights"
+
+# ログをリアルタイム確認
+Get-Content "$env:LOCALAPPDATA\TokenUsageInsights\logs\token-usage-insights.out.log" -Tail 50 -Wait
+
+# サービスを再起動
+Stop-ScheduledTask -TaskName "TokenUsageInsights" -ErrorAction SilentlyContinue
+Get-Process -Name "token-usage-insights" -ErrorAction SilentlyContinue | Stop-Process -Force
+Start-ScheduledTask -TaskName "TokenUsageInsights"
+
+# サービスを停止
+Stop-ScheduledTask -TaskName "TokenUsageInsights" -ErrorAction SilentlyContinue
+Get-Process -Name "token-usage-insights" -ErrorAction SilentlyContinue | Stop-Process -Force
+
+# 常駐サービスを登録解除
+Unregister-ScheduledTask -TaskName "TokenUsageInsights" -Confirm:$false
 ```
 
 * * *
@@ -594,7 +642,7 @@ Linux / macOS：
 curl -fsSL https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.sh | bash
 ```
 
-Linux で systemd ユーザーサービスも同時にインストールして有効化する場合：
+Linux（systemd user service）または macOS（launchd LaunchAgent）で常駐サービスも同時にインストールして有効化する場合：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.sh | bash -s -- --service
@@ -604,6 +652,12 @@ Windows PowerShell：
 
 ```powershell
 irm https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.ps1 | iex
+```
+
+Windows PowerShell で常駐サービスも同時にインストールして有効化する場合：
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.ps1))) -Service
 ```
 
 インストール後に実行します（Linux/macOS では `bin_dir` が `PATH` に含まれることを確認してください。Windows では `.cmd` shim が作成されます）：
@@ -635,7 +689,7 @@ Invoke-WebRequest -Uri https://raw.githubusercontent.com/doggy8088/TokenUsageIns
 - `static/` のフロントエンドアセット
 - モデル料金表 `pricing.csv`
 - `shell/` の Status Line およびサービススクリプト
-- `scripts/` ディレクトリ（`install.sh`、`install.ps1`、`get.sh`、`get.ps1` を含む）
+- `scripts/` ディレクトリ（`install.sh`、`install.ps1`、`get.sh`、`get.ps1`、`run-service.ps1` を含む）
 - README、LICENSE、VERSION
 
 Linux または macOS：
@@ -646,7 +700,7 @@ cd token-usage-insights-<tag>-<target>
 ./install.sh
 ```
 
-Linux で systemd ユーザーサービスをインストールして有効化する場合：
+Linux（systemd user service）または macOS（launchd LaunchAgent）で常駐サービスをインストールして有効化する場合：
 
 ```bash
 ./install.sh --service
@@ -658,6 +712,12 @@ Windows：
 Expand-Archive token-usage-insights-<tag>-x86_64-pc-windows-msvc.zip
 cd token-usage-insights-<tag>-x86_64-pc-windows-msvc
 powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+Windows でバックグラウンド常駐サービスをインストールして有効化する場合：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -Service
 ```
 
 Windows のインストール先とポートをカスタマイズ：

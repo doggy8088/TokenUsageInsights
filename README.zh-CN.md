@@ -569,13 +569,61 @@ curl -fsSL https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/s
 
 这会下载安装版并立即启用 `token-usage-insights.service`，不需要自行构建或修改 systemd 文件。
 
+### macOS：一行安装并启用 launchd LaunchAgent
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.sh | bash -s -- --service
+```
+
+这会将 `com.tokenusageinsights.plist` 安装到 `~/Library/LaunchAgents/` 并立即加载；标准输出与错误日志位于 `~/Library/Logs/`。
+
+### Windows：一行安装并启用背景常驻服务（任务计划程序）
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.ps1))) -Service
+```
+
+这会通过 Windows 任务计划程序（Task Scheduler）注册 `TokenUsageInsights` 计划任务并立即启动；用户每次登录时均会自动在后台运行，标准输出与错误日志位于 `%LOCALAPPDATA%\TokenUsageInsights\logs\`。
+
 ### 管理服务
+
+Linux 可使用：
 
 ```bash
 systemctl --user status token-usage-insights.service
 journalctl --user -u token-usage-insights.service -n 50 -f
 systemctl --user restart token-usage-insights.service
 systemctl --user stop token-usage-insights.service
+```
+
+macOS 可使用：
+
+```bash
+launchctl print gui/$(id -u)/com.tokenusageinsights
+launchctl kickstart -k gui/$(id -u)/com.tokenusageinsights
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.tokenusageinsights.plist
+```
+
+Windows PowerShell 可使用：
+
+```powershell
+# 查看服务状态
+Get-ScheduledTask -TaskName "TokenUsageInsights"
+
+# 查看实时日志
+Get-Content "$env:LOCALAPPDATA\TokenUsageInsights\logs\token-usage-insights.out.log" -Tail 50 -Wait
+
+# 重启服务
+Stop-ScheduledTask -TaskName "TokenUsageInsights" -ErrorAction SilentlyContinue
+Get-Process -Name "token-usage-insights" -ErrorAction SilentlyContinue | Stop-Process -Force
+Start-ScheduledTask -TaskName "TokenUsageInsights"
+
+# 停止服务
+Stop-ScheduledTask -TaskName "TokenUsageInsights" -ErrorAction SilentlyContinue
+Get-Process -Name "token-usage-insights" -ErrorAction SilentlyContinue | Stop-Process -Force
+
+# 卸载常驻服务
+Unregister-ScheduledTask -TaskName "TokenUsageInsights" -Confirm:$false
 ```
 
 * * *
@@ -594,7 +642,7 @@ Linux / macOS：
 curl -fsSL https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.sh | bash
 ```
 
-Linux 如需同时安装并启用 systemd user service：
+Linux（systemd user service）或 macOS（launchd LaunchAgent）如需同时安装并启用常驻服务：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.sh | bash -s -- --service
@@ -604,6 +652,12 @@ Windows PowerShell：
 
 ```powershell
 irm https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.ps1 | iex
+```
+
+Windows PowerShell 如需同时安装并启用常驻服务：
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.ps1))) -Service
 ```
 
 安装完成后即可运行（Linux/macOS 需确认 `bin_dir` 已加入 `PATH`；Windows 会创建 `.cmd` shim）：
@@ -635,7 +689,7 @@ Invoke-WebRequest -Uri https://raw.githubusercontent.com/doggy8088/TokenUsageIns
 - `static/` 前端资源
 - `pricing.csv` 模型费用表
 - `shell/` 目录下的 Status Line 与服务脚本
-- `scripts/` 目录（含 `install.sh`、`install.ps1`、`get.sh`、`get.ps1`）
+- `scripts/` 目录（含 `install.sh`、`install.ps1`、`get.sh`、`get.ps1`、`run-service.ps1`）
 - README、LICENSE 与 VERSION
 
 Linux 或 macOS：
@@ -646,7 +700,7 @@ cd token-usage-insights-<tag>-<target>
 ./install.sh
 ```
 
-Linux 如需安装并启用 systemd user service：
+Linux（systemd user service）或 macOS（launchd LaunchAgent）如需安装并启用常驻服务：
 
 ```bash
 ./install.sh --service
@@ -658,6 +712,12 @@ Windows：
 Expand-Archive token-usage-insights-<tag>-x86_64-pc-windows-msvc.zip
 cd token-usage-insights-<tag>-x86_64-pc-windows-msvc
 powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+Windows 如需安装并启用背景常驻服务：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -Service
 ```
 
 自定义 Windows 安装位置与端口号：

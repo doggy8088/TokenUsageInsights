@@ -592,7 +592,17 @@ curl -fsSL https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/s
 
 這會將 `com.tokenusageinsights.plist` 安裝到 `~/Library/LaunchAgents/` 並立即載入；標準輸出與錯誤日誌位於 `~/Library/Logs/`。
 
+### Windows：一行安裝並啟用背景常駐服務（工作排程器）
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.ps1))) -Service
+```
+
+這會透過 Windows 工作排程器（Task Scheduler）註冊 `TokenUsageInsights` 背景工作並立即啟動；使用者每次登入時均會自動於背景執行，標準輸出與錯誤日誌位於 `%LOCALAPPDATA%\TokenUsageInsights\logs\`。
+
 ### 管理服務
+
+Linux 可使用：
 
 ```bash
 systemctl --user status token-usage-insights.service
@@ -607,6 +617,28 @@ macOS 可使用：
 launchctl print gui/$(id -u)/com.tokenusageinsights
 launchctl kickstart -k gui/$(id -u)/com.tokenusageinsights
 launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.tokenusageinsights.plist
+```
+
+Windows PowerShell 可使用：
+
+```powershell
+# 檢視服務狀態
+Get-ScheduledTask -TaskName "TokenUsageInsights"
+
+# 檢視即時日誌
+Get-Content "$env:LOCALAPPDATA\TokenUsageInsights\logs\token-usage-insights.out.log" -Tail 50 -Wait
+
+# 重啟服務
+Stop-ScheduledTask -TaskName "TokenUsageInsights" -ErrorAction SilentlyContinue
+Get-Process -Name "token-usage-insights" -ErrorAction SilentlyContinue | Stop-Process -Force
+Start-ScheduledTask -TaskName "TokenUsageInsights"
+
+# 停止服務
+Stop-ScheduledTask -TaskName "TokenUsageInsights" -ErrorAction SilentlyContinue
+Get-Process -Name "token-usage-insights" -ErrorAction SilentlyContinue | Stop-Process -Force
+
+# 解除安裝常駐服務
+Unregister-ScheduledTask -TaskName "TokenUsageInsights" -Confirm:$false
 ```
 
 * * *
@@ -647,6 +679,12 @@ Windows PowerShell：
 irm https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.ps1 | iex
 ```
 
+Windows PowerShell 如需同時安裝並啟用常駐服務：
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.ps1))) -Service
+```
+
 安裝完成後即可執行（Linux/macOS 需確認 `bin_dir` 已加入 `PATH`；Windows 會建立 `.cmd` shim）：
 
 ```bash
@@ -676,7 +714,7 @@ Invoke-WebRequest -Uri https://raw.githubusercontent.com/doggy8088/TokenUsageIns
 - `static/` 前端資產
 - `pricing.csv` 模型費用表
 - `shell/` 目錄下的 Status Line 與服務腳本
-- `scripts/` 目錄（含 `install.sh`、`install.ps1`、`get.sh`、`get.ps1`）
+- `scripts/` 目錄（含 `install.sh`、`install.ps1`、`get.sh`、`get.ps1`、`run-service.ps1`）
 - README、LICENSE 與 VERSION
 
 Linux 或 macOS：
@@ -699,6 +737,12 @@ Windows：
 Expand-Archive token-usage-insights-<tag>-x86_64-pc-windows-msvc.zip
 cd token-usage-insights-<tag>-x86_64-pc-windows-msvc
 powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+Windows 如需安裝並啟用背景常駐服務：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -Service
 ```
 
 自訂 Windows 安裝位置與埠號：

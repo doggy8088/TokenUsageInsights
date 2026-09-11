@@ -569,13 +569,61 @@ curl -fsSL https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/s
 
 이 명령은 설치 버전을 다운로드하고 `token-usage-insights.service`를 즉시 활성화합니다. systemd 파일을 직접 빌드하거나 수정할 필요가 없습니다.
 
+### macOS: 한 줄로 launchd LaunchAgent 설치 및 활성화
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.sh | bash -s -- --service
+```
+
+이 명령은 `com.tokenusageinsights.plist`를 `~/Library/LaunchAgents/`에 설치하고 즉시 로드합니다. 표준 출력과 오류 로그는 `~/Library/Logs/`에 저장됩니다.
+
+### Windows: 한 줄로 백그라운드 상주 서비스(작업 스케줄러) 설치 및 활성화
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.ps1))) -Service
+```
+
+이 명령은 Windows 작업 스케줄러(Task Scheduler)에 `TokenUsageInsights` 작업을 등록하고 즉시 시작합니다. 사용자가 로그인할 때마다 백그라운드에서 자동으로 실행되며 로그는 `%LOCALAPPDATA%\TokenUsageInsights\logs\`에 저장됩니다.
+
 ### 서비스 관리
+
+Linux:
 
 ```bash
 systemctl --user status token-usage-insights.service
 journalctl --user -u token-usage-insights.service -n 50 -f
 systemctl --user restart token-usage-insights.service
 systemctl --user stop token-usage-insights.service
+```
+
+macOS:
+
+```bash
+launchctl print gui/$(id -u)/com.tokenusageinsights
+launchctl kickstart -k gui/$(id -u)/com.tokenusageinsights
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.tokenusageinsights.plist
+```
+
+Windows PowerShell:
+
+```powershell
+# 서비스 상태 확인
+Get-ScheduledTask -TaskName "TokenUsageInsights"
+
+# 실시간 로그 확인
+Get-Content "$env:LOCALAPPDATA\TokenUsageInsights\logs\token-usage-insights.out.log" -Tail 50 -Wait
+
+# 서비스 다시 시작
+Stop-ScheduledTask -TaskName "TokenUsageInsights" -ErrorAction SilentlyContinue
+Get-Process -Name "token-usage-insights" -ErrorAction SilentlyContinue | Stop-Process -Force
+Start-ScheduledTask -TaskName "TokenUsageInsights"
+
+# 서비스 중지
+Stop-ScheduledTask -TaskName "TokenUsageInsights" -ErrorAction SilentlyContinue
+Get-Process -Name "token-usage-insights" -ErrorAction SilentlyContinue | Stop-Process -Force
+
+# 상주 서비스 등록 해제
+Unregister-ScheduledTask -TaskName "TokenUsageInsights" -Confirm:$false
 ```
 
 * * *
@@ -594,7 +642,7 @@ Linux / macOS:
 curl -fsSL https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.sh | bash
 ```
 
-Linux에서 systemd 사용자 서비스를 함께 설치하고 활성화하려면:
+Linux(systemd user service) 또는 macOS(launchd LaunchAgent)에서 상주 서비스를 함께 설치하고 활성화하려면:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.sh | bash -s -- --service
@@ -604,6 +652,12 @@ Windows PowerShell:
 
 ```powershell
 irm https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.ps1 | iex
+```
+
+Windows PowerShell에서 상주 서비스를 함께 설치하고 활성화하려면:
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.ps1))) -Service
 ```
 
 설치가 끝나면 실행합니다(Linux/macOS는 `bin_dir`가 `PATH`에 포함되는지 확인하고, Windows는 `.cmd` shim을 만듭니다).
@@ -635,7 +689,7 @@ Invoke-WebRequest -Uri https://raw.githubusercontent.com/doggy8088/TokenUsageIns
 - `static/`의 프런트엔드 자산
 - 모델 가격표 `pricing.csv`
 - `shell/` 디렉터리의 Status Line 및 서비스 스크립트
-- `scripts/` 디렉터리(`install.sh`, `install.ps1`, `get.sh`, `get.ps1` 포함)
+- `scripts/` 디렉터리(`install.sh`, `install.ps1`, `get.sh`, `get.ps1`, `run-service.ps1` 포함)
 - README, LICENSE 및 VERSION
 
 Linux 또는 macOS:
@@ -646,7 +700,7 @@ cd token-usage-insights-<tag>-<target>
 ./install.sh
 ```
 
-Linux에서 systemd 사용자 서비스를 설치하고 활성화하려면:
+Linux(systemd user service) 또는 macOS(launchd LaunchAgent)에서 상주 서비스를 설치하고 활성화하려면:
 
 ```bash
 ./install.sh --service
@@ -658,6 +712,12 @@ Windows:
 Expand-Archive token-usage-insights-<tag>-x86_64-pc-windows-msvc.zip
 cd token-usage-insights-<tag>-x86_64-pc-windows-msvc
 powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+Windows에서 백그라운드 상주 서비스를 설치하고 활성화하려면:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -Service
 ```
 
 Windows 설치 위치 및 포트 사용자 지정:

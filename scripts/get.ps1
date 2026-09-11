@@ -11,6 +11,9 @@
   irm https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.ps1 | iex
 
 .EXAMPLE
+  & ([scriptblock]::Create((irm https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.ps1))) -Service
+
+.EXAMPLE
   $script = irm https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.ps1
   Invoke-Expression "& { $script } -InstallDir 'D:\Apps\Token Usage Insights' -Port 3010"
 #>
@@ -19,7 +22,9 @@ param(
     [string]$Version = "latest",
     [string]$InstallDir,
     [string]$BinDir,
-    [int]$Port = 3003
+    [string]$HostAddress,
+    [int]$Port = 3003,
+    [switch]$Service
 )
 
 $ErrorActionPreference = "Stop"
@@ -69,6 +74,8 @@ try {
     $InstallArgs = @{ Port = $Port }
     if ($InstallDir) { $InstallArgs["InstallDir"] = $InstallDir }
     if ($BinDir) { $InstallArgs["BinDir"] = $BinDir }
+    if ($HostAddress) { $InstallArgs["HostAddress"] = $HostAddress }
+    if ($Service) { $InstallArgs["Service"] = $true }
 
     Write-Host "Installing $Tag ..."
     & $InstallScript @InstallArgs

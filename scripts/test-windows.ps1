@@ -69,6 +69,18 @@ try {
         Assert-Equal 2 $entries[1].turn_no "$($case.Name) turn number is wrong."
     }
 
+    $installCmd = Get-Command (Resolve-Path (Join-Path $PSScriptRoot "install.ps1")).Path
+    Assert-Equal $true $installCmd.Parameters.ContainsKey("Service") "install.ps1 should declare -Service."
+    Assert-Equal $true $installCmd.Parameters.ContainsKey("HostAddress") "install.ps1 should declare -HostAddress."
+
+    $getCmd = Get-Command (Resolve-Path (Join-Path $PSScriptRoot "get.ps1")).Path
+    Assert-Equal $true $getCmd.Parameters.ContainsKey("Service") "get.ps1 should declare -Service."
+    Assert-Equal $true $getCmd.Parameters.ContainsKey("HostAddress") "get.ps1 should declare -HostAddress."
+
+    $runnerCmd = Get-Command (Resolve-Path (Join-Path $PSScriptRoot "run-service.ps1")).Path
+    Assert-Equal $true $runnerCmd.Parameters.ContainsKey("InstallDir") "run-service.ps1 should declare -InstallDir."
+    Assert-Equal $true $runnerCmd.Parameters.ContainsKey("HostAddress") "run-service.ps1 should declare -HostAddress."
+
     Write-Host "Windows collector smoke tests passed."
 } finally {
     $env:ANTIGRAVITY_DIR = $PreviousAntigravityDir

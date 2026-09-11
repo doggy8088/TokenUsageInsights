@@ -569,13 +569,61 @@ curl -fsSL https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/s
 
 This downloads the installed version and immediately enables `token-usage-insights.service`; you do not need to build or edit a systemd file yourself.
 
+### macOS: install and enable the launchd LaunchAgent with one command
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.sh | bash -s -- --service
+```
+
+This installs `com.tokenusageinsights.plist` into `~/Library/LaunchAgents/` and loads it immediately; stdout and stderr logs are located in `~/Library/Logs/`.
+
+### Windows: install and enable background service with one command (Task Scheduler)
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.ps1))) -Service
+```
+
+This registers the `TokenUsageInsights` task in Windows Task Scheduler and starts it immediately; it starts automatically at user logon in the background, with logs in `%LOCALAPPDATA%\TokenUsageInsights\logs\`.
+
 ### Manage the service
+
+Linux:
 
 ```bash
 systemctl --user status token-usage-insights.service
 journalctl --user -u token-usage-insights.service -n 50 -f
 systemctl --user restart token-usage-insights.service
 systemctl --user stop token-usage-insights.service
+```
+
+macOS:
+
+```bash
+launchctl print gui/$(id -u)/com.tokenusageinsights
+launchctl kickstart -k gui/$(id -u)/com.tokenusageinsights
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.tokenusageinsights.plist
+```
+
+Windows PowerShell:
+
+```powershell
+# Check status
+Get-ScheduledTask -TaskName "TokenUsageInsights"
+
+# View logs
+Get-Content "$env:LOCALAPPDATA\TokenUsageInsights\logs\token-usage-insights.out.log" -Tail 50 -Wait
+
+# Restart service
+Stop-ScheduledTask -TaskName "TokenUsageInsights" -ErrorAction SilentlyContinue
+Get-Process -Name "token-usage-insights" -ErrorAction SilentlyContinue | Stop-Process -Force
+Start-ScheduledTask -TaskName "TokenUsageInsights"
+
+# Stop service
+Stop-ScheduledTask -TaskName "TokenUsageInsights" -ErrorAction SilentlyContinue
+Get-Process -Name "token-usage-insights" -ErrorAction SilentlyContinue | Stop-Process -Force
+
+# Unregister service
+Unregister-ScheduledTask -TaskName "TokenUsageInsights" -Confirm:$false
 ```
 
 * * *
@@ -594,7 +642,7 @@ Linux / macOS:
 curl -fsSL https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.sh | bash
 ```
 
-To install and enable the systemd user service at the same time on Linux:
+To install and enable the background service at the same time (systemd on Linux; launchd on macOS):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.sh | bash -s -- --service
@@ -604,6 +652,12 @@ Windows PowerShell:
 
 ```powershell
 irm https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.ps1 | iex
+```
+
+To install and enable the background service at the same time on Windows:
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.ps1))) -Service
 ```
 
 After installation, run (on Linux/macOS, confirm that `bin_dir` is on `PATH`; Windows creates a `.cmd` shim):
@@ -635,7 +689,7 @@ If you do not want to execute a remote script directly, download the archive for
 - Frontend assets in `static/`
 - The model pricing table `pricing.csv`
 - Status Line and service scripts in `shell/`
-- The `scripts/` directory (including `install.sh`, `install.ps1`, `get.sh`, and `get.ps1`)
+- The `scripts/` directory (including `install.sh`, `install.ps1`, `get.sh`, `get.ps1`, and `run-service.ps1`)
 - README, LICENSE, and VERSION
 
 Linux or macOS:
@@ -646,7 +700,7 @@ cd token-usage-insights-<tag>-<target>
 ./install.sh
 ```
 
-To install and enable the systemd user service on Linux:
+To install and enable the background service (systemd on Linux; launchd on macOS):
 
 ```bash
 ./install.sh --service
@@ -658,6 +712,12 @@ Windows:
 Expand-Archive token-usage-insights-<tag>-x86_64-pc-windows-msvc.zip
 cd token-usage-insights-<tag>-x86_64-pc-windows-msvc
 powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+To install and enable the background service on Windows:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -Service
 ```
 
 Custom Windows installation location and port:
