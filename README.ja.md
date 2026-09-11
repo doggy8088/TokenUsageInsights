@@ -507,10 +507,8 @@ cargo build --release --bin token-usage-insights
 ./target/release/token-usage-insights export --help
 ./target/release/token-usage-insights import --help
 
-# 最新バージョンへの自動更新（--check、--force、--target-version にも対応）
-./target/release/token-usage-insights update
+# 新バージョンの確認（注意: 開発およびソースディレクトリでは安全保護のため --check のみ対応しています。直接更新は拒否されるため、インストール後に token-usage-insights update を使用してください）
 ./target/release/token-usage-insights update --check
-./target/release/token-usage-insights update --target-version v0.9.6
 ```
 
 データ形式はフロントエンドと同じで、次のフィールドを含みます：
@@ -748,7 +746,16 @@ Windows PowerShell で常駐サービスも同時にインストールして有�
 インストール後に実行します（Linux/macOS では `bin_dir` が `PATH` に含まれることを確認してください。Windows では `.cmd` shim が作成されます）：
 
 ```bash
+# ダッシュボードサービスの起動
 token-usage-insights
+
+# 新バージョンの確認
+token-usage-insights update --check
+
+# 最新バージョンへの自動更新（--force、--target-version にも対応）
+token-usage-insights update
+token-usage-insights update --force
+token-usage-insights update --target-version v0.9.6
 ```
 
 環境変数でバージョンとインストール先を指定できます（すべて任意）：

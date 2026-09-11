@@ -507,10 +507,8 @@ cargo build --release --bin token-usage-insights
 ./target/release/token-usage-insights export --help
 ./target/release/token-usage-insights import --help
 
-# 최신 버전으로 자동 업데이트 (--check, --force, --target-version 지원)
-./target/release/token-usage-insights update
+# 새 버전 확인 (참고: 개발 및 소스 디렉터리는 안전 보호로 인해 --check만 지원됩니다. 직접 업데이트는 거부되므로 설치 후 token-usage-insights update를 사용하세요)
 ./target/release/token-usage-insights update --check
-./target/release/token-usage-insights update --target-version v0.9.6
 ```
 
 데이터 형식은 프런트엔드와 같으며 다음 필드를 포함합니다.
@@ -748,7 +746,16 @@ Windows PowerShell에서 상주 서비스를 함께 설치하고 활성화하려
 설치가 끝나면 실행합니다(Linux/macOS는 `bin_dir`가 `PATH`에 포함되는지 확인하고, Windows는 `.cmd` shim을 만듭니다).
 
 ```bash
+# 대시보드 서비스 시작
 token-usage-insights
+
+# 새 버전 확인
+token-usage-insights update --check
+
+# 최신 버전으로 자동 업데이트 (--force, --target-version 지원)
+token-usage-insights update
+token-usage-insights update --force
+token-usage-insights update --target-version v0.9.6
 ```
 
 환경 변수로 버전과 설치 경로를 제어할 수 있습니다(모두 선택 사항).

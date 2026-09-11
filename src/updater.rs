@@ -377,7 +377,7 @@ fn get_process_ppid(pid: u32) -> Option<u32> {
 }
 
 #[cfg(windows)]
-fn is_process_supervised(pid: u32, install_dir: &Path) -> bool {
+fn is_process_supervised(pid: u32, _install_dir: &Path) -> bool {
     if let Some(ppid) = get_process_ppid(pid) {
         if is_process_alive(ppid) {
             if let Some(parent_exe) = get_process_exe_path(ppid) {
@@ -391,12 +391,12 @@ fn is_process_supervised(pid: u32, install_dir: &Path) -> bool {
                 }
                 if file_name == "powershell.exe" || file_name == "pwsh.exe" {
                     if let Some(cmd) = get_process_cmdline(ppid) {
-                        if cmd.iter().any(|arg| arg.contains("run-service.ps1")) {
+                        if cmd
+                            .iter()
+                            .any(|arg| arg.to_lowercase().contains("run-service.ps1"))
+                        {
                             return true;
                         }
-                    }
-                    if install_dir.join("scripts").join("run-service.ps1").exists() {
-                        return true;
                     }
                 }
             }
@@ -416,14 +416,9 @@ fn is_process_supervised(pid: u32, _install_dir: &Path) -> bool {
             return true;
         }
     }
-    if let Ok(status) = fs::read_to_string(format!("/proc/{pid}/status")) {
-        for line in status.lines() {
-            if line.starts_with("PPid:") {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 2 && parts[1] == "1" {
-                    return true;
-                }
-            }
+    if let Ok(cgroup) = fs::read_to_string(format!("/proc/{pid}/cgroup")) {
+        if cgroup.contains(".service") || cgroup.contains("system.slice") {
+            return true;
         }
     }
     false
@@ -431,13 +426,17 @@ fn is_process_supervised(pid: u32, _install_dir: &Path) -> bool {
 
 #[cfg(all(unix, not(target_os = "linux")))]
 fn is_process_supervised(pid: u32, _install_dir: &Path) -> bool {
-    if let Ok(output) = std::process::Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "ppid="])
-        .output()
-    {
-        let ppid = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if ppid == "1" {
-            return true;
+    if let Ok(output) = std::process::Command::new("launchctl").arg("list").output() {
+        if output.status.success() {
+            let text = String::from_utf8_lossy(&output.stdout);
+            let pid_str = pid.to_string();
+            for line in text.lines() {
+                if let Some(first) = line.split_whitespace().next() {
+                    if first == pid_str {
+                        return true;
+                    }
+                }
+            }
         }
     }
     false
@@ -451,6 +450,115 @@ fn get_process_cmdline(_pid: u32) -> Option<Vec<String>> {
 #[cfg(not(any(unix, windows)))]
 fn is_process_supervised(_pid: u32, _install_dir: &Path) -> bool {
     false
+}
+
+#[allow(dead_code)] // 供各平台進程檢測與重啟函式比對關鍵環境變數
+const RELEVANT_ENV_VARS: &[&str] = &[
+    "PORT",
+    "HOST",
+    "INSIGHTS_DIR",
+    "TOKEN_USAGE_INSIGHTS_INSTALL_DIR",
+    "CORS_ALLOWED_ORIGINS",
+    "ANTIGRAVITY_DIR",
+    "COPILOT_DIR",
+    "CODEX_DIR",
+    "CLAUDE_DIR",
+    "CURSOR_DIR",
+    "GROK_DIR",
+    "PI_DIR",
+    "OMP_DIR",
+    "MUSE_DIR",
+    "VSCODE_DIR",
+];
+
+#[cfg(target_os = "linux")]
+fn get_process_relevant_envs(pid: u32) -> Vec<(String, String)> {
+    let mut envs = Vec::new();
+    if let Ok(bytes) = fs::read(format!("/proc/{pid}/environ")) {
+        for entry in bytes.split(|&b| b == 0) {
+            if let Ok(s) = std::str::from_utf8(entry) {
+                if let Some((k, v)) = s.split_once('=') {
+                    if RELEVANT_ENV_VARS.contains(&k) {
+                        envs.push((k.to_string(), v.to_string()));
+                    }
+                }
+            }
+        }
+    }
+    envs
+}
+
+#[cfg(target_os = "linux")]
+fn get_process_cwd(pid: u32) -> Option<PathBuf> {
+    fs::read_link(format!("/proc/{pid}/cwd")).ok()
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn get_process_relevant_envs(pid: u32) -> Vec<(String, String)> {
+    let mut envs = Vec::new();
+    if let Ok(output) = std::process::Command::new("ps")
+        .args(["-E", "-p", &pid.to_string(), "-o", "command="])
+        .output()
+    {
+        if output.status.success() {
+            let text = String::from_utf8_lossy(&output.stdout);
+            for part in text.split_whitespace() {
+                if let Some((k, v)) = part.split_once('=') {
+                    if RELEVANT_ENV_VARS.contains(&k) {
+                        envs.push((k.to_string(), v.to_string()));
+                    }
+                }
+            }
+        }
+    }
+    envs
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn get_process_cwd(pid: u32) -> Option<PathBuf> {
+    if let Ok(output) = std::process::Command::new("lsof")
+        .args(["-a", "-d", "cwd", "-p", &pid.to_string(), "-Fn"])
+        .output()
+    {
+        if output.status.success() {
+            let text = String::from_utf8_lossy(&output.stdout);
+            for line in text.lines() {
+                if let Some(path_str) = line.strip_prefix('n') {
+                    let path = PathBuf::from(path_str.trim());
+                    if path.is_dir() {
+                        return Some(path);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn get_process_relevant_envs(_pid: u32) -> Vec<(String, String)> {
+    let mut envs = Vec::new();
+    for &k in RELEVANT_ENV_VARS {
+        if let Ok(v) = std::env::var(k) {
+            envs.push((k.to_string(), v));
+        }
+    }
+    envs
+}
+
+#[cfg(windows)]
+fn get_process_cwd(_pid: u32) -> Option<PathBuf> {
+    None
+}
+
+#[cfg(not(any(unix, windows)))]
+fn get_process_relevant_envs(_pid: u32) -> Vec<(String, String)> {
+    Vec::new()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn get_process_cwd(_pid: u32) -> Option<PathBuf> {
+    None
 }
 
 fn is_cli_subcommand(arg: &str) -> bool {
@@ -1932,14 +2040,24 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), UpdateError> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct StoppedDashboardStatus {
-    pub stopped_any: bool,
-    pub had_supervised: bool,
-    pub had_unsupervised: bool,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StoppedProcessSpec {
+    pub pid: u32,
+    pub is_supervised: bool,
+    pub exe_path: PathBuf,
+    pub args: Option<Vec<String>>,
+    pub envs: Vec<(String, String)>,
+    pub cwd: Option<PathBuf>,
 }
 
-fn stop_running_dashboard_instances(install_dir: &Path) -> Result<StoppedDashboardStatus, String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DashboardProcessPlan {
+    pub stopped_specs: Vec<StoppedProcessSpec>,
+    #[cfg(unix)]
+    pub supervised_unix_pids: Vec<u32>,
+}
+
+fn stop_running_dashboard_instances(install_dir: &Path) -> Result<DashboardProcessPlan, String> {
     let my_pid = std::process::id();
     let mut candidate_pids = std::collections::HashSet::new();
 
@@ -2059,9 +2177,10 @@ fn stop_running_dashboard_instances(install_dir: &Path) -> Result<StoppedDashboa
     }
 
     // 3. 嚴格驗證候選 PID：必須為活躍進程且執行檔路徑確認位於 install_dir，並過濾短暫 CLI 指令進程（Fail-Closed 原則）
-    let mut target_pids = std::collections::HashSet::new();
-    let mut had_supervised = false;
-    let mut had_unsupervised = false;
+    let mut stopped_specs = Vec::new();
+    #[cfg(unix)]
+    let mut supervised_unix_pids = Vec::new();
+    let mut pids_to_stop = Vec::new();
 
     for pid in candidate_pids {
         if is_process_alive(pid) {
@@ -2069,46 +2188,67 @@ fn stop_running_dashboard_instances(install_dir: &Path) -> Result<StoppedDashboa
                 if matches_install_dir(&exe_path, install_dir)
                     && is_dashboard_server_process(pid, &server_pids)
                 {
-                    if is_process_supervised(pid, install_dir) {
-                        had_supervised = true;
-                    } else {
-                        had_unsupervised = true;
+                    let is_sup = is_process_supervised(pid, install_dir);
+                    let args = get_process_cmdline(pid);
+                    let envs = get_process_relevant_envs(pid);
+                    let cwd = get_process_cwd(pid);
+                    let spec = StoppedProcessSpec {
+                        pid,
+                        is_supervised: is_sup,
+                        exe_path,
+                        args,
+                        envs,
+                        cwd,
+                    };
+
+                    #[cfg(unix)]
+                    if is_sup {
+                        log_update(
+                            "INFO",
+                            "STOP_SERVICE",
+                            &format!("進程 (PID: {pid}) 受到 Unix 服務管理器監管；將在檔案替換提交後再發送 SIGTERM 以免舊版搶先重啟"),
+                        );
+                        supervised_unix_pids.push(pid);
+                        continue;
                     }
-                    target_pids.insert(pid);
+
+                    pids_to_stop.push(pid);
+                    stopped_specs.push(spec);
                 }
             }
         }
     }
 
-    let mut remaining_pids: Vec<u32> = target_pids.into_iter().collect();
-    if remaining_pids.is_empty() {
-        // 未發現需要停止的其他進程，保留自身進程之 .server.pid
-        return Ok(StoppedDashboardStatus {
-            stopped_any: false,
-            had_supervised: false,
-            had_unsupervised: false,
-        });
-    }
-
     // 若在 Windows 環境且有受到 run-service.ps1 監管之服務進程，寫入服務重啟協商標記檔，讓 run-service.ps1 能在新版就緒後重啟
     let restart_pending_file = install_dir.join(".service_restart_pending");
     #[cfg(windows)]
-    if had_supervised {
-        safe_write_file(&restart_pending_file, b"1").map_err(|e| {
-            let err = format!("無法寫入服務重啟協商標記檔 ({restart_pending_file:?}): {e}");
-            log_update("ERROR", "STOP_SERVICE", &err);
-            err
-        })?;
+    {
+        let had_supervised = stopped_specs.iter().any(|s| s.is_supervised);
+        if had_supervised {
+            safe_write_file(&restart_pending_file, b"1").map_err(|e| {
+                let err = format!("無法寫入服務重啟協商標記檔 ({restart_pending_file:?}): {e}");
+                log_update("ERROR", "STOP_SERVICE", &err);
+                err
+            })?;
+        }
+    }
+
+    if pids_to_stop.is_empty() {
+        return Ok(DashboardProcessPlan {
+            stopped_specs,
+            #[cfg(unix)]
+            supervised_unix_pids,
+        });
     }
 
     log_update(
         "INFO",
         "STOP_SERVICE",
-        &format!("協調停止執行中之服務進程: {remaining_pids:?}"),
+        &format!("協調停止執行中之服務進程: {pids_to_stop:?}"),
     );
 
     // 4. 發送初次溫和退出訊號 (Unix: SIGTERM, Windows: taskkill 無 /F)
-    for &pid in &remaining_pids {
+    for &pid in &pids_to_stop {
         #[cfg(unix)]
         unsafe {
             libc::kill(pid as libc::pid_t, libc::SIGTERM);
@@ -2129,15 +2269,15 @@ fn stop_running_dashboard_instances(install_dir: &Path) -> Result<StoppedDashboa
     let mut escalated = false;
 
     loop {
-        remaining_pids.retain(|&pid| is_process_alive(pid));
-        if remaining_pids.is_empty() {
+        pids_to_stop.retain(|&pid| is_process_alive(pid));
+        if pids_to_stop.is_empty() {
             break;
         }
 
         let elapsed = start_time.elapsed();
         if elapsed >= timeout {
             let err = format!(
-                "等待執行中之服務進程 (PID: {remaining_pids:?}) 停止超時，更新中止以保護檔案安全"
+                "等待執行中之服務進程 (PID: {pids_to_stop:?}) 停止超時，更新中止以保護檔案安全"
             );
             log_update("ERROR", "STOP_SERVICE", &err);
             let _ = fs::remove_file(&restart_pending_file);
@@ -2149,9 +2289,9 @@ fn stop_running_dashboard_instances(install_dir: &Path) -> Result<StoppedDashboa
             log_update(
                 "WARN",
                 "STOP_SERVICE",
-                &format!("服務進程未於 2.5 秒內正常退出，升級強制終止 (PID: {remaining_pids:?})"),
+                &format!("服務進程未於 2.5 秒內正常退出，升級強制終止 (PID: {pids_to_stop:?})"),
             );
-            for &pid in &remaining_pids {
+            for &pid in &pids_to_stop {
                 #[cfg(unix)]
                 unsafe {
                     libc::kill(pid as libc::pid_t, libc::SIGKILL);
@@ -2180,36 +2320,66 @@ fn stop_running_dashboard_instances(install_dir: &Path) -> Result<StoppedDashboa
     }
 
     log_update("INFO", "STOP_SERVICE", "所有執行中之目標服務進程已安全停止");
-    Ok(StoppedDashboardStatus {
-        stopped_any: true,
-        had_supervised,
-        had_unsupervised,
+    Ok(DashboardProcessPlan {
+        stopped_specs,
+        #[cfg(unix)]
+        supervised_unix_pids,
     })
 }
 
-fn restart_background_dashboard(install_dir: &Path) {
+fn restart_dashboard_instance(spec: &StoppedProcessSpec, install_dir: &Path) -> Result<(), String> {
     let exec_name = if cfg!(windows) {
         format!("{APP_NAME}.exe")
     } else {
         APP_NAME.to_string()
     };
-    let exe = install_dir.join(exec_name);
-    if exe.exists() {
-        let mut cmd = std::process::Command::new(exe);
-        cmd.current_dir(install_dir)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x08000000;
-            cmd.creation_flags(CREATE_NO_WINDOW);
-        }
-
-        let _ = cmd.spawn();
+    let exe = if spec.exe_path.exists() {
+        spec.exe_path.clone()
+    } else {
+        install_dir.join(&exec_name)
+    };
+    if !exe.exists() {
+        return Err(format!("找不到執行檔: {exe:?}"));
     }
+
+    let args = match &spec.args {
+        Some(a) => a,
+        None => {
+            return Err("無法可靠取得先前進程之命令列參數，略過自動重啟以防組態重設".to_string());
+        }
+    };
+
+    let child_args = if args.len() > 1 { &args[1..] } else { &[] };
+
+    if child_args.iter().any(|arg| is_cli_subcommand(arg)) {
+        return Err("先前進程包含非看板 CLI 子命令，略過自動重啟".to_string());
+    }
+
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.args(child_args);
+
+    let cwd = spec.cwd.as_deref().unwrap_or(install_dir);
+    cmd.current_dir(cwd);
+
+    for (k, v) in &spec.envs {
+        cmd.env(k, v);
+    }
+
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    cmd.spawn()
+        .map_err(|e| format!("啟動背景看板進程失敗: {e}"))?;
+
+    Ok(())
 }
 
 pub(crate) fn apply_installation_with_rollback(
@@ -2224,7 +2394,20 @@ pub(crate) fn apply_installation_with_rollback(
     }
 
     println!("⏸️ 正在協調停止現有執行中之服務...");
-    let stopped_status = stop_running_dashboard_instances(install_dir)?;
+    let process_plan = match stop_running_dashboard_instances(install_dir) {
+        Ok(plan) => plan,
+        Err(err) => {
+            // 清理已建立之備份目錄與可能寫入的協商標記檔，避免殘留 .backup 阻止後續更新
+            let _ = fs::remove_dir_all(backup_dir);
+            let _ = fs::remove_file(install_dir.join(".service_restart_pending"));
+            log_update(
+                "ERROR",
+                "STOP_SERVICE",
+                &format!("停止服務進程失敗，已清理備份目錄: {err}"),
+            );
+            return Err(err);
+        }
+    };
 
     println!("🚀 正在安裝新版檔案至 {:?} ...", install_dir);
     log_update("INFO", "INSTALL", &format!("開始替換至 {install_dir:?}"));
@@ -2357,21 +2540,54 @@ pub(crate) fn apply_installation_with_rollback(
             println!("✅ 已成功回滾至先前版本。");
             log_update("INFO", "ROLLBACK", "回滾成功");
             let _ = fs::remove_dir_all(backup_dir);
-            if stopped_status.stopped_any {
-                if stopped_status.had_supervised {
-                    // 受到 run-service.ps1 或 systemd/launchd 監管的服務：
-                    // 在 Windows 上保留 .service_restart_pending，待更新鎖釋放後由 run-service.ps1 接手重啟；
-                    // 在 Linux/macOS 上由 systemd/launchd 自行重啟，絕不直接生成未監管的 raw process
-                    log_update(
-                        "INFO",
-                        "ROLLBACK",
-                        "回滾完成，保留標記由服務管理器自動重啟監管進程",
-                    );
-                } else if stopped_status.had_unsupervised {
-                    // 先前是由使用者手動以非監管方式啟動的看板進程，重啟還原後的背景看板
+
+            // 逐一處理先前停止之進程，獨立處理監管與非監管進程
+            for spec in &process_plan.stopped_specs {
+                if spec.is_supervised {
+                    #[cfg(windows)]
+                    {
+                        log_update(
+                            "INFO",
+                            "ROLLBACK",
+                            &format!("回滾完成，保留標記由 Windows 服務管理器自動重啟監管進程 (原 PID: {})", spec.pid),
+                        );
+                    }
+                } else {
+                    match restart_dashboard_instance(spec, install_dir) {
+                        Ok(()) => {
+                            println!(
+                                "🔄 回滾完成，已重新啟動 PID {} 對應之 Token 戰情室背景看板服務。",
+                                spec.pid
+                            );
+                            log_update(
+                                "INFO",
+                                "ROLLBACK",
+                                &format!(
+                                    "回滾完成，已重新啟動非監管背景看板進程 (原 PID: {})",
+                                    spec.pid
+                                ),
+                            );
+                        }
+                        Err(restart_err) => {
+                            eprintln!("⚠️ 回滾完成，但無法自動重新啟動看板進程 (原 PID: {}): {restart_err}；請手動啟動看板服務。", spec.pid);
+                            log_update(
+                                "WARN",
+                                "ROLLBACK",
+                                &format!(
+                                    "回滾後重啟進程 (原 PID: {}) 失敗: {restart_err}",
+                                    spec.pid
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+
+            #[cfg(windows)]
+            {
+                let has_supervised = process_plan.stopped_specs.iter().any(|s| s.is_supervised);
+                if !has_supervised {
                     let _ = fs::remove_file(install_dir.join(".service_restart_pending"));
-                    restart_background_dashboard(install_dir);
-                    log_update("INFO", "ROLLBACK", "回滾完成，已重新啟動非監管背景看板進程");
                 }
             }
         }
@@ -2398,24 +2614,75 @@ pub(crate) fn apply_installation_with_rollback(
         }
     }
 
-    // 更新成功後處理先前停止之服務進程重啟：
-    if stopped_status.stopped_any {
-        if stopped_status.had_supervised {
-            // Windows run-service.ps1 監管中：保留 .service_restart_pending，
-            // 當 run_update 結束釋放 UpdateLock 後，run-service.ps1 會偵測並重啟新版服務；
-            // Linux systemd / macOS launchd 亦由監管者自行重啟
-            println!("🔄 服務管理器將在新版就緒後自動重啟監管進程。");
-            log_update(
-                "INFO",
-                "RESTART",
-                "更新成功，保留標記由服務管理器自動重啟監管進程",
-            );
-        } else if stopped_status.had_unsupervised {
-            // 先前為非監管/直接啟動之看板進程，手動更新完成後自動重啟新版背景看板，避免看板離線
+    // 1. Unix 上在檔案提交完成後，通知先前記錄之監管服務進程退出以讓 supervisor 自動載入新版執行檔
+    #[cfg(unix)]
+    {
+        for &pid in &process_plan.supervised_unix_pids {
+            if is_process_alive(pid) {
+                log_update(
+                    "INFO",
+                    "RESTART",
+                    &format!("通知 Unix 服務管理器重啟服務進程 (PID: {pid})"),
+                );
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGTERM);
+                }
+                println!("🔄 已通知服務管理器重啟 (PID: {pid})，將由 supervisor 自動載入新版。");
+            }
+        }
+    }
+
+    // 2. 逐一處理先前停止之進程，獨立處理監管與非監管進程
+    for spec in &process_plan.stopped_specs {
+        if spec.is_supervised {
+            #[cfg(windows)]
+            {
+                println!(
+                    "🔄 Windows 服務管理器將在新版就緒後自動重啟監管進程 (原 PID: {})。",
+                    spec.pid
+                );
+                log_update(
+                    "INFO",
+                    "RESTART",
+                    &format!(
+                        "更新成功，保留標記由 Windows 服務管理器自動重啟監管進程 (原 PID: {})",
+                        spec.pid
+                    ),
+                );
+            }
+        } else {
+            match restart_dashboard_instance(spec, install_dir) {
+                Ok(()) => {
+                    println!(
+                        "🔄 已重新啟動 PID {} 對應之 Token 戰情室背景看板服務。",
+                        spec.pid
+                    );
+                    log_update(
+                        "INFO",
+                        "RESTART",
+                        &format!(
+                            "更新成功，已重新啟動非監管背景看板進程 (原 PID: {})",
+                            spec.pid
+                        ),
+                    );
+                }
+                Err(restart_err) => {
+                    eprintln!("⚠️ 更新完成，但無法自動重新啟動先前停止之看板進程 (原 PID: {}): {restart_err}；請手動啟動看板服務。", spec.pid);
+                    log_update(
+                        "WARN",
+                        "RESTART",
+                        &format!("重啟進程 (原 PID: {}) 失敗: {restart_err}", spec.pid),
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        let has_supervised = process_plan.stopped_specs.iter().any(|s| s.is_supervised);
+        if !has_supervised {
             let _ = fs::remove_file(install_dir.join(".service_restart_pending"));
-            restart_background_dashboard(install_dir);
-            println!("🔄 已重新啟動 Token 戰情室背景看板服務。");
-            log_update("INFO", "RESTART", "更新成功，已重新啟動非監管背景看板進程");
         }
     }
 
@@ -3353,31 +3620,52 @@ update_check_interval: 5 # check every 5 days
     }
 
     #[test]
-    fn stopped_dashboard_status_properties() {
-        let none = StoppedDashboardStatus {
-            stopped_any: false,
-            had_supervised: false,
-            had_unsupervised: false,
+    fn dashboard_process_plan_and_spec_properties() {
+        let plan = DashboardProcessPlan {
+            stopped_specs: vec![
+                StoppedProcessSpec {
+                    pid: 1234,
+                    is_supervised: false,
+                    exe_path: PathBuf::from("/opt/token-usage-insights/token-usage-insights"),
+                    args: Some(vec![
+                        "/opt/token-usage-insights/token-usage-insights".to_string(),
+                        "--no-auto-update".to_string(),
+                    ]),
+                    envs: vec![("PORT".to_string(), "3003".to_string())],
+                    cwd: Some(PathBuf::from("/opt/token-usage-insights")),
+                },
+                StoppedProcessSpec {
+                    pid: 5678,
+                    is_supervised: true,
+                    exe_path: PathBuf::from("/opt/token-usage-insights/token-usage-insights"),
+                    args: None,
+                    envs: vec![],
+                    cwd: None,
+                },
+            ],
+            #[cfg(unix)]
+            supervised_unix_pids: vec![9999],
         };
-        assert!(!none.stopped_any);
 
-        let sup = StoppedDashboardStatus {
-            stopped_any: true,
-            had_supervised: true,
-            had_unsupervised: false,
-        };
-        assert!(sup.stopped_any);
-        assert!(sup.had_supervised);
-        assert!(!sup.had_unsupervised);
+        assert_eq!(plan.stopped_specs.len(), 2);
+        assert!(!plan.stopped_specs[0].is_supervised);
+        assert_eq!(plan.stopped_specs[0].pid, 1234);
+        assert_eq!(
+            plan.stopped_specs[0].args.as_ref().unwrap(),
+            &[
+                "/opt/token-usage-insights/token-usage-insights",
+                "--no-auto-update"
+            ]
+        );
+        assert_eq!(
+            plan.stopped_specs[0].envs,
+            vec![("PORT".to_string(), "3003".to_string())]
+        );
+        assert!(plan.stopped_specs[1].is_supervised);
+        assert_eq!(plan.stopped_specs[1].pid, 5678);
 
-        let unsup = StoppedDashboardStatus {
-            stopped_any: true,
-            had_supervised: false,
-            had_unsupervised: true,
-        };
-        assert!(unsup.stopped_any);
-        assert!(!unsup.had_supervised);
-        assert!(unsup.had_unsupervised);
+        #[cfg(unix)]
+        assert_eq!(plan.supervised_unix_pids, vec![9999]);
     }
 
     #[test]
@@ -3388,5 +3676,62 @@ update_check_interval: 5 # check every 5 days
         let fail: UpdateError = "測試失敗".to_string().into();
         assert_eq!(fail, UpdateError::Failure("測試失敗".to_string()));
         assert_eq!(fail.to_string(), "測試失敗");
+    }
+
+    #[test]
+    fn restart_dashboard_instance_validations() {
+        let temp = std::env::temp_dir().join(format!(
+            "restart-validations-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let _ = fs::create_dir_all(&temp);
+        let dummy_exe = temp.join(APP_NAME);
+        let _ = fs::write(&dummy_exe, b"");
+
+        // 1. args 為 None 時應拒絕重啟
+        let spec_no_args = StoppedProcessSpec {
+            pid: 1111,
+            is_supervised: false,
+            exe_path: dummy_exe.clone(),
+            args: None,
+            envs: vec![],
+            cwd: None,
+        };
+        let res_no_args = restart_dashboard_instance(&spec_no_args, &temp);
+        assert!(res_no_args.is_err());
+        assert!(res_no_args
+            .unwrap_err()
+            .contains("無法可靠取得先前進程之命令列參數"));
+
+        // 2. args 包含 CLI subcommand 時應拒絕重啟
+        let spec_subcommand = StoppedProcessSpec {
+            pid: 2222,
+            is_supervised: false,
+            exe_path: dummy_exe.clone(),
+            args: Some(vec![APP_NAME.to_string(), "export-all".to_string()]),
+            envs: vec![],
+            cwd: None,
+        };
+        let res_subcommand = restart_dashboard_instance(&spec_subcommand, &temp);
+        assert!(res_subcommand.is_err());
+        assert!(res_subcommand
+            .unwrap_err()
+            .contains("先前進程包含非看板 CLI 子命令"));
+
+        // 3. 執行檔不存在時應報錯
+        let empty_dir = temp.join("empty_dir");
+        let spec_missing_exe = StoppedProcessSpec {
+            pid: 3333,
+            is_supervised: false,
+            exe_path: empty_dir.join("nonexistent_exe"),
+            args: Some(vec![APP_NAME.to_string()]),
+            envs: vec![],
+            cwd: None,
+        };
+        let res_missing = restart_dashboard_instance(&spec_missing_exe, &empty_dir);
+        assert!(res_missing.is_err());
+        assert!(res_missing.unwrap_err().contains("找不到執行檔"));
+
+        let _ = fs::remove_dir_all(&temp);
     }
 }

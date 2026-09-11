@@ -507,10 +507,8 @@ cargo build --release --bin token-usage-insights
 ./target/release/token-usage-insights export --help
 ./target/release/token-usage-insights import --help
 
-# Self-update to the latest release (also supports --check, --force, --target-version)
-./target/release/token-usage-insights update
+# Check for new releases (Note: development checkouts only support --check; direct update is blocked to protect source trees. Use token-usage-insights update after standard installation)
 ./target/release/token-usage-insights update --check
-./target/release/token-usage-insights update --target-version v0.9.6
 ```
 
 The data format matches the frontend and contains these fields:
@@ -748,7 +746,16 @@ To install and enable the background service at the same time on Windows:
 After installation, run (on Linux/macOS, confirm that `bin_dir` is on `PATH`; Windows creates a `.cmd` shim):
 
 ```bash
+# Start the dashboard service
 token-usage-insights
+
+# Check for new releases
+token-usage-insights update --check
+
+# Self-update to the latest release (also supports --force and --target-version)
+token-usage-insights update
+token-usage-insights update --force
+token-usage-insights update --target-version v0.9.6
 ```
 
 Environment variables can control the version and installation paths (all optional):

@@ -522,10 +522,8 @@ cargo build --release --bin token-usage-insights
 ./target/release/token-usage-insights export-all --help
 ./target/release/token-usage-insights import --help
 
-# 自我更新至最新版本（亦支援 --check 僅檢查、--force 強制覆蓋、--target-version 指定版本）
-./target/release/token-usage-insights update
+# 檢查是否有新版本（注意：開發與原始碼目錄受安全防護限制僅支援 --check；直接執行更新會回報安全保護拒絕並退出，正式原地更新請於安裝後使用 token-usage-insights update）
 ./target/release/token-usage-insights update --check
-./target/release/token-usage-insights update --target-version v0.9.6
 ```
 
 資料格式使用和前端一致，內含欄位：
@@ -773,7 +771,16 @@ Windows PowerShell 如需同時安裝並啟用常駐服務：
 安裝完成後即可執行（Linux/macOS 需確認 `bin_dir` 已加入 `PATH`；Windows 會建立 `.cmd` shim）：
 
 ```bash
+# 啟動看板服務
 token-usage-insights
+
+# 檢查是否有新版本
+token-usage-insights update --check
+
+# 原地自我更新至最新版本（亦支援 --force 強制覆蓋、--target-version 指定版本）
+token-usage-insights update
+token-usage-insights update --force
+token-usage-insights update --target-version v0.9.6
 ```
 
 環境變數可控制版本與安裝路徑（皆為選用）：
