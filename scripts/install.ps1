@@ -88,6 +88,17 @@ function Get-DashboardDisplayHost {
     return $HostAddress
 }
 
+function Get-ScheduledTaskLogonUser {
+    try {
+        $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+        if ($identity -and $identity.Name) {
+            return $identity.Name
+        }
+    } catch {}
+
+    return $env:USERNAME
+}
+
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 if (Test-Path (Join-Path $ScriptDir "$AppName.exe")) {
     $ReleaseDir = $ScriptDir
@@ -160,12 +171,13 @@ exit /b %APP_EXIT_CODE%
         $StartupShortcut = Get-StartupShortcutPath
 
         try {
+            $taskLogonUser = Get-ScheduledTaskLogonUser
             $Action = New-ScheduledTaskAction `
                 -Execute "powershell.exe" `
                 -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$RunnerScript`" -InstallDir `"$InstallDir`" -HostAddress `"$HostAddress`" -Port $Port" `
                 -WorkingDirectory $InstallDir
 
-            $Trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+            $Trigger = New-ScheduledTaskTrigger -AtLogOn -User $taskLogonUser
 
             $Settings = New-ScheduledTaskSettingsSet `
                 -AllowStartIfOnBatteries `
