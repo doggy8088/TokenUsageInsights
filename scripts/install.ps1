@@ -59,6 +59,10 @@ function Stop-ExistingServiceInstance {
         Start-Sleep -Milliseconds 250
     }
 
+    if ($runnerHostIds | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue }) {
+        throw "Failed to stop the existing background runner before reinstalling."
+    }
+
     if (Get-Process -Name $ProcessName -ErrorAction SilentlyContinue) {
         throw "Failed to stop the existing $ProcessName process before reinstalling."
     }
