@@ -34,6 +34,7 @@ function Stop-ExistingServiceInstance {
     $runnerScriptPath = [IO.Path]::GetFullPath((Join-Path $InstallDir "scripts\run-service.ps1"))
     $quotedRunnerFileArgument = "-File `"$runnerScriptPath`""
     $unquotedRunnerFileArgument = "-File $runnerScriptPath"
+    $appExecutablePath = [IO.Path]::GetFullPath((Join-Path $InstallDir "$ProcessName.exe"))
 
     try {
         Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
@@ -52,16 +53,26 @@ function Stop-ExistingServiceInstance {
         Stop-Process -Id $runnerHost.ProcessId -Force -ErrorAction SilentlyContinue
     }
 
-    $runningProcesses = @(Get-Process -Name $ProcessName -ErrorAction SilentlyContinue)
-    if ($runningProcesses.Count -gt 0) {
-        $runningProcesses | Stop-Process -Force -ErrorAction SilentlyContinue
+    $appProcesses = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+        ($_.Name -eq "$ProcessName.exe") -and
+        (
+            ($_.ExecutablePath -and [IO.Path]::GetFullPath($_.ExecutablePath).Equals($appExecutablePath, [System.StringComparison]::OrdinalIgnoreCase)) -or
+            ($_.CommandLine -and (
+                $_.CommandLine.IndexOf("`"$appExecutablePath`"", [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -or
+                $_.CommandLine.IndexOf($appExecutablePath, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+            ))
+        )
+    })
+    $appProcessIds = @($appProcesses | ForEach-Object { $_.ProcessId })
+    foreach ($appProcess in $appProcesses) {
+        Stop-Process -Id $appProcess.ProcessId -Force -ErrorAction SilentlyContinue
     }
 
     $deadline = (Get-Date).AddSeconds(15)
     while (($runnerHostIds | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue }) -and (Get-Date) -lt $deadline) {
         Start-Sleep -Milliseconds 250
     }
-    while ((Get-Process -Name $ProcessName -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) {
+    while (($appProcessIds | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue }) -and (Get-Date) -lt $deadline) {
         Start-Sleep -Milliseconds 250
     }
 
@@ -69,7 +80,7 @@ function Stop-ExistingServiceInstance {
         throw "Failed to stop the existing background runner before reinstalling."
     }
 
-    if (Get-Process -Name $ProcessName -ErrorAction SilentlyContinue) {
+    if ($appProcessIds | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue }) {
         throw "Failed to stop the existing $ProcessName process before reinstalling."
     }
 }
@@ -184,6 +195,7 @@ exit /b %APP_EXIT_CODE%
 
         $StartupShortcut = Get-StartupShortcutPath
 
+        $taskRegistered = $false
         try {
             $taskLogonUser = Get-ScheduledTaskLogonUser
             $Action = New-ScheduledTaskAction `
@@ -211,15 +223,7 @@ exit /b %APP_EXIT_CODE%
                 -Settings $Settings `
                 -Description "Token 戰情室 Dashboard Background Service" `
                 -Force | Out-Null
-
-            Start-ScheduledTask -TaskName $TaskName
-            $registeredAsTask = $true
-
-            # Registration in Task Scheduler succeeded; remove any stale Startup folder shortcut
-            # to avoid dual launches on logon.
-            if ($PSCmdlet.ShouldProcess($StartupShortcut, "Remove stale Startup shortcut")) {
-                Remove-Item -Force -Path $StartupShortcut -ErrorAction SilentlyContinue
-            }
+            $taskRegistered = $true
         } catch {
             Write-Warning "Could not register scheduled task: $($_.Exception.Message). Falling back to Startup folder..."
             try {
@@ -238,6 +242,26 @@ exit /b %APP_EXIT_CODE%
             Start-Process -FilePath "powershell.exe" `
                 -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$RunnerScript`" -InstallDir `"$InstallDir`" -HostAddress `"$HostAddress`" -Port $Port" `
                 -WorkingDirectory $InstallDir -WindowStyle Hidden
+        }
+
+        if ($taskRegistered) {
+            $registeredAsTask = $true
+
+            try {
+                Start-ScheduledTask -TaskName $TaskName
+            } catch {
+                Write-Warning "Scheduled task registered, but automatic start failed: $($_.Exception.Message)"
+            }
+
+            # Registration in Task Scheduler succeeded; remove any stale Startup folder shortcut
+            # to avoid dual launches on logon.
+            if ($PSCmdlet.ShouldProcess($StartupShortcut, "Remove stale Startup shortcut")) {
+                try {
+                    Remove-Item -Force -Path $StartupShortcut -ErrorAction Stop
+                } catch {
+                    Write-Warning "Scheduled task registered, but removing the stale Startup shortcut failed: $($_.Exception.Message)"
+                }
+            }
         }
     }
 }

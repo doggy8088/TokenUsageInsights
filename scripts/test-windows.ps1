@@ -87,6 +87,7 @@ function Invoke-InstallServiceTest {
         [string]$HostAddress,
         [int]$Port,
         [switch]$FailScheduledTaskAction,
+        [switch]$FailStartScheduledTask,
         [switch]$WhatIf
     )
 
@@ -119,10 +120,13 @@ function Invoke-InstallServiceTest {
     $global:runnerProcessAlive = $true
     $global:otherRunnerProcessAlive = $true
     $global:appProcessAlive = $true
+    $global:otherAppProcessAlive = $true
     $global:scheduledTaskTriggerUser = $null
     $runnerCommandLine = "powershell.exe -File `"$installDir\scripts\run-service.ps1`" -InstallDir `"$installDir`""
     $otherInstallDir = "$installDir-old"
     $otherRunnerCommandLine = "powershell.exe -File `"$otherInstallDir\scripts\run-service.ps1`" -InstallDir `"$otherInstallDir`""
+    $appExecutablePath = "$installDir\token-usage-insights.exe"
+    $otherAppExecutablePath = "$otherInstallDir\token-usage-insights.exe"
 
     function Stop-ScheduledTask {
         [CmdletBinding()]
@@ -147,6 +151,22 @@ function Invoke-InstallServiceTest {
                 CommandLine = $otherRunnerCommandLine
             }
         }
+        if ($global:appProcessAlive) {
+            $processes += [pscustomobject]@{
+                Name = "token-usage-insights.exe"
+                ProcessId = 221
+                CommandLine = "`"$appExecutablePath`""
+                ExecutablePath = $appExecutablePath
+            }
+        }
+        if ($global:otherAppProcessAlive) {
+            $processes += [pscustomobject]@{
+                Name = "token-usage-insights.exe"
+                ProcessId = 222
+                CommandLine = "`"$otherAppExecutablePath`""
+                ExecutablePath = $otherAppExecutablePath
+            }
+        }
         return $processes
     }
     function Get-Process {
@@ -159,12 +179,14 @@ function Invoke-InstallServiceTest {
             if (($Id -eq 112) -and $global:otherRunnerProcessAlive) {
                 return [pscustomobject]@{ Id = 112; Name = "powershell" }
             }
+            if (($Id -eq 221) -and $global:appProcessAlive) {
+                return [pscustomobject]@{ Id = 221; Name = "token-usage-insights" }
+            }
+            if (($Id -eq 222) -and $global:otherAppProcessAlive) {
+                return [pscustomobject]@{ Id = 222; Name = "token-usage-insights" }
+            }
 
             return
-        }
-
-        if (($Name -eq "token-usage-insights") -and $global:appProcessAlive) {
-            return [pscustomobject]@{ Id = 222; Name = "token-usage-insights" }
         }
     }
     function Stop-Process {
@@ -184,13 +206,16 @@ function Invoke-InstallServiceTest {
                     $global:otherRunnerProcessAlive = $false
                     $global:serviceEvents.Add("StopOtherRunner")
                 }
+                if ($Id -eq 221) {
+                    $global:appProcessAlive = $false
+                    $global:serviceEvents.Add("StopApp")
+                }
+                if ($Id -eq 222) {
+                    $global:otherAppProcessAlive = $false
+                    $global:serviceEvents.Add("StopOtherApp")
+                }
 
                 return
-            }
-
-            if ($InputObject -and $InputObject.Id -eq 222) {
-                $global:appProcessAlive = $false
-                $global:serviceEvents.Add("StopApp")
             }
         }
     }
@@ -245,6 +270,9 @@ function Invoke-InstallServiceTest {
     function Start-ScheduledTask {
         [CmdletBinding()]
         param([string]$TaskName)
+        if ($FailStartScheduledTask) {
+            throw "Simulated scheduled task start failure."
+        }
         $global:serviceEvents.Add("StartScheduledTask")
     }
     function Unregister-ScheduledTask {
@@ -312,6 +340,7 @@ function Invoke-InstallServiceTest {
             Output = @($global:hostMessages)
             TriggerUser = $global:scheduledTaskTriggerUser
             OtherRunnerStopped = (-not $global:otherRunnerProcessAlive)
+            OtherAppStopped = (-not $global:otherAppProcessAlive)
             StartupShortcutExists = (Test-Path -LiteralPath $startupShortcut)
         }
     } finally {
@@ -333,7 +362,7 @@ function Invoke-InstallServiceTest {
         )) {
             Remove-Item "Function:\$functionName" -ErrorAction SilentlyContinue
         }
-        Remove-Variable serviceEvents, hostMessages, runnerProcessAlive, otherRunnerProcessAlive, appProcessAlive, scheduledTaskTriggerUser -Scope Global -ErrorAction SilentlyContinue
+        Remove-Variable serviceEvents, hostMessages, runnerProcessAlive, otherRunnerProcessAlive, appProcessAlive, otherAppProcessAlive, scheduledTaskTriggerUser -Scope Global -ErrorAction SilentlyContinue
         $env:APPDATA = $previousAppData
         $env:USERNAME = $previousUsername
         $env:USERDOMAIN = $previousUserDomain
@@ -429,6 +458,7 @@ try {
     $stopAppIndex = $installIpv6Result.Events.IndexOf("StopApp")
     Assert-True ($copyIndex -gt $stopRunnerIndex -and $copyIndex -gt $stopAppIndex) "install.ps1 should stop existing service processes before copying files."
     Assert-Equal $false $installIpv6Result.OtherRunnerStopped "install.ps1 should not stop a different runner whose install path merely shares a prefix."
+    Assert-Equal $false $installIpv6Result.OtherAppStopped "install.ps1 should not stop a different installed executable whose path merely shares a prefix."
     Assert-True ($installIpv6Result.Output -contains "  http://[::1]:4010") "install.ps1 should bracket IPv6 dashboard URLs."
     Assert-Equal "test-domain\test-user" $installIpv6Result.TriggerUser "install.ps1 should scope the logon trigger to the current user."
 
@@ -439,6 +469,12 @@ try {
     Assert-True ($installFallbackResult.Events -contains "CreateShortcut") "install.ps1 should create a Startup shortcut when scheduled task registration setup fails."
     Assert-True ($installFallbackResult.Events -contains "StartFallbackProcess") "install.ps1 should start the fallback background runner when scheduled task setup fails."
     Assert-True ($installFallbackResult.Output -contains "  Registered in:   Startup folder") "install.ps1 should report Startup folder registration after falling back."
+
+    $installPostRegistrationFailureResult = Invoke-InstallServiceTest -HostAddress "127.0.0.1" -Port 3003 -FailStartScheduledTask
+    Assert-True ($installPostRegistrationFailureResult.Events -contains "RegisterScheduledTask") "install.ps1 should still register the scheduled task before a post-registration start failure."
+    Assert-Equal $false ($installPostRegistrationFailureResult.Events -contains "CreateShortcut") "install.ps1 should not fall back to the Startup shortcut after scheduled task registration succeeds."
+    Assert-Equal $false ($installPostRegistrationFailureResult.Events -contains "StartFallbackProcess") "install.ps1 should not launch the fallback runner after scheduled task registration succeeds."
+    Assert-True ($installPostRegistrationFailureResult.Output -contains "  Registered task: TokenUsageInsights (Task Scheduler)") "install.ps1 should continue reporting the scheduled task after a post-registration start failure."
 
     $installWhatIfResult = Invoke-InstallServiceTest -HostAddress "127.0.0.1" -Port 3003 -WhatIf
     Assert-Equal $true $installWhatIfResult.StartupShortcutExists "install.ps1 should not remove an existing Startup shortcut during -WhatIf."
