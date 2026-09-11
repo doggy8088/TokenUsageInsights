@@ -226,7 +226,36 @@ async fn main() {
 
     // HTTP 先開始監聽；可能耗時的遷移與 transcript 同步在 blocking thread 執行。
     spawn_usage_sync_task();
-    axum::serve(listener, app).await.unwrap();
+    let _pid_guard = updater::create_server_pid_guard();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .unwrap();
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        if let Ok(mut sig) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            sig.recv().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
 }
 
 /// 獲取靜態檔案的基準路徑

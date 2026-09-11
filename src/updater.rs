@@ -1,7 +1,7 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use serde::Deserialize;
@@ -43,6 +43,144 @@ fn is_process_alive(pid: u32) -> bool {
     } else {
         true
     }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn is_process_alive(_pid: u32) -> bool {
+    false
+}
+
+#[cfg(target_vendor = "apple")]
+fn get_process_exe_path(pid: u32) -> Option<PathBuf> {
+    extern "C" {
+        fn proc_pidpath(
+            pid: libc::c_int,
+            buffer: *mut libc::c_void,
+            buffersize: u32,
+        ) -> libc::c_int;
+    }
+    let mut buf = vec![0u8; 4096];
+    let ret = unsafe {
+        proc_pidpath(
+            pid as libc::c_int,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len() as u32,
+        )
+    };
+    if ret > 0 {
+        let path_bytes = &buf[..ret as usize];
+        if let Ok(path_str) = std::str::from_utf8(path_bytes) {
+            let p = PathBuf::from(path_str.trim_end_matches('\0'));
+            if p.exists() {
+                return Some(p);
+            }
+        }
+    }
+    if let Ok(output) = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output()
+    {
+        let comm = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !comm.is_empty() {
+            let p = PathBuf::from(&comm);
+            if p.is_absolute() && p.exists() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn get_process_exe_path(pid: u32) -> Option<PathBuf> {
+    fs::read_link(format!("/proc/{pid}/exe")).ok()
+}
+
+#[cfg(all(unix, not(target_os = "linux"), not(target_vendor = "apple")))]
+fn get_process_exe_path(pid: u32) -> Option<PathBuf> {
+    if let Ok(p) = fs::read_link(format!("/proc/{pid}/exe")) {
+        return Some(p);
+    }
+    if let Ok(p) = fs::read_link(format!("/proc/{pid}/file")) {
+        return Some(p);
+    }
+    if let Ok(output) = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output()
+    {
+        let comm = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !comm.is_empty() {
+            let p = PathBuf::from(&comm);
+            if p.is_absolute() && p.exists() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn get_process_exe_path(pid: u32) -> Option<PathBuf> {
+    let script =
+        format!("(Get-CimInstance Win32_Process -Filter \"ProcessId = {pid}\").ExecutablePath");
+    if let Ok(output) = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+    {
+        let out = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !out.is_empty() {
+            let p = PathBuf::from(&out);
+            if p.exists() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(any(unix, windows)))]
+fn get_process_exe_path(_pid: u32) -> Option<PathBuf> {
+    None
+}
+
+fn matches_install_dir(exe_path: &Path, install_dir: &Path) -> bool {
+    if let (Ok(can_exe), Ok(can_dir)) = (fs::canonicalize(exe_path), fs::canonicalize(install_dir))
+    {
+        can_exe.starts_with(&can_dir)
+    } else {
+        exe_path.starts_with(install_dir)
+    }
+}
+
+pub struct ServerPidGuard {
+    paths: Vec<PathBuf>,
+}
+
+impl Drop for ServerPidGuard {
+    fn drop(&mut self) {
+        for path in &self.paths {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+pub fn create_server_pid_guard() -> ServerPidGuard {
+    let mut paths = Vec::new();
+    let my_pid = std::process::id().to_string();
+
+    let env_kind = detect_environment();
+    if let EnvironmentKind::StandardInstalled { install_dir, .. } = env_kind {
+        let p = install_dir.join(".server.pid");
+        if fs::write(&p, &my_pid).is_ok() {
+            paths.push(p);
+        }
+    }
+    let insights_pid = crate::db::get_insights_dir().join(".server.pid");
+    if fs::write(&insights_pid, &my_pid).is_ok() {
+        paths.push(insights_pid);
+    }
+
+    ServerPidGuard { paths }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -462,6 +600,14 @@ impl TempDirGuard {
         fs::create_dir_all(&path).map_err(|e| format!("建立暫存目錄失敗: {e}"))?;
         Ok(Self { path })
     }
+
+    fn cleanup(&self) -> Result<(), String> {
+        if self.path.exists() {
+            fs::remove_dir_all(&self.path)
+                .map_err(|e| format!("清理暫存目錄失敗 ({:?}): {e}", self.path))?;
+        }
+        Ok(())
+    }
 }
 
 impl Drop for TempDirGuard {
@@ -648,22 +794,31 @@ fn backup_installation(install_dir: &Path, backup_dir: &Path) -> Result<(), Stri
     }
     fs::create_dir_all(backup_dir).map_err(|e| format!("建立備份目錄失敗: {e}"))?;
 
-    let mut manifest_entries = Vec::new();
-    for &item in MANAGED_ITEMS {
-        let src = install_dir.join(item);
-        let dst = backup_dir.join(item);
-        if src.exists() {
-            manifest_entries.push(item);
-            if src.is_dir() {
-                copy_dir_recursive(&src, &dst)?;
-            } else if src.is_file() {
-                fs::copy(&src, &dst).map_err(|e| format!("備份檔案失敗 {item}: {e}"))?;
+    let backup_res = (|| -> Result<(), String> {
+        let mut manifest_entries = Vec::new();
+        for &item in MANAGED_ITEMS {
+            let src = install_dir.join(item);
+            let dst = backup_dir.join(item);
+            if src.exists() {
+                manifest_entries.push(item);
+                if src.is_dir() {
+                    copy_dir_recursive(&src, &dst)?;
+                } else if src.is_file() {
+                    fs::copy(&src, &dst).map_err(|e| format!("備份檔案失敗 {item}: {e}"))?;
+                }
             }
         }
-    }
 
-    fs::write(backup_dir.join(".manifest"), manifest_entries.join("\n"))
-        .map_err(|e| format!("寫入備份清單失敗: {e}"))?;
+        fs::write(backup_dir.join(".manifest"), manifest_entries.join("\n"))
+            .map_err(|e| format!("寫入備份清單失敗: {e}"))?;
+
+        Ok(())
+    })();
+
+    if let Err(e) = backup_res {
+        let _ = fs::remove_dir_all(backup_dir);
+        return Err(e);
+    }
 
     Ok(())
 }
@@ -1128,139 +1283,257 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), String> {
     let is_zip = archive_name.ends_with(".zip");
     let extract_dir = tmp_guard.path.join("extracted");
     println!("📦 正在解壓縮檔案...");
-    if let Err(e) = extract_archive(&archive_path, &extract_dir, is_zip) {
-        log_update("ERROR", "EXTRACT", &e);
-        return Err(e);
-    }
 
-    // 尋找解壓後的根目錄（可能有一層子目錄）
-    let release_root = if extract_dir.join(APP_NAME).exists()
-        || extract_dir.join(format!("{APP_NAME}.exe")).exists()
-    {
-        extract_dir
-    } else {
-        let mut found = None;
-        if let Ok(entries) = fs::read_dir(&extract_dir) {
-            for entry in entries.flatten() {
-                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                    let sub = entry.path();
-                    if sub.join(APP_NAME).exists() || sub.join(format!("{APP_NAME}.exe")).exists() {
-                        found = Some(sub);
-                        break;
+    // 將耗時之同步解壓縮與原子替換移至 blocking thread，避免阻塞 tokio 執行緒並支援超時隔離
+    let install_task_res = tokio::task::spawn_blocking({
+        let archive_path = archive_path.clone();
+        let extract_dir = extract_dir.clone();
+        let install_dir = install_dir.clone();
+        let remote_version = remote_version.to_string();
+        move || -> Result<(), String> {
+            if let Err(e) = extract_archive(&archive_path, &extract_dir, is_zip) {
+                log_update("ERROR", "EXTRACT", &e);
+                return Err(e);
+            }
+
+            // 尋找解壓後的根目錄（可能有一層子目錄）
+            let release_root = if extract_dir.join(APP_NAME).exists()
+                || extract_dir.join(format!("{APP_NAME}.exe")).exists()
+            {
+                extract_dir
+            } else {
+                let mut found = None;
+                if let Ok(entries) = fs::read_dir(&extract_dir) {
+                    for entry in entries.flatten() {
+                        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                            let sub = entry.path();
+                            if sub.join(APP_NAME).exists()
+                                || sub.join(format!("{APP_NAME}.exe")).exists()
+                            {
+                                found = Some(sub);
+                                break;
+                            }
+                        }
                     }
                 }
-            }
-        }
-        match found {
-            Some(dir) => dir,
-            None => {
-                let err = "解壓後的目錄中未找到執行檔".to_string();
-                log_update("ERROR", "EXTRACT", &err);
-                return Err(err);
-            }
-        }
-    };
+                match found {
+                    Some(dir) => dir,
+                    None => {
+                        let err = "解壓後的目錄中未找到執行檔".to_string();
+                        log_update("ERROR", "EXTRACT", &err);
+                        return Err(err);
+                    }
+                }
+            };
 
-    let exec_name = if cfg!(windows) {
-        format!("{APP_NAME}.exe")
-    } else {
-        APP_NAME.to_string()
-    };
+            let exec_name = if cfg!(windows) {
+                format!("{APP_NAME}.exe")
+            } else {
+                APP_NAME.to_string()
+            };
 
-    // 驗證解壓後的發行包是否包含所有必要資源，避免不完整安裝造成混合版本
-    let required_items = [
-        exec_name.as_str(),
-        "static",
-        "pricing.csv",
-        "VERSION",
-        "scripts",
-        "shell",
-        "install.sh",
-        "install.ps1",
-    ];
-    for required in required_items {
-        if !release_root.join(required).exists() {
-            let err = format!("解壓發行包缺少必要資源: {required}");
-            log_update("ERROR", "VERIFY", &err);
-            return Err(err);
+            // 驗證解壓後的發行包是否包含所有必要資源，避免不完整安裝造成混合版本
+            let required_items = [
+                exec_name.as_str(),
+                "static",
+                "pricing.csv",
+                "VERSION",
+                "scripts",
+                "shell",
+                "install.sh",
+                "install.ps1",
+            ];
+            for required in required_items {
+                if !release_root.join(required).exists() {
+                    let err = format!("解壓發行包缺少必要資源: {required}");
+                    log_update("ERROR", "VERIFY", &err);
+                    return Err(err);
+                }
+            }
+
+            let backup_dir = install_dir.join(".backup");
+            apply_installation_with_rollback(&release_root, &install_dir, &backup_dir)?;
+
+            println!("🎉 成功更新至版本 {remote_version}！");
+            log_update("INFO", "INSTALL", &format!("成功更新至 {remote_version}"));
+
+            Ok(())
         }
+    })
+    .await;
+
+    match install_task_res {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(e),
+        Err(join_err) => return Err(format!("安裝任務執行異常: {join_err}")),
     }
 
-    let backup_dir = install_dir.join(".backup");
-    apply_installation_with_rollback(&release_root, &install_dir, &backup_dir)?;
-
-    println!("🎉 成功更新至版本 {remote_version}！");
-    log_update("INFO", "INSTALL", &format!("成功更新至 {remote_version}"));
+    let _ = tmp_guard.cleanup();
 
     Ok(())
 }
 
-#[cfg(unix)]
-fn stop_running_dashboard_instances(_install_dir: &Path) {
+fn stop_running_dashboard_instances(install_dir: &Path) -> Result<(), String> {
     let my_pid = std::process::id();
-    if let Ok(output) = std::process::Command::new("pgrep")
-        .arg("-f")
-        .arg(APP_NAME)
-        .output()
-    {
-        let text = String::from_utf8_lossy(&output.stdout);
-        for line in text.lines() {
-            if let Ok(pid) = line.trim().parse::<u32>() {
-                if pid != my_pid {
-                    log_update(
-                        "INFO",
-                        "STOP_SERVICE",
-                        &format!("協調停止執行中之服務進程 (PID {pid})"),
-                    );
-                    unsafe {
-                        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+    let mut target_pids = std::collections::HashSet::new();
+
+    // 1. 從 .server.pid 讀取 PID
+    let pid_file = install_dir.join(".server.pid");
+    if let Ok(content) = fs::read_to_string(&pid_file) {
+        if let Ok(pid) = content.trim().parse::<u32>() {
+            if pid != my_pid && is_process_alive(pid) {
+                target_pids.insert(pid);
+            }
+        }
+    }
+    let insights_pid_file = crate::db::get_insights_dir().join(".server.pid");
+    if let Ok(content) = fs::read_to_string(&insights_pid_file) {
+        if let Ok(pid) = content.trim().parse::<u32>() {
+            if pid != my_pid && is_process_alive(pid) {
+                if let Some(exe_path) = get_process_exe_path(pid) {
+                    if matches_install_dir(&exe_path, install_dir) {
+                        target_pids.insert(pid);
                     }
+                } else {
+                    target_pids.insert(pid);
                 }
             }
         }
     }
-    std::thread::sleep(Duration::from_millis(500));
-}
 
-#[cfg(windows)]
-fn stop_running_dashboard_instances(_install_dir: &Path) {
-    let my_pid = std::process::id();
-    let exec_name = format!("{APP_NAME}.exe");
-    if let Ok(output) = std::process::Command::new("tasklist")
-        .args([
-            "/FI",
-            &format!("IMAGENAME eq {exec_name}"),
-            "/FO",
-            "CSV",
-            "/NH",
-        ])
-        .output()
+    // 2. 透過系統進程清單掃描 APP_NAME 並比對安裝目錄
+    #[cfg(unix)]
     {
-        let text = String::from_utf8_lossy(&output.stdout);
-        for line in text.lines() {
-            let parts: Vec<&str> = line.split(',').collect();
-            if parts.len() >= 2 {
-                let pid_str = parts[1].trim().trim_matches('"');
-                if let Ok(pid) = pid_str.parse::<u32>() {
+        if let Ok(output) = std::process::Command::new("pgrep")
+            .arg("-f")
+            .arg(APP_NAME)
+            .output()
+        {
+            let text = String::from_utf8_lossy(&output.stdout);
+            for line in text.lines() {
+                if let Ok(pid) = line.trim().parse::<u32>() {
                     if pid != my_pid && is_process_alive(pid) {
-                        log_update(
-                            "INFO",
-                            "STOP_SERVICE",
-                            &format!("協調停止執行中之 Windows 服務進程 (PID {pid})"),
-                        );
-                        let _ = std::process::Command::new("taskkill")
-                            .args(["/PID", &pid.to_string(), "/T", "/F"])
-                            .output();
+                        if let Some(exe_path) = get_process_exe_path(pid) {
+                            if matches_install_dir(&exe_path, install_dir) {
+                                target_pids.insert(pid);
+                            }
+                        }
                     }
                 }
             }
         }
     }
-    std::thread::sleep(Duration::from_millis(500));
-}
 
-#[cfg(not(any(unix, windows)))]
-fn stop_running_dashboard_instances(_install_dir: &Path) {}
+    #[cfg(windows)]
+    {
+        let exec_name = format!("{APP_NAME}.exe");
+        if let Ok(output) = std::process::Command::new("tasklist")
+            .args([
+                "/FI",
+                &format!("IMAGENAME eq {exec_name}"),
+                "/FO",
+                "CSV",
+                "/NH",
+            ])
+            .output()
+        {
+            let text = String::from_utf8_lossy(&output.stdout);
+            for line in text.lines() {
+                let parts: Vec<&str> = line.split(',').collect();
+                if parts.len() >= 2 {
+                    let pid_str = parts[1].trim().trim_matches('"');
+                    if let Ok(pid) = pid_str.parse::<u32>() {
+                        if pid != my_pid && is_process_alive(pid) {
+                            if let Some(exe_path) = get_process_exe_path(pid) {
+                                if matches_install_dir(&exe_path, install_dir) {
+                                    target_pids.insert(pid);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut remaining_pids: Vec<u32> = target_pids.into_iter().collect();
+    if remaining_pids.is_empty() {
+        let _ = fs::remove_file(pid_file);
+        let _ = fs::remove_file(insights_pid_file);
+        return Ok(());
+    }
+
+    log_update(
+        "INFO",
+        "STOP_SERVICE",
+        &format!("協調停止執行中之服務進程: {remaining_pids:?}"),
+    );
+
+    // 3. 發送初次溫和退出訊號 (Unix: SIGTERM, Windows: taskkill 無 /F)
+    for &pid in &remaining_pids {
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGTERM);
+        }
+        #[cfg(windows)]
+        {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/T"])
+                .output();
+        }
+    }
+
+    // 4. 積極輪詢並在逾時 2.5 秒後升級強制終止
+    let start_time = Instant::now();
+    let timeout = Duration::from_secs(5);
+    let escalation_delay = Duration::from_millis(2500);
+    let poll_interval = Duration::from_millis(100);
+    let mut escalated = false;
+
+    loop {
+        remaining_pids.retain(|&pid| is_process_alive(pid));
+        if remaining_pids.is_empty() {
+            break;
+        }
+
+        let elapsed = start_time.elapsed();
+        if elapsed >= timeout {
+            let err = format!(
+                "等待執行中之服務進程 (PID: {remaining_pids:?}) 停止超時，更新中止以保護檔案安全"
+            );
+            log_update("ERROR", "STOP_SERVICE", &err);
+            return Err(err);
+        }
+
+        if elapsed >= escalation_delay && !escalated {
+            escalated = true;
+            log_update(
+                "WARN",
+                "STOP_SERVICE",
+                &format!("服務進程未於 2.5 秒內正常退出，升級強制終止 (PID: {remaining_pids:?})"),
+            );
+            for &pid in &remaining_pids {
+                #[cfg(unix)]
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                }
+                #[cfg(windows)]
+                {
+                    let _ = std::process::Command::new("taskkill")
+                        .args(["/PID", &pid.to_string(), "/T", "/F"])
+                        .output();
+                }
+            }
+        }
+
+        std::thread::sleep(poll_interval);
+    }
+
+    let _ = fs::remove_file(pid_file);
+    let _ = fs::remove_file(insights_pid_file);
+    log_update("INFO", "STOP_SERVICE", "所有執行中之服務進程已安全停止");
+    Ok(())
+}
 
 pub(crate) fn apply_installation_with_rollback(
     release_root: &Path,
@@ -1268,7 +1541,7 @@ pub(crate) fn apply_installation_with_rollback(
     backup_dir: &Path,
 ) -> Result<(), String> {
     println!("⏸️ 正在協調停止現有執行中之服務...");
-    stop_running_dashboard_instances(install_dir);
+    stop_running_dashboard_instances(install_dir)?;
 
     println!("💾 正在備份現有安裝...");
     if let Err(e) = backup_installation(install_dir, backup_dir) {
@@ -1383,10 +1656,11 @@ pub(crate) fn apply_installation_with_rollback(
         }
 
         // 確保自訂安裝目錄保有安裝標記，避免未來更新無法辨識
-        let _ = fs::write(
+        fs::write(
             install_dir.join(".install_marker"),
             "token-usage-insights:installed",
-        );
+        )
+        .map_err(|e| format!("寫入安裝標記失敗: {e}"))?;
 
         Ok(())
     })();
@@ -1418,10 +1692,16 @@ pub(crate) fn apply_installation_with_rollback(
             let fallback_backup =
                 install_dir.join(format!(".backup-old-{}", Utc::now().timestamp()));
             if let Err(re) = fs::rename(backup_dir, &fallback_backup) {
-                log_update("ERROR", "CLEANUP", &format!("備份目錄換名失敗: {re}"));
-                return Err(format!(
-                    "更新已安裝，但備份目錄無法清理或換名 ({backup_dir:?}): {re}；請手動移除以允許後續更新"
-                ));
+                log_update("WARN", "CLEANUP", &format!("備份目錄換名失敗: {re}"));
+                eprintln!(
+                    "⚠️ 更新已安裝完成，但備份目錄無法清理或換名 ({backup_dir:?}): {re}；請稍後手動移除。"
+                );
+            } else {
+                log_update(
+                    "INFO",
+                    "CLEANUP",
+                    &format!("備份目錄已安全移至 {fallback_backup:?}"),
+                );
             }
         }
     }
@@ -1580,33 +1860,7 @@ pub async fn check_and_auto_update_on_launch() {
         }
     };
 
-    // 3. 檢查先前更新之殘留狀態與回滾保護（在判斷任何略過旗標前執行，確保不載入損毀狀態）
-    let backup_dir = install_dir.join(".backup");
-    if backup_dir.join(".rollback_failed").exists() {
-        eprintln!(
-            "❌ 偵測到先前更新回滾失敗標記 ({backup_dir:?})；為防止讀取損毀檔案，程序終止。請依備份手動還原。"
-        );
-        log_update("ERROR", "STARTUP_FATAL", "先前回滾失敗，程序終止");
-        std::process::exit(1);
-    }
-    if backup_dir.exists() && backup_dir.join(".manifest").exists() {
-        println!("⚠️ 偵測到未完成之中斷更新備份，正在自動救援還原至健全版本...");
-        log_update(
-            "WARN",
-            "STARTUP_RECOVERY",
-            "偵測到中斷更新備份，執行自動救援還原",
-        );
-        if let Err(e) = restore_from_backup(&backup_dir, &install_dir) {
-            eprintln!("❌ 自動救援還原失敗: {e}；程序終止以保護狀態。");
-            log_update("ERROR", "STARTUP_FATAL", &format!("救援還原失敗: {e}"));
-            std::process::exit(1);
-        }
-        let _ = fs::remove_dir_all(&backup_dir);
-        println!("✅ 已成功自動還原至健全版本。");
-        log_update("INFO", "STARTUP_RECOVERY", "自動救援還原成功");
-    }
-
-    // 4. 若已有其他更新程序正在進行中，等待其完成並重啟，嚴禁同時啟動伺服器
+    // 3. 若已有其他更新程序正在進行中，等待其完成並重啟，嚴禁同時啟動伺服器或干擾更新中之備份目錄
     if UpdateLock::is_locked(&install_dir) {
         println!("⏳ 偵測到已有更新程序正在進行中，等待更新完成...");
         log_update("INFO", "STARTUP_WAIT", "偵測到進行中的更新鎖，等待其釋放");
@@ -1641,6 +1895,33 @@ pub async fn check_and_auto_update_on_launch() {
                 std::process::exit(1);
             }
         }
+    }
+
+    // 4. 此時目錄已確認無進行中更新鎖，檢查先前更新之殘留中斷狀態與回滾保護
+    let backup_dir = install_dir.join(".backup");
+    if backup_dir.join(".rollback_failed").exists() {
+        eprintln!(
+            "❌ 偵測到先前更新回滾失敗標記 ({backup_dir:?})；為防止讀取損毀檔案，程序終止。請依備份手動還原。"
+        );
+        log_update("ERROR", "STARTUP_FATAL", "先前回滾失敗，程序終止");
+        std::process::exit(1);
+    }
+    if backup_dir.exists() && backup_dir.join(".manifest").exists() {
+        println!("⚠️ 偵測到未完成之中斷更新備份，正在自動救援還原至健全版本...");
+        log_update(
+            "WARN",
+            "STARTUP_RECOVERY",
+            "偵測到中斷更新備份，執行自動救援還原",
+        );
+        if let Err(e) = restore_from_backup(&backup_dir, &install_dir) {
+            eprintln!("❌ 自動救援還原失敗: {e}；程序終止以保護狀態。");
+            log_update("ERROR", "STARTUP_FATAL", &format!("救援還原失敗: {e}"));
+            std::process::exit(1);
+        }
+        let _ = fs::remove_dir_all(&backup_dir);
+        println!("✅ 已成功自動還原至健全版本，正在重新啟動 Token 戰情室...");
+        log_update("INFO", "STARTUP_RECOVERY", "自動救援還原成功，重啟進程");
+        restart_current_process(&args);
     }
 
     // 5. 檢查是否關閉自動更新（命令列旗標 > 環境變數 > config.yaml）
@@ -2129,6 +2410,49 @@ update_check_interval: 5 # check every 5 days
             "backup_dir should be removed after successful rollback"
         );
 
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn process_exe_path_and_matches_install_dir() {
+        let my_pid = std::process::id();
+        let exe_path = get_process_exe_path(my_pid);
+        assert!(
+            exe_path.is_some(),
+            "should be able to get current process exe path"
+        );
+        let path = exe_path.unwrap();
+        assert!(path.exists(), "process exe path should exist: {:?}", path);
+
+        let parent = path.parent().unwrap();
+        assert!(matches_install_dir(&path, parent));
+        assert!(!matches_install_dir(
+            &path,
+            Path::new("/nonexistent/directory")
+        ));
+    }
+
+    #[test]
+    fn server_pid_guard_lifecycle() {
+        let temp = std::env::temp_dir().join(format!(
+            "pid-test-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        fs::create_dir_all(&temp).unwrap();
+        let pid_path = temp.join(".server.pid");
+
+        {
+            let _guard = ServerPidGuard {
+                paths: vec![pid_path.clone()],
+            };
+            fs::write(&pid_path, std::process::id().to_string()).unwrap();
+            assert!(pid_path.exists());
+        }
+
+        assert!(
+            !pid_path.exists(),
+            ".server.pid should be removed when guard is dropped"
+        );
         let _ = fs::remove_dir_all(&temp);
     }
 }
