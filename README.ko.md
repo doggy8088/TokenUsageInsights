@@ -646,12 +646,14 @@ if (-not $InstallDir -and (Test-Path $StartupShortcut)) {
 if (-not $InstallDir) {
     $InstallDir = Join-Path $env:LOCALAPPDATA "TokenUsageInsights"
 }
+$TargetExe = "$InstallDir\token-usage-insights.exe".ToLowerInvariant().Replace('/', '\')
+$EscapedDir = [regex]::Escape($InstallDir)
 
 # 서비스 상태 확인(작업 스케줄러 또는 백그라운드 프로세스)
 Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
-    ($_.CommandLine -like "*run-service.ps1*" -and $_.CommandLine -like "*$InstallDir*") -or
-    ($_.ExecutablePath -and $_.ExecutablePath -like "$InstallDir*")
+    ($_.CommandLine -like "*run-service.ps1*" -and $_.CommandLine -match "(?i)[\s`"'\\]$EscapedDir([\\`"'\s]|$)") -or
+    ($_.ExecutablePath -and ($_.ExecutablePath.ToLowerInvariant().Replace('/', '\') -eq $TargetExe))
 } | Select-Object ProcessId, Name, CommandLine
 
 # 실시간 로그 확인
@@ -660,8 +662,8 @@ Get-Content (Join-Path $InstallDir "logs\token-usage-insights.out.log") -Tail 50
 # 서비스 다시 시작(해당 설치 디렉터리에 한정, 작업 스케줄러 및 시작프로그램 모드 자동 호환)
 Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
-    ($_.CommandLine -like "*run-service.ps1*" -and $_.CommandLine -like "*$InstallDir*") -or
-    ($_.ExecutablePath -and $_.ExecutablePath -like "$InstallDir*")
+    ($_.CommandLine -like "*run-service.ps1*" -and $_.CommandLine -match "(?i)[\s`"'\\]$EscapedDir([\\`"'\s]|$)") -or
+    ($_.ExecutablePath -and ($_.ExecutablePath.ToLowerInvariant().Replace('/', '\') -eq $TargetExe))
 } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
     Start-ScheduledTask -TaskName $TaskName
@@ -672,8 +674,8 @@ if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
 # 서비스 중지(해당 설치 디렉터리에 한정)
 Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
-    ($_.CommandLine -like "*run-service.ps1*" -and $_.CommandLine -like "*$InstallDir*") -or
-    ($_.ExecutablePath -and $_.ExecutablePath -like "$InstallDir*")
+    ($_.CommandLine -like "*run-service.ps1*" -and $_.CommandLine -match "(?i)[\s`"'\\]$EscapedDir([\\`"'\s]|$)") -or
+    ($_.ExecutablePath -and ($_.ExecutablePath.ToLowerInvariant().Replace('/', '\') -eq $TargetExe))
 } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 
 # 상주 서비스 등록 해제
@@ -683,8 +685,8 @@ if (Test-Path $StartupShortcut) {
     Remove-Item $StartupShortcut -Force -ErrorAction SilentlyContinue
 }
 Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
-    ($_.CommandLine -like "*run-service.ps1*" -and $_.CommandLine -like "*$InstallDir*") -or
-    ($_.ExecutablePath -and $_.ExecutablePath -like "$InstallDir*")
+    ($_.CommandLine -like "*run-service.ps1*" -and $_.CommandLine -match "(?i)[\s`"'\\]$EscapedDir([\\`"'\s]|$)") -or
+    ($_.ExecutablePath -and ($_.ExecutablePath.ToLowerInvariant().Replace('/', '\') -eq $TargetExe))
 } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 ```
 

@@ -50,6 +50,7 @@ $payload | ConvertTo-Json -Compress | Set-Content -LiteralPath '__CAPTURE_PATH__
 
     function Invoke-RestMethod { @{ tag_name = "v-test" } }
     function Invoke-WebRequest {
+        [CmdletBinding()]
         param(
             [string]$Uri,
             [string]$OutFile,
@@ -575,6 +576,70 @@ try {
     Assert-Equal $true $installWhatIfResult.StartupShortcutExists "install.ps1 should not remove an existing Startup shortcut during -WhatIf."
     Assert-Equal $false ($installWhatIfResult.Output -contains "Token 戰情室 installed.") "install.ps1 should not output completion message during -WhatIf."
     Assert-Equal $false ($installWhatIfResult.Output -contains "  Registered in:   Startup folder") "install.ps1 should not report service registration during -WhatIf."
+
+    # Test Rotate-ServiceLog behavior from run-service.ps1
+    $runServiceContent = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot "run-service.ps1")
+    $ast = [System.Management.Automation.Language.Parser]::ParseInput($runServiceContent, [ref]$null, [ref]$null)
+    $fnDef = $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq "Rotate-ServiceLog" }, $true)
+    Assert-True ($null -ne $fnDef -and $fnDef.Count -eq 1) "run-service.ps1 should define Rotate-ServiceLog."
+    $MaxHistoryBytes = 500
+    Invoke-Expression $fnDef[0].Extent.Text
+
+    $logTestDir = Join-Path $Root "log-rotation-tests"
+    New-Item -ItemType Directory -Force -Path $logTestDir | Out-Null
+    $testCurrent = Join-Path $logTestDir "test.out.log"
+    $testPrev = Join-Path $logTestDir "test.prev.out.log"
+    $testHist = Join-Path $logTestDir "test.history.out.log"
+
+    # 1. Normal rotation
+    Set-Content -LiteralPath $testCurrent -Value "first batch of logs"
+    Rotate-ServiceLog -CurrentLogPath $testCurrent -PreviousLogPath $testPrev -HistoryLogPath $testHist
+    Assert-Equal $false (Test-Path -LiteralPath $testCurrent) "Rotate-ServiceLog should move the current log."
+    Assert-Equal $true (Test-Path -LiteralPath $testPrev) "Rotate-ServiceLog should create the previous log."
+    Assert-Equal $true (Test-Path -LiteralPath $testHist) "Rotate-ServiceLog should create the history log."
+    Assert-True ((Get-Content -LiteralPath $testHist -Raw) -match "first batch of logs") "Rotate-ServiceLog should append to history."
+
+    # 2. Fallback .bak move when previous destination move fails
+    Set-Content -LiteralPath $testCurrent -Value "second batch of logs"
+    function Move-Item {
+        param([string]$LiteralPath, [string]$Destination, [switch]$Force, $ErrorAction)
+        if ($Destination -eq $testPrev) {
+            throw "Simulated permission denied for previous log"
+        }
+        Microsoft.PowerShell.Management\Move-Item -LiteralPath $LiteralPath -Destination $Destination -Force
+    }
+    try {
+        Rotate-ServiceLog -CurrentLogPath $testCurrent -PreviousLogPath $testPrev -HistoryLogPath $testHist
+    } finally {
+        Remove-Item Function:\Move-Item -ErrorAction SilentlyContinue
+    }
+    Assert-Equal $false (Test-Path -LiteralPath $testCurrent) "Rotate-ServiceLog should move the current log via fallback .bak when previous path fails."
+    $bakFiles = @(Get-ChildItem -Path $logTestDir -Filter "test.prev.out.log.*.bak")
+    Assert-True ($bakFiles.Count -ge 1) "Rotate-ServiceLog should create a timestamped .bak file on previous move failure."
+
+    # 3. Preserve active log without data loss if all moves fail
+    Set-Content -LiteralPath $testCurrent -Value "third batch of logs"
+    function Move-Item {
+        param([string]$LiteralPath, [string]$Destination, [switch]$Force, $ErrorAction)
+        throw "All move attempts fail"
+    }
+    try {
+        Rotate-ServiceLog -CurrentLogPath $testCurrent -PreviousLogPath $testPrev -HistoryLogPath $testHist
+    } finally {
+        Remove-Item Function:\Move-Item -ErrorAction SilentlyContinue
+    }
+    Assert-Equal $true (Test-Path -LiteralPath $testCurrent) "Rotate-ServiceLog should not delete current log if all move attempts fail."
+    Assert-True ((Get-Content -LiteralPath $testCurrent -Raw) -match "third batch of logs") "Current log content should be preserved on move failures."
+
+    # 4. Process boundary regex verification
+    $mockInstallDir = "C:\Users\tester\AppData\Local\TokenUsageInsights"
+    $escapedDir = [regex]::Escape($mockInstallDir)
+    $boundaryPattern = "(?i)[\s`"'\\]$escapedDir([\\`"'\s]|$)"
+    Assert-True ('powershell -File "' + $mockInstallDir + '\run-service.ps1"' -match $boundaryPattern) "Boundary regex should match double-quoted install dir."
+    Assert-True ("powershell -File '$mockInstallDir\run-service.ps1'" -match $boundaryPattern) "Boundary regex should match single-quoted install dir."
+    Assert-True ("powershell -File $mockInstallDir\run-service.ps1" -match $boundaryPattern) "Boundary regex should match unquoted install dir with leading space."
+    Assert-Equal $false ('powershell -File "' + $mockInstallDir + '-old\run-service.ps1"' -match $boundaryPattern) "Boundary regex should not match install dir prefix collision."
+    Assert-Equal $false ('powershell -File "' + $mockInstallDir + '2\run-service.ps1"' -match $boundaryPattern) "Boundary regex should not match install dir number suffix."
 
     Write-Host "Windows collector smoke tests passed."
 } finally {

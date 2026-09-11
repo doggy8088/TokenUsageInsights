@@ -646,12 +646,14 @@ if (-not $InstallDir -and (Test-Path $StartupShortcut)) {
 if (-not $InstallDir) {
     $InstallDir = Join-Path $env:LOCALAPPDATA "TokenUsageInsights"
 }
+$TargetExe = "$InstallDir\token-usage-insights.exe".ToLowerInvariant().Replace('/', '\')
+$EscapedDir = [regex]::Escape($InstallDir)
 
 # 查看服务状态（任务计划程序或后台进程）
 Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
-    ($_.CommandLine -like "*run-service.ps1*" -and $_.CommandLine -like "*$InstallDir*") -or
-    ($_.ExecutablePath -and $_.ExecutablePath -like "$InstallDir*")
+    ($_.CommandLine -like "*run-service.ps1*" -and $_.CommandLine -match "(?i)[\s`"'\\]$EscapedDir([\\`"'\s]|$)") -or
+    ($_.ExecutablePath -and ($_.ExecutablePath.ToLowerInvariant().Replace('/', '\') -eq $TargetExe))
 } | Select-Object ProcessId, Name, CommandLine
 
 # 查看实时日志
@@ -660,8 +662,8 @@ Get-Content (Join-Path $InstallDir "logs\token-usage-insights.out.log") -Tail 50
 # 重启服务（仅限此安装目录，自动兼容任务计划程序与启动文件夹模式）
 Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
-    ($_.CommandLine -like "*run-service.ps1*" -and $_.CommandLine -like "*$InstallDir*") -or
-    ($_.ExecutablePath -and $_.ExecutablePath -like "$InstallDir*")
+    ($_.CommandLine -like "*run-service.ps1*" -and $_.CommandLine -match "(?i)[\s`"'\\]$EscapedDir([\\`"'\s]|$)") -or
+    ($_.ExecutablePath -and ($_.ExecutablePath.ToLowerInvariant().Replace('/', '\') -eq $TargetExe))
 } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
     Start-ScheduledTask -TaskName $TaskName
@@ -672,8 +674,8 @@ if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
 # 停止服务（仅限此安装目录）
 Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
-    ($_.CommandLine -like "*run-service.ps1*" -and $_.CommandLine -like "*$InstallDir*") -or
-    ($_.ExecutablePath -and $_.ExecutablePath -like "$InstallDir*")
+    ($_.CommandLine -like "*run-service.ps1*" -and $_.CommandLine -match "(?i)[\s`"'\\]$EscapedDir([\\`"'\s]|$)") -or
+    ($_.ExecutablePath -and ($_.ExecutablePath.ToLowerInvariant().Replace('/', '\') -eq $TargetExe))
 } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 
 # 卸载常驻服务
@@ -683,8 +685,8 @@ if (Test-Path $StartupShortcut) {
     Remove-Item $StartupShortcut -Force -ErrorAction SilentlyContinue
 }
 Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
-    ($_.CommandLine -like "*run-service.ps1*" -and $_.CommandLine -like "*$InstallDir*") -or
-    ($_.ExecutablePath -and $_.ExecutablePath -like "$InstallDir*")
+    ($_.CommandLine -like "*run-service.ps1*" -and $_.CommandLine -match "(?i)[\s`"'\\]$EscapedDir([\\`"'\s]|$)") -or
+    ($_.ExecutablePath -and ($_.ExecutablePath.ToLowerInvariant().Replace('/', '\') -eq $TargetExe))
 } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 ```
 

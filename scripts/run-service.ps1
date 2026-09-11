@@ -28,6 +28,7 @@ if (!(Test-Path $LogDir)) {
 $OutLog = Join-Path $LogDir "$AppName.out.log"
 $ErrLog = Join-Path $LogDir "$AppName.err.log"
 $MaxHistoryBytes = 5MB
+$MaxActiveLogBytes = 10MB
 
 function Rotate-ServiceLog {
     param(
@@ -117,33 +118,62 @@ function Rotate-ServiceLog {
             Move-Item -LiteralPath $CurrentLogPath -Destination $PreviousLogPath -Force -ErrorAction Stop
         } catch {
             Write-Warning "Log rotation move failed for ${CurrentLogPath}: $($_.Exception.Message)"
-            Remove-Item -LiteralPath $CurrentLogPath -Force -ErrorAction SilentlyContinue
-            New-Item -ItemType File -Path $CurrentLogPath -Force | Out-Null
+            $timestamp = (Get-Date).ToString("yyyyMMddHHmmss")
+            $fallbackPrev = "${PreviousLogPath}.${timestamp}.bak"
+            try {
+                Move-Item -LiteralPath $CurrentLogPath -Destination $fallbackPrev -Force -ErrorAction Stop
+            } catch {
+                Write-Warning "Fallback log rotation move failed for ${CurrentLogPath}: $($_.Exception.Message)"
+            }
         }
     }
 }
 
-Rotate-ServiceLog `
-    -CurrentLogPath $OutLog `
-    -PreviousLogPath (Join-Path $LogDir "$AppName.prev.out.log") `
-    -HistoryLogPath (Join-Path $LogDir "$AppName.history.out.log")
-Rotate-ServiceLog `
-    -CurrentLogPath $ErrLog `
-    -PreviousLogPath (Join-Path $LogDir "$AppName.prev.err.log") `
-    -HistoryLogPath (Join-Path $LogDir "$AppName.history.err.log")
+while ($true) {
+    Rotate-ServiceLog `
+        -CurrentLogPath $OutLog `
+        -PreviousLogPath (Join-Path $LogDir "$AppName.prev.out.log") `
+        -HistoryLogPath (Join-Path $LogDir "$AppName.history.out.log")
+    Rotate-ServiceLog `
+        -CurrentLogPath $ErrLog `
+        -PreviousLogPath (Join-Path $LogDir "$AppName.prev.err.log") `
+        -HistoryLogPath (Join-Path $LogDir "$AppName.history.err.log")
 
-$Process = Start-Process -FilePath $Exe `
-    -WorkingDirectory $InstallDir `
-    -WindowStyle Hidden `
-    -RedirectStandardOutput $OutLog `
-    -RedirectStandardError $ErrLog `
-    -PassThru
+    $Process = $null
+    $Process = Start-Process -FilePath $Exe `
+        -WorkingDirectory $InstallDir `
+        -WindowStyle Hidden `
+        -RedirectStandardOutput $OutLog `
+        -RedirectStandardError $ErrLog `
+        -PassThru
 
-try {
-    $Process.WaitForExit()
-    exit $Process.ExitCode
-} finally {
-    if ($Process -and -not $Process.HasExited) {
-        Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue
+    $restartForLogRotation = $false
+    try {
+        while (-not $Process.WaitForExit(5000)) {
+            $outItem = Get-Item -LiteralPath $OutLog -ErrorAction SilentlyContinue
+            $errItem = Get-Item -LiteralPath $ErrLog -ErrorAction SilentlyContinue
+            if (($outItem -and $outItem.Length -ge $MaxActiveLogBytes) -or ($errItem -and $errItem.Length -ge $MaxActiveLogBytes)) {
+                Write-Warning "Active log size exceeded ${MaxActiveLogBytes} bytes. Restarting service to rotate logs..."
+                $restartForLogRotation = $true
+                Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue
+                try {
+                    $null = $Process.WaitForExit(5000)
+                } catch {}
+                break
+            }
+        }
+    } finally {
+        if ($Process -and -not $Process.HasExited) {
+            Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue
+            try {
+                $null = $Process.WaitForExit(5000)
+            } catch {}
+        }
     }
+
+    if ($restartForLogRotation) {
+        continue
+    }
+
+    exit $Process.ExitCode
 }

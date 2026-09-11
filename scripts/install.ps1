@@ -411,7 +411,12 @@ exit /b %APP_EXIT_CODE%
                 Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
             } catch {}
 
-            if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+            $taskStillExists = $false
+            try {
+                $taskStillExists = [bool](Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)
+            } catch {}
+
+            if ($taskStillExists) {
                 throw "Could not register scheduled task and failed to unregister existing task '$TaskName'. Aborting fallback to prevent duplicate execution."
             }
 
