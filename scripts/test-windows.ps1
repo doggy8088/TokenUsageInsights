@@ -460,7 +460,17 @@ try {
     Assert-Equal $false $installIpv6Result.OtherRunnerStopped "install.ps1 should not stop a different runner whose install path merely shares a prefix."
     Assert-Equal $false $installIpv6Result.OtherAppStopped "install.ps1 should not stop a different installed executable whose path merely shares a prefix."
     Assert-True ($installIpv6Result.Output -contains "  http://[::1]:4010") "install.ps1 should bracket IPv6 dashboard URLs."
-    Assert-Equal "test-domain\test-user" $installIpv6Result.TriggerUser "install.ps1 should scope the logon trigger to the current user."
+    $expectedTriggerUser = try {
+        $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+        if ($identity -and $identity.Name) {
+            $identity.Name
+        } else {
+            "test-domain\test-user"
+        }
+    } catch {
+        "test-domain\test-user"
+    }
+    Assert-Equal $expectedTriggerUser $installIpv6Result.TriggerUser "install.ps1 should scope the logon trigger to the current user."
 
     $installWildcardResult = Invoke-InstallServiceTest -HostAddress "::" -Port 3003
     Assert-True ($installWildcardResult.Output -contains "  http://localhost:3003") "install.ps1 should print localhost for unspecified IPv6 dashboard URLs."
@@ -478,6 +488,8 @@ try {
 
     $installWhatIfResult = Invoke-InstallServiceTest -HostAddress "127.0.0.1" -Port 3003 -WhatIf
     Assert-Equal $true $installWhatIfResult.StartupShortcutExists "install.ps1 should not remove an existing Startup shortcut during -WhatIf."
+    Assert-Equal $false ($installWhatIfResult.Output -contains "Token 戰情室 installed.") "install.ps1 should not output completion message during -WhatIf."
+    Assert-Equal $false ($installWhatIfResult.Output -contains "  Registered in:   Startup folder") "install.ps1 should not report service registration during -WhatIf."
 
     Write-Host "Windows collector smoke tests passed."
 } finally {

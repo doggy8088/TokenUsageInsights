@@ -632,10 +632,14 @@ Get-Content "$env:LOCALAPPDATA\TokenUsageInsights\logs\token-usage-insights.out.
 # 重啟服務（自動相容工作排程器與啟動資料夾模式）
 Stop-ScheduledTask -TaskName "TokenUsageInsights" -ErrorAction SilentlyContinue
 Get-Process -Name "token-usage-insights" -ErrorAction SilentlyContinue | Stop-Process -Force
+$StartupShortcut = Join-Path ([Environment]::GetFolderPath('Startup')) "token-usage-insights.lnk"
+if (!(Test-Path $StartupShortcut)) {
+    $StartupShortcut = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Startup\token-usage-insights.lnk"
+}
 if (Get-ScheduledTask -TaskName "TokenUsageInsights" -ErrorAction SilentlyContinue) {
     Start-ScheduledTask -TaskName "TokenUsageInsights"
-} else {
-    Start-Process powershell.exe "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$env:LOCALAPPDATA\TokenUsageInsights\scripts\run-service.ps1`"" -WindowStyle Hidden
+} elseif (Test-Path $StartupShortcut) {
+    Start-Process $StartupShortcut
 }
 
 # 停止服務

@@ -278,30 +278,34 @@ exit /b %APP_EXIT_CODE%
         try {
             Start-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
         } catch {}
+    } elseif ($existingShortcut -and (Test-Path $StartupShortcut)) {
+        try {
+            Start-Process $StartupShortcut
+        } catch {}
     }
-}
 
-Write-Host "Token 戰情室 installed."
-Write-Host ""
-Write-Host "Install directory:"
-Write-Host "  $InstallDir"
-Write-Host ""
-Write-Host "Executable shim:"
-Write-Host "  $(Join-Path $BinDir "$AppName.cmd")"
-Write-Host ""
-if ($Service) {
-    Write-Host "Background service:"
-    if ($registeredAsTask) {
-        Write-Host "  Registered task: $TaskName (Task Scheduler)"
-    } else {
-        Write-Host "  Registered in:   Startup folder"
-    }
-    Write-Host "  Logs directory:  $(Join-Path $InstallDir 'logs')"
+    Write-Host "Token 戰情室 installed."
     Write-Host ""
-    $displayHost = Get-DashboardDisplayHost -HostAddress $HostAddress
-    Write-Host "Dashboard URL:"
-    Write-Host "  http://${displayHost}:${Port}"
-} else {
-    Write-Host "Run:"
+    Write-Host "Install directory:"
+    Write-Host "  $InstallDir"
+    Write-Host ""
+    Write-Host "Executable shim:"
     Write-Host "  $(Join-Path $BinDir "$AppName.cmd")"
+    Write-Host ""
+    if ($Service) {
+        Write-Host "Background service:"
+        if ($registeredAsTask) {
+            Write-Host "  Registered task: $TaskName (Task Scheduler)"
+        } else {
+            Write-Host "  Registered in:   Startup folder"
+        }
+        Write-Host "  Logs directory:  $(Join-Path $InstallDir 'logs')"
+        Write-Host ""
+        $displayHost = Get-DashboardDisplayHost -HostAddress $HostAddress
+        Write-Host "Dashboard URL:"
+        Write-Host "  http://${displayHost}:${Port}"
+    } else {
+        Write-Host "Run:"
+        Write-Host "  $(Join-Path $BinDir "$AppName.cmd")"
+    }
 }
