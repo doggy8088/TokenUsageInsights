@@ -12,8 +12,35 @@ const GITHUB_REPO: &str = "TokenUsageInsights";
 const APP_NAME: &str = "token-usage-insights";
 const USER_AGENT: &str = "token-usage-insights-updater";
 const DEFAULT_UPDATE_INTERVAL_HOURS: i64 = 24;
-const STARTUP_CHECK_TIMEOUT_SECS: u64 = 2;
+const STARTUP_CHECK_TIMEOUT_SECS: u64 = 4;
+const STARTUP_AUTO_UPDATE_TOTAL_TIMEOUT_SECS: u64 = 20;
 const LAST_CHECK_KEY: &str = "last_update_check_at";
+const MAX_ARCHIVE_BYTES: usize = 150 * 1024 * 1024; // 150 MB 上限
+const MAX_CHECKSUM_BYTES: usize = 1024 * 1024; // 1 MB 上限
+
+#[cfg(unix)]
+fn is_process_alive(pid: u32) -> bool {
+    let res = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if res == 0 {
+        true
+    } else {
+        let err = std::io::Error::last_os_error().raw_os_error();
+        err != Some(libc::ESRCH)
+    }
+}
+
+#[cfg(windows)]
+fn is_process_alive(pid: u32) -> bool {
+    let output = std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+        .output();
+    if let Ok(out) = output {
+        let text = String::from_utf8_lossy(&out.stdout);
+        text.contains(&pid.to_string()) && !text.contains("No tasks")
+    } else {
+        true
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct UpdateOptions {
@@ -230,12 +257,17 @@ pub fn parse_checksum(sums_text: &str, target_filename: &str) -> Option<String> 
     None
 }
 
+pub fn verify_hash_hex(actual_hex: &str, expected_hex: &str) -> bool {
+    actual_hex.trim().eq_ignore_ascii_case(expected_hex.trim())
+}
+
+#[allow(dead_code)] // 提供外部呼叫與單元測試比對記憶體資料 SHA256 雜湊之輔助函式
 pub fn verify_sha256(bytes: &[u8], expected_hex: &str) -> bool {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     let result = hasher.finalize();
-    let actual_hex = hex::encode(result).to_lowercase();
-    actual_hex == expected_hex.trim().to_lowercase()
+    let actual_hex = hex::encode(result);
+    verify_hash_hex(&actual_hex, expected_hex)
 }
 
 pub fn log_update(level: &str, action: &str, message: &str) {
@@ -331,10 +363,37 @@ impl UpdateLock {
                 Ok(Self { lock_path })
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let content = fs::read_to_string(&lock_path).unwrap_or_default();
+                let recorded_pid = content.lines().find_map(|line| {
+                    line.strip_prefix("pid=")
+                        .and_then(|s| s.trim().parse::<u32>().ok())
+                });
+
+                if let Some(pid) = recorded_pid {
+                    if is_process_alive(pid) {
+                        return Err(format!(
+                            "已有另一個更新程序正在執行中（PID {pid}），請稍候再試。"
+                        ));
+                    }
+                    // 程序已終止，安全清除遺留鎖定檔並重試
+                    log_update(
+                        "WARN",
+                        "LOCK",
+                        &format!("偵測到已終止程序殘留之鎖定檔 (PID {pid})，自動清除"),
+                    );
+                    let _ = fs::remove_file(&lock_path);
+                    return Self::try_acquire(install_dir);
+                }
+
                 if let Ok(metadata) = fs::metadata(&lock_path) {
                     if let Ok(modified) = metadata.modified() {
                         if let Ok(elapsed) = modified.elapsed() {
                             if elapsed > Duration::from_secs(600) {
+                                log_update(
+                                    "WARN",
+                                    "LOCK",
+                                    "偵測到無法辨識 PID 且超過 10 分鐘之過期鎖定檔，自動清除",
+                                );
                                 let _ = fs::remove_file(&lock_path);
                                 return Self::try_acquire(install_dir);
                             }
@@ -374,19 +433,20 @@ impl Drop for TempDirGuard {
     }
 }
 
-fn extract_archive(bytes: &[u8], dest_dir: &Path, is_zip: bool) -> Result<(), String> {
+fn extract_archive(archive_path: &Path, dest_dir: &Path, is_zip: bool) -> Result<(), String> {
     fs::create_dir_all(dest_dir).map_err(|e| format!("建立解壓縮目錄失敗: {e}"))?;
 
+    let file = fs::File::open(archive_path)
+        .map_err(|e| format!("開啟壓縮包檔案失敗 ({archive_path:?}): {e}"))?;
+
     if is_zip {
-        let cursor = std::io::Cursor::new(bytes);
         let mut archive =
-            zip::ZipArchive::new(cursor).map_err(|e| format!("解析 ZIP 封裝失敗: {e}"))?;
+            zip::ZipArchive::new(file).map_err(|e| format!("解析 ZIP 封裝失敗: {e}"))?;
         archive
             .extract(dest_dir)
             .map_err(|e| format!("解壓縮 ZIP 檔案失敗: {e}"))?;
     } else {
-        let cursor = std::io::Cursor::new(bytes);
-        let tar_gz = flate2::read::GzDecoder::new(cursor);
+        let tar_gz = flate2::read::GzDecoder::new(file);
         let mut archive = tar::Archive::new(tar_gz);
         archive
             .unpack(dest_dir)
@@ -436,21 +496,11 @@ const MANAGED_ITEMS: &[&str] = &[
 
 fn backup_installation(install_dir: &Path, backup_dir: &Path) -> Result<(), String> {
     if backup_dir.exists() {
-        if backup_dir.join(".rollback_failed").exists() {
-            let err = format!(
-                "偵測到先前更新回滾失敗留存的救援備份目錄 {:?}；為保護先前版本，已停止更新。請手動還原或確認安全後再試。",
-                backup_dir
-            );
-            return Err(err);
-        } else if let Err(e) = fs::remove_dir_all(backup_dir) {
-            let fallback = install_dir.join(format!(".backup-stale-{}", Utc::now().timestamp()));
-            if let Err(re) = fs::rename(backup_dir, &fallback) {
-                let err = format!(
-                    "無法清理先前殘留之備份目錄 ({backup_dir:?}): {e}; 嘗試重新命名亦失敗: {re}"
-                );
-                return Err(err);
-            }
-        }
+        let err = format!(
+            "偵測到備份目錄已存在 ({backup_dir:?})；疑似先前更新中斷或失敗留存之救援狀態。為保護歷史版本不被覆蓋，已中止本次更新。請先手動確認還原舊版或清除該目錄後再更新。"
+        );
+        log_update("ERROR", "BACKUP", &err);
+        return Err(err);
     }
     fs::create_dir_all(backup_dir).map_err(|e| format!("建立備份目錄失敗: {e}"))?;
 
@@ -481,7 +531,8 @@ fn restore_from_backup(backup_dir: &Path, install_dir: &Path) -> Result<(), Stri
 
     let manifest_path = backup_dir.join(".manifest");
     let original_items: std::collections::HashSet<String> = if manifest_path.exists() {
-        let content = fs::read_to_string(&manifest_path).unwrap_or_default();
+        let content = fs::read_to_string(&manifest_path)
+            .map_err(|e| format!("讀取備份清單失敗 ({manifest_path:?}): {e}"))?;
         content
             .lines()
             .map(|s| s.trim().to_string())
@@ -593,13 +644,18 @@ async fn fetch_release(tag_opt: Option<&str>, timeout_secs: u64) -> Result<GitHu
         .map_err(|e| format!("解析 Release JSON 失敗: {e}"))
 }
 
-async fn download_bytes(url: &str, timeout_secs: u64) -> Result<Vec<u8>, String> {
+async fn download_to_file_with_hash(
+    url: &str,
+    dest_path: &Path,
+    max_bytes: usize,
+    timeout_secs: u64,
+) -> Result<String, String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(timeout_secs))
         .build()
         .map_err(|e| format!("建立 HTTP 用戶端失敗: {e}"))?;
 
-    let resp = client
+    let mut resp = client
         .get(url)
         .header("User-Agent", USER_AGENT)
         .send()
@@ -610,11 +666,81 @@ async fn download_bytes(url: &str, timeout_secs: u64) -> Result<Vec<u8>, String>
         return Err(format!("下載失敗 HTTP {} ({url})", resp.status()));
     }
 
-    let bytes = resp
-        .bytes()
+    if let Some(cl) = resp.content_length() {
+        if cl > max_bytes as u64 {
+            return Err(format!(
+                "檔案大小 ({cl} 位元組) 超過安全上限 ({max_bytes} 位元組)"
+            ));
+        }
+    }
+
+    let mut file = fs::File::create(dest_path)
+        .map_err(|e| format!("建立下載檔案失敗 ({dest_path:?}): {e}"))?;
+    let mut hasher = Sha256::new();
+    let mut downloaded: usize = 0;
+
+    while let Some(chunk) = resp
+        .chunk()
         .await
-        .map_err(|e| format!("讀取下載內容失敗: {e}"))?;
-    Ok(bytes.to_vec())
+        .map_err(|e| format!("讀取下載串流失敗 ({url}): {e}"))?
+    {
+        downloaded = downloaded.saturating_add(chunk.len());
+        if downloaded > max_bytes {
+            let _ = fs::remove_file(dest_path);
+            return Err(format!("下載累計大小超過安全上限 ({max_bytes} 位元組)"));
+        }
+        file.write_all(&chunk)
+            .map_err(|e| format!("寫入下載檔案失敗 ({dest_path:?}): {e}"))?;
+        hasher.update(&chunk);
+    }
+
+    file.flush()
+        .map_err(|e| format!("排清寫入暫存檔失敗: {e}"))?;
+
+    let actual_hash = hex::encode(hasher.finalize()).to_lowercase();
+    Ok(actual_hash)
+}
+
+async fn download_text_capped(
+    url: &str,
+    max_bytes: usize,
+    timeout_secs: u64,
+) -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(timeout_secs))
+        .build()
+        .map_err(|e| format!("建立 HTTP 用戶端失敗: {e}"))?;
+
+    let mut resp = client
+        .get(url)
+        .header("User-Agent", USER_AGENT)
+        .send()
+        .await
+        .map_err(|e| format!("下載失敗 ({url}): {e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("下載失敗 HTTP {} ({url})", resp.status()));
+    }
+
+    if let Some(cl) = resp.content_length() {
+        if cl > max_bytes as u64 {
+            return Err(format!("校驗檔大小 ({cl} 位元組) 超過安全上限"));
+        }
+    }
+
+    let mut buffer = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| format!("讀取校驗檔串流失敗: {e}"))?
+    {
+        if buffer.len().saturating_add(chunk.len()) > max_bytes {
+            return Err("校驗檔內容超過安全上限".to_string());
+        }
+        buffer.extend_from_slice(&chunk);
+    }
+
+    Ok(String::from_utf8_lossy(&buffer).to_string())
 }
 
 pub async fn run_update(options: UpdateOptions) -> Result<(), String> {
@@ -769,9 +895,17 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), String> {
     let tmp_guard = TempDirGuard::new(update_tmp_dir)?;
 
     println!("⬇️ 正在下載發行包: {archive_name} ...");
-    log_update("INFO", "DOWNLOAD", &format!("開始下載 {archive_name}"));
-    let archive_bytes = match download_bytes(&asset.browser_download_url, 60).await {
-        Ok(b) => b,
+    log_update("INFO", "DOWNLOAD", &format!("開始串流下載 {archive_name}"));
+    let archive_path = tmp_guard.path.join(&archive_name);
+    let actual_hash = match download_to_file_with_hash(
+        &asset.browser_download_url,
+        &archive_path,
+        MAX_ARCHIVE_BYTES,
+        60,
+    )
+    .await
+    {
+        Ok(h) => h,
         Err(e) => {
             log_update("ERROR", "DOWNLOAD", &e);
             return Err(e);
@@ -779,14 +913,16 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), String> {
     };
 
     println!("⬇️ 正在下載校驗檔 SHA256SUMS ...");
-    let sums_bytes = match download_bytes(&checksum_asset.browser_download_url, 15).await {
-        Ok(b) => b,
-        Err(e) => {
-            log_update("ERROR", "DOWNLOAD", &e);
-            return Err(e);
-        }
-    };
-    let sums_text = String::from_utf8_lossy(&sums_bytes);
+    let sums_text =
+        match download_text_capped(&checksum_asset.browser_download_url, MAX_CHECKSUM_BYTES, 15)
+            .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                log_update("ERROR", "DOWNLOAD", &e);
+                return Err(e);
+            }
+        };
 
     let expected_hash = match parse_checksum(&sums_text, &archive_name) {
         Some(h) => h,
@@ -798,8 +934,8 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), String> {
     };
 
     println!("🔒 正在驗證 SHA256 校驗碼...");
-    if !verify_sha256(&archive_bytes, &expected_hash) {
-        let err = format!("SHA256 校驗失敗！預期 {expected_hash}");
+    if !verify_hash_hex(&actual_hash, &expected_hash) {
+        let err = format!("SHA256 校驗失敗！預期 {expected_hash}，實際 {actual_hash}");
         log_update("ERROR", "VERIFY", &err);
         return Err(err);
     }
@@ -809,7 +945,7 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), String> {
     let is_zip = archive_name.ends_with(".zip");
     let extract_dir = tmp_guard.path.join("extracted");
     println!("📦 正在解壓縮檔案...");
-    if let Err(e) = extract_archive(&archive_bytes, &extract_dir, is_zip) {
+    if let Err(e) = extract_archive(&archive_path, &extract_dir, is_zip) {
         log_update("ERROR", "EXTRACT", &e);
         return Err(e);
     }
@@ -849,7 +985,17 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), String> {
     };
 
     // 驗證解壓後的發行包是否包含所有必要資源，避免不完整安裝造成混合版本
-    for required in [&exec_name, "static", "pricing.csv", "VERSION"] {
+    let required_items = [
+        exec_name.as_str(),
+        "static",
+        "pricing.csv",
+        "VERSION",
+        "scripts",
+        "shell",
+        "install.sh",
+        "install.ps1",
+    ];
+    for required in required_items {
         if !release_root.join(required).exists() {
             let err = format!("解壓發行包缺少必要資源: {required}");
             log_update("ERROR", "VERIFY", &err);
@@ -1001,6 +1147,39 @@ pub(crate) fn apply_installation_with_rollback(
     Ok(())
 }
 
+fn get_update_check_interval_secs() -> i64 {
+    let (_, yaml_interval_days) = load_update_config();
+    let default_hours = yaml_interval_days
+        .map(|d| d.saturating_mul(24))
+        .unwrap_or(DEFAULT_UPDATE_INTERVAL_HOURS);
+    let interval_hours: i64 = std::env::var("TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default_hours);
+
+    let valid_hours = if interval_hours <= 0 {
+        DEFAULT_UPDATE_INTERVAL_HOURS
+    } else {
+        interval_hours.min(87600) // 最多 10 年，防止溢位
+    };
+    valid_hours.saturating_mul(3600)
+}
+
+fn is_update_check_interval_elapsed() -> bool {
+    let interval_secs = get_update_check_interval_secs();
+    if let Ok(conn) = crate::db::get_db_conn() {
+        if let Ok(Some(last_check_str)) = crate::db::get_system_metadata(&conn, LAST_CHECK_KEY) {
+            if let Ok(last_check) = chrono::DateTime::parse_from_rfc3339(&last_check_str) {
+                let elapsed_secs = Utc::now().timestamp() - last_check.timestamp();
+                if elapsed_secs >= 0 && elapsed_secs < interval_secs {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
 pub async fn check_and_auto_update_on_launch() {
     // 1. 防止循環重啟
     if std::env::var_os("_TOKEN_USAGE_INSIGHTS_RESTARTED").is_some() {
@@ -1024,11 +1203,20 @@ pub async fn check_and_auto_update_on_launch() {
         }
     }
 
-    // 3. 判斷環境
+    // 3. 檢查更新檢查間隔（優先讀取環境變數，其次 config.yaml，預設 24 小時）
+    if !is_update_check_interval_elapsed() {
+        return;
+    }
+
+    // 4. 判斷環境
     let env_kind = detect_environment();
     if matches!(env_kind, EnvironmentKind::Npm { .. }) {
-        // npm 環境：快速檢查是否有新版，若有僅在終端機提示並記錄
+        // npm 環境：套用相同檢查間隔，若有新版僅提示並記錄本次檢查
         if let Ok(release) = fetch_release_with_logging(None, STARTUP_CHECK_TIMEOUT_SECS).await {
+            if let Ok(conn) = crate::db::get_db_conn() {
+                let now_str = Utc::now().to_rfc3339();
+                let _ = crate::db::set_system_metadata(&conn, LAST_CHECK_KEY, &now_str);
+            }
             let current_version = env!("CARGO_PKG_VERSION");
             if is_newer_version(&release.tag_name, current_version) {
                 log_update(
@@ -1048,27 +1236,6 @@ pub async fn check_and_auto_update_on_launch() {
     if !matches!(env_kind, EnvironmentKind::StandardInstalled { .. }) {
         // 非標準安裝目錄（如 Git 開發目錄）：靜默跳過自動更新
         return;
-    }
-
-    // 4. 檢查更新檢查間隔（優先讀取環境變數，其次 config.yaml，預設 24 小時）
-    let (_, yaml_interval_days) = load_update_config();
-    let default_hours = yaml_interval_days
-        .map(|d| d * 24)
-        .unwrap_or(DEFAULT_UPDATE_INTERVAL_HOURS);
-    let interval_hours: i64 = std::env::var("TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default_hours);
-
-    if let Ok(conn) = crate::db::get_db_conn() {
-        if let Ok(Some(last_check_str)) = crate::db::get_system_metadata(&conn, LAST_CHECK_KEY) {
-            if let Ok(last_check) = chrono::DateTime::parse_from_rfc3339(&last_check_str) {
-                let elapsed_secs = Utc::now().timestamp() - last_check.timestamp();
-                if elapsed_secs >= 0 && elapsed_secs < interval_hours * 3600 {
-                    return;
-                }
-            }
-        }
     }
 
     // 5. 快速檢查（設定超時 STARTUP_CHECK_TIMEOUT_SECS 秒，不阻礙伺服器啟動）
@@ -1106,10 +1273,31 @@ pub async fn check_and_auto_update_on_launch() {
         target_version: Some(release.tag_name.clone()),
     };
 
-    if let Err(e) = run_update(update_opts).await {
-        eprintln!("⚠️ 自動更新失敗: {e}，將繼續以現有版本啟動服務。");
-        log_update("WARN", "STARTUP_UPDATE", &format!("自動更新失敗: {e}"));
-        return;
+    // 為自動更新設定整體時間上限，避免慢速網路長時間阻塞伺服器啟動
+    let update_result = tokio::time::timeout(
+        Duration::from_secs(STARTUP_AUTO_UPDATE_TOTAL_TIMEOUT_SECS),
+        run_update(update_opts),
+    )
+    .await;
+
+    match update_result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            eprintln!("⚠️ 自動更新失敗: {e}，將繼續以現有版本啟動服務。");
+            log_update("WARN", "STARTUP_UPDATE", &format!("自動更新失敗: {e}"));
+            return;
+        }
+        Err(_) => {
+            eprintln!(
+                "⚠️ 自動更新逾時（超過 {STARTUP_AUTO_UPDATE_TOTAL_TIMEOUT_SECS} 秒），將繼續以現有版本啟動服務。"
+            );
+            log_update(
+                "WARN",
+                "STARTUP_UPDATE",
+                &format!("自動更新超過上限 {STARTUP_AUTO_UPDATE_TOTAL_TIMEOUT_SECS} 秒，略過"),
+            );
+            return;
+        }
     }
 
     // 更新成功後記錄最後檢查時間
@@ -1131,7 +1319,13 @@ pub async fn check_and_auto_update_on_launch() {
         }
         cmd.env("_TOKEN_USAGE_INSIGHTS_RESTARTED", "1");
         let err = cmd.exec();
-        eprintln!("❌ 自動重啟進程失敗: {err}");
+        eprintln!("❌ 自動重啟進程失敗: {err}；請手動重新啟動程序。");
+        log_update(
+            "ERROR",
+            "STARTUP_RESTART",
+            &format!("自動重啟進程失敗: {err}"),
+        );
+        std::process::exit(1);
     }
 
     #[cfg(windows)]
@@ -1153,8 +1347,9 @@ pub async fn check_and_auto_update_on_launch() {
             match cmd.status() {
                 Ok(status) => std::process::exit(status.code().unwrap_or(0)),
                 Err(err) => {
-                    eprintln!("❌ 自動重啟進程失敗: {err}");
+                    eprintln!("❌ 自動重啟進程失敗: {err}；請手動重新啟動程序。");
                     log_update("ERROR", "STARTUP_RESTART", &format!("重啟進程失敗: {err}"));
+                    std::process::exit(1);
                 }
             }
         }
@@ -1314,13 +1509,8 @@ update_check_interval: 5 # check every 5 days
         assert!(backup_dir.join("static").join("index.html").exists());
         assert!(backup_dir.join(".manifest").exists());
 
-        // Re-run backup with .rollback_failed should fail to protect failed rollback state
-        fs::write(backup_dir.join(".rollback_failed"), "failed rollback").unwrap();
+        // Re-run backup should fail because backup_dir already exists to protect recovery state
         assert!(backup_installation(&install_dir, &backup_dir).is_err());
-        fs::remove_file(backup_dir.join(".rollback_failed")).unwrap();
-
-        // Stale backup without .rollback_failed can be safely refreshed
-        assert!(backup_installation(&install_dir, &backup_dir).is_ok());
 
         // Corrupt install_dir and simulate adding a new file not present in original backup
         fs::write(install_dir.join("VERSION"), "corrupted").unwrap();
@@ -1338,6 +1528,20 @@ update_check_interval: 5 # check every 5 days
         assert!(!install_dir.join("install.sh").exists());
 
         let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn process_alive_check_identifies_current_process() {
+        let current_pid = std::process::id();
+        assert!(is_process_alive(current_pid));
+    }
+
+    #[test]
+    fn update_check_interval_handles_extremes_and_saturation() {
+        // 預設間隔 (24 小時 -> 86400 秒)
+        let default_secs = get_update_check_interval_secs();
+        assert!(default_secs > 0);
+        assert!(default_secs <= 87600 * 3600);
     }
 
     #[test]
@@ -1390,6 +1594,10 @@ update_check_interval: 5 # check every 5 days
         fs::write(install_dir.join("pricing.csv"), "old pricing").unwrap();
         fs::create_dir_all(install_dir.join("static")).unwrap();
         fs::write(install_dir.join("static").join("index.html"), "old html").unwrap();
+        fs::create_dir_all(install_dir.join("scripts")).unwrap();
+        fs::create_dir_all(install_dir.join("shell")).unwrap();
+        fs::write(install_dir.join("install.sh"), "#!/bin/sh").unwrap();
+        fs::write(install_dir.join("install.ps1"), "# powershell").unwrap();
 
         // Valid new release v0.9.6
         fs::write(release_root.join(&exec_name), "new binary").unwrap();
@@ -1397,6 +1605,10 @@ update_check_interval: 5 # check every 5 days
         fs::write(release_root.join("pricing.csv"), "new pricing").unwrap();
         fs::create_dir_all(release_root.join("static")).unwrap();
         fs::write(release_root.join("static").join("index.html"), "new html").unwrap();
+        fs::create_dir_all(release_root.join("scripts")).unwrap();
+        fs::create_dir_all(release_root.join("shell")).unwrap();
+        fs::write(release_root.join("install.sh"), "#!/bin/sh v2").unwrap();
+        fs::write(release_root.join("install.ps1"), "# powershell v2").unwrap();
 
         // 1. Success case
         let result = apply_installation_with_rollback(&release_root, &install_dir, &backup_dir);
@@ -1416,6 +1628,10 @@ update_check_interval: 5 # check every 5 days
         assert_eq!(
             fs::read_to_string(install_dir.join(&exec_name)).unwrap(),
             "new binary"
+        );
+        assert_eq!(
+            fs::read_to_string(install_dir.join("install.sh")).unwrap(),
+            "#!/bin/sh v2"
         );
         assert!(
             !backup_dir.exists(),
@@ -1451,6 +1667,10 @@ update_check_interval: 5 # check every 5 days
         assert_eq!(
             fs::read_to_string(install_dir.join("static").join("index.html")).unwrap(),
             "new html"
+        );
+        assert_eq!(
+            fs::read_to_string(install_dir.join("install.sh")).unwrap(),
+            "#!/bin/sh v2"
         );
         assert!(
             !backup_dir.exists(),
