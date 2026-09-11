@@ -16600,7 +16600,7 @@ mod tests {
     #[test]
     fn grok_parser_v7_migration_reparses_existing_grok_46_session() {
         let root = temp_jsonl_path("grok-v7-migration");
-        let session_dir_high = root.join("sessions/work/grok-46-session");
+        let session_dir_high = root.join("sessions").join("work").join("grok-46-session");
         fs::create_dir_all(&session_dir_high).unwrap();
         fs::write(
             session_dir_high.join("summary.json"),
@@ -16619,7 +16619,10 @@ mod tests {
         .unwrap();
         let file_size_high = fs::metadata(&updates_high_path).unwrap().len();
 
-        let session_dir_latest = root.join("sessions/work/grok-46-latest-session");
+        let session_dir_latest = root
+            .join("sessions")
+            .join("work")
+            .join("grok-46-latest-session");
         fs::create_dir_all(&session_dir_latest).unwrap();
         fs::write(
             session_dir_latest.join("summary.json"),
@@ -16758,7 +16761,7 @@ mod tests {
     #[test]
     fn sync_grok_usage_logs_rebuilds_session_and_keeps_reported_cost() {
         let root = temp_jsonl_path("grok-sync");
-        let session_dir = root.join("sessions/work/grok-session");
+        let session_dir = root.join("sessions").join("work").join("grok-session");
         fs::create_dir_all(&session_dir).unwrap();
         fs::write(
             session_dir.join("summary.json"),
@@ -16980,7 +16983,7 @@ mod tests {
     fn sync_grok_multi_model_turn_survives_database_and_timeline() {
         let root = temp_jsonl_path("grok-multi-model-sync").with_extension("");
         let session_id = "grok-multi-model";
-        let session_dir = root.join("sessions/work").join(session_id);
+        let session_dir = root.join("sessions").join("work").join(session_id);
         fs::create_dir_all(&session_dir).unwrap();
         let updates_path = session_dir.join("updates.jsonl");
         fs::write(

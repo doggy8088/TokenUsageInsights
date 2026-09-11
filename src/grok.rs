@@ -927,7 +927,7 @@ mod tests {
     #[test]
     fn parses_provider_usage_and_model_usage() {
         let root = test_updates_path("usage");
-        let session_dir = root.join("sessions/work/session-1");
+        let session_dir = root.join("sessions").join("work").join("session-1");
         fs::create_dir_all(&session_dir).unwrap();
         fs::write(
             session_dir.join("summary.json"),
@@ -1109,7 +1109,7 @@ mod tests {
     #[test]
     fn parses_multi_model_turn_into_separate_entries() {
         let root = test_updates_path("multi-model");
-        let session_dir = root.join("sessions/work/session-multi");
+        let session_dir = root.join("sessions").join("work").join("session-multi");
         fs::create_dir_all(&session_dir).unwrap();
         let events = [
             serde_json::json!({
@@ -1227,7 +1227,7 @@ mod tests {
     #[test]
     fn context_snapshot_deltas_are_incremental_across_turns() {
         let root = test_updates_path("context");
-        let session_dir = root.join("sessions/work/session-2");
+        let session_dir = root.join("sessions").join("work").join("session-2");
         fs::create_dir_all(&session_dir).unwrap();
         fs::write(
             session_dir.join("updates.jsonl"),
