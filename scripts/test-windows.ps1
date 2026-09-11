@@ -50,13 +50,7 @@ $payload | ConvertTo-Json -Compress | Set-Content -LiteralPath '__CAPTURE_PATH__
 
     function Invoke-RestMethod { @{ tag_name = "v-test" } }
     function Invoke-WebRequest {
-        param(
-            [string]$Uri,
-            [string]$OutFile,
-            [switch]$UseBasicParsing,
-            [parameter(ValueFromRemainingArguments = $true)]
-            $RemainingArgs
-        )
+        param([string]$Uri, [string]$OutFile)
         Set-Content -LiteralPath $OutFile -Value "placeholder"
     }
     function Expand-Archive {
@@ -92,10 +86,12 @@ function Invoke-InstallServiceTest {
     param(
         [string]$HostAddress,
         [int]$Port,
+        [bool]$ServiceInstall = $true,
         [switch]$FailScheduledTaskAction,
         [switch]$FailStartScheduledTask,
-        [switch]$WhatIf,
-        [switch]$ExistingTaskInOtherDir
+        [switch]$TaskTargetsLegacyInstall,
+        [switch]$RemoveStartupShortcutBeforeInstall,
+        [switch]$WhatIf
     )
 
     $tempRoot = Join-Path $Root ([guid]::NewGuid())
@@ -106,10 +102,12 @@ function Invoke-InstallServiceTest {
     $previousAppData = $env:APPDATA
     $previousUsername = $env:USERNAME
     $previousUserDomain = $env:USERDOMAIN
+    $previousStartupOverride = $env:TOKEN_USAGE_INSIGHTS_STARTUP_DIR
     $env:APPDATA = Join-Path $tempRoot "AppData\Roaming"
     $env:USERNAME = "test-user"
     $env:USERDOMAIN = "test-domain"
     $startupShortcut = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Startup\token-usage-insights.lnk"
+    $env:TOKEN_USAGE_INSIGHTS_STARTUP_DIR = Split-Path -Parent $startupShortcut
 
     New-Item -ItemType Directory -Force -Path (Join-Path $releaseDir "static") | Out-Null
     New-Item -ItemType Directory -Force -Path (Join-Path $releaseDir "shell") | Out-Null
@@ -124,6 +122,7 @@ function Invoke-InstallServiceTest {
 
     $global:serviceEvents = New-Object System.Collections.Generic.List[string]
     $global:hostMessages = New-Object System.Collections.Generic.List[string]
+    $global:mockShortcuts = @{}
     $global:runnerProcessAlive = $true
     $global:otherRunnerProcessAlive = $true
     $global:appProcessAlive = $true
@@ -132,26 +131,9 @@ function Invoke-InstallServiceTest {
     $runnerCommandLine = "powershell.exe -File `"$installDir\scripts\run-service.ps1`" -InstallDir `"$installDir`""
     $otherInstallDir = "$installDir-old"
     $otherRunnerCommandLine = "powershell.exe -File `"$otherInstallDir\scripts\run-service.ps1`" -InstallDir `"$otherInstallDir`""
+    $legacyTaskActionArguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -f:`"$otherInstallDir\scripts\run-service.ps1`" -InstallDir `"$otherInstallDir`" -HostAddress `"127.0.0.1`" -Port 3003"
     $appExecutablePath = "$installDir\token-usage-insights.exe"
     $otherAppExecutablePath = "$otherInstallDir\token-usage-insights.exe"
-
-    function Get-ScheduledTask {
-        [CmdletBinding()]
-        param([string]$TaskName)
-        if ($ExistingTaskInOtherDir) {
-            return [pscustomobject]@{
-                TaskName = $TaskName
-                Actions = @(
-                    [pscustomobject]@{
-                        Execute = "powershell.exe"
-                        Argument = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$otherInstallDir\scripts\run-service.ps1`" -InstallDir `"$otherInstallDir`""
-                        WorkingDirectory = $otherInstallDir
-                    }
-                )
-            }
-        }
-        return $null
-    }
 
     function Stop-ScheduledTask {
         [CmdletBinding()]
@@ -270,6 +252,17 @@ function Invoke-InstallServiceTest {
         }
         @{ Action = "ok" }
     }
+    function Get-ScheduledTask {
+        [CmdletBinding()]
+        param([string]$TaskName)
+        if ($TaskTargetsLegacyInstall) {
+            return [pscustomobject]@{
+                Actions = @([pscustomobject]@{ Arguments = $legacyTaskActionArguments })
+            }
+        }
+
+        return $null
+    }
     function New-ScheduledTaskTrigger {
         [CmdletBinding()]
         param(
@@ -314,14 +307,24 @@ function Invoke-InstallServiceTest {
             $shell | Add-Member -MemberType ScriptMethod -Name CreateShortcut -Value {
                 param([string]$ShortcutPath)
                 $global:serviceEvents.Add("CreateShortcut")
+                $existingShortcutData = $global:mockShortcuts[$ShortcutPath]
                 $shortcut = [pscustomobject]@{
-                    TargetPath = $null
-                    Arguments = $null
-                    WorkingDirectory = $null
-                    WindowStyle = $null
-                    Description = $null
+                    ShortcutPath = $ShortcutPath
+                    TargetPath = if ($existingShortcutData) { $existingShortcutData.TargetPath } else { $null }
+                    Arguments = if ($existingShortcutData) { $existingShortcutData.Arguments } else { $null }
+                    WorkingDirectory = if ($existingShortcutData) { $existingShortcutData.WorkingDirectory } else { $null }
+                    WindowStyle = if ($existingShortcutData) { $existingShortcutData.WindowStyle } else { $null }
+                    Description = if ($existingShortcutData) { $existingShortcutData.Description } else { $null }
                 }
                 $shortcut | Add-Member -MemberType ScriptMethod -Name Save -Value {
+                    Set-Content -LiteralPath $this.ShortcutPath -Value "shortcut" -Force
+                    $global:mockShortcuts[$this.ShortcutPath] = [pscustomobject]@{
+                        TargetPath = $this.TargetPath
+                        Arguments = $this.Arguments
+                        WorkingDirectory = $this.WorkingDirectory
+                        WindowStyle = $this.WindowStyle
+                        Description = $this.Description
+                    }
                     $global:serviceEvents.Add("SaveShortcut")
                 }
                 return $shortcut
@@ -339,7 +342,11 @@ function Invoke-InstallServiceTest {
             [string]$WorkingDirectory,
             [string]$WindowStyle
         )
-        $global:serviceEvents.Add("StartFallbackProcess")
+        if ($FilePath -eq "powershell.exe") {
+            $global:serviceEvents.Add("StartFallbackProcess")
+        } elseif ($FilePath -eq $startupShortcut) {
+            $global:serviceEvents.Add("StartStartupShortcut")
+        }
     }
     function Write-Host {
         param([Parameter(ValueFromRemainingArguments = $true)]$Arguments)
@@ -347,12 +354,18 @@ function Invoke-InstallServiceTest {
     }
 
     try {
+        if ($RemoveStartupShortcutBeforeInstall) {
+            Remove-Item -LiteralPath $startupShortcut -Force -ErrorAction SilentlyContinue
+        }
+
         $arguments = @{
             InstallDir = $installDir
             BinDir = $binDir
             HostAddress = $HostAddress
             Port = $Port
-            Service = $true
+        }
+        if ($ServiceInstall) {
+            $arguments["Service"] = $true
         }
         if ($WhatIf) {
             $arguments["WhatIf"] = $true
@@ -370,13 +383,13 @@ function Invoke-InstallServiceTest {
         }
     } finally {
         foreach ($functionName in @(
-            "Get-ScheduledTask",
             "Stop-ScheduledTask",
             "Get-CimInstance",
             "Get-Process",
             "Stop-Process",
             "Copy-Item",
             "New-ScheduledTaskAction",
+            "Get-ScheduledTask",
             "New-ScheduledTaskTrigger",
             "New-ScheduledTaskSettingsSet",
             "Register-ScheduledTask",
@@ -388,10 +401,11 @@ function Invoke-InstallServiceTest {
         )) {
             Remove-Item "Function:\$functionName" -ErrorAction SilentlyContinue
         }
-        Remove-Variable serviceEvents, hostMessages, runnerProcessAlive, otherRunnerProcessAlive, appProcessAlive, otherAppProcessAlive, scheduledTaskTriggerUser -Scope Global -ErrorAction SilentlyContinue
+        Remove-Variable serviceEvents, hostMessages, mockShortcuts, runnerProcessAlive, otherRunnerProcessAlive, appProcessAlive, otherAppProcessAlive, scheduledTaskTriggerUser -Scope Global -ErrorAction SilentlyContinue
         $env:APPDATA = $previousAppData
         $env:USERNAME = $previousUsername
         $env:USERDOMAIN = $previousUserDomain
+        $env:TOKEN_USAGE_INSIGHTS_STARTUP_DIR = $previousStartupOverride
 
         if (Test-Path -LiteralPath $tempRoot) {
             Remove-Item -LiteralPath $tempRoot -Recurse -Force
@@ -498,6 +512,17 @@ try {
     }
     Assert-Equal $expectedTriggerUser $installIpv6Result.TriggerUser "install.ps1 should scope the logon trigger to the current user."
 
+    $installLegacyTaskResult = Invoke-InstallServiceTest -HostAddress "127.0.0.1" -Port 3003 -TaskTargetsLegacyInstall
+    Assert-Equal $true $installLegacyTaskResult.OtherRunnerStopped "install.ps1 should stop the runner tied to an existing scheduled task from a previous install directory."
+    Assert-Equal $true $installLegacyTaskResult.OtherAppStopped "install.ps1 should stop the executable tied to an existing scheduled task from a previous install directory."
+
+    $installNonServiceRestartResult = Invoke-InstallServiceTest -HostAddress "127.0.0.1" -Port 3003 -ServiceInstall:$false
+    Assert-True ($installNonServiceRestartResult.Events -contains "StartStartupShortcut") "install.ps1 should relaunch the existing Startup shortcut when rerun without -Service."
+
+    $installTaskToStartupMigrationResult = Invoke-InstallServiceTest -HostAddress "127.0.0.1" -Port 3003 -ServiceInstall:$false -TaskTargetsLegacyInstall -RemoveStartupShortcutBeforeInstall
+    Assert-Equal $false ($installTaskToStartupMigrationResult.Events -contains "StartStartupShortcut") "install.ps1 should not convert a task-based service into a Startup shortcut when rerun without -Service."
+    Assert-Equal $false ($installTaskToStartupMigrationResult.Events -contains "StartScheduledTask") "install.ps1 should not restart the scheduled task when rerun without -Service."
+
     $installWildcardResult = Invoke-InstallServiceTest -HostAddress "::" -Port 3003
     Assert-True ($installWildcardResult.Output -contains "  http://localhost:3003") "install.ps1 should print localhost for unspecified IPv6 dashboard URLs."
 
@@ -516,10 +541,6 @@ try {
     Assert-Equal $true $installWhatIfResult.StartupShortcutExists "install.ps1 should not remove an existing Startup shortcut during -WhatIf."
     Assert-Equal $false ($installWhatIfResult.Output -contains "Token 戰情室 installed.") "install.ps1 should not output completion message during -WhatIf."
     Assert-Equal $false ($installWhatIfResult.Output -contains "  Registered in:   Startup folder") "install.ps1 should not report service registration during -WhatIf."
-
-    $installCrossDirectoryResult = Invoke-InstallServiceTest -HostAddress "127.0.0.1" -Port 3003 -ExistingTaskInOtherDir
-    Assert-Equal $true $installCrossDirectoryResult.OtherRunnerStopped "install.ps1 should stop a previous runner when existing scheduled task pointed to a different directory."
-    Assert-Equal $true $installCrossDirectoryResult.OtherAppStopped "install.ps1 should stop a previous app process when existing scheduled task pointed to a different directory."
 
     Write-Host "Windows collector smoke tests passed."
 } finally {
