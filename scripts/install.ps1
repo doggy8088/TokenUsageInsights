@@ -275,6 +275,9 @@ foreach ($RequiredItem in @("static", "pricing.csv")) {
 }
 
 $TaskName = "TokenUsageInsights"
+if ($env:USERNAME) {
+    $TaskName = "TokenUsageInsights_$env:USERNAME"
+}
 $registeredAsTask = $false
 
 if ($PSCmdlet.ShouldProcess($InstallDir, "Install Token Usage Insights")) {
@@ -284,6 +287,16 @@ if ($PSCmdlet.ShouldProcess($InstallDir, "Install Token Usage Insights")) {
     $existingTask = $false
     try {
         $existingTask = [bool](Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)
+        if (-not $existingTask) {
+            $legacyTask = Get-ScheduledTask -TaskName "TokenUsageInsights" -ErrorAction SilentlyContinue
+            if ($legacyTask) {
+                $existingTask = $true
+                try {
+                    Stop-ScheduledTask -TaskName "TokenUsageInsights" -ErrorAction SilentlyContinue
+                    Unregister-ScheduledTask -TaskName "TokenUsageInsights" -Confirm:$false -ErrorAction SilentlyContinue
+                } catch {}
+            }
+        }
     } catch {}
     $hadScheduledTaskBeforeStop = $existingTask
     $hadStartupShortcutBeforeStop = $false
@@ -371,6 +384,10 @@ exit /b %APP_EXIT_CODE%
                 Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
             } catch {}
 
+            if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+                throw "Could not register scheduled task and failed to unregister existing task '$TaskName'. Aborting fallback to prevent duplicate execution."
+            }
+
             Set-StartupShortcutForRunner `
                 -ShortcutPath $startupShortcutPath `
                 -RunnerScript $RunnerScript `
@@ -394,11 +411,13 @@ exit /b %APP_EXIT_CODE%
 
             # Registration in Task Scheduler succeeded; remove any stale Startup folder shortcut
             # to avoid dual launches on logon.
-            if ($PSCmdlet.ShouldProcess($startupShortcutPath, "Remove stale Startup shortcut")) {
-                try {
-                    Remove-Item -Force -Path $startupShortcutPath -ErrorAction Stop
-                } catch {
-                    Write-Warning "Scheduled task registered, but removing the stale Startup shortcut failed: $($_.Exception.Message)"
+            if (Test-Path $startupShortcutPath) {
+                if ($PSCmdlet.ShouldProcess($startupShortcutPath, "Remove stale Startup shortcut")) {
+                    try {
+                        Remove-Item -Force -Path $startupShortcutPath -ErrorAction Stop
+                    } catch {
+                        throw "Scheduled task registered, but removing the stale Startup shortcut failed: $($_.Exception.Message). Please remove it manually to avoid duplicate execution: $startupShortcutPath"
+                    }
                 }
             }
         }

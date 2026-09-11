@@ -535,7 +535,7 @@ try {
     Assert-True ($installPostRegistrationFailureResult.Events -contains "RegisterScheduledTask") "install.ps1 should still register the scheduled task before a post-registration start failure."
     Assert-Equal $false ($installPostRegistrationFailureResult.Events -contains "SaveShortcut") "install.ps1 should not fall back to the Startup shortcut after scheduled task registration succeeds."
     Assert-Equal $false ($installPostRegistrationFailureResult.Events -contains "StartFallbackProcess") "install.ps1 should not launch the fallback runner after scheduled task registration succeeds."
-    Assert-True ($installPostRegistrationFailureResult.Output -contains "  Registered task: TokenUsageInsights (Task Scheduler)") "install.ps1 should continue reporting the scheduled task after a post-registration start failure."
+    Assert-True ($installPostRegistrationFailureResult.Output -contains "  Registered task: TokenUsageInsights_test-user (Task Scheduler)") "install.ps1 should continue reporting the scheduled task after a post-registration start failure."
 
     $installWhatIfResult = Invoke-InstallServiceTest -HostAddress "127.0.0.1" -Port 3003 -WhatIf
     Assert-Equal $true $installWhatIfResult.StartupShortcutExists "install.ps1 should not remove an existing Startup shortcut during -WhatIf."

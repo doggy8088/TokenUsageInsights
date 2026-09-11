@@ -583,7 +583,7 @@ curl -fsSL https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/s
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.ps1))) -Service
 ```
 
-이 명령은 Windows 작업 스케줄러(Task Scheduler)에 `TokenUsageInsights` 작업을 등록하고 즉시 시작합니다. 사용자가 로그인할 때마다 백그라운드에서 자동으로 실행되며 로그는 `%LOCALAPPDATA%\TokenUsageInsights\logs\`에 저장됩니다.
+이 명령은 Windows 작업 스케줄러(Task Scheduler)에 현재 사용자 전용 `TokenUsageInsights_<username>` 작업을 등록하고 즉시 시작합니다. 사용자가 로그인할 때마다 백그라운드에서 자동으로 실행되며 표준 출력 및 오류 로그는 설치 디렉터리 하위의 `logs\`(기본값은 `%LOCALAPPDATA%\TokenUsageInsights\logs\`)에 저장됩니다.
 
 ### 서비스 관리
 
@@ -607,71 +607,82 @@ launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.tokenusageinsights.pli
 Windows PowerShell:
 
 ```powershell
-# 서비스 상태 확인(작업 스케줄러 또는 백그라운드 프로세스)
-Get-ScheduledTask -TaskName "TokenUsageInsights" -ErrorAction SilentlyContinue
-Get-Process -Name "token-usage-insights" -ErrorAction SilentlyContinue
-
-# 실시간 로그 확인(사용자 지정 -InstallDir 지원)
+# 설치 디렉터리 확인(기본값은 %LOCALAPPDATA%\TokenUsageInsights, 또는 작업/바로 가기에서 동적 확인)
+$TaskName = if ($env:USERNAME) { "TokenUsageInsights_$env:USERNAME" } else { "TokenUsageInsights" }
 $InstallDir = $null
-$Task = Get-ScheduledTask -TaskName "TokenUsageInsights" -ErrorAction SilentlyContinue
+$Task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+if (-not $Task) {
+    $Task = Get-ScheduledTask -TaskName "TokenUsageInsights" -ErrorAction SilentlyContinue
+}
 if ($Task -and $Task.Actions) {
     foreach ($Action in @($Task.Actions)) {
         if ($Action.Arguments -match '(?i)-InstallDir(?:\s+|:)(?:"([^"]+)"|(\S+))') {
             $DetectedInstallDir = if ($Matches[1]) { $Matches[1] } else { $Matches[2] }
             $InstallDir = [Environment]::ExpandEnvironmentVariables($DetectedInstallDir)
             break
+        } elseif ($Action.WorkingDirectory) {
+            $InstallDir = $Action.WorkingDirectory
+            break
         }
     }
 }
-if (-not $InstallDir) {
-    $StartupShortcut = Join-Path ([Environment]::GetFolderPath('Startup')) "token-usage-insights.lnk"
-    if (!(Test-Path $StartupShortcut)) {
-        $StartupShortcut = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Startup\token-usage-insights.lnk"
-    }
-    if (Test-Path $StartupShortcut) {
-        $WshShell = New-Object -ComObject WScript.Shell
-        $Shortcut = $WshShell.CreateShortcut($StartupShortcut)
-        if ($Shortcut.Arguments -match '(?i)-InstallDir(?:\s+|:)(?:"([^"]+)"|(\S+))') {
-            $DetectedInstallDir = if ($Matches[1]) { $Matches[1] } else { $Matches[2] }
-            $InstallDir = [Environment]::ExpandEnvironmentVariables($DetectedInstallDir)
-        } elseif ($Shortcut.WorkingDirectory) {
-            $InstallDir = $Shortcut.WorkingDirectory
-        }
+$StartupShortcut = Join-Path ([Environment]::GetFolderPath('Startup')) "token-usage-insights.lnk"
+if (!(Test-Path $StartupShortcut)) {
+    $StartupShortcut = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Startup\token-usage-insights.lnk"
+}
+if (-not $InstallDir -and (Test-Path $StartupShortcut)) {
+    $WshShell = New-Object -ComObject WScript.Shell
+    $Shortcut = $WshShell.CreateShortcut($StartupShortcut)
+    if ($Shortcut.Arguments -match '(?i)-InstallDir(?:\s+|:)(?:"([^"]+)"|(\S+))') {
+        $DetectedInstallDir = if ($Matches[1]) { $Matches[1] } else { $Matches[2] }
+        $InstallDir = [Environment]::ExpandEnvironmentVariables($DetectedInstallDir)
+    } elseif ($Shortcut.WorkingDirectory) {
+        $InstallDir = $Shortcut.WorkingDirectory
     }
 }
 if (-not $InstallDir) {
     $InstallDir = Join-Path $env:LOCALAPPDATA "TokenUsageInsights"
 }
+
+# 서비스 상태 확인(작업 스케줄러 또는 백그라운드 프로세스)
+Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+    ($_.CommandLine -like "*run-service.ps1*" -and $_.CommandLine -like "*$InstallDir*") -or
+    ($_.ExecutablePath -and $_.ExecutablePath -like "$InstallDir*")
+} | Select-Object ProcessId, Name, CommandLine
+
+# 실시간 로그 확인
 Get-Content (Join-Path $InstallDir "logs\token-usage-insights.out.log") -Tail 50 -Wait
 
-# 서비스 다시 시작(작업 스케줄러 및 시작프로그램 모드 자동 호환)
-Stop-ScheduledTask -TaskName "TokenUsageInsights" -ErrorAction SilentlyContinue
-Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like "*run-service.ps1*" } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-Get-Process -Name "token-usage-insights" -ErrorAction SilentlyContinue | Stop-Process -Force
-$StartupShortcut = Join-Path ([Environment]::GetFolderPath('Startup')) "token-usage-insights.lnk"
-if (!(Test-Path $StartupShortcut)) {
-    $StartupShortcut = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Startup\token-usage-insights.lnk"
-}
-if (Get-ScheduledTask -TaskName "TokenUsageInsights" -ErrorAction SilentlyContinue) {
-    Start-ScheduledTask -TaskName "TokenUsageInsights"
+# 서비스 다시 시작(해당 설치 디렉터리에 한정, 작업 스케줄러 및 시작프로그램 모드 자동 호환)
+Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+    ($_.CommandLine -like "*run-service.ps1*" -and $_.CommandLine -like "*$InstallDir*") -or
+    ($_.ExecutablePath -and $_.ExecutablePath -like "$InstallDir*")
+} | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+    Start-ScheduledTask -TaskName $TaskName
 } elseif (Test-Path $StartupShortcut) {
     Start-Process $StartupShortcut
 }
 
-# 서비스 중지
-Stop-ScheduledTask -TaskName "TokenUsageInsights" -ErrorAction SilentlyContinue
-Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like "*run-service.ps1*" } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-Get-Process -Name "token-usage-insights" -ErrorAction SilentlyContinue | Stop-Process -Force
+# 서비스 중지(해당 설치 디렉터리에 한정)
+Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+    ($_.CommandLine -like "*run-service.ps1*" -and $_.CommandLine -like "*$InstallDir*") -or
+    ($_.ExecutablePath -and $_.ExecutablePath -like "$InstallDir*")
+} | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 
 # 상주 서비스 등록 해제
+Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
 Unregister-ScheduledTask -TaskName "TokenUsageInsights" -Confirm:$false -ErrorAction SilentlyContinue
-$StartupShortcut = Join-Path ([Environment]::GetFolderPath('Startup')) "token-usage-insights.lnk"
-if (!(Test-Path $StartupShortcut)) {
-    $StartupShortcut = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Startup\token-usage-insights.lnk"
+if (Test-Path $StartupShortcut) {
+    Remove-Item $StartupShortcut -Force -ErrorAction SilentlyContinue
 }
-Remove-Item $StartupShortcut -Force -ErrorAction SilentlyContinue
-Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like "*run-service.ps1*" } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-Get-Process -Name "token-usage-insights" -ErrorAction SilentlyContinue | Stop-Process -Force
+Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+    ($_.CommandLine -like "*run-service.ps1*" -and $_.CommandLine -like "*$InstallDir*") -or
+    ($_.ExecutablePath -and $_.ExecutablePath -like "$InstallDir*")
+} | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 ```
 
 * * *
