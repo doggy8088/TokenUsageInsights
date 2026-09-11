@@ -96,8 +96,10 @@ function Invoke-InstallServiceTest {
     $binDir = Join-Path $tempRoot "bin"
     $previousAppData = $env:APPDATA
     $previousUsername = $env:USERNAME
+    $previousUserDomain = $env:USERDOMAIN
     $env:APPDATA = Join-Path $tempRoot "AppData\Roaming"
     $env:USERNAME = "test-user"
+    $env:USERDOMAIN = "test-domain"
 
     New-Item -ItemType Directory -Force -Path (Join-Path $releaseDir "static") | Out-Null
     New-Item -ItemType Directory -Force -Path (Join-Path $releaseDir "shell") | Out-Null
@@ -299,6 +301,7 @@ function Invoke-InstallServiceTest {
         Remove-Variable serviceEvents, hostMessages, runnerProcessAlive, appProcessAlive, scheduledTaskTriggerUser -Scope Global -ErrorAction SilentlyContinue
         $env:APPDATA = $previousAppData
         $env:USERNAME = $previousUsername
+        $env:USERDOMAIN = $previousUserDomain
 
         if (Test-Path -LiteralPath $tempRoot) {
             Remove-Item -LiteralPath $tempRoot -Recurse -Force
@@ -391,7 +394,7 @@ try {
     $stopAppIndex = $installIpv6Result.Events.IndexOf("StopApp")
     Assert-True ($copyIndex -gt $stopRunnerIndex -and $copyIndex -gt $stopAppIndex) "install.ps1 should stop existing service processes before copying files."
     Assert-True ($installIpv6Result.Output -contains "  http://[::1]:4010") "install.ps1 should bracket IPv6 dashboard URLs."
-    Assert-Equal "test-user" $installIpv6Result.TriggerUser "install.ps1 should scope the logon trigger to the current user."
+    Assert-Equal "test-domain\test-user" $installIpv6Result.TriggerUser "install.ps1 should scope the logon trigger to the current user."
 
     $installWildcardResult = Invoke-InstallServiceTest -HostAddress "::" -Port 3003
     Assert-True ($installWildcardResult.Output -contains "  http://localhost:3003") "install.ps1 should print localhost for unspecified IPv6 dashboard URLs."

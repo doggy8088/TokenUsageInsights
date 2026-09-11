@@ -96,7 +96,15 @@ function Get-ScheduledTaskLogonUser {
         }
     } catch {}
 
-    return $env:USERNAME
+    if ($env:USERDOMAIN -and $env:USERNAME) {
+        return "$($env:USERDOMAIN)\$($env:USERNAME)"
+    }
+
+    if ($env:COMPUTERNAME -and $env:USERNAME) {
+        return "$($env:COMPUTERNAME)\$($env:USERNAME)"
+    }
+
+    return $null
 }
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -177,7 +185,11 @@ exit /b %APP_EXIT_CODE%
                 -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$RunnerScript`" -InstallDir `"$InstallDir`" -HostAddress `"$HostAddress`" -Port $Port" `
                 -WorkingDirectory $InstallDir
 
-            $Trigger = New-ScheduledTaskTrigger -AtLogOn -User $taskLogonUser
+            if ($taskLogonUser) {
+                $Trigger = New-ScheduledTaskTrigger -AtLogOn -User $taskLogonUser
+            } else {
+                $Trigger = New-ScheduledTaskTrigger -AtLogOn
+            }
 
             $Settings = New-ScheduledTaskSettingsSet `
                 -AllowStartIfOnBatteries `
