@@ -402,6 +402,52 @@ mod tests {
     }
 
     #[test]
+    fn parse_session_usage_file_calculates_cost_for_muse_spark_1_3_contributor() {
+        let root = temp_dir("spark13");
+        let session_dir = root
+            .join("sessions")
+            .join("2026")
+            .join("09")
+            .join("11")
+            .join("bda9278c-cea8-4033-bd9b-3f6eae98c6b2");
+        fs::create_dir_all(&session_dir).unwrap();
+        let path = session_dir.join("session.jsonl");
+
+        let mut file = File::create(&path).unwrap();
+        writeln!(
+            file,
+            r#"{{"schema_version":1,"id":"a","stream":{{"kind":"session","id":"bda9278c-cea8-4033-bd9b-3f6eae98c6b2"}},"sequence":1,"recorded_at":1789072091105545,"payload_type":"runtime.session.metadata","payload":{{"kind":"metadata","record":{{"provider_id":"meta","model_id":"muse-spark-1.3-contributor"}}}}}}"#
+        ).unwrap();
+        writeln!(
+            file,
+            r#"{{"schema_version":1,"id":"b","stream":{{"kind":"session","id":"bda9278c-cea8-4033-bd9b-3f6eae98c6b2"}},"sequence":2,"recorded_at":1789072091127816,"payload_type":"runtime.session","payload":{{"kind":"run","event":{{"kind":"model_completed","usage":{{"input_tokens":10000,"output_tokens":500,"cached_tokens":8000,"reasoning_tokens":100}},"duration_ms":1200,"model":"muse-spark-1.3-contributor"}}}}}}"#
+        ).unwrap();
+
+        let entries = parse_session_usage_file(&path).unwrap();
+        fs::remove_dir_all(&root).ok();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].model.as_deref(),
+            Some("muse-spark-1.3-contributor")
+        );
+
+        let rules = crate::pricing::load_prepared_pricing_rules();
+        let tokens = entries[0].tokens.as_ref().unwrap();
+        let cost = rules
+            .calculate_usage_cost(
+                entries[0].model.as_deref(),
+                tokens.input,
+                tokens.output,
+                tokens.cache_read.unwrap_or(0),
+                0,
+                0,
+            )
+            .expect("cost calculation should succeed for muse-spark-1.3-contributor");
+        assert!((cost - 0.000316).abs() < 1e-12);
+    }
+
+    #[test]
     fn find_session_files_discovers_nested_session_jsonl() {
         let root = temp_dir("find");
         let nested = root

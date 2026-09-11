@@ -277,6 +277,8 @@ Usage:
 
 The dashboard fully backfills existing `chatSessions` files and resynchronizes them when file size or modification time changes. Chat sessions without token fields are still shown with a token count of 0. Only local chat files are read; cloud sessions, Remote SSH hosts, and `state.vscdb` are not included.
 
+**Where cache-read tokens come from**: VS Code's `chatSessions` files only persist the `promptTokens` of the last model call in a request plus the accumulated `completionTokens`; they never record prompt-cache reads. The dashboard therefore also reads the Copilot Chat extension debug log written next to them, `GitHub.copilot-chat/debug-logs/<sessionId>/main.jsonl`, sums `inputTokens`, `outputTokens`, and `cachedTokens` across every model call of the turn, and splits the result into non-cached input, cache read, and output tokens so cost estimates use the cache-read rate. The debug log is controlled by the VS Code setting `github.copilot.chat.agentDebugLog.fileLogging.enabled` (already enabled by experiment for some users) and keeps only the 50 most recent sessions by default. Sessions without a debug log fall back to VS Code's own token fields and show 0 cache reads.
+
 If VS Code uses `--user-data-dir` or Portable Mode, specify a custom data root for the dashboard:
 
 macOS / Linux:
@@ -567,13 +569,125 @@ curl -fsSL https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/s
 
 This downloads the installed version and immediately enables `token-usage-insights.service`; you do not need to build or edit a systemd file yourself.
 
+### macOS: install and enable the launchd LaunchAgent with one command
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.sh | bash -s -- --service
+```
+
+This installs `com.tokenusageinsights.plist` into `~/Library/LaunchAgents/` and loads it immediately; stdout and stderr logs are located in `~/Library/Logs/`.
+
+### Windows: install and enable background service with one command (Task Scheduler)
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.ps1))) -Service
+```
+
+This registers the `TokenUsageInsights_<username>` task in Windows Task Scheduler for the current user and starts it immediately; it starts automatically at user logon in the background, with logs in the installation `logs\` directory (default `%LOCALAPPDATA%\TokenUsageInsights\logs\`).
+
 ### Manage the service
+
+Linux:
 
 ```bash
 systemctl --user status token-usage-insights.service
 journalctl --user -u token-usage-insights.service -n 50 -f
 systemctl --user restart token-usage-insights.service
 systemctl --user stop token-usage-insights.service
+```
+
+macOS:
+
+```bash
+launchctl print gui/$(id -u)/com.tokenusageinsights
+launchctl kickstart -k gui/$(id -u)/com.tokenusageinsights
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.tokenusageinsights.plist
+```
+
+Windows PowerShell:
+
+```powershell
+# Resolve installation directory (defaults to %LOCALAPPDATA%\TokenUsageInsights, or dynamically resolved from task/shortcut)
+$TaskName = if ($env:USERNAME) { "TokenUsageInsights_$env:USERNAME" } else { "TokenUsageInsights" }
+$InstallDir = $null
+$Task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+if (-not $Task) {
+    $Task = Get-ScheduledTask -TaskName "TokenUsageInsights" -ErrorAction SilentlyContinue
+    if ($Task) {
+        $TaskName = "TokenUsageInsights"
+    }
+}
+if ($Task -and $Task.Actions) {
+    foreach ($Action in @($Task.Actions)) {
+        if ($Action.Arguments -match '(?i)-InstallDir(?:\s+|:)(?:"([^"]+)"|(\S+))') {
+            $DetectedInstallDir = if ($Matches[1]) { $Matches[1] } else { $Matches[2] }
+            $InstallDir = [Environment]::ExpandEnvironmentVariables($DetectedInstallDir)
+            break
+        } elseif ($Action.WorkingDirectory) {
+            $InstallDir = $Action.WorkingDirectory
+            break
+        }
+    }
+}
+$StartupShortcut = Join-Path ([Environment]::GetFolderPath('Startup')) "token-usage-insights.lnk"
+if (!(Test-Path $StartupShortcut)) {
+    $StartupShortcut = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Startup\token-usage-insights.lnk"
+}
+if (-not $InstallDir -and (Test-Path $StartupShortcut)) {
+    $WshShell = New-Object -ComObject WScript.Shell
+    $Shortcut = $WshShell.CreateShortcut($StartupShortcut)
+    if ($Shortcut.Arguments -match '(?i)-InstallDir(?:\s+|:)(?:"([^"]+)"|(\S+))') {
+        $DetectedInstallDir = if ($Matches[1]) { $Matches[1] } else { $Matches[2] }
+        $InstallDir = [Environment]::ExpandEnvironmentVariables($DetectedInstallDir)
+    } elseif ($Shortcut.WorkingDirectory) {
+        $InstallDir = $Shortcut.WorkingDirectory
+    }
+}
+if (-not $InstallDir) {
+    $InstallDir = Join-Path $env:LOCALAPPDATA "TokenUsageInsights"
+}
+$TargetExe = "$InstallDir\token-usage-insights.exe".ToLowerInvariant().Replace('/', '\')
+$EscapedDir = [regex]::Escape($InstallDir)
+
+# Check service status (Task Scheduler or background process)
+Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+    ($_.CommandLine -like "*run-service.ps1*" -and $_.CommandLine -match "(?i)[\s`"'\\]$EscapedDir([\\`"'\s]|$)") -or
+    ($_.ExecutablePath -and ($_.ExecutablePath.ToLowerInvariant().Replace('/', '\') -eq $TargetExe))
+} | Select-Object ProcessId, Name, CommandLine
+
+# View logs
+Get-Content (Join-Path $InstallDir "logs\token-usage-insights.out.log") -Tail 50 -Wait
+
+# Restart service (scoped to this install directory; compatible with Task Scheduler and Startup folder modes)
+Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+    ($_.CommandLine -like "*run-service.ps1*" -and $_.CommandLine -match "(?i)[\s`"'\\]$EscapedDir([\\`"'\s]|$)") -or
+    ($_.ExecutablePath -and ($_.ExecutablePath.ToLowerInvariant().Replace('/', '\') -eq $TargetExe))
+} | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+    Start-ScheduledTask -TaskName $TaskName
+} elseif (Test-Path $StartupShortcut) {
+    Start-Process $StartupShortcut
+}
+
+# Stop service (scoped to this install directory)
+Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+    ($_.CommandLine -like "*run-service.ps1*" -and $_.CommandLine -match "(?i)[\s`"'\\]$EscapedDir([\\`"'\s]|$)") -or
+    ($_.ExecutablePath -and ($_.ExecutablePath.ToLowerInvariant().Replace('/', '\') -eq $TargetExe))
+} | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+
+# Unregister service
+Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+Unregister-ScheduledTask -TaskName "TokenUsageInsights" -Confirm:$false -ErrorAction SilentlyContinue
+if (Test-Path $StartupShortcut) {
+    Remove-Item $StartupShortcut -Force -ErrorAction SilentlyContinue
+}
+Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+    ($_.CommandLine -like "*run-service.ps1*" -and $_.CommandLine -match "(?i)[\s`"'\\]$EscapedDir([\\`"'\s]|$)") -or
+    ($_.ExecutablePath -and ($_.ExecutablePath.ToLowerInvariant().Replace('/', '\') -eq $TargetExe))
+} | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 ```
 
 * * *
@@ -592,7 +706,7 @@ Linux / macOS:
 curl -fsSL https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.sh | bash
 ```
 
-To install and enable the systemd user service at the same time on Linux:
+To install and enable the background service at the same time (systemd on Linux; launchd on macOS):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.sh | bash -s -- --service
@@ -602,6 +716,12 @@ Windows PowerShell:
 
 ```powershell
 irm https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.ps1 | iex
+```
+
+To install and enable the background service at the same time on Windows:
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.ps1))) -Service
 ```
 
 After installation, run (on Linux/macOS, confirm that `bin_dir` is on `PATH`; Windows creates a `.cmd` shim):
@@ -614,7 +734,7 @@ Environment variables can control the version and installation paths (all option
 
 | Variable | Platforms | Description |
 | --- | --- | --- |
-| `TOKEN_USAGE_INSIGHTS_VERSION` | Linux / macOS / Windows | Release tag to install, such as `v0.9.2`; defaults to `latest` |
+| `TOKEN_USAGE_INSIGHTS_VERSION` | Linux / macOS / Windows | Release tag to install, such as `v0.9.5`; defaults to `latest` |
 | `TOKEN_USAGE_INSIGHTS_INSTALL_DIR` | Linux / macOS | Installation directory, passed to `install.sh` |
 | `TOKEN_USAGE_INSIGHTS_BIN_DIR` | Linux / macOS | Executable-link directory, passed to `install.sh` |
 
@@ -633,7 +753,7 @@ If you do not want to execute a remote script directly, download the archive for
 - Frontend assets in `static/`
 - The model pricing table `pricing.csv`
 - Status Line and service scripts in `shell/`
-- The `scripts/` directory (including `install.sh`, `install.ps1`, `get.sh`, and `get.ps1`)
+- The `scripts/` directory (including `install.sh`, `install.ps1`, `get.sh`, `get.ps1`, and `run-service.ps1`)
 - README, LICENSE, and VERSION
 
 Linux or macOS:
@@ -644,7 +764,7 @@ cd token-usage-insights-<tag>-<target>
 ./install.sh
 ```
 
-To install and enable the systemd user service on Linux:
+To install and enable the background service (systemd on Linux; launchd on macOS):
 
 ```bash
 ./install.sh --service
@@ -656,6 +776,12 @@ Windows:
 Expand-Archive token-usage-insights-<tag>-x86_64-pc-windows-msvc.zip
 cd token-usage-insights-<tag>-x86_64-pc-windows-msvc
 powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+To install and enable the background service on Windows:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -Service
 ```
 
 Custom Windows installation location and port:

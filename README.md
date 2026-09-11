@@ -277,6 +277,8 @@ COPILOT_APP_DIR="/path/to/copilot-app-data" token-usage-insights
 
 看板會完整回填現有 `chatSessions` 檔案，也會在檔案大小或修改時間變更時重新同步；沒有 Token 欄位的聊天 Session 仍會顯示，但 Token 數為 0。資料只讀取本機聊天檔案，不包含雲端 Session、Remote SSH 主機或 `state.vscdb`。
 
+**快取讀取 Token 來源**：VS Code 的 `chatSessions` 檔案只記錄每個請求最後一次模型呼叫的 `promptTokens` 與累計的 `completionTokens`，並不記錄 Prompt Cache 的快取讀取數。看板會另外讀取 Copilot Chat 擴充功能在同一個工作區目錄下寫入的除錯記錄 `GitHub.copilot-chat/debug-logs/<sessionId>/main.jsonl`，把該回合所有模型呼叫的 `inputTokens`、`outputTokens` 與 `cachedTokens` 加總後，拆成非快取輸入、快取讀取與輸出 Token，成本估算也會依快取讀取費率計價。此除錯記錄由 VS Code 設定 `github.copilot.chat.agentDebugLog.fileLogging.enabled` 控制（部分使用者已由實驗功能開啟），且預設只保留最近 50 個 Session 的記錄；沒有除錯記錄的 Session 會回退使用 VS Code 內建的 Token 欄位，快取讀取會顯示為 0。
+
 若 VS Code 使用 `--user-data-dir` 或 Portable Mode，可指定看板自訂的資料根目錄：
 
 macOS / Linux：
@@ -582,13 +584,125 @@ curl -fsSL https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/s
 
 這會下載安裝版並立即啟用 `token-usage-insights.service`，不需要自行建置或修改 systemd 檔案。
 
+### macOS：一行安裝並啟用 launchd LaunchAgent
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.sh | bash -s -- --service
+```
+
+這會將 `com.tokenusageinsights.plist` 安裝到 `~/Library/LaunchAgents/` 並立即載入；標準輸出與錯誤日誌位於 `~/Library/Logs/`。
+
+### Windows：一行安裝並啟用背景常駐服務（工作排程器）
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.ps1))) -Service
+```
+
+這會透過 Windows 工作排程器（Task Scheduler）註冊專屬於目前使用者的 `TokenUsageInsights_<username>` 背景工作並立即啟動；使用者每次登入時均會自動於背景執行，標準輸出與錯誤日誌位於安裝目錄下的 `logs\`（預設為 `%LOCALAPPDATA%\TokenUsageInsights\logs\`）。
+
 ### 管理服務
+
+Linux 可使用：
 
 ```bash
 systemctl --user status token-usage-insights.service
 journalctl --user -u token-usage-insights.service -n 50 -f
 systemctl --user restart token-usage-insights.service
 systemctl --user stop token-usage-insights.service
+```
+
+macOS 可使用：
+
+```bash
+launchctl print gui/$(id -u)/com.tokenusageinsights
+launchctl kickstart -k gui/$(id -u)/com.tokenusageinsights
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.tokenusageinsights.plist
+```
+
+Windows PowerShell 可使用：
+
+```powershell
+# 解析安裝目錄（預設為 %LOCALAPPDATA%\TokenUsageInsights，或由已註冊排程/捷徑動態解析）
+$TaskName = if ($env:USERNAME) { "TokenUsageInsights_$env:USERNAME" } else { "TokenUsageInsights" }
+$InstallDir = $null
+$Task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+if (-not $Task) {
+    $Task = Get-ScheduledTask -TaskName "TokenUsageInsights" -ErrorAction SilentlyContinue
+    if ($Task) {
+        $TaskName = "TokenUsageInsights"
+    }
+}
+if ($Task -and $Task.Actions) {
+    foreach ($Action in @($Task.Actions)) {
+        if ($Action.Arguments -match '(?i)-InstallDir(?:\s+|:)(?:"([^"]+)"|(\S+))') {
+            $DetectedInstallDir = if ($Matches[1]) { $Matches[1] } else { $Matches[2] }
+            $InstallDir = [Environment]::ExpandEnvironmentVariables($DetectedInstallDir)
+            break
+        } elseif ($Action.WorkingDirectory) {
+            $InstallDir = $Action.WorkingDirectory
+            break
+        }
+    }
+}
+$StartupShortcut = Join-Path ([Environment]::GetFolderPath('Startup')) "token-usage-insights.lnk"
+if (!(Test-Path $StartupShortcut)) {
+    $StartupShortcut = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Startup\token-usage-insights.lnk"
+}
+if (-not $InstallDir -and (Test-Path $StartupShortcut)) {
+    $WshShell = New-Object -ComObject WScript.Shell
+    $Shortcut = $WshShell.CreateShortcut($StartupShortcut)
+    if ($Shortcut.Arguments -match '(?i)-InstallDir(?:\s+|:)(?:"([^"]+)"|(\S+))') {
+        $DetectedInstallDir = if ($Matches[1]) { $Matches[1] } else { $Matches[2] }
+        $InstallDir = [Environment]::ExpandEnvironmentVariables($DetectedInstallDir)
+    } elseif ($Shortcut.WorkingDirectory) {
+        $InstallDir = $Shortcut.WorkingDirectory
+    }
+}
+if (-not $InstallDir) {
+    $InstallDir = Join-Path $env:LOCALAPPDATA "TokenUsageInsights"
+}
+$TargetExe = "$InstallDir\token-usage-insights.exe".ToLowerInvariant().Replace('/', '\')
+$EscapedDir = [regex]::Escape($InstallDir)
+
+# 檢視服務狀態（工作排程器或背景行程）
+Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+    ($_.CommandLine -like "*run-service.ps1*" -and $_.CommandLine -match "(?i)[\s`"'\\]$EscapedDir([\\`"'\s]|$)") -or
+    ($_.ExecutablePath -and ($_.ExecutablePath.ToLowerInvariant().Replace('/', '\') -eq $TargetExe))
+} | Select-Object ProcessId, Name, CommandLine
+
+# 檢視即時日誌
+Get-Content (Join-Path $InstallDir "logs\token-usage-insights.out.log") -Tail 50 -Wait
+
+# 重啟服務（僅限此安裝目錄，自動相容工作排程器與啟動資料夾模式）
+Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+    ($_.CommandLine -like "*run-service.ps1*" -and $_.CommandLine -match "(?i)[\s`"'\\]$EscapedDir([\\`"'\s]|$)") -or
+    ($_.ExecutablePath -and ($_.ExecutablePath.ToLowerInvariant().Replace('/', '\') -eq $TargetExe))
+} | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+    Start-ScheduledTask -TaskName $TaskName
+} elseif (Test-Path $StartupShortcut) {
+    Start-Process $StartupShortcut
+}
+
+# 停止服務（僅限此安裝目錄）
+Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+    ($_.CommandLine -like "*run-service.ps1*" -and $_.CommandLine -match "(?i)[\s`"'\\]$EscapedDir([\\`"'\s]|$)") -or
+    ($_.ExecutablePath -and ($_.ExecutablePath.ToLowerInvariant().Replace('/', '\') -eq $TargetExe))
+} | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+
+# 解除安裝常駐服務
+Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+Unregister-ScheduledTask -TaskName "TokenUsageInsights" -Confirm:$false -ErrorAction SilentlyContinue
+if (Test-Path $StartupShortcut) {
+    Remove-Item $StartupShortcut -Force -ErrorAction SilentlyContinue
+}
+Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+    ($_.CommandLine -like "*run-service.ps1*" -and $_.CommandLine -match "(?i)[\s`"'\\]$EscapedDir([\\`"'\s]|$)") -or
+    ($_.ExecutablePath -and ($_.ExecutablePath.ToLowerInvariant().Replace('/', '\') -eq $TargetExe))
+} | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 ```
 
 * * *
@@ -617,7 +731,7 @@ Linux / macOS：
 curl -fsSL https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.sh | bash
 ```
 
-Linux 如需同時安裝並啟用 systemd user service：
+Linux（systemd user service）或 macOS（launchd LaunchAgent）如需同時安裝並啟用常駐服務：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.sh | bash -s -- --service
@@ -627,6 +741,12 @@ Windows PowerShell：
 
 ```powershell
 irm https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.ps1 | iex
+```
+
+Windows PowerShell 如需同時安裝並啟用常駐服務：
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.ps1))) -Service
 ```
 
 安裝完成後即可執行（Linux/macOS 需確認 `bin_dir` 已加入 `PATH`；Windows 會建立 `.cmd` shim）：
@@ -639,7 +759,7 @@ token-usage-insights
 
 | 變數 | 適用平台 | 說明 |
 | --- | --- | --- |
-| `TOKEN_USAGE_INSIGHTS_VERSION` | Linux / macOS / Windows | 指定要安裝的 Release tag，例如 `v0.9.2`。預設 `latest` |
+| `TOKEN_USAGE_INSIGHTS_VERSION` | Linux / macOS / Windows | 指定要安裝的 Release tag，例如 `v0.9.5`。預設 `latest` |
 | `TOKEN_USAGE_INSIGHTS_INSTALL_DIR` | Linux / macOS | 安裝目錄，會轉交給 `install.sh` |
 | `TOKEN_USAGE_INSIGHTS_BIN_DIR` | Linux / macOS | 執行檔連結目錄，會轉交給 `install.sh` |
 
@@ -658,7 +778,7 @@ Invoke-WebRequest -Uri https://raw.githubusercontent.com/doggy8088/TokenUsageIns
 - `static/` 前端資產
 - `pricing.csv` 模型費用表
 - `shell/` 目錄下的 Status Line 與服務腳本
-- `scripts/` 目錄（含 `install.sh`、`install.ps1`、`get.sh`、`get.ps1`）
+- `scripts/` 目錄（含 `install.sh`、`install.ps1`、`get.sh`、`get.ps1`、`run-service.ps1`）
 - README、LICENSE 與 VERSION
 
 Linux 或 macOS：
@@ -669,7 +789,7 @@ cd token-usage-insights-<tag>-<target>
 ./install.sh
 ```
 
-Linux 如需安裝並啟用 systemd user service：
+Linux（systemd user service）或 macOS（launchd LaunchAgent）如需安裝並啟用常駐服務：
 
 ```bash
 ./install.sh --service
@@ -681,6 +801,12 @@ Windows：
 Expand-Archive token-usage-insights-<tag>-x86_64-pc-windows-msvc.zip
 cd token-usage-insights-<tag>-x86_64-pc-windows-msvc
 powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+Windows 如需安裝並啟用背景常駐服務：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -Service
 ```
 
 自訂 Windows 安裝位置與埠號：

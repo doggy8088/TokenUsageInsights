@@ -1856,7 +1856,7 @@ mod tests {
                 .as_nanos()
         ));
         let session_id = "grok-multi-model-timeline";
-        let session_dir = root.join("sessions/work").join(session_id);
+        let session_dir = root.join("sessions").join("work").join(session_id);
         fs::create_dir_all(&session_dir).unwrap();
         let updates_path = session_dir.join("updates.jsonl");
         fs::write(

@@ -179,13 +179,14 @@ const CURSOR_MODEL_ATTRIBUTION_MIGRATION_KEY: &str = "migration:cursor_model_att
 const CURSOR_CACHE_TOKENS_UNKNOWN_MIGRATION_KEY: &str = "migration:cursor_cache_tokens_unknown_v1";
 const CURSOR_AGENT_SOURCE_KIND: &str = "cursor-agent";
 const CURSOR_IDE_SOURCE_KIND: &str = "cursor-ide";
-const GROK_PARSER_MIGRATION_KEY: &str = "migration:grok_parser_v6";
+const GROK_PARSER_MIGRATION_KEY: &str = "migration:grok_parser_v7";
 const LEGACY_GROK_PARSER_MIGRATION_KEYS: &[&str] = &[
     "migration:grok_parser_v1",
     "migration:grok_model_normalization_v2",
     "migration:grok_parser_v3",
     "migration:grok_parser_v4",
     "migration:grok_parser_v5",
+    "migration:grok_parser_v6",
 ];
 
 /// Source kind written for usage entries originating from the Copilot CLI
@@ -1549,6 +1550,34 @@ fn insert_vscode_usage_entry(
     )
 }
 
+fn file_modified_nanos(metadata: &fs::Metadata) -> i64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|value| value.as_nanos() as i64)
+        .unwrap_or(0)
+}
+
+/// Sync-state signature `(size, mtime)` of a VS Code chat session file.
+///
+/// The Copilot Chat extension flushes its per-session debug log (the only
+/// local source of prompt-cache reads) a few seconds after VS Code finishes
+/// writing the `chatSessions` file. Folding the debug log's size and mtime into
+/// the signature makes a later flush trigger a resync instead of leaving the
+/// session stuck without cache-read tokens.
+fn vscode_sync_signature(filepath: &Path, metadata: &fs::Metadata) -> (u64, i64) {
+    let mut size = metadata.len();
+    let mut modified = file_modified_nanos(metadata);
+    if let Some(debug_metadata) =
+        crate::vscode::debug_log_path(filepath).and_then(|debug_path| fs::metadata(debug_path).ok())
+    {
+        size = size.saturating_add(debug_metadata.len());
+        modified = modified.max(file_modified_nanos(&debug_metadata));
+    }
+    (size, modified)
+}
+
 fn sync_vscode_chat_sessions(conn: &mut Connection) -> Result<(), String> {
     let mut seen_sessions = HashSet::new();
 
@@ -1557,13 +1586,7 @@ fn sync_vscode_chat_sessions(conn: &mut Connection) -> Result<(), String> {
             Ok(metadata) => metadata,
             Err(_) => continue,
         };
-        let current_size = metadata.len();
-        let modified_time = metadata
-            .modified()
-            .ok()
-            .and_then(|value| value.duration_since(SystemTime::UNIX_EPOCH).ok())
-            .map(|value| value.as_nanos() as i64)
-            .unwrap_or(0);
+        let (current_size, modified_time) = vscode_sync_signature(&filepath, &metadata);
         let state_key = format!("vscode:{}", filepath.to_string_lossy());
         let previous_state: Option<(u64, i64)> = conn
             .query_row(
@@ -7723,6 +7746,7 @@ pub fn get_usage_entries_by_year(
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use std::sync::{
         atomic::{AtomicU64, Ordering},
         Mutex,
@@ -7730,6 +7754,49 @@ mod tests {
 
     static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn vscode_sync_signature_includes_debug_log_size_and_mtime() {
+        let root = std::env::temp_dir().join(format!(
+            "tui-vscode-sync-signature-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let workspace = root.join("workspaceStorage").join("ws1");
+        let chat_sessions = workspace.join("chatSessions");
+        fs::create_dir_all(&chat_sessions).unwrap();
+        let session_file = chat_sessions.join("abc.jsonl");
+        fs::write(&session_file, "0123456789").unwrap();
+        let metadata = fs::metadata(&session_file).unwrap();
+
+        // Without a debug log the signature is just the session file itself.
+        let (size, modified) = vscode_sync_signature(&session_file, &metadata);
+        assert_eq!(size, 10);
+        assert_eq!(modified, file_modified_nanos(&metadata));
+
+        // A debug log flushed later grows the size and bumps the mtime, so the
+        // session is picked up by the next sync even though the chat file is
+        // unchanged.
+        let debug_path = crate::vscode::debug_log_path(&session_file).unwrap();
+        fs::create_dir_all(debug_path.parent().unwrap()).unwrap();
+        fs::write(&debug_path, "{}\n{}\n").unwrap();
+        let future = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(4_102_444_800);
+        fs::File::options()
+            .write(true)
+            .open(&debug_path)
+            .unwrap()
+            .set_modified(future)
+            .unwrap();
+        let (size_with_log, modified_with_log) = vscode_sync_signature(&session_file, &metadata);
+        assert_eq!(size_with_log, 10 + 6);
+        assert!(modified_with_log > modified);
+        assert_eq!(
+            modified_with_log,
+            file_modified_nanos(&fs::metadata(&debug_path).unwrap())
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
 
     fn temp_jsonl_path(prefix: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
@@ -16625,9 +16692,170 @@ mod tests {
     }
 
     #[test]
+    fn grok_parser_v7_migration_reparses_existing_grok_46_session() {
+        let root = temp_jsonl_path("grok-v7-migration");
+        let session_dir_high = root.join("sessions").join("work").join("grok-46-session");
+        fs::create_dir_all(&session_dir_high).unwrap();
+        fs::write(
+            session_dir_high.join("summary.json"),
+            r#"{"info":{"cwd":"/tmp/grok-project"},"current_model_id":"grok-4.6","reasoning_effort":"high","generated_title":"Grok 4.6 migration test"}"#,
+        )
+        .unwrap();
+        let updates_high_path = session_dir_high.join("updates.jsonl");
+        fs::write(
+            &updates_high_path,
+            concat!(
+                r#"{"timestamp":1710000000,"params":{"update":{"sessionUpdate":"turn_started","turn_number":0}}}"#, "\n",
+                r#"{"timestamp":1710000001,"params":{"update":{"sessionUpdate":"user_message_chunk","content":{"text":"hello grok 4.6"}}}}"#, "\n",
+                r#"{"timestamp":1710000002,"params":{"update":{"sessionUpdate":"turn_completed","usage":{"input_tokens":100,"cache_read_input_tokens":50,"output_tokens":50,"total_tokens":200},"total_cost_usd":0.0005}}}"#, "\n"
+            ),
+        )
+        .unwrap();
+        let file_size_high = fs::metadata(&updates_high_path).unwrap().len();
+
+        let session_dir_latest = root
+            .join("sessions")
+            .join("work")
+            .join("grok-46-latest-session");
+        fs::create_dir_all(&session_dir_latest).unwrap();
+        fs::write(
+            session_dir_latest.join("summary.json"),
+            r#"{"info":{"cwd":"/tmp/grok-project"},"current_model_id":"grok-4.6-latest","generated_title":"Grok 4.6 latest migration test"}"#,
+        )
+        .unwrap();
+        let updates_latest_path = session_dir_latest.join("updates.jsonl");
+        fs::write(
+            &updates_latest_path,
+            concat!(
+                r#"{"timestamp":1710000010,"params":{"update":{"sessionUpdate":"turn_started","turn_number":0}}}"#, "\n",
+                r#"{"timestamp":1710000011,"params":{"update":{"sessionUpdate":"user_message_chunk","content":{"text":"hello grok 4.6 latest"}}}}"#, "\n",
+                r#"{"timestamp":1710000012,"params":{"update":{"sessionUpdate":"turn_completed","usage":{"input_tokens":200,"cache_read_input_tokens":0,"output_tokens":80,"total_tokens":280},"total_cost_usd":0.0008}}}"#, "\n"
+            ),
+        )
+        .unwrap();
+        let file_size_latest = fs::metadata(&updates_latest_path).unwrap().len();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // Simulate database state that already executed grok_parser_v6
+        // with the files marked as synced and raw "grok-4.6" / "grok-4.6-latest" persisted.
+        conn.execute(
+            "DELETE FROM sync_state WHERE filename = ?",
+            params![GROK_PARSER_MIGRATION_KEY],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES ('migration:grok_parser_v6', 1, 0)",
+            [],
+        )
+        .unwrap();
+
+        let relative_high_path = portable_relative_path(&root, &updates_high_path);
+        conn.execute(
+            "INSERT INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES (?, ?, 0)",
+            params![format!("grok:{relative_high_path}"), file_size_high],
+        )
+        .unwrap();
+
+        let relative_latest_path = portable_relative_path(&root, &updates_latest_path);
+        conn.execute(
+            "INSERT INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES (?, ?, 0)",
+            params![format!("grok:{relative_latest_path}"), file_size_latest],
+        )
+        .unwrap();
+
+        let transcript_high = updates_high_path.to_string_lossy().into_owned();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, turn_no, model,
+                source_kind, transcript_path, delta_input, delta_output, delta_total
+             ) VALUES ('grok', '2024-03-09T18:40:00Z', '2024-03-09', 'grok-46-session', 0, 'grok-4.6',
+                'grok-build', ?, 100, 50, 150)",
+            params![transcript_high],
+        )
+        .unwrap();
+
+        let transcript_latest = updates_latest_path.to_string_lossy().into_owned();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, turn_no, model,
+                source_kind, transcript_path, delta_input, delta_output, delta_total
+             ) VALUES ('grok', '2024-03-09T18:40:10Z', '2024-03-09', 'grok-46-latest-session', 0, 'grok-4.6-latest',
+                'grok-build', ?, 200, 80, 280)",
+            params![transcript_latest],
+        )
+        .unwrap();
+
+        let raw_models: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT model FROM usage_entries WHERE assistant_type = 'grok' ORDER BY session_id")
+                .unwrap();
+            let rows = stmt.query_map([], |row| row.get(0)).unwrap();
+            rows.map(Result::unwrap).collect()
+        };
+        assert_eq!(raw_models, vec!["grok-4.6-latest", "grok-4.6"]);
+
+        // Re-run init_db to execute v7 migration
+        init_db(&conn).unwrap();
+
+        // v7 migration marker should be recorded and v6 marker cleaned up
+        let v7_done: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = ?)",
+                params![GROK_PARSER_MIGRATION_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(v7_done);
+
+        let v6_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = 'migration:grok_parser_v6')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!v6_exists);
+
+        // sync_state for both sessions was cleared, allowing reparse
+        let grok_sync_count: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state WHERE filename LIKE 'grok:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(grok_sync_count, 0);
+
+        // Running sync re-parses with new display_model_name
+        sync_grok_usage_logs(&mut conn, &root).unwrap();
+
+        let updated_entries: Vec<(String, Option<String>)> = {
+            let mut stmt = conn
+                .prepare("SELECT model, reasoning_effort FROM usage_entries WHERE assistant_type = 'grok' ORDER BY session_id")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap();
+            rows.map(Result::unwrap).collect()
+        };
+        assert_eq!(
+            updated_entries,
+            vec![
+                ("Grok 4.6".to_string(), None),
+                ("Grok 4.6 (High)".to_string(), Some("High".to_string())),
+            ]
+        );
+    }
+
+    #[test]
     fn sync_grok_usage_logs_rebuilds_session_and_keeps_reported_cost() {
         let root = temp_jsonl_path("grok-sync");
-        let session_dir = root.join("sessions/work/grok-session");
+        let session_dir = root.join("sessions").join("work").join("grok-session");
         fs::create_dir_all(&session_dir).unwrap();
         fs::write(
             session_dir.join("summary.json"),
@@ -16849,7 +17077,7 @@ mod tests {
     fn sync_grok_multi_model_turn_survives_database_and_timeline() {
         let root = temp_jsonl_path("grok-multi-model-sync").with_extension("");
         let session_id = "grok-multi-model";
-        let session_dir = root.join("sessions/work").join(session_id);
+        let session_dir = root.join("sessions").join("work").join(session_id);
         fs::create_dir_all(&session_dir).unwrap();
         let updates_path = session_dir.join("updates.jsonl");
         fs::write(

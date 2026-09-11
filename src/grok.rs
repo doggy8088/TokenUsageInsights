@@ -393,6 +393,13 @@ fn is_grok45_model_id(model: &str) -> bool {
     )
 }
 
+fn is_grok46_model_id(model: &str) -> bool {
+    matches!(
+        normalize_model_id(model).as_str(),
+        "grok46" | "grok46latest"
+    )
+}
+
 fn is_grok_build_01_model_id(model: &str) -> bool {
     matches!(
         normalize_model_id(model).as_str(),
@@ -409,6 +416,12 @@ pub(crate) fn display_model_name(model: &str, reasoning_effort: Option<&str>) ->
             return format!("Grok 4.5 ({effort})");
         }
         return "Grok 4.5".to_string();
+    }
+    if is_grok46_model_id(model) {
+        if let Some(effort) = reasoning_effort.and_then(normalize_reasoning_effort) {
+            return format!("Grok 4.6 ({effort})");
+        }
+        return "Grok 4.6".to_string();
     }
     if is_grok_build_01_model_id(model) {
         return "Grok Build 0.1".to_string();
@@ -914,7 +927,7 @@ mod tests {
     #[test]
     fn parses_provider_usage_and_model_usage() {
         let root = test_updates_path("usage");
-        let session_dir = root.join("sessions/work/session-1");
+        let session_dir = root.join("sessions").join("work").join("session-1");
         fs::create_dir_all(&session_dir).unwrap();
         fs::write(
             session_dir.join("summary.json"),
@@ -1096,7 +1109,7 @@ mod tests {
     #[test]
     fn parses_multi_model_turn_into_separate_entries() {
         let root = test_updates_path("multi-model");
-        let session_dir = root.join("sessions/work/session-multi");
+        let session_dir = root.join("sessions").join("work").join("session-multi");
         fs::create_dir_all(&session_dir).unwrap();
         let events = [
             serde_json::json!({
@@ -1186,10 +1199,16 @@ mod tests {
         );
         assert_eq!(display_model_name("grok-4.5", None), "Grok 4.5");
         assert_eq!(
+            display_model_name("grok-4.6", Some("high")),
+            "Grok 4.6 (High)"
+        );
+        assert_eq!(display_model_name("grok-4.6-latest", None), "Grok 4.6");
+        assert_eq!(
             display_model_name("grok-build-0.1", Some("high")),
             "Grok Build 0.1"
         );
         assert!(!is_grok45_model_id("grok-build-0.1"));
+        assert!(is_grok46_model_id("grok-4.6"));
         assert!(is_grok_build_01_model_id("grok-build-0.1"));
     }
 
@@ -1208,7 +1227,7 @@ mod tests {
     #[test]
     fn context_snapshot_deltas_are_incremental_across_turns() {
         let root = test_updates_path("context");
-        let session_dir = root.join("sessions/work/session-2");
+        let session_dir = root.join("sessions").join("work").join("session-2");
         fs::create_dir_all(&session_dir).unwrap();
         fs::write(
             session_dir.join("updates.jsonl"),

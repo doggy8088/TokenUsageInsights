@@ -277,6 +277,8 @@ VS Code Stable 및 Insiders를 지원합니다.
 
 대시보드는 기존 `chatSessions` 파일을 모두 채우고 파일 크기나 수정 시간이 변경되면 다시 동기화합니다. Token 필드가 없는 채팅 Session도 표시되지만 Token 수는 0입니다. 로컬 채팅 파일만 읽으며 클라우드 Session, Remote SSH 호스트 또는 `state.vscdb`는 포함하지 않습니다.
 
+**캐시 읽기 Token 출처**: VS Code의 `chatSessions` 파일은 각 요청에서 마지막 모델 호출의 `promptTokens`와 누적 `completionTokens`만 기록하며 Prompt Cache 캐시 읽기 수는 기록하지 않습니다. 따라서 대시보드는 같은 워크스페이스 디렉터리에 Copilot Chat 확장이 기록하는 디버그 로그 `GitHub.copilot-chat/debug-logs/<sessionId>/main.jsonl`도 함께 읽어, 해당 턴의 모든 모델 호출의 `inputTokens`, `outputTokens`, `cachedTokens`를 합산한 뒤 비캐시 입력, 캐시 읽기, 출력 Token으로 나누고 비용 추정에도 캐시 읽기 단가를 적용합니다. 이 디버그 로그는 VS Code 설정 `github.copilot.chat.agentDebugLog.fileLogging.enabled`로 제어되며(일부 사용자는 실험 기능으로 이미 활성화됨) 기본적으로 최근 50개 Session만 보존합니다. 디버그 로그가 없는 Session은 VS Code 기본 Token 필드로 대체되며 캐시 읽기는 0으로 표시됩니다.
+
 VS Code에서 `--user-data-dir` 또는 Portable Mode를 사용하는 경우 대시보드의 사용자 지정 데이터 루트를 지정할 수 있습니다.
 
 macOS / Linux:
@@ -567,13 +569,125 @@ curl -fsSL https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/s
 
 이 명령은 설치 버전을 다운로드하고 `token-usage-insights.service`를 즉시 활성화합니다. systemd 파일을 직접 빌드하거나 수정할 필요가 없습니다.
 
+### macOS: 한 줄로 launchd LaunchAgent 설치 및 활성화
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.sh | bash -s -- --service
+```
+
+이 명령은 `com.tokenusageinsights.plist`를 `~/Library/LaunchAgents/`에 설치하고 즉시 로드합니다. 표준 출력과 오류 로그는 `~/Library/Logs/`에 저장됩니다.
+
+### Windows: 한 줄로 백그라운드 상주 서비스(작업 스케줄러) 설치 및 활성화
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.ps1))) -Service
+```
+
+이 명령은 Windows 작업 스케줄러(Task Scheduler)에 현재 사용자 전용 `TokenUsageInsights_<username>` 작업을 등록하고 즉시 시작합니다. 사용자가 로그인할 때마다 백그라운드에서 자동으로 실행되며 표준 출력 및 오류 로그는 설치 디렉터리 하위의 `logs\`(기본값은 `%LOCALAPPDATA%\TokenUsageInsights\logs\`)에 저장됩니다.
+
 ### 서비스 관리
+
+Linux:
 
 ```bash
 systemctl --user status token-usage-insights.service
 journalctl --user -u token-usage-insights.service -n 50 -f
 systemctl --user restart token-usage-insights.service
 systemctl --user stop token-usage-insights.service
+```
+
+macOS:
+
+```bash
+launchctl print gui/$(id -u)/com.tokenusageinsights
+launchctl kickstart -k gui/$(id -u)/com.tokenusageinsights
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.tokenusageinsights.plist
+```
+
+Windows PowerShell:
+
+```powershell
+# 설치 디렉터리 확인(기본값은 %LOCALAPPDATA%\TokenUsageInsights, 또는 작업/바로 가기에서 동적 확인)
+$TaskName = if ($env:USERNAME) { "TokenUsageInsights_$env:USERNAME" } else { "TokenUsageInsights" }
+$InstallDir = $null
+$Task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+if (-not $Task) {
+    $Task = Get-ScheduledTask -TaskName "TokenUsageInsights" -ErrorAction SilentlyContinue
+    if ($Task) {
+        $TaskName = "TokenUsageInsights"
+    }
+}
+if ($Task -and $Task.Actions) {
+    foreach ($Action in @($Task.Actions)) {
+        if ($Action.Arguments -match '(?i)-InstallDir(?:\s+|:)(?:"([^"]+)"|(\S+))') {
+            $DetectedInstallDir = if ($Matches[1]) { $Matches[1] } else { $Matches[2] }
+            $InstallDir = [Environment]::ExpandEnvironmentVariables($DetectedInstallDir)
+            break
+        } elseif ($Action.WorkingDirectory) {
+            $InstallDir = $Action.WorkingDirectory
+            break
+        }
+    }
+}
+$StartupShortcut = Join-Path ([Environment]::GetFolderPath('Startup')) "token-usage-insights.lnk"
+if (!(Test-Path $StartupShortcut)) {
+    $StartupShortcut = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Startup\token-usage-insights.lnk"
+}
+if (-not $InstallDir -and (Test-Path $StartupShortcut)) {
+    $WshShell = New-Object -ComObject WScript.Shell
+    $Shortcut = $WshShell.CreateShortcut($StartupShortcut)
+    if ($Shortcut.Arguments -match '(?i)-InstallDir(?:\s+|:)(?:"([^"]+)"|(\S+))') {
+        $DetectedInstallDir = if ($Matches[1]) { $Matches[1] } else { $Matches[2] }
+        $InstallDir = [Environment]::ExpandEnvironmentVariables($DetectedInstallDir)
+    } elseif ($Shortcut.WorkingDirectory) {
+        $InstallDir = $Shortcut.WorkingDirectory
+    }
+}
+if (-not $InstallDir) {
+    $InstallDir = Join-Path $env:LOCALAPPDATA "TokenUsageInsights"
+}
+$TargetExe = "$InstallDir\token-usage-insights.exe".ToLowerInvariant().Replace('/', '\')
+$EscapedDir = [regex]::Escape($InstallDir)
+
+# 서비스 상태 확인(작업 스케줄러 또는 백그라운드 프로세스)
+Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+    ($_.CommandLine -like "*run-service.ps1*" -and $_.CommandLine -match "(?i)[\s`"'\\]$EscapedDir([\\`"'\s]|$)") -or
+    ($_.ExecutablePath -and ($_.ExecutablePath.ToLowerInvariant().Replace('/', '\') -eq $TargetExe))
+} | Select-Object ProcessId, Name, CommandLine
+
+# 실시간 로그 확인
+Get-Content (Join-Path $InstallDir "logs\token-usage-insights.out.log") -Tail 50 -Wait
+
+# 서비스 다시 시작(해당 설치 디렉터리에 한정, 작업 스케줄러 및 시작프로그램 모드 자동 호환)
+Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+    ($_.CommandLine -like "*run-service.ps1*" -and $_.CommandLine -match "(?i)[\s`"'\\]$EscapedDir([\\`"'\s]|$)") -or
+    ($_.ExecutablePath -and ($_.ExecutablePath.ToLowerInvariant().Replace('/', '\') -eq $TargetExe))
+} | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+    Start-ScheduledTask -TaskName $TaskName
+} elseif (Test-Path $StartupShortcut) {
+    Start-Process $StartupShortcut
+}
+
+# 서비스 중지(해당 설치 디렉터리에 한정)
+Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+    ($_.CommandLine -like "*run-service.ps1*" -and $_.CommandLine -match "(?i)[\s`"'\\]$EscapedDir([\\`"'\s]|$)") -or
+    ($_.ExecutablePath -and ($_.ExecutablePath.ToLowerInvariant().Replace('/', '\') -eq $TargetExe))
+} | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+
+# 상주 서비스 등록 해제
+Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+Unregister-ScheduledTask -TaskName "TokenUsageInsights" -Confirm:$false -ErrorAction SilentlyContinue
+if (Test-Path $StartupShortcut) {
+    Remove-Item $StartupShortcut -Force -ErrorAction SilentlyContinue
+}
+Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+    ($_.CommandLine -like "*run-service.ps1*" -and $_.CommandLine -match "(?i)[\s`"'\\]$EscapedDir([\\`"'\s]|$)") -or
+    ($_.ExecutablePath -and ($_.ExecutablePath.ToLowerInvariant().Replace('/', '\') -eq $TargetExe))
+} | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 ```
 
 * * *
@@ -592,7 +706,7 @@ Linux / macOS:
 curl -fsSL https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.sh | bash
 ```
 
-Linux에서 systemd 사용자 서비스를 함께 설치하고 활성화하려면:
+Linux(systemd user service) 또는 macOS(launchd LaunchAgent)에서 상주 서비스를 함께 설치하고 활성화하려면:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.sh | bash -s -- --service
@@ -602,6 +716,12 @@ Windows PowerShell:
 
 ```powershell
 irm https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.ps1 | iex
+```
+
+Windows PowerShell에서 상주 서비스를 함께 설치하고 활성화하려면:
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.ps1))) -Service
 ```
 
 설치가 끝나면 실행합니다(Linux/macOS는 `bin_dir`가 `PATH`에 포함되는지 확인하고, Windows는 `.cmd` shim을 만듭니다).
@@ -614,7 +734,7 @@ token-usage-insights
 
 | 변수 | 대상 플랫폼 | 설명 |
 | --- | --- | --- |
-| `TOKEN_USAGE_INSIGHTS_VERSION` | Linux / macOS / Windows | 설치할 Release tag(예: `v0.9.2`); 기본값은 `latest` |
+| `TOKEN_USAGE_INSIGHTS_VERSION` | Linux / macOS / Windows | 설치할 Release tag(예: `v0.9.5`); 기본값은 `latest` |
 | `TOKEN_USAGE_INSIGHTS_INSTALL_DIR` | Linux / macOS | `install.sh`에 전달할 설치 디렉터리 |
 | `TOKEN_USAGE_INSIGHTS_BIN_DIR` | Linux / macOS | `install.sh`에 전달할 실행 파일 링크 디렉터리 |
 
@@ -633,7 +753,7 @@ Invoke-WebRequest -Uri https://raw.githubusercontent.com/doggy8088/TokenUsageIns
 - `static/`의 프런트엔드 자산
 - 모델 가격표 `pricing.csv`
 - `shell/` 디렉터리의 Status Line 및 서비스 스크립트
-- `scripts/` 디렉터리(`install.sh`, `install.ps1`, `get.sh`, `get.ps1` 포함)
+- `scripts/` 디렉터리(`install.sh`, `install.ps1`, `get.sh`, `get.ps1`, `run-service.ps1` 포함)
 - README, LICENSE 및 VERSION
 
 Linux 또는 macOS:
@@ -644,7 +764,7 @@ cd token-usage-insights-<tag>-<target>
 ./install.sh
 ```
 
-Linux에서 systemd 사용자 서비스를 설치하고 활성화하려면:
+Linux(systemd user service) 또는 macOS(launchd LaunchAgent)에서 상주 서비스를 설치하고 활성화하려면:
 
 ```bash
 ./install.sh --service
@@ -656,6 +776,12 @@ Windows:
 Expand-Archive token-usage-insights-<tag>-x86_64-pc-windows-msvc.zip
 cd token-usage-insights-<tag>-x86_64-pc-windows-msvc
 powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+Windows에서 백그라운드 상주 서비스를 설치하고 활성화하려면:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -Service
 ```
 
 Windows 설치 위치 및 포트 사용자 지정:

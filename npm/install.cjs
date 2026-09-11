@@ -110,19 +110,53 @@ function run(command, args, options = {}) {
   if (result.status !== 0) throw new Error(`命令執行失敗：${command}`);
 }
 
+// 以 .NET ZipFile API 解壓，不依賴 Microsoft.PowerShell.Archive 模組：
+// 從 pwsh 7 啟動 npx 時，powershell.exe 會繼承 PowerShell 7 的 PSModulePath，
+// 導致 Expand-Archive 因 PSEdition 檢查而無法自動載入。
+const WINDOWS_ZIP_SCRIPT = [
+  "$ErrorActionPreference = 'Stop'",
+  'Add-Type -AssemblyName System.IO.Compression.FileSystem',
+  '$root = [System.IO.Path]::GetFullPath($env:TUI_DESTINATION)',
+  "if (-not $root.EndsWith([System.IO.Path]::DirectorySeparatorChar)) { $root += [System.IO.Path]::DirectorySeparatorChar }",
+  '$zip = [System.IO.Compression.ZipFile]::OpenRead($env:TUI_ARCHIVE)',
+  'try {',
+  '  foreach ($entry in $zip.Entries) {',
+  '    $target = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($root, $entry.FullName))',
+  '    if (-not $target.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)) { throw "壓縮包含不安全路徑：$($entry.FullName)" }',
+  "    if ($entry.FullName.EndsWith('/') -or $entry.FullName.EndsWith('\\')) {",
+  '      [System.IO.Directory]::CreateDirectory($target) | Out-Null',
+  '      continue',
+  '    }',
+  '    [System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($target)) | Out-Null',
+  '    [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $target, $true)',
+  '  }',
+  '} finally {',
+  '  $zip.Dispose()',
+  '}',
+].join('\n');
+
+function windowsPowerShellEnvironment(archive, destination, baseEnvironment = process.env) {
+  const env = { ...baseEnvironment, TUI_ARCHIVE: archive, TUI_DESTINATION: destination };
+  // 移除從 pwsh 7 繼承的 PSModulePath，讓 Windows PowerShell 5.1 使用自身預設模組路徑。
+  for (const key of Object.keys(env)) {
+    if (key.toLowerCase() === 'psmodulepath') delete env[key];
+  }
+  return env;
+}
+
+function extractWindowsZip(archive, destination) {
+  // Windows 10 1803 以後內建 bsdtar（tar.exe），可直接解壓 zip。
+  const tar = spawnSync('tar', ['-xf', archive, '-C', destination], { stdio: 'inherit' });
+  if (!tar.error && tar.status === 0) return;
+  run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', WINDOWS_ZIP_SCRIPT], {
+    env: windowsPowerShellEnvironment(archive, destination),
+  });
+}
+
 function extract(archive, destination) {
   mkdirSync(destination, { recursive: true });
   if (archive.endsWith('.zip') && process.platform === 'win32') {
-    run(
-      'powershell.exe',
-      [
-        '-NoProfile',
-        '-NonInteractive',
-        '-Command',
-        'Expand-Archive -LiteralPath $env:TUI_ARCHIVE -DestinationPath $env:TUI_DESTINATION -Force',
-      ],
-      { env: { ...process.env, TUI_ARCHIVE: archive, TUI_DESTINATION: destination } },
-    );
+    extractWindowsZip(archive, destination);
     return;
   }
   run('tar', [archive.endsWith('.tar.gz') ? '-xzf' : '-xf', archive, '-C', destination]);
@@ -218,6 +252,7 @@ if (require.main === module) {
 
 module.exports = {
   TARGETS,
+  WINDOWS_ZIP_SCRIPT,
   artifactName,
   cargoTarget,
   checksumForArtifact,
@@ -229,4 +264,5 @@ module.exports = {
   releaseBaseUrl,
   sha256,
   verifyChecksum,
+  windowsPowerShellEnvironment,
 };
