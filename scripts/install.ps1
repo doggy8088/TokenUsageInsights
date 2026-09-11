@@ -16,11 +16,15 @@ $InstallDir = [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($
 $BinDir = [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($BinDir))
 
 function Get-StartupShortcutPath {
+    param(
+        [switch]$EnsureDirectory
+    )
+
     $startupFolder = [Environment]::GetFolderPath('Startup')
     if (-not (Test-Path $startupFolder)) {
         $startupFolder = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Startup"
     }
-    if (-not (Test-Path $startupFolder)) {
+    if ($EnsureDirectory -and (-not (Test-Path $startupFolder))) {
         New-Item -ItemType Directory -Force -Path $startupFolder | Out-Null
     }
 
@@ -31,25 +35,84 @@ function Stop-ExistingServiceInstance {
     param(
         [string]$TaskName,
         [string]$ProcessName,
-        [string]$InstallDir
+        [string]$InstallDir,
+        [string]$StartupShortcutPath
     )
 
-    $runnerScriptPath = [IO.Path]::GetFullPath((Join-Path $InstallDir "scripts\run-service.ps1"))
-    $quotedRunnerFileArgument = "-File `"$runnerScriptPath`""
-    $unquotedRunnerFileArgument = "-File $runnerScriptPath"
-    $appExecutablePath = [IO.Path]::GetFullPath((Join-Path $InstallDir "$ProcessName.exe"))
+    $targetDirs = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    if ($InstallDir) {
+        $null = $targetDirs.Add([IO.Path]::GetFullPath($InstallDir))
+    }
+
+    try {
+        $existingTaskObj = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        if ($existingTaskObj -and $existingTaskObj.Actions) {
+            foreach ($act in $existingTaskObj.Actions) {
+                if ($act.WorkingDirectory) {
+                    $null = $targetDirs.Add([IO.Path]::GetFullPath($act.WorkingDirectory))
+                }
+                if ($act.Argument -and $act.Argument -match '-InstallDir\s+"?([^"]+?)(?:"|\s|$)') {
+                    $null = $targetDirs.Add([IO.Path]::GetFullPath($Matches[1]))
+                }
+                if ($act.Argument -and $act.Argument -match '-File\s+"?([^"]+?[\\/]run-service\.ps1)"?') {
+                    $scriptDir = Split-Path -Parent $Matches[1]
+                    $installParent = Split-Path -Parent $scriptDir
+                    if ($installParent) {
+                        $null = $targetDirs.Add([IO.Path]::GetFullPath($installParent))
+                    }
+                }
+            }
+        }
+    } catch {}
+
+    if ($StartupShortcutPath -and (Test-Path $StartupShortcutPath)) {
+        try {
+            $wsh = New-Object -ComObject WScript.Shell
+            $sc = $wsh.CreateShortcut($StartupShortcutPath)
+            if ($sc.WorkingDirectory) {
+                $null = $targetDirs.Add([IO.Path]::GetFullPath($sc.WorkingDirectory))
+            }
+            if ($sc.Arguments -and $sc.Arguments -match '-InstallDir\s+"?([^"]+?)(?:"|\s|$)') {
+                $null = $targetDirs.Add([IO.Path]::GetFullPath($Matches[1]))
+            }
+            if ($sc.Arguments -and $sc.Arguments -match '-File\s+"?([^"]+?[\\/]run-service\.ps1)"?') {
+                $scriptDir = Split-Path -Parent $Matches[1]
+                $installParent = Split-Path -Parent $scriptDir
+                if ($installParent) {
+                    $null = $targetDirs.Add([IO.Path]::GetFullPath($installParent))
+                }
+            }
+        } catch {}
+    }
 
     try {
         Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     } catch {}
 
+    $runnerScriptPaths = @($targetDirs | ForEach-Object { [IO.Path]::GetFullPath((Join-Path $_ "scripts\run-service.ps1")) })
+    $appExecutablePaths = @($targetDirs | ForEach-Object { [IO.Path]::GetFullPath((Join-Path $_ "$ProcessName.exe")) })
+
     $runnerHosts = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
-        ($_.Name -in @("powershell.exe", "pwsh.exe")) -and
-        $_.CommandLine -and
-        (
-            $_.CommandLine.IndexOf($quotedRunnerFileArgument, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -or
-            $_.CommandLine.IndexOf($unquotedRunnerFileArgument, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
-        )
+        $cmd = $_.CommandLine
+        if (($_.Name -in @("powershell.exe", "pwsh.exe")) -and $cmd) {
+            $cmdNorm = $cmd.Replace('\', '/')
+            $match = $false
+            foreach ($scriptPath in $runnerScriptPaths) {
+                $scriptPathNorm = $scriptPath.Replace('\', '/')
+                $quoted = "-File `"$scriptPathNorm`""
+                $unquoted = "-File $scriptPathNorm"
+                if (
+                    $cmdNorm.IndexOf($quoted, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -or
+                    $cmdNorm.IndexOf($unquoted, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+                ) {
+                    $match = $true
+                    break
+                }
+            }
+            $match
+        } else {
+            $false
+        }
     })
     $runnerHostIds = @($runnerHosts | ForEach-Object { $_.ProcessId })
     foreach ($runnerHost in $runnerHosts) {
@@ -57,14 +120,29 @@ function Stop-ExistingServiceInstance {
     }
 
     $appProcesses = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
-        ($_.Name -eq "$ProcessName.exe") -and
-        (
-            ($_.ExecutablePath -and [IO.Path]::GetFullPath($_.ExecutablePath).Equals($appExecutablePath, [System.StringComparison]::OrdinalIgnoreCase)) -or
-            ($_.CommandLine -and (
-                $_.CommandLine.IndexOf("`"$appExecutablePath`"", [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -or
-                $_.CommandLine.IndexOf($appExecutablePath, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
-            ))
-        )
+        if ($_.Name -eq "$ProcessName.exe") {
+            $exePath = $_.ExecutablePath
+            $cmd = $_.CommandLine
+            $exePathNorm = if ($exePath) { [IO.Path]::GetFullPath($exePath).Replace('\', '/') } else { $null }
+            $cmdNorm = if ($cmd) { $cmd.Replace('\', '/') } else { $null }
+            $match = $false
+            foreach ($exeTarget in $appExecutablePaths) {
+                $exeTargetNorm = $exeTarget.Replace('\', '/')
+                if (
+                    ($exePathNorm -and $exePathNorm.Equals($exeTargetNorm, [System.StringComparison]::OrdinalIgnoreCase)) -or
+                    ($cmdNorm -and (
+                        $cmdNorm.IndexOf("`"$exeTargetNorm`"", [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -or
+                        $cmdNorm.IndexOf($exeTargetNorm, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+                    ))
+                ) {
+                    $match = $true
+                    break
+                }
+            }
+            $match
+        } else {
+            $false
+        }
     })
     $appProcessIds = @($appProcesses | ForEach-Object { $_.ProcessId })
     foreach ($appProcess in $appProcesses) {
@@ -158,10 +236,11 @@ if ($PSCmdlet.ShouldProcess($InstallDir, "Install Token Usage Insights")) {
     try {
         $existingTask = [bool](Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)
     } catch {}
-    $existingShortcut = Test-Path (Get-StartupShortcutPath)
+    $StartupShortcut = Get-StartupShortcutPath
+    $existingShortcut = Test-Path $StartupShortcut
 
     if ($Service -or $existingTask -or $existingShortcut -or (Get-Process -Name $AppName -ErrorAction SilentlyContinue)) {
-        Stop-ExistingServiceInstance -TaskName $TaskName -ProcessName $AppName -InstallDir $InstallDir
+        Stop-ExistingServiceInstance -TaskName $TaskName -ProcessName $AppName -InstallDir $InstallDir -StartupShortcutPath $StartupShortcut
     }
 
     Copy-Item -Force $BinarySrc (Join-Path $InstallDir "$AppName.exe")
@@ -204,8 +283,6 @@ exit /b %APP_EXIT_CODE%
             throw "Missing background service runner script: $RunnerScript"
         }
 
-        $StartupShortcut = Get-StartupShortcutPath
-
         $taskRegistered = $false
         try {
             $taskLogonUser = Get-ScheduledTaskLogonUser
@@ -241,6 +318,7 @@ exit /b %APP_EXIT_CODE%
                 Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
             } catch {}
 
+            $StartupShortcut = Get-StartupShortcutPath -EnsureDirectory
             $WshShell = New-Object -ComObject WScript.Shell
             $Shortcut = $WshShell.CreateShortcut($StartupShortcut)
             $Shortcut.TargetPath = "powershell.exe"

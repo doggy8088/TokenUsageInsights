@@ -51,7 +51,9 @@ $Process = Start-Process -FilePath $Exe `
     -PassThru
 
 try {
-    $Process.WaitForExit()
+    while (-not $Process.WaitForExit(500)) {
+        # Active wait until process exits
+    }
     exit $Process.ExitCode
 } finally {
     if ($Process -and -not $Process.HasExited) {

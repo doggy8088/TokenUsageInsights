@@ -50,7 +50,13 @@ $payload | ConvertTo-Json -Compress | Set-Content -LiteralPath '__CAPTURE_PATH__
 
     function Invoke-RestMethod { @{ tag_name = "v-test" } }
     function Invoke-WebRequest {
-        param([string]$Uri, [string]$OutFile)
+        param(
+            [string]$Uri,
+            [string]$OutFile,
+            [switch]$UseBasicParsing,
+            [parameter(ValueFromRemainingArguments = $true)]
+            $RemainingArgs
+        )
         Set-Content -LiteralPath $OutFile -Value "placeholder"
     }
     function Expand-Archive {
@@ -88,7 +94,8 @@ function Invoke-InstallServiceTest {
         [int]$Port,
         [switch]$FailScheduledTaskAction,
         [switch]$FailStartScheduledTask,
-        [switch]$WhatIf
+        [switch]$WhatIf,
+        [switch]$ExistingTaskInOtherDir
     )
 
     $tempRoot = Join-Path $Root ([guid]::NewGuid())
@@ -127,6 +134,24 @@ function Invoke-InstallServiceTest {
     $otherRunnerCommandLine = "powershell.exe -File `"$otherInstallDir\scripts\run-service.ps1`" -InstallDir `"$otherInstallDir`""
     $appExecutablePath = "$installDir\token-usage-insights.exe"
     $otherAppExecutablePath = "$otherInstallDir\token-usage-insights.exe"
+
+    function Get-ScheduledTask {
+        [CmdletBinding()]
+        param([string]$TaskName)
+        if ($ExistingTaskInOtherDir) {
+            return [pscustomobject]@{
+                TaskName = $TaskName
+                Actions = @(
+                    [pscustomobject]@{
+                        Execute = "powershell.exe"
+                        Argument = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$otherInstallDir\scripts\run-service.ps1`" -InstallDir `"$otherInstallDir`""
+                        WorkingDirectory = $otherInstallDir
+                    }
+                )
+            }
+        }
+        return $null
+    }
 
     function Stop-ScheduledTask {
         [CmdletBinding()]
@@ -345,6 +370,7 @@ function Invoke-InstallServiceTest {
         }
     } finally {
         foreach ($functionName in @(
+            "Get-ScheduledTask",
             "Stop-ScheduledTask",
             "Get-CimInstance",
             "Get-Process",
@@ -476,13 +502,13 @@ try {
     Assert-True ($installWildcardResult.Output -contains "  http://localhost:3003") "install.ps1 should print localhost for unspecified IPv6 dashboard URLs."
 
     $installFallbackResult = Invoke-InstallServiceTest -HostAddress "127.0.0.1" -Port 3003 -FailScheduledTaskAction
-    Assert-True ($installFallbackResult.Events -contains "CreateShortcut") "install.ps1 should create a Startup shortcut when scheduled task registration setup fails."
+    Assert-True ($installFallbackResult.Events -contains "SaveShortcut") "install.ps1 should create a Startup shortcut when scheduled task registration setup fails."
     Assert-True ($installFallbackResult.Events -contains "StartFallbackProcess") "install.ps1 should start the fallback background runner when scheduled task setup fails."
     Assert-True ($installFallbackResult.Output -contains "  Registered in:   Startup folder") "install.ps1 should report Startup folder registration after falling back."
 
     $installPostRegistrationFailureResult = Invoke-InstallServiceTest -HostAddress "127.0.0.1" -Port 3003 -FailStartScheduledTask
     Assert-True ($installPostRegistrationFailureResult.Events -contains "RegisterScheduledTask") "install.ps1 should still register the scheduled task before a post-registration start failure."
-    Assert-Equal $false ($installPostRegistrationFailureResult.Events -contains "CreateShortcut") "install.ps1 should not fall back to the Startup shortcut after scheduled task registration succeeds."
+    Assert-Equal $false ($installPostRegistrationFailureResult.Events -contains "SaveShortcut") "install.ps1 should not fall back to the Startup shortcut after scheduled task registration succeeds."
     Assert-Equal $false ($installPostRegistrationFailureResult.Events -contains "StartFallbackProcess") "install.ps1 should not launch the fallback runner after scheduled task registration succeeds."
     Assert-True ($installPostRegistrationFailureResult.Output -contains "  Registered task: TokenUsageInsights (Task Scheduler)") "install.ps1 should continue reporting the scheduled task after a post-registration start failure."
 
@@ -490,6 +516,10 @@ try {
     Assert-Equal $true $installWhatIfResult.StartupShortcutExists "install.ps1 should not remove an existing Startup shortcut during -WhatIf."
     Assert-Equal $false ($installWhatIfResult.Output -contains "Token 戰情室 installed.") "install.ps1 should not output completion message during -WhatIf."
     Assert-Equal $false ($installWhatIfResult.Output -contains "  Registered in:   Startup folder") "install.ps1 should not report service registration during -WhatIf."
+
+    $installCrossDirectoryResult = Invoke-InstallServiceTest -HostAddress "127.0.0.1" -Port 3003 -ExistingTaskInOtherDir
+    Assert-Equal $true $installCrossDirectoryResult.OtherRunnerStopped "install.ps1 should stop a previous runner when existing scheduled task pointed to a different directory."
+    Assert-Equal $true $installCrossDirectoryResult.OtherAppStopped "install.ps1 should stop a previous app process when existing scheduled task pointed to a different directory."
 
     Write-Host "Windows collector smoke tests passed."
 } finally {
