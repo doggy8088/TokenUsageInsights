@@ -181,13 +181,40 @@ while ($true) {
     # If an external updater requested this service to stop for an update,
     # wait for the update to complete and restart the service
     $restartPendingFile = Join-Path $InstallDir ".service_restart_pending"
-    if (Test-Path $restartPendingFile) {
+    if (Test-Path -LiteralPath $restartPendingFile) {
         $lockFile = Join-Path $InstallDir ".update.lock"
         $waitCount = 0
-        while ((Test-Path $lockFile) -and $waitCount -lt 900) {
+        $isLocked = $true
+        while ($waitCount -lt 900) {
+            $isLocked = $false
+            if (Test-Path -LiteralPath $lockFile) {
+                try {
+                    $stream = [System.IO.File]::Open($lockFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::ReadWrite)
+                    try {
+                        $stream.Lock(0, 1)
+                        $stream.Unlock(0, 1)
+                    } catch {
+                        $isLocked = $true
+                    } finally {
+                        $stream.Dispose()
+                    }
+                } catch {
+                    $isLocked = $true
+                }
+            }
+
+            if (-not $isLocked) {
+                break
+            }
             Start-Sleep -Milliseconds 100
             $waitCount++
         }
+
+        if ($isLocked) {
+            Write-Error "等待更新程序完成逾時（90 秒），更新鎖仍未釋放。為防止損毀安裝目錄，保持停止狀態退出。"
+            exit 1
+        }
+
         Remove-Item -LiteralPath $restartPendingFile -Force -ErrorAction SilentlyContinue
         continue
     }

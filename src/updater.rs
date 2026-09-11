@@ -330,15 +330,17 @@ pub fn detect_environment() -> EnvironmentKind {
 
     // 4. 檢查安裝標記檔（由 install.sh 或 install.ps1 寫入的自訂安裝目錄）
     let marker_path = exe_dir.join(".install_marker");
-    if marker_path.is_file() {
-        if let Ok(content) = fs::read_to_string(&marker_path) {
-            if content.trim() == "token-usage-insights:installed" {
-                let install_dir =
-                    fs::canonicalize(exe_dir).unwrap_or_else(|_| exe_dir.to_path_buf());
-                return EnvironmentKind::StandardInstalled {
-                    install_dir,
-                    exe_path,
-                };
+    if let Ok(meta) = fs::symlink_metadata(&marker_path) {
+        if meta.is_file() && !meta.file_type().is_symlink() {
+            if let Ok(content) = fs::read_to_string(&marker_path) {
+                if content.trim() == "token-usage-insights:installed" {
+                    let install_dir =
+                        fs::canonicalize(exe_dir).unwrap_or_else(|_| exe_dir.to_path_buf());
+                    return EnvironmentKind::StandardInstalled {
+                        install_dir,
+                        exe_path,
+                    };
+                }
             }
         }
     }
@@ -596,7 +598,7 @@ fn unlock_file(_file: &fs::File) -> Result<(), std::io::Error> {
 
 #[derive(Debug)]
 struct UpdateLock {
-    lock_path: PathBuf,
+    _lock_path: PathBuf,
     _file: fs::File,
 }
 
@@ -627,7 +629,7 @@ impl UpdateLock {
         let _ = writeln!(f, "pid={}", std::process::id());
 
         Ok(Self {
-            lock_path,
+            _lock_path: lock_path,
             _file: file,
         })
     }
@@ -660,7 +662,6 @@ impl UpdateLock {
 impl Drop for UpdateLock {
     fn drop(&mut self) {
         let _ = unlock_file(&self._file);
-        let _ = fs::remove_file(&self.lock_path);
     }
 }
 
@@ -712,6 +713,48 @@ impl Drop for TempDirGuard {
     }
 }
 
+#[cfg(windows)]
+fn atomic_rename_overwrite(src: &Path, dst: &Path) -> Result<(), std::io::Error> {
+    use std::os::windows::ffi::OsStrExt;
+    let mut src_wide: Vec<u16> = src.as_os_str().encode_wide().collect();
+    src_wide.push(0);
+    let mut dst_wide: Vec<u16> = dst.as_os_str().encode_wide().collect();
+    dst_wide.push(0);
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x00000001;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x00000008;
+
+    extern "system" {
+        fn MoveFileExW(
+            lpExistingFileName: *const u16,
+            lpNewFileName: *const u16,
+            dwFlags: u32,
+        ) -> i32;
+    }
+
+    let ret = unsafe {
+        MoveFileExW(
+            src_wide.as_ptr(),
+            dst_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+
+    if ret != 0 {
+        return Ok(());
+    }
+
+    if dst.exists() {
+        let _ = fs::remove_file(dst);
+    }
+    fs::rename(src, dst)
+}
+
+#[cfg(not(windows))]
+fn atomic_rename_overwrite(src: &Path, dst: &Path) -> Result<(), std::io::Error> {
+    fs::rename(src, dst)
+}
+
 fn safe_replace_file(src: &Path, dst: &Path) -> Result<(), String> {
     if let Ok(meta) = dst.symlink_metadata() {
         if meta.file_type().is_symlink() {
@@ -721,10 +764,10 @@ fn safe_replace_file(src: &Path, dst: &Path) -> Result<(), String> {
     let tmp = dst.with_extension(format!("tmp.{}", std::process::id()));
     let _ = fs::remove_file(&tmp);
     fs::copy(src, &tmp).map_err(|e| format!("複製暫存檔失敗 ({tmp:?}): {e}"))?;
-    fs::rename(&tmp, dst).map_err(|e| format!("替換檔案失敗 ({dst:?}): {e}"))
+    atomic_rename_overwrite(&tmp, dst).map_err(|e| format!("替換檔案失敗 ({dst:?}): {e}"))
 }
 
-fn safe_write_file(dst: &Path, content: &str) -> Result<(), String> {
+fn safe_write_file(dst: &Path, content: &[u8]) -> Result<(), String> {
     if let Ok(meta) = dst.symlink_metadata() {
         if meta.file_type().is_symlink() {
             let _ = fs::remove_file(dst);
@@ -733,7 +776,7 @@ fn safe_write_file(dst: &Path, content: &str) -> Result<(), String> {
     let tmp = dst.with_extension(format!("tmp.{}", std::process::id()));
     let _ = fs::remove_file(&tmp);
     fs::write(&tmp, content).map_err(|e| format!("寫入暫存檔失敗 ({tmp:?}): {e}"))?;
-    fs::rename(&tmp, dst).map_err(|e| format!("替換標記檔失敗 ({dst:?}): {e}"))
+    atomic_rename_overwrite(&tmp, dst).map_err(|e| format!("替換標記檔失敗 ({dst:?}): {e}"))
 }
 
 fn extract_archive(archive_path: &Path, dest_dir: &Path, is_zip: bool) -> Result<(), String> {
@@ -870,6 +913,12 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
     if !src.exists() {
         return Ok(());
     }
+    if let Ok(meta) = dst.symlink_metadata() {
+        if meta.file_type().is_symlink() {
+            let _ = fs::remove_file(dst);
+            let _ = fs::remove_dir_all(dst);
+        }
+    }
     fs::create_dir_all(dst).map_err(|e| format!("建立目標目錄失敗 {dst:?}: {e}"))?;
     for entry in fs::read_dir(src).map_err(|e| format!("讀取目錄失敗 {src:?}: {e}"))? {
         let entry = entry.map_err(|e| format!("讀取項目失敗: {e}"))?;
@@ -879,9 +928,15 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
             .file_type()
             .map_err(|e| format!("讀取檔案類型失敗: {e}"))?;
         if file_type.is_dir() {
+            if let Ok(meta) = dst_path.symlink_metadata() {
+                if meta.file_type().is_symlink() {
+                    let _ = fs::remove_file(&dst_path);
+                    let _ = fs::remove_dir_all(&dst_path);
+                }
+            }
             copy_dir_recursive(&src_path, &dst_path)?;
         } else {
-            fs::copy(&src_path, &dst_path)
+            safe_replace_file(&src_path, &dst_path)
                 .map_err(|e| format!("複製檔案失敗 {src_path:?} -> {dst_path:?}: {e}"))?;
         }
     }
@@ -912,30 +967,43 @@ fn backup_installation(install_dir: &Path, backup_dir: &Path) -> Result<(), Stri
         log_update("ERROR", "BACKUP", &err);
         return Err(err);
     }
-    fs::create_dir_all(backup_dir).map_err(|e| format!("建立備份目錄失敗: {e}"))?;
+    let staging_dir = install_dir.join(format!(".backup-staging-{}", std::process::id()));
+    if staging_dir.exists() {
+        let _ = fs::remove_dir_all(&staging_dir);
+    }
+    fs::create_dir_all(&staging_dir).map_err(|e| format!("建立備份暫存目錄失敗: {e}"))?;
 
     let backup_res = (|| -> Result<(), String> {
         let mut manifest_entries = Vec::new();
         for &item in MANAGED_ITEMS {
             let src = install_dir.join(item);
-            let dst = backup_dir.join(item);
+            let dst = staging_dir.join(item);
             if src.exists() {
                 manifest_entries.push(item);
                 if src.is_dir() {
                     copy_dir_recursive(&src, &dst)?;
                 } else if src.is_file() {
-                    fs::copy(&src, &dst).map_err(|e| format!("備份檔案失敗 {item}: {e}"))?;
+                    safe_replace_file(&src, &dst)
+                        .map_err(|e| format!("備份檔案失敗 {item}: {e}"))?;
                 }
             }
         }
 
-        fs::write(backup_dir.join(".manifest"), manifest_entries.join("\n"))
-            .map_err(|e| format!("寫入備份清單失敗: {e}"))?;
+        safe_write_file(
+            &staging_dir.join(".manifest"),
+            manifest_entries.join("\n").as_bytes(),
+        )
+        .map_err(|e| format!("寫入備份清單失敗: {e}"))?;
+
+        fs::rename(&staging_dir, backup_dir).map_err(|e| {
+            format!("切換至正式備份目錄失敗 ({staging_dir:?} -> {backup_dir:?}): {e}")
+        })?;
 
         Ok(())
     })();
 
     if let Err(e) = backup_res {
+        let _ = fs::remove_dir_all(&staging_dir);
         let _ = fs::remove_dir_all(backup_dir);
         return Err(e);
     }
@@ -988,6 +1056,12 @@ fn restore_from_backup(backup_dir: &Path, install_dir: &Path) -> Result<(), Stri
         let dst = install_dir.join(&name);
         let file_type = entry.file_type().map_err(|e| e.to_string())?;
         if file_type.is_dir() {
+            if let Ok(meta) = dst.symlink_metadata() {
+                if meta.file_type().is_symlink() {
+                    let _ = fs::remove_file(&dst);
+                    let _ = fs::remove_dir_all(&dst);
+                }
+            }
             if dst.exists() {
                 fs::remove_dir_all(&dst)
                     .map_err(|e| format!("清理還原目標目錄失敗 {dst:?}: {e}"))?;
@@ -1005,7 +1079,7 @@ fn restore_from_backup(backup_dir: &Path, install_dir: &Path) -> Result<(), Stri
             if is_current_exe {
                 self_replace::self_replace(&src).map_err(|e| format!("回滾目前執行檔失敗: {e}"))?;
             } else {
-                fs::copy(&src, &dst)
+                safe_replace_file(&src, &dst)
                     .map_err(|e| format!("還原檔案失敗 {src:?} -> {dst:?}: {e}"))?;
             }
         }
@@ -1516,18 +1590,52 @@ fn stop_running_dashboard_instances(install_dir: &Path) -> Result<(), String> {
     }
 
     // 2. 透過系統進程清單掃描 APP_NAME
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
-        if let Ok(output) = std::process::Command::new("pgrep")
+        if let Ok(entries) = fs::read_dir("/proc") {
+            for entry in entries.flatten() {
+                if let Ok(name) = entry.file_name().into_string() {
+                    if let Ok(pid) = name.parse::<u32>() {
+                        if pid != my_pid {
+                            candidate_pids.insert(pid);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        let pgrep_res = std::process::Command::new("pgrep")
             .arg("-f")
             .arg(APP_NAME)
-            .output()
-        {
-            let text = String::from_utf8_lossy(&output.stdout);
-            for line in text.lines() {
-                if let Ok(pid) = line.trim().parse::<u32>() {
-                    if pid != my_pid {
-                        candidate_pids.insert(pid);
+            .output();
+        match pgrep_res {
+            Ok(output) => {
+                let text = String::from_utf8_lossy(&output.stdout);
+                for line in text.lines() {
+                    if let Ok(pid) = line.trim().parse::<u32>() {
+                        if pid != my_pid {
+                            candidate_pids.insert(pid);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                // pgrep 啟動失敗時，嘗試 ps 作為回退；若兩者皆失敗則 fail closed
+                let ps_res = std::process::Command::new("ps")
+                    .args(["-axo", "pid="])
+                    .output()
+                    .map_err(|pe| {
+                        format!("進程列舉失敗 (pgrep: {e}, ps: {pe})；更新中止以確保安全")
+                    })?;
+                let text = String::from_utf8_lossy(&ps_res.stdout);
+                for line in text.lines() {
+                    if let Ok(pid) = line.trim().parse::<u32>() {
+                        if pid != my_pid {
+                            candidate_pids.insert(pid);
+                        }
                     }
                 }
             }
@@ -1537,7 +1645,7 @@ fn stop_running_dashboard_instances(install_dir: &Path) -> Result<(), String> {
     #[cfg(windows)]
     {
         let exec_name = format!("{APP_NAME}.exe");
-        if let Ok(output) = std::process::Command::new("tasklist")
+        let output = std::process::Command::new("tasklist")
             .args([
                 "/FI",
                 &format!("IMAGENAME eq {exec_name}"),
@@ -1546,16 +1654,15 @@ fn stop_running_dashboard_instances(install_dir: &Path) -> Result<(), String> {
                 "/NH",
             ])
             .output()
-        {
-            let text = String::from_utf8_lossy(&output.stdout);
-            for line in text.lines() {
-                let parts: Vec<&str> = line.split(',').collect();
-                if parts.len() >= 2 {
-                    let pid_str = parts[1].trim().trim_matches('"');
-                    if let Ok(pid) = pid_str.parse::<u32>() {
-                        if pid != my_pid {
-                            candidate_pids.insert(pid);
-                        }
+            .map_err(|e| format!("列舉 Windows 進程失敗: {e}"))?;
+        let text = String::from_utf8_lossy(&output.stdout);
+        for line in text.lines() {
+            let parts: Vec<&str> = line.split(',').collect();
+            if parts.len() >= 2 {
+                let pid_str = parts[1].trim().trim_matches('"');
+                if let Ok(pid) = pid_str.parse::<u32>() {
+                    if pid != my_pid {
+                        candidate_pids.insert(pid);
                     }
                 }
             }
@@ -1582,7 +1689,14 @@ fn stop_running_dashboard_instances(install_dir: &Path) -> Result<(), String> {
 
     // 若在 Windows 環境，寫入服務重啟協商標記檔，讓 run-service.ps1 能在新版就緒後重啟
     let restart_pending_file = install_dir.join(".service_restart_pending");
-    let _ = fs::write(&restart_pending_file, "1");
+    #[cfg(windows)]
+    {
+        safe_write_file(&restart_pending_file, b"1").map_err(|e| {
+            let err = format!("無法寫入服務重啟協商標記檔 ({restart_pending_file:?}): {e}");
+            log_update("ERROR", "STOP_SERVICE", &err);
+            err
+        })?;
+    }
 
     log_update(
         "INFO",
@@ -1785,7 +1899,7 @@ pub(crate) fn apply_installation_with_rollback(
         // 確保自訂安裝目錄保有安裝標記，避免未來更新無法辨識（使用安全非追蹤符號連結寫入）
         safe_write_file(
             &install_dir.join(".install_marker"),
-            "token-usage-insights:installed",
+            b"token-usage-insights:installed",
         )?;
 
         Ok(())
@@ -1971,11 +2085,7 @@ fn attempt_startup_recovery(install_dir: &Path, args: &[String]) {
         std::process::exit(1);
     }
 
-    if !backup_dir.join(".manifest").exists() {
-        return;
-    }
-
-    println!("⚠️ 偵測到未完成之中斷更新備份，正在取得更新鎖定以進行自動救援還原...");
+    println!("⚠️ 偵測到先前更新殘留之備份目錄，正在取得更新鎖定以進行檢查與救援還原...");
     let _recovery_lock = match UpdateLock::try_acquire(install_dir) {
         Ok(l) => l,
         Err(e) => {
@@ -1988,6 +2098,30 @@ fn attempt_startup_recovery(install_dir: &Path, args: &[String]) {
         }
     };
 
+    let manifest_path = backup_dir.join(".manifest");
+    if !manifest_path.exists() {
+        // 未含有效 manifest 的備份視為未完成之備份交易（此階段尚未替換任何安裝檔案）
+        // 必須安全清理或換名，避免阻礙後續所有更新
+        println!("⚠️ 偵測到未含有效清單的未完成備份交易目錄 ({backup_dir:?})，正在安全清理...");
+        log_update(
+            "WARN",
+            "STARTUP_RECOVERY",
+            "偵測到無 manifest 之未完成備份目錄，執行安全清理",
+        );
+        if let Err(e) = fs::remove_dir_all(&backup_dir) {
+            let incomplete_name = format!(".backup-incomplete-{}", Utc::now().timestamp());
+            let fallback = install_dir.join(&incomplete_name);
+            if let Err(re) = fs::rename(&backup_dir, &fallback) {
+                eprintln!(
+                    "❌ 偵測到未完成交易備份目錄但無法清理或更名 ({backup_dir:?}): {e}; {re}；程序終止以保護狀態。"
+                );
+                log_update("ERROR", "STARTUP_FATAL", "清理未完成備份目錄失敗，程序終止");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     println!("⚠️ 正在自動救援還原至健全版本...");
     log_update("WARN", "STARTUP_RECOVERY", "取得更新鎖，執行自動救援還原");
 
@@ -1997,26 +2131,26 @@ fn attempt_startup_recovery(install_dir: &Path, args: &[String]) {
         std::process::exit(1);
     }
 
-    // 還原成功：優先移除清單標記，防止下次啟動因目錄清理問題陷入無限重啟循環
-    let manifest_path = backup_dir.join(".manifest");
-    let _ = fs::remove_file(&manifest_path);
-
+    // 還原成功：嚴禁在確認目錄清理或更名成功前先刪除 .manifest。
+    // 若清理與更名都失敗，保留 .manifest 並終止程序，絕不留下失去 manifest 卻阻擋更新的孤立 .backup
     if let Err(e) = fs::remove_dir_all(&backup_dir) {
         log_update(
             "WARN",
             "STARTUP_RECOVERY",
-            &format!("清理已還原備份目錄失敗: {e}"),
+            &format!("清理已還原備份目錄失敗: {e}，嘗試更名隔離"),
         );
-        let fallback = install_dir.join(format!(".backup-restored-{}", Utc::now().timestamp()));
+        let restored_name = format!(".backup-restored-{}", Utc::now().timestamp());
+        let fallback = install_dir.join(&restored_name);
         if let Err(re) = fs::rename(&backup_dir, &fallback) {
-            log_update(
-                "WARN",
-                "STARTUP_RECOVERY",
-                &format!("更名備份目錄失敗: {re}"),
-            );
             eprintln!(
-                "⚠️ 已成功還原，但備份目錄無法完全清理或換名 ({backup_dir:?}): {re}；請稍後手動刪除。"
+                "❌ 自動救援還原已完成，但無法清理或更名備份目錄 ({backup_dir:?}): {e}; {re}；程序終止以保留完整救援狀態。請手動清理該目錄。"
             );
+            log_update(
+                "ERROR",
+                "STARTUP_FATAL",
+                "已還原但備份目錄無法清理且無法更名，程序終止以保留狀態",
+            );
+            std::process::exit(1);
         }
     }
 
@@ -2032,17 +2166,44 @@ pub async fn check_and_auto_update_on_launch() {
     }
 
     let args: Vec<String> = std::env::args().collect();
+    let env_kind = detect_environment();
 
-    // 2. 檢查是否關閉自動更新（命令列旗標 > 環境變數 > config.yaml）
-    // 優先於任何環境分支與網路連線檢查
+    // 2. 若為標準安裝，無論是否關閉自動更新，都必須優先處理鎖定等待與中斷交易救援還原
+    if let EnvironmentKind::StandardInstalled { install_dir, .. } = &env_kind {
+        if UpdateLock::is_locked(install_dir) {
+            println!("⏳ 偵測到已有更新程序正在進行中，等待更新完成...");
+            log_update("INFO", "STARTUP_WAIT", "偵測到進行中的更新鎖，等待其釋放");
+            match wait_for_lock_release(
+                install_dir,
+                Duration::from_secs(STARTUP_AUTO_UPDATE_TOTAL_TIMEOUT_SECS),
+            )
+            .await
+            {
+                Ok(()) => {
+                    attempt_startup_recovery(install_dir, &args);
+                    println!("🔄 更新程序已完成，正在重新啟動 Token 戰情室...");
+                    log_update("INFO", "STARTUP_RESTART", "其他程序更新完成，重啟進程");
+                    restart_current_process(&args);
+                }
+                Err(e) => {
+                    eprintln!("❌ 等待更新程序超時: {e}；為防止讀取不一致檔案，程序終止。");
+                    log_update("ERROR", "STARTUP_LOCK", &format!("等待更新鎖超時: {e}"));
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        // 目錄無活躍更新鎖，檢查先前更新之殘留中斷狀態與回滾保護
+        attempt_startup_recovery(install_dir, &args);
+    }
+
+    // 3. 此時安裝目錄已保證處於一致健全狀態；檢查是否關閉自動更新（命令列旗標 > 環境變數 > config.yaml）
     if is_auto_update_disabled(&args) {
         return;
     }
 
-    // 3. 判斷環境
-    let env_kind = detect_environment();
+    // 4. npm 環境處理
     if matches!(env_kind, EnvironmentKind::Npm { .. }) {
-        // npm 環境：套用檢查間隔，若有新版僅提示並記錄本次檢查
         if !is_update_check_interval_elapsed() {
             return;
         }
@@ -2075,39 +2236,12 @@ pub async fn check_and_auto_update_on_launch() {
         }
     };
 
-    // 4. 若已有其他更新程序正在進行中，等待其完成並重啟，嚴禁同時啟動伺服器或干擾更新中之備份目錄
-    if UpdateLock::is_locked(&install_dir) {
-        println!("⏳ 偵測到已有更新程序正在進行中，等待更新完成...");
-        log_update("INFO", "STARTUP_WAIT", "偵測到進行中的更新鎖，等待其釋放");
-        match wait_for_lock_release(
-            &install_dir,
-            Duration::from_secs(STARTUP_AUTO_UPDATE_TOTAL_TIMEOUT_SECS),
-        )
-        .await
-        {
-            Ok(()) => {
-                attempt_startup_recovery(&install_dir, &args);
-                println!("🔄 更新程序已完成，正在重新啟動 Token 戰情室...");
-                log_update("INFO", "STARTUP_RESTART", "其他程序更新完成，重啟進程");
-                restart_current_process(&args);
-            }
-            Err(e) => {
-                eprintln!("❌ 等待更新程序超時: {e}；為防止讀取不一致檔案，程序終止。");
-                log_update("ERROR", "STARTUP_LOCK", &format!("等待更新鎖超時: {e}"));
-                std::process::exit(1);
-            }
-        }
-    }
-
-    // 5. 目錄未被鎖定，檢查先前更新之殘留中斷狀態與回滾保護
-    attempt_startup_recovery(&install_dir, &args);
-
-    // 6. 檢查更新檢查間隔（優先讀取環境變數，其次 config.yaml，預設 24 小時）
+    // 5. 檢查更新檢查間隔（優先讀取環境變數，其次 config.yaml，預設 24 小時）
     if !is_update_check_interval_elapsed() {
         return;
     }
 
-    // 7. 快速檢查（設定超時 STARTUP_CHECK_TIMEOUT_SECS 秒，不阻礙伺服器啟動）
+    // 6. 快速檢查（設定超時 STARTUP_CHECK_TIMEOUT_SECS 秒，不阻礙伺服器啟動）
     let release = match fetch_release_with_logging(None, STARTUP_CHECK_TIMEOUT_SECS).await {
         Ok(r) => r,
         Err(e) => {
@@ -2570,6 +2704,91 @@ update_check_interval: 5 # check every 5 days
             !pid_path.exists(),
             ".server.pid should be removed when guard is dropped"
         );
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn safe_replace_file_overwrites_existing_file() {
+        let temp = std::env::temp_dir().join(format!(
+            "safe-replace-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        fs::create_dir_all(&temp).unwrap();
+        let src = temp.join("source.txt");
+        let dst = temp.join("destination.txt");
+
+        fs::write(&src, "new content").unwrap();
+        fs::write(&dst, "old content").unwrap();
+
+        assert!(safe_replace_file(&src, &dst).is_ok());
+        assert_eq!(fs::read_to_string(&dst).unwrap(), "new content");
+
+        #[cfg(unix)]
+        {
+            let outside = temp.join("outside.txt");
+            let symlink_dst = temp.join("link_dst.txt");
+            fs::write(&outside, "sensitive outside content").unwrap();
+            std::os::unix::fs::symlink(&outside, &symlink_dst).unwrap();
+
+            assert!(safe_replace_file(&src, &symlink_dst).is_ok());
+            // Symlink should be replaced with regular file, and outside file untouched
+            let meta = fs::symlink_metadata(&symlink_dst).unwrap();
+            assert!(!meta.file_type().is_symlink());
+            assert_eq!(fs::read_to_string(&symlink_dst).unwrap(), "new content");
+            assert_eq!(
+                fs::read_to_string(&outside).unwrap(),
+                "sensitive outside content"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn incomplete_backup_without_manifest_is_cleaned_up_on_recovery() {
+        let temp = std::env::temp_dir().join(format!(
+            "incomplete-backup-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let install_dir = temp.join("install");
+        let backup_dir = install_dir.join(".backup");
+        fs::create_dir_all(&backup_dir).unwrap();
+        fs::write(backup_dir.join("partial_file"), "partial").unwrap();
+
+        assert!(backup_dir.exists());
+        assert!(!backup_dir.join(".manifest").exists());
+
+        attempt_startup_recovery(&install_dir, &[]);
+
+        assert!(
+            !backup_dir.exists(),
+            "incomplete backup without manifest should be safely removed during recovery"
+        );
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_marker_symlink_is_rejected() {
+        let temp = std::env::temp_dir().join(format!(
+            "marker-symlink-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        fs::create_dir_all(&temp).unwrap();
+        let target = temp.join("target_marker");
+        let marker = temp.join(".install_marker");
+
+        fs::write(&target, "token-usage-insights:installed").unwrap();
+        std::os::unix::fs::symlink(&target, &marker).unwrap();
+
+        let meta = fs::symlink_metadata(&marker).unwrap();
+        let is_valid_marker = meta.is_file() && !meta.file_type().is_symlink();
+        assert!(
+            !is_valid_marker,
+            "symlinked marker should not be treated as a valid regular marker file"
+        );
+
         let _ = fs::remove_dir_all(&temp);
     }
 }
