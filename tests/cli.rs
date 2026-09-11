@@ -40,6 +40,8 @@ fn help_and_invalid_commands_exit_without_initializing_the_server() {
         vec!["import"],
         vec!["export-all", "--out"],
         vec!["update", "--unknown"],
+        vec!["update", "-v", "-f"],
+        vec!["update", "--target-version", "--check"],
     ] {
         let result = Command::new(env!("CARGO_BIN_EXE_token-usage-insights"))
             .env("INSIGHTS_DIR", &missing_dir)

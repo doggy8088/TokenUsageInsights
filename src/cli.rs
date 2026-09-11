@@ -587,7 +587,7 @@ async fn run_update_cli(args: &[String]) -> i32 {
 fn next_flag_value(args: &[String], i: &mut usize, flag: &str) -> String {
     match args.get(*i + 1) {
         Some(value) => {
-            if value.starts_with("--") {
+            if value.starts_with('-') {
                 eprintln!("缺少 --{flag} 的值");
                 std::process::exit(2);
             }

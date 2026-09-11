@@ -102,13 +102,6 @@ pub fn standard_install_dir() -> PathBuf {
     PathBuf::from(".")
 }
 
-fn is_valid_installed_payload(dir: &Path) -> bool {
-    let has_static = dir.join("static").is_dir();
-    let has_pricing = dir.join("pricing.csv").is_file();
-    let has_version = dir.join("VERSION").is_file();
-    has_static && has_pricing && has_version
-}
-
 pub fn detect_environment() -> EnvironmentKind {
     let raw_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from(APP_NAME));
     let exe_path = fs::canonicalize(&raw_exe).unwrap_or(raw_exe);
@@ -134,7 +127,7 @@ pub fn detect_environment() -> EnvironmentKind {
         }
     }
 
-    // 3. 檢查標準安裝目錄
+    // 3. 檢查標準安裝目錄（包含以 TOKEN_USAGE_INSIGHTS_INSTALL_DIR 明確指定的路徑）
     let std_dir = standard_install_dir();
     let canonical_std_dir = fs::canonicalize(&std_dir).unwrap_or(std_dir);
     if let Ok(canonical_exe_dir) = fs::canonicalize(exe_dir) {
@@ -144,14 +137,6 @@ pub fn detect_environment() -> EnvironmentKind {
                 exe_path,
             };
         }
-    }
-
-    // 4. 若當前目錄包含完整的已安裝發行檔結構（例如以自訂目錄透過 --service 部署且無 git/npm），亦認定為已安裝目錄
-    if is_valid_installed_payload(exe_dir) {
-        return EnvironmentKind::StandardInstalled {
-            install_dir: exe_dir.to_path_buf(),
-            exe_path,
-        };
     }
 
     EnvironmentKind::Other { exe_path }
@@ -263,12 +248,31 @@ pub fn parse_config_yaml(content: &str) -> (Option<bool>, Option<i64>) {
         if trimmed.starts_with('#') || trimmed.is_empty() {
             continue;
         }
-        if let Some((key, val)) = trimmed.split_once(':') {
+        if let Some((key, raw_val)) = trimmed.split_once(':') {
             let key = key.trim();
-            let val = val.trim().trim_matches('"').trim_matches('\'');
+            let raw_val = raw_val.trim();
+            let val = if let Some(rest) = raw_val.strip_prefix('"') {
+                if let Some(end) = rest.find('"') {
+                    &rest[..end]
+                } else {
+                    rest.trim_matches('"')
+                }
+            } else if let Some(rest) = raw_val.strip_prefix('\'') {
+                if let Some(end) = rest.find('\'') {
+                    &rest[..end]
+                } else {
+                    rest.trim_matches('\'')
+                }
+            } else {
+                raw_val.split('#').next().unwrap_or("").trim()
+            };
+
             if key == "auto_update" {
-                if let Ok(b) = val.parse::<bool>() {
-                    auto_update = Some(b);
+                let lower = val.to_lowercase();
+                if lower == "true" || lower == "1" || lower == "yes" {
+                    auto_update = Some(true);
+                } else if lower == "false" || lower == "0" || lower == "no" {
+                    auto_update = Some(false);
                 }
             } else if key == "update_check_interval" {
                 if let Ok(days) = val.parse::<i64>() {
@@ -396,36 +400,47 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
     Ok(())
 }
 
+const MANAGED_ITEMS: &[&str] = &[
+    APP_NAME,
+    #[cfg(windows)]
+    "token-usage-insights.exe",
+    "static",
+    "pricing.csv",
+    "shell",
+    "scripts",
+    "install.sh",
+    "install.ps1",
+    "VERSION",
+    "README.md",
+    "LICENSE",
+];
+
 fn backup_installation(install_dir: &Path, backup_dir: &Path) -> Result<(), String> {
     if backup_dir.exists() {
-        let _ = fs::remove_dir_all(backup_dir);
+        let err = format!(
+            "偵測到先前更新留存的備份目錄 {:?}；為保護先前版本，已停止更新。請手動還原或移除該備份目錄後再試。",
+            backup_dir
+        );
+        return Err(err);
     }
     fs::create_dir_all(backup_dir).map_err(|e| format!("建立備份目錄失敗: {e}"))?;
 
-    let backup_items = [
-        APP_NAME,
-        #[cfg(windows)]
-        "token-usage-insights.exe",
-        "static",
-        "pricing.csv",
-        "shell",
-        "scripts",
-        "install.sh",
-        "install.ps1",
-        "VERSION",
-        "README.md",
-        "LICENSE",
-    ];
-
-    for item in backup_items {
+    let mut manifest_entries = Vec::new();
+    for &item in MANAGED_ITEMS {
         let src = install_dir.join(item);
         let dst = backup_dir.join(item);
-        if src.is_dir() {
-            copy_dir_recursive(&src, &dst)?;
-        } else if src.is_file() {
-            fs::copy(&src, &dst).map_err(|e| format!("備份檔案失敗 {item}: {e}"))?;
+        if src.exists() {
+            manifest_entries.push(item);
+            if src.is_dir() {
+                copy_dir_recursive(&src, &dst)?;
+            } else if src.is_file() {
+                fs::copy(&src, &dst).map_err(|e| format!("備份檔案失敗 {item}: {e}"))?;
+            }
         }
     }
+
+    fs::write(backup_dir.join(".manifest"), manifest_entries.join("\n"))
+        .map_err(|e| format!("寫入備份清單失敗: {e}"))?;
 
     Ok(())
 }
@@ -434,19 +449,90 @@ fn restore_from_backup(backup_dir: &Path, install_dir: &Path) -> Result<(), Stri
     if !backup_dir.exists() {
         return Ok(());
     }
+
+    let manifest_path = backup_dir.join(".manifest");
+    let original_items: std::collections::HashSet<String> = if manifest_path.exists() {
+        let content = fs::read_to_string(&manifest_path).unwrap_or_default();
+        content
+            .lines()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+
+    // 1. 移除更新期間新增、但原始安裝中並不存在的受管理項目
+    for &item in MANAGED_ITEMS {
+        if !original_items.contains(item) {
+            let path = install_dir.join(item);
+            if path.is_dir() {
+                if let Err(e) = fs::remove_dir_all(&path) {
+                    log_update(
+                        "WARN",
+                        "ROLLBACK",
+                        &format!("清理新增目錄失敗 {path:?}: {e}"),
+                    );
+                }
+            } else if path.is_file() {
+                if let Err(e) = fs::remove_file(&path) {
+                    log_update(
+                        "WARN",
+                        "ROLLBACK",
+                        &format!("清理新增檔案失敗 {path:?}: {e}"),
+                    );
+                }
+            }
+        }
+    }
+
+    // 2. 還原備份項目
     for entry in fs::read_dir(backup_dir).map_err(|e| format!("讀取備份目錄失敗: {e}"))? {
         let entry = entry.map_err(|e| format!("讀取備份項目失敗: {e}"))?;
+        let name = entry.file_name();
+        if name == ".manifest" {
+            continue;
+        }
         let src = entry.path();
-        let dst = install_dir.join(entry.file_name());
+        let dst = install_dir.join(&name);
         let file_type = entry.file_type().map_err(|e| e.to_string())?;
         if file_type.is_dir() {
-            let _ = fs::remove_dir_all(&dst);
+            if dst.exists() {
+                fs::remove_dir_all(&dst)
+                    .map_err(|e| format!("清理還原目標目錄失敗 {dst:?}: {e}"))?;
+            }
             copy_dir_recursive(&src, &dst)?;
         } else {
-            fs::copy(&src, &dst).map_err(|e| format!("還原檔案失敗 {src:?} -> {dst:?}: {e}"))?;
+            let current_exe = std::env::current_exe().ok();
+            let is_current_exe = current_exe
+                .as_ref()
+                .and_then(|c| fs::canonicalize(c).ok())
+                .zip(fs::canonicalize(&dst).ok())
+                .map(|(a, b)| a == b)
+                .unwrap_or(false);
+
+            if is_current_exe {
+                self_replace::self_replace(&src).map_err(|e| format!("回滾目前執行檔失敗: {e}"))?;
+            } else {
+                fs::copy(&src, &dst)
+                    .map_err(|e| format!("還原檔案失敗 {src:?} -> {dst:?}: {e}"))?;
+            }
         }
     }
     Ok(())
+}
+
+async fn fetch_release_with_logging(
+    tag_opt: Option<&str>,
+    timeout_secs: u64,
+) -> Result<GitHubRelease, String> {
+    match fetch_release(tag_opt, timeout_secs).await {
+        Ok(r) => Ok(r),
+        Err(e) => {
+            log_update("ERROR", "CHECK", &format!("查詢 GitHub Releases 失敗: {e}"));
+            Err(e)
+        }
+    }
 }
 
 async fn fetch_release(tag_opt: Option<&str>, timeout_secs: u64) -> Result<GitHubRelease, String> {
@@ -516,7 +602,8 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), String> {
     match &env_kind {
         EnvironmentKind::Npm { .. } => {
             if options.check_only {
-                let release = fetch_release(options.target_version.as_deref(), 15).await?;
+                let release =
+                    fetch_release_with_logging(options.target_version.as_deref(), 15).await?;
                 let current_version = env!("CARGO_PKG_VERSION");
                 let remote_version = release.tag_name.trim();
                 let is_newer = is_newer_version(remote_version, current_version);
@@ -540,7 +627,8 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), String> {
         }
         EnvironmentKind::GitOrDev { root, .. } => {
             if options.check_only {
-                let release = fetch_release(options.target_version.as_deref(), 15).await?;
+                let release =
+                    fetch_release_with_logging(options.target_version.as_deref(), 15).await?;
                 let current_version = env!("CARGO_PKG_VERSION");
                 let remote_version = release.tag_name.trim();
                 let is_newer = is_newer_version(remote_version, current_version);
@@ -562,7 +650,8 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), String> {
         }
         EnvironmentKind::Other { exe_path } => {
             if options.check_only {
-                let release = fetch_release(options.target_version.as_deref(), 15).await?;
+                let release =
+                    fetch_release_with_logging(options.target_version.as_deref(), 15).await?;
                 let current_version = env!("CARGO_PKG_VERSION");
                 let remote_version = release.tag_name.trim();
                 let is_newer = is_newer_version(remote_version, current_version);
@@ -608,7 +697,7 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), String> {
         &format!("開始檢查更新（目前版本 v{current_version}）"),
     );
 
-    let release = fetch_release(options.target_version.as_deref(), 15).await?;
+    let release = fetch_release_with_logging(options.target_version.as_deref(), 15).await?;
     let remote_version = release.tag_name.trim();
 
     let is_newer = is_newer_version(remote_version, current_version);
@@ -803,7 +892,9 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), String> {
             let src = release_root.join(folder);
             let dst = install_dir.join(folder);
             if src.exists() {
-                let _ = fs::remove_dir_all(&dst);
+                if dst.exists() {
+                    fs::remove_dir_all(&dst).map_err(|e| format!("清除舊目錄失敗 {dst:?}: {e}"))?;
+                }
                 copy_dir_recursive(&src, &dst)?;
             }
         }
@@ -917,13 +1008,17 @@ pub async fn check_and_auto_update_on_launch() {
                 }
             }
         }
-        let now_str = Utc::now().to_rfc3339();
-        let _ = crate::db::set_system_metadata(&conn, LAST_CHECK_KEY, &now_str);
     }
 
     // 5. 快速檢查（設定超時，不阻礙伺服器啟動）
     let release = match fetch_release(None, STARTUP_CHECK_TIMEOUT_SECS).await {
-        Ok(r) => r,
+        Ok(r) => {
+            if let Ok(conn) = crate::db::get_db_conn() {
+                let now_str = Utc::now().to_rfc3339();
+                let _ = crate::db::set_system_metadata(&conn, LAST_CHECK_KEY, &now_str);
+            }
+            r
+        }
         Err(e) => {
             log_update("WARN", "STARTUP_CHECK", &format!("啟動更新檢查略過: {e}"));
             return;
@@ -1105,6 +1200,14 @@ update_check_interval: '7'
         let (auto2, interval2) = parse_config_yaml(yaml2);
         assert_eq!(auto2, Some(true));
         assert_eq!(interval2, Some(7));
+
+        let yaml3 = r#"
+auto_update: false # disable auto updates
+update_check_interval: 5 # check every 5 days
+"#;
+        let (auto3, interval3) = parse_config_yaml(yaml3);
+        assert_eq!(auto3, Some(false));
+        assert_eq!(interval3, Some(5));
     }
 
     #[test]
@@ -1131,10 +1234,15 @@ update_check_interval: '7'
         assert!(backup_dir.join("VERSION").exists());
         assert!(backup_dir.join("pricing.csv").exists());
         assert!(backup_dir.join("static").join("index.html").exists());
+        assert!(backup_dir.join(".manifest").exists());
 
-        // Corrupt install_dir
+        // Re-run backup should fail because backup_dir already exists
+        assert!(backup_installation(&install_dir, &backup_dir).is_err());
+
+        // Corrupt install_dir and simulate adding a new file not present in original backup
         fs::write(install_dir.join("VERSION"), "corrupted").unwrap();
         fs::remove_file(install_dir.join("pricing.csv")).unwrap();
+        fs::write(install_dir.join("install.sh"), "#!/bin/sh\n").unwrap();
 
         // Restore
         restore_from_backup(&backup_dir, &install_dir).unwrap();
@@ -1143,6 +1251,8 @@ update_check_interval: '7'
             "v0.9.5"
         );
         assert!(install_dir.join("pricing.csv").exists());
+        // The newly added install.sh was not in the backup manifest and should be removed
+        assert!(!install_dir.join("install.sh").exists());
 
         let _ = fs::remove_dir_all(&temp);
     }
