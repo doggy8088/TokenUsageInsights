@@ -4,8 +4,18 @@
 
 ## [未發行]
 
+## [0.9.4] - 2026-09-11
+
+### 新增與改善
+
+- 支援 macOS `launchd` 背景常駐服務安裝：`scripts/install.sh` 新增 `--service`、`--uninstall`、`--status` 參數與全域模式支援，自動建立並載入 `com.user.token-usage-insights.plist`，支援開機自動載入、異常自動重啟與標準／錯誤日誌輸出至 `~/.token-usage-insights/logs/service.log`（[#42](https://github.com/doggy8088/TokenUsageInsights/pull/42)）。
+- 支援 Windows 常駐服務安裝與背景排程執行：`scripts/install.ps1` 新增 `-InstallService` 參數與非破壞性重裝邏輯，透過 Windows 工作排程器建立開機自動啟動的背景 runner（`scripts/run-service.ps1`）；支援日誌自動輪替（預設 10MB、最多保留 5 份歷史檔）、終端機動態大小監控、跨目錄重裝與隔離舊版排程任務，並提供服務狀態查詢與解除安裝支援（[#50](https://github.com/doggy8088/TokenUsageInsights/issues/50)、[#51](https://github.com/doggy8088/TokenUsageInsights/pull/51)）。
+- 五種語言 README（正體中文、英文、日文、韓文、簡體中文）同步補齊 macOS launchd 服務與 Windows 工作排程服務的安裝、狀態查詢、日誌檢視與解除安裝說明。
+
 ### 修正
 
+- 補充 xAI Grok 4.6 模型定價與模型辨識：`pricing.csv` 新增 Grok 4.6 一般版與 Low、Medium、High 推理層級的短／長上下文定價（共 12 筆規則）；`src/grok.rs` 辨識 `grok-4.6` 與 `grok-4.6-latest` 並依 reasoning effort 顯示推理層級名稱（[#47](https://github.com/doggy8088/TokenUsageInsights/pull/47)）。
+- 將 Grok 解析器遷移版本升級至 `migration:grok_parser_v7`，確保現有資料庫升級時能清理舊版 v6 標記並重設同步狀態，使既有 raw `grok-4.6` 工作階段能正確重解析為標準化顯示名稱與推理層級。
 - 補充 Muse Code 模型 `muse-spark-1.3` 與 `muse-spark-1.3-contributor` 的標準費率規則，修復 Muse 使用量記錄出現 `muse-spark-1.3-contributor` 時因缺少價格條目導致的「找不到可用的模型價格規則」錯誤。費率採 Meta 官方 model-catalog 牌價（標準版 `muse-spark-1.3` 輸入 1.25、快取 0.15、輸出 4.25 美元／每百萬 tokens；貢獻者優惠版 `muse-spark-1.3-contributor` 輸入 0.10、快取 0.002、輸出 0.20 美元）。
 - 修復 GitHub Copilot Chat（VS Code）Session 的「快取讀取 Token」永遠顯示 0 的問題（[#41](https://github.com/doggy8088/TokenUsageInsights/issues/41)）。VS Code 的 `chatSessions` 檔案本身不記錄快取讀取數；看板現在會一併讀取 Copilot Chat 擴充功能寫入的 `GitHub.copilot-chat/debug-logs/<sessionId>/main.jsonl`，依 `user_message` 回合加總 `inputTokens`、`outputTokens` 與 `cachedTokens`，並以提示文字與時間戳配對到對應的聊天請求。
 - VS Code Copilot Chat 的同步狀態現在會納入除錯記錄檔的大小與修改時間，確保擴充功能在聊天檔案寫入後數秒才刷寫的除錯記錄能在下一次同步被補上。
@@ -16,7 +26,7 @@
 
 ### 相容性
 
-- 無資料庫結構、環境變數或安裝流程變更。既有 VS Code Copilot Chat Session 會在下一次同步時依除錯記錄重新計算 Token。
+- Grok 解析器遷移至 v7，現有資料庫升級後首次啟動會自動重設 Grok 同步狀態並重新解析，不影響其他 Agent 資料。無環境變數變更。既有 VS Code Copilot Chat Session 會在下一次同步時依除錯記錄重新計算 Token。macOS 與 Windows 服務安裝為選用功能，不影響直接執行二進位檔或 npx 啟動。
 
 ## [0.9.3] - 2026-09-10
 
@@ -570,7 +580,11 @@
 - 修正行動版側邊欄遮擋、黑畫面、標題擠壓、圖表導覽索引與年度版面問題。
 - 修正並補齊多個 Gemini、Claude、GPT 與 GPT-OSS 模型的定價規則。
 
-[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.9.0...HEAD
+[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.9.4...HEAD
+[0.9.4]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.9.3...v0.9.4
+[0.9.3]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.9.2...v0.9.3
+[0.9.2]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.9.1...v0.9.2
+[0.9.1]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.8.3...v0.9.0
 [0.8.3]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.8.2...v0.8.3
 [0.8.2]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.8.1...v0.8.2
