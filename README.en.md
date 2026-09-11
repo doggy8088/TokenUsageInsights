@@ -611,31 +611,34 @@ Windows PowerShell:
 Get-ScheduledTask -TaskName "TokenUsageInsights" -ErrorAction SilentlyContinue
 Get-Process -Name "token-usage-insights" -ErrorAction SilentlyContinue
 
-# View logs (auto-detect the installed InstallDir)
-$InstallDir = Join-Path $env:LOCALAPPDATA "TokenUsageInsights"
-$ResolvedInstallDir = $false
+# View logs (supports custom -InstallDir)
+$InstallDir = $null
 $Task = Get-ScheduledTask -TaskName "TokenUsageInsights" -ErrorAction SilentlyContinue
 if ($Task -and $Task.Actions) {
     foreach ($Action in @($Task.Actions)) {
         if ($Action.Arguments -match '(?i)-InstallDir\s+"([^"]+)"') {
             $InstallDir = [Environment]::ExpandEnvironmentVariables($Matches[1])
-            $ResolvedInstallDir = $true
             break
         }
     }
 }
-if (-not $ResolvedInstallDir) {
+if (-not $InstallDir) {
     $StartupShortcut = Join-Path ([Environment]::GetFolderPath('Startup')) "token-usage-insights.lnk"
     if (!(Test-Path $StartupShortcut)) {
         $StartupShortcut = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Startup\token-usage-insights.lnk"
     }
     if (Test-Path $StartupShortcut) {
-        $Shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut($StartupShortcut)
+        $WshShell = New-Object -ComObject WScript.Shell
+        $Shortcut = $WshShell.CreateShortcut($StartupShortcut)
         if ($Shortcut.Arguments -match '(?i)-InstallDir\s+"([^"]+)"') {
             $InstallDir = [Environment]::ExpandEnvironmentVariables($Matches[1])
-            $ResolvedInstallDir = $true
+        } elseif ($Shortcut.WorkingDirectory) {
+            $InstallDir = $Shortcut.WorkingDirectory
         }
     }
+}
+if (-not $InstallDir) {
+    $InstallDir = Join-Path $env:LOCALAPPDATA "TokenUsageInsights"
 }
 Get-Content (Join-Path $InstallDir "logs\token-usage-insights.out.log") -Tail 50 -Wait
 
