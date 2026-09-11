@@ -180,7 +180,7 @@ pub(crate) async fn run(args: &[String]) -> Option<i32> {
         return None;
     }
 
-    if args[1] == "--no-auto-update" {
+    if args.len() == 2 && args[1] == "--no-auto-update" {
         return None;
     }
 

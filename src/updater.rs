@@ -17,6 +17,8 @@ const STARTUP_AUTO_UPDATE_TOTAL_TIMEOUT_SECS: u64 = 20;
 const LAST_CHECK_KEY: &str = "last_update_check_at";
 const MAX_ARCHIVE_BYTES: usize = 150 * 1024 * 1024; // 150 MB 上限
 const MAX_CHECKSUM_BYTES: usize = 1024 * 1024; // 1 MB 上限
+const MAX_EXTRACTED_BYTES: u64 = 300 * 1024 * 1024; // 300 MB 解壓縮展開上限
+const MAX_EXTRACTED_ENTRIES: usize = 10_000; // 最多 10,000 個檔案/目錄
 
 #[cfg(unix)]
 fn is_process_alive(pid: u32) -> bool {
@@ -32,11 +34,12 @@ fn is_process_alive(pid: u32) -> bool {
 #[cfg(windows)]
 fn is_process_alive(pid: u32) -> bool {
     let output = std::process::Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
         .output();
     if let Ok(out) = output {
         let text = String::from_utf8_lossy(&out.stdout);
-        text.contains(&pid.to_string()) && !text.contains("No tasks")
+        let pid_token = format!("\"{pid}\"");
+        text.lines().any(|line| line.contains(&pid_token))
     } else {
         true
     }
@@ -346,13 +349,18 @@ pub fn load_update_config() -> (Option<bool>, Option<i64>) {
     (None, None)
 }
 
+#[derive(Debug)]
 struct UpdateLock {
     lock_path: PathBuf,
 }
 
 impl UpdateLock {
+    fn lock_path(install_dir: &Path) -> PathBuf {
+        install_dir.join(".update.lock")
+    }
+
     fn try_acquire(install_dir: &Path) -> Result<Self, String> {
-        let lock_path = install_dir.join(".update.lock");
+        let lock_path = Self::lock_path(install_dir);
         match fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -381,7 +389,9 @@ impl UpdateLock {
                         "LOCK",
                         &format!("偵測到已終止程序殘留之鎖定檔 (PID {pid})，自動清除"),
                     );
-                    let _ = fs::remove_file(&lock_path);
+                    fs::remove_file(&lock_path).map_err(|e| {
+                        format!("清除已終止程序遺留之更新鎖定檔失敗 ({lock_path:?}): {e}")
+                    })?;
                     return Self::try_acquire(install_dir);
                 }
 
@@ -394,7 +404,9 @@ impl UpdateLock {
                                     "LOCK",
                                     "偵測到無法辨識 PID 且超過 10 分鐘之過期鎖定檔，自動清除",
                                 );
-                                let _ = fs::remove_file(&lock_path);
+                                fs::remove_file(&lock_path).map_err(|e| {
+                                    format!("清除過期更新鎖定檔失敗 ({lock_path:?}): {e}")
+                                })?;
                                 return Self::try_acquire(install_dir);
                             }
                         }
@@ -404,6 +416,32 @@ impl UpdateLock {
             }
             Err(e) => Err(format!("無法建立更新鎖 ({lock_path:?}): {e}")),
         }
+    }
+
+    /// 檢查是否有活躍中的更新程序持鎖
+    fn is_locked(install_dir: &Path) -> bool {
+        let lock_path = Self::lock_path(install_dir);
+        if !lock_path.exists() {
+            return false;
+        }
+        let content = fs::read_to_string(&lock_path).unwrap_or_default();
+        let recorded_pid = content.lines().find_map(|line| {
+            line.strip_prefix("pid=")
+                .and_then(|s| s.trim().parse::<u32>().ok())
+        });
+        if let Some(pid) = recorded_pid {
+            if is_process_alive(pid) {
+                return true;
+            }
+        }
+        if let Ok(metadata) = fs::metadata(&lock_path) {
+            if let Ok(modified) = metadata.modified() {
+                if let Ok(elapsed) = modified.elapsed() {
+                    return elapsed <= Duration::from_secs(600);
+                }
+            }
+        }
+        false
     }
 }
 
@@ -434,23 +472,130 @@ impl Drop for TempDirGuard {
 }
 
 fn extract_archive(archive_path: &Path, dest_dir: &Path, is_zip: bool) -> Result<(), String> {
+    use std::io::Read;
     fs::create_dir_all(dest_dir).map_err(|e| format!("建立解壓縮目錄失敗: {e}"))?;
 
     let file = fs::File::open(archive_path)
         .map_err(|e| format!("開啟壓縮包檔案失敗 ({archive_path:?}): {e}"))?;
 
+    let mut total_bytes: u64 = 0;
+
     if is_zip {
         let mut archive =
             zip::ZipArchive::new(file).map_err(|e| format!("解析 ZIP 封裝失敗: {e}"))?;
-        archive
-            .extract(dest_dir)
-            .map_err(|e| format!("解壓縮 ZIP 檔案失敗: {e}"))?;
+        if archive.len() > MAX_EXTRACTED_ENTRIES {
+            return Err(format!(
+                "ZIP 壓縮包項目數超過安全上限 ({MAX_EXTRACTED_ENTRIES})"
+            ));
+        }
+
+        for i in 0..archive.len() {
+            let mut entry = archive
+                .by_index(i)
+                .map_err(|e| format!("讀取 ZIP 項目失敗: {e}"))?;
+            let enclosed = entry
+                .enclosed_name()
+                .ok_or_else(|| "ZIP 內含無效相對路徑".to_string())?
+                .to_path_buf();
+            let outpath = dest_dir.join(enclosed);
+
+            if entry.is_dir() {
+                fs::create_dir_all(&outpath)
+                    .map_err(|e| format!("建立目錄失敗 ({outpath:?}): {e}"))?;
+            } else {
+                if let Some(parent) = outpath.parent() {
+                    fs::create_dir_all(parent)
+                        .map_err(|e| format!("建立上層目錄失敗 ({parent:?}): {e}"))?;
+                }
+                let mut outfile = fs::File::create(&outpath)
+                    .map_err(|e| format!("建立檔案失敗 ({outpath:?}): {e}"))?;
+                let mut buffer = [0u8; 8192];
+                loop {
+                    let n = entry
+                        .read(&mut buffer)
+                        .map_err(|e| format!("解壓讀取失敗: {e}"))?;
+                    if n == 0 {
+                        break;
+                    }
+                    total_bytes = total_bytes.saturating_add(n as u64);
+                    if total_bytes > MAX_EXTRACTED_BYTES {
+                        return Err(format!(
+                            "解壓縮展開大小超過安全上限 ({MAX_EXTRACTED_BYTES} 位元組)"
+                        ));
+                    }
+                    outfile
+                        .write_all(&buffer[..n])
+                        .map_err(|e| format!("寫入解壓檔案失敗: {e}"))?;
+                }
+            }
+        }
     } else {
         let tar_gz = flate2::read::GzDecoder::new(file);
         let mut archive = tar::Archive::new(tar_gz);
-        archive
-            .unpack(dest_dir)
-            .map_err(|e| format!("解壓縮 tar.gz 檔案失敗: {e}"))?;
+        let mut count: usize = 0;
+
+        for entry in archive
+            .entries()
+            .map_err(|e| format!("讀取 tar 項目清單失敗: {e}"))?
+        {
+            count = count.saturating_add(1);
+            if count > MAX_EXTRACTED_ENTRIES {
+                return Err(format!(
+                    "tar.gz 壓縮包項目數超過安全上限 ({MAX_EXTRACTED_ENTRIES})"
+                ));
+            }
+            let mut entry = entry.map_err(|e| format!("讀取 tar 項目失敗: {e}"))?;
+            let path = entry
+                .path()
+                .map_err(|e| format!("讀取 tar 路徑失敗: {e}"))?
+                .to_path_buf();
+
+            if path.is_absolute()
+                || path
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                return Err(format!("tar 包含不安全的檔案路徑: {path:?}"));
+            }
+            let outpath = dest_dir.join(&path);
+
+            if entry.header().entry_type().is_dir() {
+                fs::create_dir_all(&outpath)
+                    .map_err(|e| format!("建立目錄失敗 ({outpath:?}): {e}"))?;
+            } else {
+                if let Some(parent) = outpath.parent() {
+                    fs::create_dir_all(parent)
+                        .map_err(|e| format!("建立上層目錄失敗 ({parent:?}): {e}"))?;
+                }
+                let mut outfile = fs::File::create(&outpath)
+                    .map_err(|e| format!("建立檔案失敗 ({outpath:?}): {e}"))?;
+                let mut buffer = [0u8; 8192];
+                loop {
+                    let n = entry
+                        .read(&mut buffer)
+                        .map_err(|e| format!("解壓讀取失敗: {e}"))?;
+                    if n == 0 {
+                        break;
+                    }
+                    total_bytes = total_bytes.saturating_add(n as u64);
+                    if total_bytes > MAX_EXTRACTED_BYTES {
+                        return Err(format!(
+                            "解壓縮展開大小超過安全上限 ({MAX_EXTRACTED_BYTES} 位元組)"
+                        ));
+                    }
+                    outfile
+                        .write_all(&buffer[..n])
+                        .map_err(|e| format!("寫入解壓檔案失敗: {e}"))?;
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Ok(mode) = entry.header().mode() {
+                        let _ = fs::set_permissions(&outpath, fs::Permissions::from_mode(mode));
+                    }
+                }
+            }
+        }
     }
 
     Ok(())
@@ -743,6 +888,35 @@ async fn download_text_capped(
     Ok(String::from_utf8_lossy(&buffer).to_string())
 }
 
+fn print_and_log_check_result(
+    remote_version: &str,
+    current_version: &str,
+    hint_newer: Option<&str>,
+) {
+    let is_newer = is_newer_version(remote_version, current_version);
+    println!("  目前版本: v{current_version}");
+    println!("  最新版本: {remote_version}");
+    if is_newer {
+        if let Some(hint) = hint_newer {
+            println!("{hint}");
+        } else {
+            println!("💡 發現新版本！可執行 token-usage-insights update 進行更新。");
+        }
+        log_update(
+            "INFO",
+            "CHECK",
+            &format!("版本檢查完成：發現新版本 {remote_version}（目前為 v{current_version}）"),
+        );
+    } else {
+        println!("✅ 目前已是最新版本。");
+        log_update(
+            "INFO",
+            "CHECK",
+            &format!("版本檢查完成：目前已是最新版本 v{current_version}"),
+        );
+    }
+}
+
 pub async fn run_update(options: UpdateOptions) -> Result<(), String> {
     let env_kind = detect_environment();
 
@@ -753,14 +927,11 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), String> {
                     fetch_release_with_logging(options.target_version.as_deref(), 15).await?;
                 let current_version = env!("CARGO_PKG_VERSION");
                 let remote_version = release.tag_name.trim();
-                let is_newer = is_newer_version(remote_version, current_version);
-                println!("  目前版本: v{current_version}");
-                println!("  最新版本: {remote_version}");
-                if is_newer {
-                    println!("💡 發現新版本！可執行 npx token-usage-insights@latest 使用最新版。");
-                } else {
-                    println!("✅ 目前已是最新版本。");
-                }
+                print_and_log_check_result(
+                    remote_version,
+                    current_version,
+                    Some("💡 發現新版本！可執行 npx token-usage-insights@latest 使用最新版。"),
+                );
                 return Ok(());
             }
             let msg = r#"⚠️ 偵測到目前透過 npm / npx 執行，不支援直接原地自我更新。
@@ -778,14 +949,11 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), String> {
                     fetch_release_with_logging(options.target_version.as_deref(), 15).await?;
                 let current_version = env!("CARGO_PKG_VERSION");
                 let remote_version = release.tag_name.trim();
-                let is_newer = is_newer_version(remote_version, current_version);
-                println!("  目前版本: v{current_version}");
-                println!("  最新版本: {remote_version}");
-                if is_newer {
-                    println!("💡 發現新版本！請使用 git pull / cargo build 進行更新。");
-                } else {
-                    println!("✅ 目前已是最新版本。");
-                }
+                print_and_log_check_result(
+                    remote_version,
+                    current_version,
+                    Some("💡 發現新版本！請使用 git pull / cargo build 進行更新。"),
+                );
                 return Ok(());
             }
             let msg = format!(
@@ -801,14 +969,11 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), String> {
                     fetch_release_with_logging(options.target_version.as_deref(), 15).await?;
                 let current_version = env!("CARGO_PKG_VERSION");
                 let remote_version = release.tag_name.trim();
-                let is_newer = is_newer_version(remote_version, current_version);
-                println!("  目前版本: v{current_version}");
-                println!("  最新版本: {remote_version}");
-                if is_newer {
-                    println!("💡 發現新版本！請在標準安裝目錄中執行更新。");
-                } else {
-                    println!("✅ 目前已是最新版本。");
-                }
+                print_and_log_check_result(
+                    remote_version,
+                    current_version,
+                    Some("💡 發現新版本！請在標準安裝目錄中執行更新。"),
+                );
                 return Ok(());
             }
             let msg = format!(
@@ -830,11 +995,18 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), String> {
         _ => unreachable!(),
     };
 
-    let target = current_target_triple().ok_or_else(|| {
-        let msg = "目前作業系統或硬體架構不支援預先編譯的二進位發行檔".to_string();
-        log_update("ERROR", "CHECK", &msg);
-        msg
-    })?;
+    // 若非純檢查，在開始任何更新操作前先取得安裝目錄之獨占鎖
+    let _lock = if !options.check_only {
+        Some(match UpdateLock::try_acquire(&install_dir) {
+            Ok(l) => l,
+            Err(e) => {
+                log_update("ERROR", "LOCK", &e);
+                return Err(e);
+            }
+        })
+    } else {
+        None
+    };
 
     let current_version = env!("CARGO_PKG_VERSION");
     println!("🔍 正在檢查最新發行版本...");
@@ -847,24 +1019,30 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), String> {
     let release = fetch_release_with_logging(options.target_version.as_deref(), 15).await?;
     let remote_version = release.tag_name.trim();
 
+    if options.check_only {
+        let hint = match current_target_triple() {
+            Some(_) => None,
+            None => Some("💡 發現新版本！但目前作業系統/硬體架構無預編譯發行包，需手動編譯。"),
+        };
+        print_and_log_check_result(remote_version, current_version, hint);
+        return Ok(());
+    }
+
     let is_newer = is_newer_version(remote_version, current_version);
     println!("  目前版本: v{current_version}");
     println!("  目標版本: {remote_version}");
-
-    if options.check_only {
-        if is_newer {
-            println!("💡 發現新版本！可執行 token-usage-insights update 進行更新。");
-        } else {
-            println!("✅ 目前已是最新版本。");
-        }
-        return Ok(());
-    }
 
     if !is_newer && !options.force && options.target_version.is_none() {
         println!("✅ 目前已是最新版本 ({remote_version})。使用 --force 可強制重新安裝。");
         log_update("INFO", "CHECK", "已是最新版本，略過更新");
         return Ok(());
     }
+
+    let target = current_target_triple().ok_or_else(|| {
+        let msg = "目前作業系統或硬體架構不支援預先編譯的二進位發行檔".to_string();
+        log_update("ERROR", "CHECK", &msg);
+        msg
+    })?;
 
     let archive_name = archive_filename(remote_version, target);
     let asset = release
@@ -887,12 +1065,15 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), String> {
             err
         })?;
 
-    // 取得安裝目錄之獨占鎖
-    let _lock = UpdateLock::try_acquire(&install_dir)?;
-
     // 使用 TempDirGuard 確保異常離開時自動清理暫存（置於 install_dir 底下確保受獨占鎖保護）
     let update_tmp_dir = install_dir.join(".update-tmp");
-    let tmp_guard = TempDirGuard::new(update_tmp_dir)?;
+    let tmp_guard = match TempDirGuard::new(update_tmp_dir) {
+        Ok(g) => g,
+        Err(e) => {
+            log_update("ERROR", "PREPARE", &e);
+            return Err(e);
+        }
+    };
 
     println!("⬇️ 正在下載發行包: {archive_name} ...");
     log_update("INFO", "DOWNLOAD", &format!("開始串流下載 {archive_name}"));
@@ -1087,10 +1268,23 @@ pub(crate) fn apply_installation_with_rollback(
             let src = release_root.join(folder);
             let dst = install_dir.join(folder);
             if src.exists() {
+                let staging = install_dir.join(format!(".{folder}-staging-{}", std::process::id()));
+                let _ = fs::remove_dir_all(&staging);
+                copy_dir_recursive(&src, &staging)?;
+
                 if dst.exists() {
-                    fs::remove_dir_all(&dst).map_err(|e| format!("清除舊目錄失敗 {dst:?}: {e}"))?;
+                    let old = install_dir.join(format!(".{folder}-old-{}", std::process::id()));
+                    let _ = fs::remove_dir_all(&old);
+                    fs::rename(&dst, &old).map_err(|e| format!("目錄安全換名失敗 {dst:?}: {e}"))?;
+                    if let Err(e) = fs::rename(&staging, &dst) {
+                        let _ = fs::rename(&old, &dst);
+                        return Err(format!("原子切換目錄失敗 {folder}: {e}"));
+                    }
+                    let _ = fs::remove_dir_all(&old);
+                } else {
+                    fs::rename(&staging, &dst)
+                        .map_err(|e| format!("移動新目錄失敗 {folder}: {e}"))?;
                 }
-                copy_dir_recursive(&src, &dst)?;
             }
         }
 
@@ -1137,7 +1331,6 @@ pub(crate) fn apply_installation_with_rollback(
     if backup_dir.exists() {
         if let Err(e) = fs::remove_dir_all(backup_dir) {
             log_update("WARN", "CLEANUP", &format!("清理備份目錄失敗: {e}"));
-            let _ = fs::remove_file(backup_dir.join(".manifest"));
             let fallback_backup =
                 install_dir.join(format!(".backup-old-{}", Utc::now().timestamp()));
             let _ = fs::rename(backup_dir, &fallback_backup);
@@ -1180,135 +1373,25 @@ fn is_update_check_interval_elapsed() -> bool {
     true
 }
 
-pub async fn check_and_auto_update_on_launch() {
-    // 1. 防止循環重啟
-    if std::env::var_os("_TOKEN_USAGE_INSIGHTS_RESTARTED").is_some() {
-        return;
-    }
+fn is_lock_conflict_error(err: &str) -> bool {
+    err.contains("已有另一個更新程序正在執行中")
+}
 
-    // 2. 檢查是否關閉自動更新（命令列旗標 > 環境變數 > config.yaml）
-    let args: Vec<String> = std::env::args().collect();
-    if args.iter().any(|arg| arg == "--no-auto-update") {
-        return;
-    }
-    if let Ok(val) = std::env::var("TOKEN_USAGE_INSIGHTS_AUTO_UPDATE") {
-        let lower = val.trim().to_lowercase();
-        if lower == "0" || lower == "false" || lower == "no" || lower == "off" {
-            return;
+async fn wait_for_lock_release(install_dir: &Path, timeout: Duration) -> Result<(), String> {
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        if !UpdateLock::is_locked(install_dir) {
+            return Ok(());
         }
-    } else {
-        let (yaml_auto, _) = load_update_config();
-        if yaml_auto == Some(false) {
-            return;
-        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
+    Err(format!(
+        "等待更新程序釋放鎖定逾時（超過 {} 秒）",
+        timeout.as_secs()
+    ))
+}
 
-    // 3. 檢查更新檢查間隔（優先讀取環境變數，其次 config.yaml，預設 24 小時）
-    if !is_update_check_interval_elapsed() {
-        return;
-    }
-
-    // 4. 判斷環境
-    let env_kind = detect_environment();
-    if matches!(env_kind, EnvironmentKind::Npm { .. }) {
-        // npm 環境：套用相同檢查間隔，若有新版僅提示並記錄本次檢查
-        if let Ok(release) = fetch_release_with_logging(None, STARTUP_CHECK_TIMEOUT_SECS).await {
-            if let Ok(conn) = crate::db::get_db_conn() {
-                let now_str = Utc::now().to_rfc3339();
-                let _ = crate::db::set_system_metadata(&conn, LAST_CHECK_KEY, &now_str);
-            }
-            let current_version = env!("CARGO_PKG_VERSION");
-            if is_newer_version(&release.tag_name, current_version) {
-                log_update(
-                    "INFO",
-                    "STARTUP_CHECK",
-                    &format!("npm 環境偵測到新版本 {}", release.tag_name),
-                );
-                println!(
-                    "💡 發現新版本 {}！您可以執行 npx token-usage-insights@latest 啟動最新版本。",
-                    release.tag_name
-                );
-            }
-        }
-        return;
-    }
-
-    if !matches!(env_kind, EnvironmentKind::StandardInstalled { .. }) {
-        // 非標準安裝目錄（如 Git 開發目錄）：靜默跳過自動更新
-        return;
-    }
-
-    // 5. 快速檢查（設定超時 STARTUP_CHECK_TIMEOUT_SECS 秒，不阻礙伺服器啟動）
-    let release = match fetch_release_with_logging(None, STARTUP_CHECK_TIMEOUT_SECS).await {
-        Ok(r) => r,
-        Err(e) => {
-            log_update("WARN", "STARTUP_CHECK", &format!("啟動更新檢查略過: {e}"));
-            return;
-        }
-    };
-
-    let current_version = env!("CARGO_PKG_VERSION");
-    if !is_newer_version(&release.tag_name, current_version) {
-        // 沒有新版本：成功確認當前已是最新，記錄本次檢查時間
-        if let Ok(conn) = crate::db::get_db_conn() {
-            let now_str = Utc::now().to_rfc3339();
-            let _ = crate::db::set_system_metadata(&conn, LAST_CHECK_KEY, &now_str);
-        }
-        return;
-    }
-
-    println!(
-        "🚀 發現新版本 {}（目前為 v{}），正在自動更新...",
-        release.tag_name, current_version
-    );
-    log_update(
-        "INFO",
-        "STARTUP_CHECK",
-        &format!("觸發啟動自動更新至 {}", release.tag_name),
-    );
-
-    let update_opts = UpdateOptions {
-        check_only: false,
-        force: false,
-        target_version: Some(release.tag_name.clone()),
-    };
-
-    // 為自動更新設定整體時間上限，避免慢速網路長時間阻塞伺服器啟動
-    let update_result = tokio::time::timeout(
-        Duration::from_secs(STARTUP_AUTO_UPDATE_TOTAL_TIMEOUT_SECS),
-        run_update(update_opts),
-    )
-    .await;
-
-    match update_result {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            eprintln!("⚠️ 自動更新失敗: {e}，將繼續以現有版本啟動服務。");
-            log_update("WARN", "STARTUP_UPDATE", &format!("自動更新失敗: {e}"));
-            return;
-        }
-        Err(_) => {
-            eprintln!(
-                "⚠️ 自動更新逾時（超過 {STARTUP_AUTO_UPDATE_TOTAL_TIMEOUT_SECS} 秒），將繼續以現有版本啟動服務。"
-            );
-            log_update(
-                "WARN",
-                "STARTUP_UPDATE",
-                &format!("自動更新超過上限 {STARTUP_AUTO_UPDATE_TOTAL_TIMEOUT_SECS} 秒，略過"),
-            );
-            return;
-        }
-    }
-
-    // 更新成功後記錄最後檢查時間
-    if let Ok(conn) = crate::db::get_db_conn() {
-        let now_str = Utc::now().to_rfc3339();
-        let _ = crate::db::set_system_metadata(&conn, LAST_CHECK_KEY, &now_str);
-    }
-
-    println!("🔄 更新完成，正在自動重啟 Token 戰情室...");
-    log_update("INFO", "STARTUP_RESTART", "更新完成，重啟進程");
-
+fn restart_current_process(args: &[String]) -> ! {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -1352,6 +1435,196 @@ pub async fn check_and_auto_update_on_launch() {
                     std::process::exit(1);
                 }
             }
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        std::process::exit(0);
+    }
+}
+
+pub async fn check_and_auto_update_on_launch() {
+    // 1. 防止循環重啟
+    if std::env::var_os("_TOKEN_USAGE_INSIGHTS_RESTARTED").is_some() {
+        return;
+    }
+
+    // 2. 檢查是否關閉自動更新（命令列旗標 > 環境變數 > config.yaml）
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|arg| arg == "--no-auto-update") {
+        return;
+    }
+    if let Ok(val) = std::env::var("TOKEN_USAGE_INSIGHTS_AUTO_UPDATE") {
+        let lower = val.trim().to_lowercase();
+        if lower == "0" || lower == "false" || lower == "no" || lower == "off" {
+            return;
+        }
+    } else {
+        let (yaml_auto, _) = load_update_config();
+        if yaml_auto == Some(false) {
+            return;
+        }
+    }
+
+    // 3. 判斷環境
+    let env_kind = detect_environment();
+    if matches!(env_kind, EnvironmentKind::Npm { .. }) {
+        // npm 環境：套用檢查間隔，若有新版僅提示並記錄本次檢查
+        if !is_update_check_interval_elapsed() {
+            return;
+        }
+        if let Ok(release) = fetch_release_with_logging(None, STARTUP_CHECK_TIMEOUT_SECS).await {
+            if let Ok(conn) = crate::db::get_db_conn() {
+                let now_str = Utc::now().to_rfc3339();
+                let _ = crate::db::set_system_metadata(&conn, LAST_CHECK_KEY, &now_str);
+            }
+            let current_version = env!("CARGO_PKG_VERSION");
+            if is_newer_version(&release.tag_name, current_version) {
+                log_update(
+                    "INFO",
+                    "STARTUP_CHECK",
+                    &format!("npm 環境偵測到新版本 {}", release.tag_name),
+                );
+                println!(
+                    "💡 發現新版本 {}！您可以執行 npx token-usage-insights@latest 啟動最新版本。",
+                    release.tag_name
+                );
+            }
+        }
+        return;
+    }
+
+    let install_dir = match &env_kind {
+        EnvironmentKind::StandardInstalled { install_dir, .. } => install_dir.clone(),
+        _ => {
+            // 非標準安裝目錄（如 Git 開發目錄）：靜默跳過自動更新
+            return;
+        }
+    };
+
+    // 4. 若已有其他更新程序正在進行中，等待其完成並重啟，嚴禁同時啟動伺服器
+    if UpdateLock::is_locked(&install_dir) {
+        println!("⏳ 偵測到已有更新程序正在進行中，等待更新完成...");
+        log_update("INFO", "STARTUP_WAIT", "偵測到進行中的更新鎖，等待其釋放");
+        match wait_for_lock_release(
+            &install_dir,
+            Duration::from_secs(STARTUP_AUTO_UPDATE_TOTAL_TIMEOUT_SECS),
+        )
+        .await
+        {
+            Ok(()) => {
+                println!("🔄 更新程序已完成，正在重新啟動 Token 戰情室...");
+                log_update("INFO", "STARTUP_RESTART", "其他程序更新完成，重啟進程");
+                restart_current_process(&args);
+            }
+            Err(e) => {
+                eprintln!("❌ 等待更新程序超時: {e}；為防止讀取不一致檔案，程序終止。");
+                log_update("ERROR", "STARTUP_LOCK", &format!("等待更新鎖超時: {e}"));
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // 5. 檢查更新檢查間隔（優先讀取環境變數，其次 config.yaml，預設 24 小時）
+    if !is_update_check_interval_elapsed() {
+        return;
+    }
+
+    // 6. 快速檢查（設定超時 STARTUP_CHECK_TIMEOUT_SECS 秒，不阻礙伺服器啟動）
+    let release = match fetch_release_with_logging(None, STARTUP_CHECK_TIMEOUT_SECS).await {
+        Ok(r) => r,
+        Err(e) => {
+            log_update("WARN", "STARTUP_CHECK", &format!("啟動更新檢查略過: {e}"));
+            return;
+        }
+    };
+
+    let current_version = env!("CARGO_PKG_VERSION");
+    if !is_newer_version(&release.tag_name, current_version) {
+        // 沒有新版本：成功確認當前已是最新，記錄本次檢查時間
+        if let Ok(conn) = crate::db::get_db_conn() {
+            let now_str = Utc::now().to_rfc3339();
+            let _ = crate::db::set_system_metadata(&conn, LAST_CHECK_KEY, &now_str);
+        }
+        return;
+    }
+
+    println!(
+        "🚀 發現新版本 {}（目前為 v{}），正在自動更新...",
+        release.tag_name, current_version
+    );
+    log_update(
+        "INFO",
+        "STARTUP_CHECK",
+        &format!("觸發啟動自動更新至 {}", release.tag_name),
+    );
+
+    let update_opts = UpdateOptions {
+        check_only: false,
+        force: false,
+        target_version: Some(release.tag_name.clone()),
+    };
+
+    // 為自動更新設定整體時間上限，避免慢速網路長時間阻塞伺服器啟動
+    let update_result = tokio::time::timeout(
+        Duration::from_secs(STARTUP_AUTO_UPDATE_TOTAL_TIMEOUT_SECS),
+        run_update(update_opts),
+    )
+    .await;
+
+    match update_result {
+        Ok(Ok(())) => {
+            if let Ok(conn) = crate::db::get_db_conn() {
+                let now_str = Utc::now().to_rfc3339();
+                let _ = crate::db::set_system_metadata(&conn, LAST_CHECK_KEY, &now_str);
+            }
+
+            println!("🔄 更新完成，正在自動重啟 Token 戰情室...");
+            log_update("INFO", "STARTUP_RESTART", "更新完成，重啟進程");
+            restart_current_process(&args);
+        }
+        Ok(Err(e)) => {
+            if is_lock_conflict_error(&e) {
+                println!("⏳ 偵測到已有更新程序正在進行中，等待更新完成...");
+                log_update("INFO", "STARTUP_WAIT", "遇到更新鎖競爭，等待另一程序完成");
+                match wait_for_lock_release(
+                    &install_dir,
+                    Duration::from_secs(STARTUP_AUTO_UPDATE_TOTAL_TIMEOUT_SECS),
+                )
+                .await
+                {
+                    Ok(()) => {
+                        println!("🔄 更新已由另一程序完成，正在重新啟動 Token 戰情室...");
+                        log_update("INFO", "STARTUP_RESTART", "另一程序更新完成，重啟進程");
+                        restart_current_process(&args);
+                    }
+                    Err(wait_err) => {
+                        eprintln!(
+                            "❌ 等待更新程序超時: {wait_err}；為防止讀取不一致檔案，程序終止。"
+                        );
+                        log_update(
+                            "ERROR",
+                            "STARTUP_LOCK",
+                            &format!("等待更新鎖超時: {wait_err}"),
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                eprintln!("⚠️ 自動更新失敗: {e}，將繼續以現有版本啟動服務。");
+                log_update("WARN", "STARTUP_UPDATE", &format!("自動更新失敗: {e}"));
+            }
+        }
+        Err(_) => {
+            eprintln!(
+                "⚠️ 自動更新逾時（超過 {STARTUP_AUTO_UPDATE_TOTAL_TIMEOUT_SECS} 秒），將繼續以現有版本啟動服務。"
+            );
+            log_update(
+                "WARN",
+                "STARTUP_UPDATE",
+                &format!("自動更新超過上限 {STARTUP_AUTO_UPDATE_TOTAL_TIMEOUT_SECS} 秒，略過"),
+            );
         }
     }
 }
@@ -1544,26 +1817,38 @@ update_check_interval: 5 # check every 5 days
         assert!(default_secs <= 87600 * 3600);
     }
 
-    #[test]
-    fn update_lock_prevents_concurrent_access() {
+    #[tokio::test]
+    async fn update_lock_prevents_concurrent_access() {
         let temp = std::env::temp_dir().join(format!(
             "test-lock-{}",
             Utc::now().timestamp_nanos_opt().unwrap_or(0)
         ));
         fs::create_dir_all(&temp).unwrap();
 
+        assert!(!UpdateLock::is_locked(&temp));
+
         let lock1 = UpdateLock::try_acquire(&temp);
         assert!(lock1.is_ok());
+        assert!(UpdateLock::is_locked(&temp));
 
         let lock2 = UpdateLock::try_acquire(&temp);
         assert!(lock2.is_err());
+        let err_msg = lock2.unwrap_err();
+        assert!(is_lock_conflict_error(&err_msg));
 
         drop(lock1);
+        assert!(!UpdateLock::is_locked(&temp));
+
+        assert!(wait_for_lock_release(&temp, Duration::from_millis(500))
+            .await
+            .is_ok());
 
         let lock3 = UpdateLock::try_acquire(&temp);
         assert!(lock3.is_ok());
+        assert!(UpdateLock::is_locked(&temp));
 
         drop(lock3);
+        assert!(!UpdateLock::is_locked(&temp));
         let _ = fs::remove_dir_all(&temp);
     }
 

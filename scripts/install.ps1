@@ -356,7 +356,7 @@ if ($PSCmdlet.ShouldProcess($InstallDir, "Install Token Usage Insights")) {
         }
     }
 
-    Set-Content -Path (Join-Path $InstallDir ".install_marker") -Value "token-usage-insights:installed" -NoNewline
+    Set-Content -Path (Join-Path $InstallDir ".install_marker") -Value "token-usage-insights:installed" -NoNewline -Encoding Ascii
 
     $Shim = Join-Path $BinDir "$AppName.cmd"
     $BatchInstallDir = $InstallDir.Replace("%", "%%")
