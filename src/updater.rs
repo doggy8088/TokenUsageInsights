@@ -1426,6 +1426,13 @@ impl UpdateLock {
 
     fn try_acquire(install_dir: &Path) -> Result<Self, String> {
         let lock_path = Self::lock_path(install_dir);
+        if let Ok(meta) = fs::symlink_metadata(&lock_path) {
+            if meta.file_type().is_symlink() || !meta.is_file() {
+                return Err(format!(
+                    "拒絕在符號連結或非正規檔案上建立更新鎖 ({lock_path:?})；更新中止以確保安全"
+                ));
+            }
+        }
         let file = fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -1433,6 +1440,12 @@ impl UpdateLock {
             .truncate(false)
             .open(&lock_path)
             .map_err(|e| format!("無法建立或開啟更新鎖定檔 ({lock_path:?}): {e}"))?;
+
+        if let Ok(meta) = file.metadata() {
+            if !meta.is_file() {
+                return Err(format!("開啟的更新鎖定檔非正規檔案 ({lock_path:?})"));
+            }
+        }
 
         let locked = try_lock_file_exclusive(&file)
             .map_err(|e| format!("嘗試鎖定更新檔失敗 ({lock_path:?}): {e}"))?;
@@ -1454,8 +1467,18 @@ impl UpdateLock {
     /// 檢查是否有活躍中的更新程序持鎖（使用 OS 層級非阻塞顧問鎖）
     fn is_locked(install_dir: &Path) -> bool {
         let lock_path = Self::lock_path(install_dir);
-        if !lock_path.exists() {
-            return false;
+        match fs::symlink_metadata(&lock_path) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() || !meta.is_file() {
+                    return true;
+                }
+            }
+            Err(_) => {
+                if !lock_path.exists() {
+                    return false;
+                }
+                return true;
+            }
         }
         let file = match fs::OpenOptions::new()
             .read(true)
@@ -4222,6 +4245,40 @@ update_check_interval: 5 # check every 5 days
 
         drop(lock3);
         assert!(!UpdateLock::is_locked(&temp));
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn update_lock_rejects_symlink() {
+        let temp = std::env::temp_dir().join(format!(
+            "test-lock-symlink-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        fs::create_dir_all(&temp).unwrap();
+
+        let outside_file = temp.join("external_lock_target.txt");
+        fs::write(&outside_file, "external file content").unwrap();
+
+        let lock_symlink = temp.join(".update.lock");
+        std::os::unix::fs::symlink(&outside_file, &lock_symlink).unwrap();
+
+        // 檢查 is_locked 應回傳 true (fail-closed)
+        assert!(UpdateLock::is_locked(&temp));
+
+        // 嘗試獲取鎖應被拒絕
+        let lock_res = UpdateLock::try_acquire(&temp);
+        assert!(lock_res.is_err());
+        let err_msg = lock_res.unwrap_err();
+        assert!(
+            err_msg.contains("符號連結") || err_msg.contains("非正規檔案"),
+            "應明確拒絕符號連結鎖檔: {err_msg}"
+        );
+
+        // 外部檔案不應被寫入 pid
+        let outside_content = fs::read_to_string(&outside_file).unwrap();
+        assert_eq!(outside_content, "external file content");
+
         let _ = fs::remove_dir_all(&temp);
     }
 

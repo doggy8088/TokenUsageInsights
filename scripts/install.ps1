@@ -7,7 +7,9 @@ param(
     [string]$BinDir = $(Join-Path $HOME "bin"),
     [string]$HostAddress = $(if ($env:HOST) { $env:HOST } else { "0.0.0.0" }),
     [int]$Port = $(if ($env:PORT) { [int]$env:PORT } else { 3003 }),
-    [switch]$Service
+    [switch]$Service,
+    [string]$AutoUpdate = $(if ($env:TOKEN_USAGE_INSIGHTS_AUTO_UPDATE) { $env:TOKEN_USAGE_INSIGHTS_AUTO_UPDATE } else { "" }),
+    [string]$UpdateIntervalHours = $(if ($env:TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS) { $env:TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS } else { "" })
 )
 
 $ErrorActionPreference = "Stop"
@@ -262,13 +264,23 @@ function Set-StartupShortcutForRunner {
         [string]$RunnerScript,
         [string]$InstallDir,
         [string]$HostAddress,
-        [int]$Port
+        [int]$Port,
+        [string]$AutoUpdate = "",
+        [string]$UpdateIntervalHours = ""
     )
+
+    $runnerArgs = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$RunnerScript`" -InstallDir `"$InstallDir`" -HostAddress `"$HostAddress`" -Port $Port"
+    if ($AutoUpdate) {
+        $runnerArgs += " -AutoUpdate `"$AutoUpdate`""
+    }
+    if ($UpdateIntervalHours) {
+        $runnerArgs += " -UpdateIntervalHours `"$UpdateIntervalHours`""
+    }
 
     $WshShell = New-Object -ComObject WScript.Shell
     $Shortcut = $WshShell.CreateShortcut($ShortcutPath)
     $Shortcut.TargetPath = "powershell.exe"
-    $Shortcut.Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$RunnerScript`" -InstallDir `"$InstallDir`" -HostAddress `"$HostAddress`" -Port $Port"
+    $Shortcut.Arguments = $runnerArgs
     $Shortcut.WorkingDirectory = $InstallDir
     $Shortcut.WindowStyle = 7
     $Shortcut.Description = "Token 戰情室 Dashboard Background Service"
@@ -389,12 +401,20 @@ exit /b %APP_EXIT_CODE%
             throw "Missing background service runner script: $RunnerScript"
         }
 
+        $runnerArgs = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$RunnerScript`" -InstallDir `"$InstallDir`" -HostAddress `"$HostAddress`" -Port $Port"
+        if ($AutoUpdate) {
+            $runnerArgs += " -AutoUpdate `"$AutoUpdate`""
+        }
+        if ($UpdateIntervalHours) {
+            $runnerArgs += " -UpdateIntervalHours `"$UpdateIntervalHours`""
+        }
+
         $taskRegistered = $false
         try {
             $taskLogonUser = Get-ScheduledTaskLogonUser
             $Action = New-ScheduledTaskAction `
                 -Execute "powershell.exe" `
-                -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$RunnerScript`" -InstallDir `"$InstallDir`" -HostAddress `"$HostAddress`" -Port $Port" `
+                -Argument $runnerArgs `
                 -WorkingDirectory $InstallDir
 
             if ($taskLogonUser) {
@@ -439,10 +459,12 @@ exit /b %APP_EXIT_CODE%
                 -RunnerScript $RunnerScript `
                 -InstallDir $InstallDir `
                 -HostAddress $HostAddress `
-                -Port $Port
+                -Port $Port `
+                -AutoUpdate $AutoUpdate `
+                -UpdateIntervalHours $UpdateIntervalHours
 
             Start-Process -FilePath "powershell.exe" `
-                -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$RunnerScript`" -InstallDir `"$InstallDir`" -HostAddress `"$HostAddress`" -Port $Port" `
+                -ArgumentList $runnerArgs `
                 -WorkingDirectory $InstallDir -WindowStyle Hidden
         }
 
@@ -478,7 +500,9 @@ exit /b %APP_EXIT_CODE%
                     -RunnerScript $runnerScript `
                     -InstallDir $InstallDir `
                     -HostAddress $HostAddress `
-                    -Port $Port
+                    -Port $Port `
+                    -AutoUpdate $AutoUpdate `
+                    -UpdateIntervalHours $UpdateIntervalHours
                 $startupShortcutReady = Test-Path $startupShortcutPath
             } catch {}
         }

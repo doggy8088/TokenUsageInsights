@@ -6,7 +6,9 @@
 param(
     [string]$InstallDir = (Split-Path -Parent $PSScriptRoot),
     [string]$HostAddress = $(if ($env:HOST) { $env:HOST } else { "0.0.0.0" }),
-    [int]$Port = $(if ($env:PORT) { [int]$env:PORT } else { 3003 })
+    [int]$Port = $(if ($env:PORT) { [int]$env:PORT } else { 3003 }),
+    [string]$AutoUpdate = $(if ($env:TOKEN_USAGE_INSIGHTS_AUTO_UPDATE) { $env:TOKEN_USAGE_INSIGHTS_AUTO_UPDATE } else { "" }),
+    [string]$UpdateIntervalHours = $(if ($env:TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS) { $env:TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS } else { "" })
 )
 
 $ErrorActionPreference = "Stop"
@@ -17,6 +19,12 @@ $env:PORT = "$Port"
 $env:HOST = "$HostAddress"
 $env:TOKEN_USAGE_INSIGHTS_SERVICE = "1"
 $env:TOKEN_USAGE_INSIGHTS_INSTALL_DIR = "$InstallDir"
+if ($AutoUpdate) {
+    $env:TOKEN_USAGE_INSIGHTS_AUTO_UPDATE = "$AutoUpdate"
+}
+if ($UpdateIntervalHours) {
+    $env:TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS = "$UpdateIntervalHours"
+}
 
 $Exe = Join-Path $InstallDir "$AppName.exe"
 if (!(Test-Path $Exe)) {
