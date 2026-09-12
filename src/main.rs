@@ -134,6 +134,7 @@ fn spawn_usage_sync_task() {
 
 #[tokio::main]
 async fn main() {
+    updater::wait_for_parent_exit_if_requested().await;
     if let Some(code) = cli::run(&std::env::args().collect::<Vec<_>>()).await {
         std::process::exit(code);
     }

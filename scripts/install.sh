@@ -95,6 +95,17 @@ if [[ "$install_service" == true ]]; then
       service_dir="${HOME}/.config/systemd/user"
       service_file="${service_dir}/${app_name}.service"
       mkdir -p "$service_dir"
+
+      systemd_escape() {
+        # Systemd unit quoting: escape \, ", and $
+        printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\$/\$\$/g'
+      }
+
+      install_dir_systemd="$(systemd_escape "$install_dir")"
+      executable_systemd="$(systemd_escape "${install_dir}/${app_name}")"
+      host_systemd="$(systemd_escape "$host")"
+      port_systemd="$(systemd_escape "$port")"
+
       cat > "$service_file" <<SERVICE
 [Unit]
 Description=Token 戰情室 Dashboard Service
@@ -102,13 +113,13 @@ After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=${install_dir}
-ExecStart=${install_dir}/${app_name}
+WorkingDirectory="${install_dir_systemd}"
+ExecStart="${executable_systemd}"
 Restart=always
 RestartSec=5
-Environment=PORT=${port}
-Environment=HOST=${host}
-Environment=TOKEN_USAGE_INSIGHTS_INSTALL_DIR=${install_dir}
+Environment="PORT=${port_systemd}"
+Environment="HOST=${host_systemd}"
+Environment="TOKEN_USAGE_INSIGHTS_INSTALL_DIR=${install_dir_systemd}"
 
 [Install]
 WantedBy=default.target

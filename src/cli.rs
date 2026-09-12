@@ -591,18 +591,24 @@ async fn run_update_cli(args: &[String]) -> i32 {
     }
 }
 
-fn next_flag_value(args: &[String], i: &mut usize, flag: &str) -> String {
+fn parse_flag_value(args: &[String], i: &mut usize, flag: &str) -> Result<String, String> {
     match args.get(*i + 1) {
         Some(value) => {
-            if value.starts_with("--") {
-                eprintln!("缺少 --{flag} 的值");
-                std::process::exit(2);
+            if value.starts_with('-') {
+                return Err(format!("缺少 --{flag} 的值"));
             }
             *i += 1;
-            value.clone()
+            Ok(value.clone())
         }
-        None => {
-            eprintln!("缺少 --{flag} 的值");
+        None => Err(format!("缺少 --{flag} 的值")),
+    }
+}
+
+fn next_flag_value(args: &[String], i: &mut usize, flag: &str) -> String {
+    match parse_flag_value(args, i, flag) {
+        Ok(val) => val,
+        Err(err) => {
+            eprintln!("{err}");
             std::process::exit(2);
         }
     }
@@ -863,5 +869,32 @@ mod tests {
             validate_import_source_assistant("codex", None).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn parse_flag_value_rejects_missing_and_option_like_values() {
+        let mut i = 0;
+        let args_short = vec!["update".to_string(), "-v".to_string(), "-f".to_string()];
+        let err_short = super::parse_flag_value(&args_short, &mut i, "target-version").unwrap_err();
+        assert_eq!(err_short, "缺少 --target-version 的值");
+        assert_eq!(i, 0);
+
+        let args_long = vec![
+            "update".to_string(),
+            "-v".to_string(),
+            "--force".to_string(),
+        ];
+        let err_long = super::parse_flag_value(&args_long, &mut i, "target-version").unwrap_err();
+        assert_eq!(err_long, "缺少 --target-version 的值");
+
+        let args_end = vec!["update".to_string(), "-v".to_string()];
+        let err_end = super::parse_flag_value(&args_end, &mut i, "target-version").unwrap_err();
+        assert_eq!(err_end, "缺少 --target-version 的值");
+
+        let mut j = 1;
+        let args_valid = vec!["update".to_string(), "-v".to_string(), "v0.9.6".to_string()];
+        let val = super::parse_flag_value(&args_valid, &mut j, "target-version").unwrap();
+        assert_eq!(val, "v0.9.6");
+        assert_eq!(j, 2);
     }
 }

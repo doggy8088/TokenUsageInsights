@@ -1739,6 +1739,16 @@ fn print_and_log_check_result(
     }
 }
 
+pub(crate) fn get_installed_version(install_dir: &Path) -> String {
+    if let Ok(content) = fs::read_to_string(install_dir.join("VERSION")) {
+        let v = content.trim().trim_start_matches('v');
+        if !v.is_empty() {
+            return v.to_string();
+        }
+    }
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
 pub async fn run_update(options: UpdateOptions) -> Result<(), UpdateError> {
     let env_kind = detect_environment();
 
@@ -1836,7 +1846,9 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), UpdateError> {
         None
     };
 
-    let current_version = env!("CARGO_PKG_VERSION");
+    // 取得更新鎖後，重新讀取安裝目錄目前實際之版本，防範排隊等待鎖期間已被其他更新程序完成升級
+    let current_version_str = get_installed_version(&install_dir);
+    let current_version = current_version_str.as_str();
     println!("🔍 正在檢查最新發行版本...");
     log_update(
         "INFO",
@@ -2747,6 +2759,19 @@ async fn wait_for_lock_release(install_dir: &Path, timeout: Duration) -> Result<
     ))
 }
 
+pub async fn wait_for_parent_exit_if_requested() {
+    if let Ok(val) = std::env::var("_TOKEN_USAGE_INSIGHTS_WAIT_PID") {
+        std::env::remove_var("_TOKEN_USAGE_INSIGHTS_WAIT_PID");
+        if let Ok(parent_pid) = val.trim().parse::<u32>() {
+            let start = tokio::time::Instant::now();
+            let timeout = Duration::from_secs(10);
+            while is_process_alive(parent_pid) && start.elapsed() < timeout {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+}
+
 fn restart_current_process(args: &[String]) -> ! {
     #[cfg(unix)]
     {
@@ -2783,8 +2808,20 @@ fn restart_current_process(args: &[String]) -> ! {
                 cmd.args(&args[1..]);
             }
             cmd.env("_TOKEN_USAGE_INSIGHTS_RESTARTED", "1");
-            match cmd.status() {
-                Ok(status) => std::process::exit(status.code().unwrap_or(0)),
+            let parent_pid = std::process::id();
+            cmd.env("_TOKEN_USAGE_INSIGHTS_WAIT_PID", parent_pid.to_string());
+            use std::os::windows::process::CommandExt;
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+            cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
+            match cmd.spawn() {
+                Ok(_) => {
+                    log_update(
+                        "INFO",
+                        "STARTUP_RESTART",
+                        "已啟動新進程，目前進程安全退出以釋放連接埠與資源",
+                    );
+                    std::process::exit(0);
+                }
                 Err(err) => {
                     eprintln!("❌ 自動重啟進程失敗: {err}；請手動重新啟動程序。");
                     log_update("ERROR", "STARTUP_RESTART", &format!("重啟進程失敗: {err}"));
@@ -2824,10 +2861,17 @@ fn is_auto_update_disabled(args: &[String]) -> bool {
     false
 }
 
-fn attempt_startup_recovery(install_dir: &Path, args: &[String]) {
+#[derive(Debug, PartialEq, Eq)]
+enum RecoveryStatus {
+    CleanedOrNoBackup,
+    SuccessRestored,
+    LockContended,
+}
+
+fn attempt_startup_recovery(install_dir: &Path, args: &[String]) -> RecoveryStatus {
     let backup_dir = install_dir.join(".backup");
     if !backup_dir.exists() {
-        return;
+        return RecoveryStatus::CleanedOrNoBackup;
     }
 
     // 若存在 .committed 標記，代表更新早已成功完成，僅備份目錄在最後刪除時中斷
@@ -2843,7 +2887,7 @@ fn attempt_startup_recovery(install_dir: &Path, args: &[String]) {
             let cleanup_name = format!(".backup-cleaned-{}", Utc::now().timestamp());
             let _ = fs::rename(&backup_dir, install_dir.join(&cleanup_name));
         }
-        return;
+        return RecoveryStatus::CleanedOrNoBackup;
     }
 
     if backup_dir.join(".rollback_failed").exists() {
@@ -2855,7 +2899,7 @@ fn attempt_startup_recovery(install_dir: &Path, args: &[String]) {
     }
 
     println!("⚠️ 偵測到先前更新殘留之備份目錄，正在取得更新鎖定以進行檢查與救援還原...");
-    let _recovery_lock = match UpdateLock::try_acquire(install_dir) {
+    let recovery_lock = match UpdateLock::try_acquire(install_dir) {
         Ok(l) => l,
         Err(e) => {
             log_update(
@@ -2863,7 +2907,7 @@ fn attempt_startup_recovery(install_dir: &Path, args: &[String]) {
                 "STARTUP_RECOVERY",
                 &format!("目前更新鎖被占用，暫緩救援: {e}"),
             );
-            return;
+            return RecoveryStatus::LockContended;
         }
     };
 
@@ -2888,7 +2932,7 @@ fn attempt_startup_recovery(install_dir: &Path, args: &[String]) {
                 std::process::exit(1);
             }
         }
-        return;
+        return RecoveryStatus::CleanedOrNoBackup;
     }
 
     println!("⚠️ 正在自動救援還原至健全版本...");
@@ -2923,9 +2967,14 @@ fn attempt_startup_recovery(install_dir: &Path, args: &[String]) {
         }
     }
 
+    // 釋放更新鎖後再執行重啟，避免子程序或被重啟程序繼承鎖檔案
+    drop(recovery_lock);
+
     println!("✅ 已成功自動還原至健全版本，正在重新啟動 Token 戰情室...");
     log_update("INFO", "STARTUP_RECOVERY", "自動救援還原成功，重啟進程");
     restart_current_process(args);
+    #[allow(unreachable_code)]
+    RecoveryStatus::SuccessRestored
 }
 
 pub async fn perform_startup_recovery() {
@@ -2937,30 +2986,59 @@ pub async fn perform_startup_recovery() {
     let env_kind = detect_environment();
 
     if let EnvironmentKind::StandardInstalled { install_dir, .. } = &env_kind {
-        if UpdateLock::is_locked(install_dir) {
-            println!("⏳ 偵測到已有更新程序正在進行中，等待更新完成...");
-            log_update("INFO", "STARTUP_WAIT", "偵測到進行中的更新鎖，等待其釋放");
-            match wait_for_lock_release(
-                install_dir,
-                Duration::from_secs(STARTUP_AUTO_UPDATE_TOTAL_TIMEOUT_SECS),
-            )
-            .await
-            {
-                Ok(()) => {
-                    attempt_startup_recovery(install_dir, &args);
-                    println!("🔄 更新程序已完成，正在重新啟動 Token 戰情室...");
-                    log_update("INFO", "STARTUP_RESTART", "其他程序更新完成，重啟進程");
-                    restart_current_process(&args);
+        let mut had_lock_wait = false;
+        let start_time = tokio::time::Instant::now();
+        let total_timeout = Duration::from_secs(STARTUP_AUTO_UPDATE_TOTAL_TIMEOUT_SECS);
+
+        loop {
+            if UpdateLock::is_locked(install_dir) {
+                had_lock_wait = true;
+                println!("⏳ 偵測到已有更新程序正在進行中，等待更新完成...");
+                log_update("INFO", "STARTUP_WAIT", "偵測到進行中的更新鎖，等待其釋放");
+                let elapsed = start_time.elapsed();
+                if elapsed >= total_timeout {
+                    eprintln!("❌ 等待更新程序超時；為防止讀取不一致檔案，程序終止。");
+                    log_update("ERROR", "STARTUP_LOCK", "等待更新鎖超時");
+                    std::process::exit(1);
                 }
-                Err(e) => {
+                let remaining = total_timeout - elapsed;
+                if let Err(e) = wait_for_lock_release(install_dir, remaining).await {
                     eprintln!("❌ 等待更新程序超時: {e}；為防止讀取不一致檔案，程序終止。");
                     log_update("ERROR", "STARTUP_LOCK", &format!("等待更新鎖超時: {e}"));
                     std::process::exit(1);
                 }
             }
-        }
 
-        attempt_startup_recovery(install_dir, &args);
+            match attempt_startup_recovery(install_dir, &args) {
+                RecoveryStatus::SuccessRestored => return,
+                RecoveryStatus::CleanedOrNoBackup => {
+                    if had_lock_wait {
+                        if UpdateLock::is_locked(install_dir) {
+                            // 鎖釋放後又有另一更新程序搶先加鎖，繼續等待
+                            continue;
+                        }
+                        let installed = get_installed_version(install_dir);
+                        if is_newer_version(&installed, env!("CARGO_PKG_VERSION")) {
+                            println!(
+                                "🔄 更新程序已完成，正在重新啟動 Token 戰情室至新版 v{installed}..."
+                            );
+                            log_update(
+                                "INFO",
+                                "STARTUP_RESTART",
+                                &format!("其他程序更新完成，重啟至 v{installed}"),
+                            );
+                            restart_current_process(&args);
+                        }
+                    }
+                    break;
+                }
+                RecoveryStatus::LockContended => {
+                    // 鎖定在救援檢查前已被其他程序占用，回到迴圈等待釋放
+                    had_lock_wait = true;
+                    continue;
+                }
+            }
+        }
     }
 }
 
@@ -3047,7 +3125,7 @@ async fn run_background_auto_update() {
     let update_opts = UpdateOptions {
         check_only: false,
         force: false,
-        target_version: Some(release.tag_name.clone()),
+        target_version: None,
         prefetched_release: Some(release.clone()),
     };
 
@@ -3060,37 +3138,70 @@ async fn run_background_auto_update() {
                 let _ = crate::db::set_system_metadata(&conn, LAST_CHECK_KEY, &now_str);
             }
 
-            println!("🔄 更新完成，正在自動重啟 Token 戰情室...");
-            log_update("INFO", "STARTUP_RESTART", "更新完成，重啟進程");
-            restart_current_process(&args);
+            let installed = get_installed_version(&install_dir);
+            if is_newer_version(&installed, env!("CARGO_PKG_VERSION")) {
+                println!("🔄 更新完成，正在自動重啟 Token 戰情室至新版 v{installed}...");
+                log_update(
+                    "INFO",
+                    "STARTUP_RESTART",
+                    &format!("更新完成，重啟至 v{installed}"),
+                );
+                restart_current_process(&args);
+            } else {
+                log_update("INFO", "STARTUP_CHECK", "目前進程與磁碟版本相符，無需重啟");
+            }
         }
         Err(e) => {
             let err_msg = e.to_string();
             if is_lock_conflict_error(&err_msg) {
                 println!("⏳ 偵測到已有更新程序正在進行中，等待更新完成...");
                 log_update("INFO", "STARTUP_WAIT", "遇到更新鎖競爭，等待另一程序完成");
-                match wait_for_lock_release(
-                    &install_dir,
-                    Duration::from_secs(STARTUP_AUTO_UPDATE_TOTAL_TIMEOUT_SECS),
-                )
-                .await
-                {
-                    Ok(()) => {
-                        attempt_startup_recovery(&install_dir, &args);
-                        println!("🔄 更新已由另一程序完成，正在重新啟動 Token 戰情室...");
-                        log_update("INFO", "STARTUP_RESTART", "另一程序更新完成，重啟進程");
-                        restart_current_process(&args);
+                let start_time = tokio::time::Instant::now();
+                let total_timeout = Duration::from_secs(STARTUP_AUTO_UPDATE_TOTAL_TIMEOUT_SECS);
+                loop {
+                    if UpdateLock::is_locked(&install_dir) {
+                        let elapsed = start_time.elapsed();
+                        if elapsed >= total_timeout {
+                            eprintln!("❌ 等待更新程序超時；為防止讀取不一致檔案，程序終止。");
+                            log_update("ERROR", "STARTUP_LOCK", "等待更新鎖超時");
+                            std::process::exit(1);
+                        }
+                        let remaining = total_timeout - elapsed;
+                        if let Err(wait_err) = wait_for_lock_release(&install_dir, remaining).await
+                        {
+                            eprintln!(
+                                "❌ 等待更新程序超時: {wait_err}；為防止讀取不一致檔案，程序終止。"
+                            );
+                            log_update(
+                                "ERROR",
+                                "STARTUP_LOCK",
+                                &format!("等待更新鎖超時: {wait_err}"),
+                            );
+                            std::process::exit(1);
+                        }
                     }
-                    Err(wait_err) => {
-                        eprintln!(
-                            "❌ 等待更新程序超時: {wait_err}；為防止讀取不一致檔案，程序終止。"
-                        );
-                        log_update(
-                            "ERROR",
-                            "STARTUP_LOCK",
-                            &format!("等待更新鎖超時: {wait_err}"),
-                        );
-                        std::process::exit(1);
+
+                    match attempt_startup_recovery(&install_dir, &args) {
+                        RecoveryStatus::SuccessRestored => return,
+                        RecoveryStatus::CleanedOrNoBackup => {
+                            if UpdateLock::is_locked(&install_dir) {
+                                continue;
+                            }
+                            let installed = get_installed_version(&install_dir);
+                            if is_newer_version(&installed, env!("CARGO_PKG_VERSION")) {
+                                println!(
+                                    "🔄 更新已由另一程序完成，正在重新啟動 Token 戰情室至新版 v{installed}..."
+                                );
+                                log_update(
+                                    "INFO",
+                                    "STARTUP_RESTART",
+                                    &format!("另一程序更新完成，重啟至 v{installed}"),
+                                );
+                                restart_current_process(&args);
+                            }
+                            break;
+                        }
+                        RecoveryStatus::LockContended => continue,
                     }
                 }
             } else {
@@ -3774,5 +3885,46 @@ update_check_interval: 5 # check every 5 days
                 "RELEVANT_ENV_VARS 應包含關鍵環境變數 {key}"
             );
         }
+    }
+
+    #[test]
+    fn get_installed_version_reads_version_file_or_fallback() {
+        let temp = std::env::temp_dir().join(format!(
+            "test-inst-ver-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let _ = fs::create_dir_all(&temp);
+
+        // 1. VERSION 檔案不存在時回退至 CARGO_PKG_VERSION
+        assert_eq!(get_installed_version(&temp), env!("CARGO_PKG_VERSION"));
+
+        // 2. VERSION 檔案包含 'v' 前綴
+        fs::write(temp.join("VERSION"), "v1.2.3\n").unwrap();
+        assert_eq!(get_installed_version(&temp), "1.2.3");
+
+        // 3. VERSION 檔案不含 'v' 前綴
+        fs::write(temp.join("VERSION"), "2.0.0").unwrap();
+        assert_eq!(get_installed_version(&temp), "2.0.0");
+
+        // 4. VERSION 檔案空白時回退
+        fs::write(temp.join("VERSION"), "  \n").unwrap();
+        assert_eq!(get_installed_version(&temp), env!("CARGO_PKG_VERSION"));
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[tokio::test]
+    async fn wait_for_parent_exit_returns_immediately_when_no_env() {
+        std::env::remove_var("_TOKEN_USAGE_INSIGHTS_WAIT_PID");
+        wait_for_parent_exit_if_requested().await;
+        assert!(std::env::var("_TOKEN_USAGE_INSIGHTS_WAIT_PID").is_err());
+    }
+
+    #[tokio::test]
+    async fn wait_for_parent_exit_cleans_env_when_pid_not_alive() {
+        // 使用一個極不可能存活的 PID
+        std::env::set_var("_TOKEN_USAGE_INSIGHTS_WAIT_PID", "999999999");
+        wait_for_parent_exit_if_requested().await;
+        assert!(std::env::var("_TOKEN_USAGE_INSIGHTS_WAIT_PID").is_err());
     }
 }
