@@ -508,19 +508,41 @@ fn get_process_cwd(pid: u32) -> Option<PathBuf> {
 
 #[cfg(all(unix, not(target_os = "linux")))]
 fn get_process_relevant_envs(pid: u32) -> Option<Vec<(String, String)>> {
-    let output = std::process::Command::new("ps")
-        .args(["-E", "-p", &pid.to_string(), "-o", "command="])
+    // macOS 上使用 ps -E 的輸出無法可靠解析包含空白的環境變數值（split_whitespace 會截斷），
+    // 改以 /usr/bin/env sysctl kern.procargs2 解析 null-byte 分隔的原始環境字串。
+    // 若無法無損讀取，回傳 None 讓呼叫端略過重啟以防路徑偏離。
+    let output = std::process::Command::new("sysctl")
+        .args(["-b", &format!("kern.procargs2.{pid}")])
         .output()
         .ok()?;
-    if !output.status.success() {
+    if !output.status.success() || output.stdout.is_empty() {
         return None;
     }
-    let text = String::from_utf8_lossy(&output.stdout);
+    // kern.procargs2 格式：argc (4 bytes LE) | exec_path\0 | args... | envs...
+    // 所有欄位以 NUL 分隔；我們跳過 argc + exec_path + argv，取 env 區段
+    let bytes = &output.stdout;
+    if bytes.len() < 4 {
+        return None;
+    }
+    let argc = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+    // 跳過 argc 欄位（4 bytes）後，以 NUL 拆分
+    let mut parts = bytes[4..].split(|&b| b == 0);
+    // 第一個部分是 exec_path，再跳過 argc 個 argv 項目
+    let _ = parts.next(); // exec_path
+    for _ in 0..argc {
+        parts.next(); // argv[i]
+    }
+    // 其餘為 KEY=VALUE 形式的環境變數
     let mut envs = Vec::new();
-    for part in text.split_whitespace() {
-        if let Some((k, v)) = part.split_once('=') {
-            if RELEVANT_ENV_VARS.contains(&k) {
-                envs.push((k.to_string(), v.to_string()));
+    for entry in parts {
+        if entry.is_empty() {
+            break;
+        }
+        if let Ok(s) = std::str::from_utf8(entry) {
+            if let Some((k, v)) = s.split_once('=') {
+                if RELEVANT_ENV_VARS.contains(&k) {
+                    envs.push((k.to_string(), v.to_string()));
+                }
             }
         }
     }
@@ -2218,6 +2240,26 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), UpdateError> {
 
     println!("⬇️ 正在下載發行包: {} ...", asset.name);
     log_update("INFO", "DOWNLOAD", &format!("開始串流下載 {}", asset.name));
+
+    // 安全性驗證：確認 asset.name 為單純檔案名稱，防止路徑穿越攻擊
+    {
+        let name_path = std::path::Path::new(&asset.name);
+        let is_safe = name_path
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)))
+            && name_path.components().count() == 1
+            && !asset.name.contains('/')
+            && !asset.name.contains('\\');
+        if !is_safe {
+            let err = format!(
+                "發行包名稱包含非法路徑字元，拒絕下載以防路徑穿越: {:?}",
+                asset.name
+            );
+            log_update("ERROR", "DOWNLOAD", &err);
+            return Err(err.into());
+        }
+    }
+
     let archive_path = tmp_guard.path.join(&asset.name);
     let actual_hash = match download_to_file_with_hash(
         &asset.browser_download_url,
@@ -3009,6 +3051,7 @@ pub(crate) fn apply_installation_with_rollback(
     }
 
     // 2. 逐一處理先前停止之進程，獨立處理監管與非監管進程
+    let mut restart_errors: Vec<String> = Vec::new();
     for spec in &process_plan.stopped_specs {
         if spec.is_supervised {
             #[cfg(windows)]
@@ -3043,12 +3086,10 @@ pub(crate) fn apply_installation_with_rollback(
                     );
                 }
                 Err(restart_err) => {
+                    let msg = format!("重啟進程 (原 PID: {}) 失敗: {restart_err}", spec.pid);
                     eprintln!("⚠️ 更新完成，但無法自動重新啟動先前停止之看板進程 (原 PID: {}): {restart_err}；請手動啟動看板服務。", spec.pid);
-                    log_update(
-                        "WARN",
-                        "RESTART",
-                        &format!("重啟進程 (原 PID: {}) 失敗: {restart_err}", spec.pid),
-                    );
+                    log_update("ERROR", "RESTART", &msg);
+                    restart_errors.push(msg);
                 }
             }
         }
@@ -3060,6 +3101,13 @@ pub(crate) fn apply_installation_with_rollback(
         if !has_supervised {
             let _ = fs::remove_file(install_dir.join(".service_restart_pending"));
         }
+    }
+
+    if !restart_errors.is_empty() {
+        let combined = restart_errors.join("; ");
+        return Err(format!(
+            "更新安裝成功，但重啟看板進程時發生錯誤: {combined}"
+        ));
     }
 
     Ok(())
@@ -3538,22 +3586,30 @@ async fn run_background_auto_update() {
                     if UpdateLock::is_locked(&install_dir) {
                         let elapsed = start_time.elapsed();
                         if elapsed >= total_timeout {
-                            eprintln!("❌ 等待更新程序超時；為防止讀取不一致檔案，程序終止。");
-                            log_update("ERROR", "STARTUP_LOCK", "等待更新鎖超時");
-                            std::process::exit(1);
+                            // 背景自動更新任務中遇到鎖競爭超時，記錄警告並放棄本輪更新；
+                            // 絕不在背景任務中呼叫 process::exit，以免強制終止正在服務的看板程序
+                            eprintln!("⚠️ 等待更新程序超時；本輪背景更新略過，看板服務繼續運行。");
+                            log_update(
+                                "WARN",
+                                "STARTUP_LOCK",
+                                "背景更新等待更新鎖超時，放棄本輪更新，不終止程序",
+                            );
+                            return;
                         }
                         let remaining = total_timeout - elapsed;
                         if let Err(wait_err) = wait_for_lock_release(&install_dir, remaining).await
                         {
                             eprintln!(
-                                "❌ 等待更新程序超時: {wait_err}；為防止讀取不一致檔案，程序終止。"
+                                "⚠️ 等待更新程序超時: {wait_err}；本輪背景更新略過，看板服務繼續運行。"
                             );
                             log_update(
-                                "ERROR",
+                                "WARN",
                                 "STARTUP_LOCK",
-                                &format!("等待更新鎖超時: {wait_err}"),
+                                &format!(
+                                    "背景更新等待更新鎖超時: {wait_err}，放棄本輪更新，不終止程序"
+                                ),
                             );
-                            std::process::exit(1);
+                            return;
                         }
                     }
 
