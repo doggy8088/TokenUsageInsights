@@ -96,15 +96,22 @@ if [[ "$install_service" == true ]]; then
       service_file="${service_dir}/${app_name}.service"
       mkdir -p "$service_dir"
 
-      systemd_escape() {
-        # Systemd unit quoting: escape \, ", $, and %
+      # General unit value escaping (for WorkingDirectory and Environment):
+      # Escapes \, ", and % (specifier expansion)
+      systemd_escape_value() {
+        printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/%/%%/g'
+      }
+
+      # Command-line escaping (for ExecStart):
+      # Escapes \, ", %, and $ (which systemd expands in ExecStart command lines)
+      systemd_escape_exec() {
         printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\$/\$\$/g' -e 's/%/%%/g'
       }
 
-      install_dir_systemd="$(systemd_escape "$install_dir")"
-      executable_systemd="$(systemd_escape "${install_dir}/${app_name}")"
-      host_systemd="$(systemd_escape "$host")"
-      port_systemd="$(systemd_escape "$port")"
+      install_dir_systemd="$(systemd_escape_value "$install_dir")"
+      executable_systemd="$(systemd_escape_exec "${install_dir}/${app_name}")"
+      host_systemd="$(systemd_escape_value "$host")"
+      port_systemd="$(systemd_escape_value "$port")"
 
       cat > "$service_file" <<SERVICE
 [Unit]

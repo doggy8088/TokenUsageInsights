@@ -149,9 +149,19 @@ while ($true) {
         -RedirectStandardError $ErrLog `
         -PassThru
 
+    $restartPendingFile = Join-Path $InstallDir ".service_restart_pending"
     $restartForLogRotation = $false
     try {
-        while (-not $Process.WaitForExit(5000)) {
+        while (-not $Process.WaitForExit(1000)) {
+            if (Test-Path -LiteralPath $restartPendingFile) {
+                Write-Host "偵測到更新程序已啟動並設定重啟協商標記，正在協調停止目前服務進程..."
+                Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue
+                try {
+                    $null = $Process.WaitForExit(5000)
+                } catch {}
+                break
+            }
+
             $outItem = Get-Item -LiteralPath $OutLog -ErrorAction SilentlyContinue
             $errItem = Get-Item -LiteralPath $ErrLog -ErrorAction SilentlyContinue
             if (($outItem -and $outItem.Length -ge $MaxActiveLogBytes) -or ($errItem -and $errItem.Length -ge $MaxActiveLogBytes)) {
@@ -174,13 +184,17 @@ while ($true) {
     }
 
     # Exit code 75 indicates the process completed an auto-update and requested the runner to restart it
-    if ($restartForLogRotation -or $Process.ExitCode -eq 75) {
+    if ($Process.ExitCode -eq 75) {
+        Remove-Item -LiteralPath $restartPendingFile -Force -ErrorAction SilentlyContinue
+        continue
+    }
+
+    if ($restartForLogRotation) {
         continue
     }
 
     # If an external updater requested this service to stop for an update,
     # wait for the update to complete and restart the service
-    $restartPendingFile = Join-Path $InstallDir ".service_restart_pending"
     if (Test-Path -LiteralPath $restartPendingFile) {
         $lockFile = Join-Path $InstallDir ".update.lock"
         $waitCount = 0

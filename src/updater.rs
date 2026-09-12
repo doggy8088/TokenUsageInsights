@@ -486,20 +486,19 @@ const RELEVANT_ENV_VARS: &[&str] = &[
 ];
 
 #[cfg(target_os = "linux")]
-fn get_process_relevant_envs(pid: u32) -> Vec<(String, String)> {
+fn get_process_relevant_envs(pid: u32) -> Option<Vec<(String, String)>> {
+    let bytes = fs::read(format!("/proc/{pid}/environ")).ok()?;
     let mut envs = Vec::new();
-    if let Ok(bytes) = fs::read(format!("/proc/{pid}/environ")) {
-        for entry in bytes.split(|&b| b == 0) {
-            if let Ok(s) = std::str::from_utf8(entry) {
-                if let Some((k, v)) = s.split_once('=') {
-                    if RELEVANT_ENV_VARS.contains(&k) {
-                        envs.push((k.to_string(), v.to_string()));
-                    }
+    for entry in bytes.split(|&b| b == 0) {
+        if let Ok(s) = std::str::from_utf8(entry) {
+            if let Some((k, v)) = s.split_once('=') {
+                if RELEVANT_ENV_VARS.contains(&k) {
+                    envs.push((k.to_string(), v.to_string()));
                 }
             }
         }
     }
-    envs
+    Some(envs)
 }
 
 #[cfg(target_os = "linux")]
@@ -508,24 +507,24 @@ fn get_process_cwd(pid: u32) -> Option<PathBuf> {
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
-fn get_process_relevant_envs(pid: u32) -> Vec<(String, String)> {
-    let mut envs = Vec::new();
-    if let Ok(output) = std::process::Command::new("ps")
+fn get_process_relevant_envs(pid: u32) -> Option<Vec<(String, String)>> {
+    let output = std::process::Command::new("ps")
         .args(["-E", "-p", &pid.to_string(), "-o", "command="])
         .output()
-    {
-        if output.status.success() {
-            let text = String::from_utf8_lossy(&output.stdout);
-            for part in text.split_whitespace() {
-                if let Some((k, v)) = part.split_once('=') {
-                    if RELEVANT_ENV_VARS.contains(&k) {
-                        envs.push((k.to_string(), v.to_string()));
-                    }
-                }
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut envs = Vec::new();
+    for part in text.split_whitespace() {
+        if let Some((k, v)) = part.split_once('=') {
+            if RELEVANT_ENV_VARS.contains(&k) {
+                envs.push((k.to_string(), v.to_string()));
             }
         }
     }
-    envs
+    Some(envs)
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
@@ -550,14 +549,115 @@ fn get_process_cwd(pid: u32) -> Option<PathBuf> {
 }
 
 #[cfg(windows)]
-fn get_process_relevant_envs(_pid: u32) -> Vec<(String, String)> {
-    let mut envs = Vec::new();
-    for &k in RELEVANT_ENV_VARS {
-        if let Ok(v) = std::env::var(k) {
-            envs.push((k.to_string(), v));
+fn get_process_relevant_envs(pid: u32) -> Option<Vec<(String, String)>> {
+    unsafe {
+        let ntdll = GetModuleHandleA(b"ntdll.dll\0".as_ptr());
+        if ntdll.is_null() {
+            return None;
         }
+        let func_ptr = GetProcAddress(ntdll, b"NtQueryInformationProcess\0".as_ptr());
+        if func_ptr.is_null() {
+            return None;
+        }
+        let nt_query: NtQueryInformationProcessFn = std::mem::transmute(func_ptr);
+
+        let mut handle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid);
+        if handle.is_null() {
+            handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        }
+        if handle.is_null() {
+            return None;
+        }
+
+        let mut pbi = std::mem::zeroed::<ProcessBasicInformation>();
+        let mut return_len = 0u32;
+        let status = nt_query(
+            handle,
+            0, // ProcessBasicInformation
+            &mut pbi as *mut _ as *mut std::ffi::c_void,
+            std::mem::size_of::<ProcessBasicInformation>() as u32,
+            &mut return_len,
+        );
+
+        if status != 0 || pbi.peb_base_address.is_null() {
+            CloseHandle(handle);
+            return None;
+        }
+
+        #[cfg(target_pointer_width = "64")]
+        let (proc_params_offset, env_offset) = (0x20usize, 0x80usize);
+        #[cfg(target_pointer_width = "32")]
+        let (proc_params_offset, env_offset) = (0x10usize, 0x48usize);
+
+        let peb_ptr = pbi.peb_base_address as usize;
+        let mut params_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut bytes_read = 0usize;
+
+        let ok1 = ReadProcessMemory(
+            handle,
+            (peb_ptr + proc_params_offset) as *const std::ffi::c_void,
+            &mut params_ptr as *mut _ as *mut std::ffi::c_void,
+            std::mem::size_of::<*mut std::ffi::c_void>(),
+            &mut bytes_read,
+        );
+
+        if ok1 == 0 || params_ptr.is_null() {
+            CloseHandle(handle);
+            return None;
+        }
+
+        let mut env_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        let ok2 = ReadProcessMemory(
+            handle,
+            (params_ptr as usize + env_offset) as *const std::ffi::c_void,
+            &mut env_ptr as *mut _ as *mut std::ffi::c_void,
+            std::mem::size_of::<*mut std::ffi::c_void>(),
+            &mut bytes_read,
+        );
+
+        if ok2 == 0 || env_ptr.is_null() {
+            CloseHandle(handle);
+            return None;
+        }
+
+        let bytes_to_page_end = 4096 - ((env_ptr as usize) & 0xFFF);
+        let read_size = bytes_to_page_end.max(512).min(4096);
+        let mut env_buf = vec![0u8; read_size];
+        let ok3 = ReadProcessMemory(
+            handle,
+            env_ptr,
+            env_buf.as_mut_ptr() as *mut std::ffi::c_void,
+            read_size,
+            &mut bytes_read,
+        );
+        CloseHandle(handle);
+
+        if ok3 == 0 || bytes_read < 4 {
+            return None;
+        }
+
+        let u16_slice: &[u16] =
+            std::slice::from_raw_parts(env_buf.as_ptr() as *const u16, bytes_read / 2);
+
+        let mut results = Vec::new();
+        let mut start = 0;
+        for i in 0..u16_slice.len() {
+            if u16_slice[i] == 0 {
+                if i > start {
+                    let entry = String::from_utf16_lossy(&u16_slice[start..i]);
+                    if let Some((k, v)) = entry.split_once('=') {
+                        if RELEVANT_ENV_VARS.contains(&k) {
+                            results.push((k.to_string(), v.to_string()));
+                        }
+                    }
+                } else {
+                    break;
+                }
+                start = i + 1;
+            }
+        }
+        Some(results)
     }
-    envs
 }
 
 #[cfg(windows)]
@@ -670,12 +770,22 @@ fn get_process_cwd(pid: u32) -> Option<PathBuf> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn get_process_relevant_envs(_pid: u32) -> Vec<(String, String)> {
-    Vec::new()
+fn get_process_relevant_envs(_pid: u32) -> Option<Vec<(String, String)>> {
+    None
 }
 
 #[cfg(not(any(unix, windows)))]
 fn get_process_cwd(_pid: u32) -> Option<PathBuf> {
+    None
+}
+
+fn get_process_relevant_envs_with_retry(pid: u32) -> Option<Vec<(String, String)>> {
+    for _ in 0..3 {
+        if let Some(envs) = get_process_relevant_envs(pid) {
+            return Some(envs);
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
     None
 }
 
@@ -2399,7 +2509,7 @@ fn stop_running_dashboard_instances(install_dir: &Path) -> Result<DashboardProce
                     let is_sup = is_process_supervised(pid, install_dir);
                     let is_server = server_pids.contains(&pid);
                     let args = get_process_cmdline_with_retry(pid);
-                    let envs = get_process_relevant_envs(pid);
+                    let envs = get_process_relevant_envs_with_retry(pid);
                     let cwd = get_process_cwd_with_retry(pid);
 
                     // 非監管進程重啟驗證：若為非監管進程，必須確保重啟所需之元資料可用，否則絕不冒險停止進程
@@ -2420,6 +2530,14 @@ fn stop_running_dashboard_instances(install_dir: &Path) -> Result<DashboardProce
                             );
                             continue;
                         }
+                        if envs.is_none() {
+                            log_update(
+                                "WARN",
+                                "STOP_SERVICE",
+                                &format!("非監管進程 (PID: {pid}) 無法讀取目標進程環境變數，略過停止以防重啟後繼承錯誤環境"),
+                            );
+                            continue;
+                        }
                     }
 
                     let spec = StoppedProcessSpec {
@@ -2434,7 +2552,7 @@ fn stop_running_dashboard_instances(install_dir: &Path) -> Result<DashboardProce
                                 None
                             }
                         }),
-                        envs,
+                        envs: envs.unwrap_or_default(),
                         cwd,
                     };
 
@@ -2607,6 +2725,11 @@ fn restart_dashboard_instance(spec: &StoppedProcessSpec, install_dir: &Path) -> 
     };
     cmd.current_dir(cwd);
 
+    // 先從繼承的環境中移除所有相關環境變數，確保重啟進程的環境不受更新器自身環境污染
+    for &key in RELEVANT_ENV_VARS {
+        cmd.env_remove(key);
+    }
+    // 再套用從目標進程記憶體讀取的原始環境變數
     for (k, v) in &spec.envs {
         cmd.env(k, v);
     }
