@@ -458,17 +458,24 @@ const RELEVANT_ENV_VARS: &[&str] = &[
     "HOST",
     "INSIGHTS_DIR",
     "TOKEN_USAGE_INSIGHTS_INSTALL_DIR",
+    "TOKEN_USAGE_INSIGHTS_AUTO_UPDATE",
+    "TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS",
+    "TOKEN_USAGE_INSIGHTS_SERVICE",
     "CORS_ALLOWED_ORIGINS",
     "ANTIGRAVITY_DIR",
     "COPILOT_DIR",
+    "COPILOT_APP_DIR",
     "CODEX_DIR",
     "CLAUDE_DIR",
     "CURSOR_DIR",
+    "CURSOR_STATE_DB",
     "GROK_DIR",
     "PI_DIR",
     "OMP_DIR",
     "MUSE_DIR",
     "VSCODE_DIR",
+    "VSCODE_USER_DATA_DIR",
+    "VSCODE_PORTABLE_DATA_DIR",
 ];
 
 #[cfg(target_os = "linux")]
@@ -3733,5 +3740,39 @@ update_check_interval: 5 # check every 5 days
         assert!(res_missing.unwrap_err().contains("找不到執行檔"));
 
         let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn relevant_env_vars_contains_all_critical_keys() {
+        let expected = [
+            "PORT",
+            "HOST",
+            "INSIGHTS_DIR",
+            "TOKEN_USAGE_INSIGHTS_INSTALL_DIR",
+            "TOKEN_USAGE_INSIGHTS_AUTO_UPDATE",
+            "TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS",
+            "TOKEN_USAGE_INSIGHTS_SERVICE",
+            "CORS_ALLOWED_ORIGINS",
+            "ANTIGRAVITY_DIR",
+            "COPILOT_DIR",
+            "COPILOT_APP_DIR",
+            "CODEX_DIR",
+            "CLAUDE_DIR",
+            "CURSOR_DIR",
+            "CURSOR_STATE_DB",
+            "GROK_DIR",
+            "PI_DIR",
+            "OMP_DIR",
+            "MUSE_DIR",
+            "VSCODE_DIR",
+            "VSCODE_USER_DATA_DIR",
+            "VSCODE_PORTABLE_DATA_DIR",
+        ];
+        for key in expected {
+            assert!(
+                RELEVANT_ENV_VARS.contains(&key),
+                "RELEVANT_ENV_VARS 應包含關鍵環境變數 {key}"
+            );
+        }
     }
 }
