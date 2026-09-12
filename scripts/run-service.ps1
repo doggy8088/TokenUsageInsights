@@ -131,6 +131,71 @@ function Rotate-ServiceLog {
     }
 }
 
+function Wait-ForUpdateCompletion {
+    param(
+        [string]$InstallDir,
+        [string]$RestartPendingFile
+    )
+
+    $lockFile = Join-Path $InstallDir ".update.lock"
+    $hasPendingMarker = Test-Path -LiteralPath $RestartPendingFile
+    $isLocked = $false
+
+    if (Test-Path -LiteralPath $lockFile) {
+        try {
+            $stream = [System.IO.File]::Open($lockFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::ReadWrite)
+            try {
+                $stream.Lock(0, 1)
+                $stream.Unlock(0, 1)
+            } catch {
+                $isLocked = $true
+            } finally {
+                $stream.Dispose()
+            }
+        } catch {
+            $isLocked = $true
+        }
+    }
+
+    if ($hasPendingMarker -or $isLocked) {
+        $waitCount = 0
+        while ($waitCount -lt 900) {
+            $isLocked = $false
+            if (Test-Path -LiteralPath $lockFile) {
+                try {
+                    $stream = [System.IO.File]::Open($lockFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::ReadWrite)
+                    try {
+                        $stream.Lock(0, 1)
+                        $stream.Unlock(0, 1)
+                    } catch {
+                        $isLocked = $true
+                    } finally {
+                        $stream.Dispose()
+                    }
+                } catch {
+                    $isLocked = $true
+                }
+            }
+
+            if (-not $isLocked) {
+                break
+            }
+            Start-Sleep -Milliseconds 100
+            $waitCount++
+        }
+
+        if ($isLocked) {
+            Write-Error "等待更新程序完成逾時（90 秒），更新鎖仍未釋放。為防止損毀安裝目錄，保持停止狀態退出。"
+            exit 1
+        }
+
+        Remove-Item -LiteralPath $RestartPendingFile -Force -ErrorAction SilentlyContinue
+        return $true
+    }
+
+    return $false
+}
+
 while ($true) {
     Rotate-ServiceLog `
         -CurrentLogPath $OutLog `
@@ -189,47 +254,14 @@ while ($true) {
         continue
     }
 
-    if ($restartForLogRotation) {
+    # 檢查是否有外部更新程序要求重啟或正在替換檔案；若有更新正在進行，等待鎖釋放後再重啟
+    # 注意：在日誌輪轉重啟 ($restartForLogRotation) 前必須先檢查此項，防止輪轉與更新併發時誤啟動舊進程
+    $updateCompleted = Wait-ForUpdateCompletion -InstallDir $InstallDir -RestartPendingFile $restartPendingFile
+    if ($updateCompleted) {
         continue
     }
 
-    # If an external updater requested this service to stop for an update,
-    # wait for the update to complete and restart the service
-    if (Test-Path -LiteralPath $restartPendingFile) {
-        $lockFile = Join-Path $InstallDir ".update.lock"
-        $waitCount = 0
-        $isLocked = $true
-        while ($waitCount -lt 900) {
-            $isLocked = $false
-            if (Test-Path -LiteralPath $lockFile) {
-                try {
-                    $stream = [System.IO.File]::Open($lockFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::ReadWrite)
-                    try {
-                        $stream.Lock(0, 1)
-                        $stream.Unlock(0, 1)
-                    } catch {
-                        $isLocked = $true
-                    } finally {
-                        $stream.Dispose()
-                    }
-                } catch {
-                    $isLocked = $true
-                }
-            }
-
-            if (-not $isLocked) {
-                break
-            }
-            Start-Sleep -Milliseconds 100
-            $waitCount++
-        }
-
-        if ($isLocked) {
-            Write-Error "等待更新程序完成逾時（90 秒），更新鎖仍未釋放。為防止損毀安裝目錄，保持停止狀態退出。"
-            exit 1
-        }
-
-        Remove-Item -LiteralPath $restartPendingFile -Force -ErrorAction SilentlyContinue
+    if ($restartForLogRotation) {
         continue
     }
 

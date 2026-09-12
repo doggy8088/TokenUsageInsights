@@ -1622,7 +1622,12 @@ fn extract_archive(archive_path: &Path, dest_dir: &Path, is_zip: bool) -> Result
                 .enclosed_name()
                 .ok_or_else(|| "ZIP 內含無效相對路徑".to_string())?
                 .to_path_buf();
-            let outpath = dest_dir.join(enclosed);
+            let outpath = dest_dir.join(&enclosed);
+            if !outpath.starts_with(dest_dir) {
+                return Err(format!(
+                    "ZIP 包含超出解壓目錄的不安全檔案路徑: {enclosed:?}"
+                ));
+            }
 
             if let Some(mode) = entry.unix_mode() {
                 if mode & 0o170000 == 0o120000 {
@@ -1682,9 +1687,16 @@ fn extract_archive(archive_path: &Path, dest_dir: &Path, is_zip: bool) -> Result
                 .to_path_buf();
 
             if path.is_absolute()
-                || path
-                    .components()
-                    .any(|c| matches!(c, std::path::Component::ParentDir))
+                || path.to_string_lossy().starts_with('/')
+                || path.to_string_lossy().starts_with('\\')
+                || path.components().any(|c| {
+                    matches!(
+                        c,
+                        std::path::Component::ParentDir
+                            | std::path::Component::RootDir
+                            | std::path::Component::Prefix(..)
+                    )
+                })
             {
                 return Err(format!("tar 包含不安全的檔案路徑: {path:?}"));
             }
@@ -1693,6 +1705,9 @@ fn extract_archive(archive_path: &Path, dest_dir: &Path, is_zip: bool) -> Result
                 return Err(format!("tar 包含不安全的連結項目: {path:?}"));
             }
             let outpath = dest_dir.join(&path);
+            if !outpath.starts_with(dest_dir) {
+                return Err(format!("tar 包含超出解壓目錄的不安全檔案路徑: {path:?}"));
+            }
 
             if entry.header().entry_type().is_dir() {
                 fs::create_dir_all(&outpath)
@@ -4832,5 +4847,60 @@ update_check_interval: 5 # check every 5 days
             let sup = get_process_supervisor_pid(my_pid);
             let _ = sup;
         }
+    }
+
+    #[test]
+    fn extract_archive_rejects_unsafe_tar_paths() {
+        let temp = std::env::temp_dir().join(format!(
+            "extract-unsafe-tar-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let _ = fs::create_dir_all(&temp);
+
+        // 建立包含不安全 RootDir / ParentDir 路徑的 tar.gz
+        let tar_path = temp.join("unsafe.tar.gz");
+        let file = fs::File::create(&tar_path).unwrap();
+        let gz = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut builder = tar::Builder::new(gz);
+
+        let data = b"hello unsafe";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+
+        // 1. 測試根路徑名稱 "/escaped.txt"
+        header.as_mut_bytes()[..12].copy_from_slice(b"/escaped.txt");
+        header.set_cksum();
+        builder.append(&header, &data[..]).unwrap();
+
+        // 2. 測試 Windows 反斜線根路徑 "\\escaped.txt"
+        let mut header2 = tar::Header::new_gnu();
+        header2.set_size(data.len() as u64);
+        header2.set_mode(0o644);
+        header2.as_mut_bytes()[..12].copy_from_slice(b"\\escaped.txt");
+        header2.set_cksum();
+        builder.append(&header2, &data[..]).unwrap();
+
+        // 3. 測試父目錄穿越路徑 "../escaped.txt"
+        let mut header3 = tar::Header::new_gnu();
+        header3.set_size(data.len() as u64);
+        header3.set_mode(0o644);
+        header3.as_mut_bytes()[..14].copy_from_slice(b"../escaped.txt");
+        header3.set_cksum();
+        builder.append(&header3, &data[..]).unwrap();
+
+        builder.into_inner().unwrap().finish().unwrap();
+
+        let extract_dest = temp.join("dest");
+        let res = extract_archive(&tar_path, &extract_dest, false);
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert!(
+            err.contains("不安全") || err.contains("超出"),
+            "應拒絕不安全的 tar 路徑: {err}"
+        );
+
+        let _ = fs::remove_dir_all(&temp);
     }
 }
