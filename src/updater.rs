@@ -1878,7 +1878,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
                 }
             }
             copy_dir_recursive(&src_path, &dst_path)?;
-        } else {
+        } else if file_type.is_file() {
             safe_replace_file(&src_path, &dst_path)
                 .map_err(|e| format!("複製檔案失敗 {src_path:?} -> {dst_path:?}: {e}"))?;
         }
@@ -2022,6 +2022,11 @@ fn restore_from_backup(backup_dir: &Path, install_dir: &Path) -> Result<(), Stri
         let src = entry.path();
         let dst = install_dir.join(&name);
         let file_type = entry.file_type().map_err(|e| e.to_string())?;
+        if file_type.is_symlink() {
+            return Err(format!(
+                "拒絕還原備份目錄中的符號連結項目 ({src:?})；更新中止以確保系統安全"
+            ));
+        }
         if file_type.is_dir() {
             if let Ok(meta) = dst.symlink_metadata() {
                 if meta.file_type().is_symlink() {
@@ -2034,7 +2039,7 @@ fn restore_from_backup(backup_dir: &Path, install_dir: &Path) -> Result<(), Stri
                     .map_err(|e| format!("清理還原目標目錄失敗 {dst:?}: {e}"))?;
             }
             copy_dir_recursive(&src, &dst)?;
-        } else {
+        } else if file_type.is_file() {
             let current_exe = std::env::current_exe().ok();
             let is_current_exe = current_exe
                 .as_ref()
@@ -2049,6 +2054,10 @@ fn restore_from_backup(backup_dir: &Path, install_dir: &Path) -> Result<(), Stri
                 safe_replace_file(&src, &dst)
                     .map_err(|e| format!("還原檔案失敗 {src:?} -> {dst:?}: {e}"))?;
             }
+        } else {
+            return Err(format!(
+                "備份目錄包含不支援的檔案類型 ({src:?})，已中止還原"
+            ));
         }
     }
     Ok(())
@@ -2777,6 +2786,9 @@ fn stop_running_dashboard_instances(install_dir: &Path) -> Result<DashboardProce
             let exe_path = match get_process_exe_path(pid) {
                 Some(p) => p,
                 None => {
+                    if !is_process_alive(pid) {
+                        continue;
+                    }
                     let msg = format!(
                         "無法驗證活躍候選進程 (PID: {pid}) 之執行檔路徑；為防在服務執行中覆寫檔案，更新中止以確保安全 (Fail-Closed)"
                     );
@@ -2786,6 +2798,9 @@ fn stop_running_dashboard_instances(install_dir: &Path) -> Result<DashboardProce
             };
 
             if matches_install_dir(&exe_path, install_dir) {
+                if !is_process_alive(pid) {
+                    continue;
+                }
                 if !is_dashboard_server_process(pid, &server_pids) {
                     let msg = format!(
                         "偵測到有 Token 戰情室指令進程 (PID: {pid}) 正在安裝目錄中執行；為防檔案衝突，更新中止以確保安全 (Fail-Closed)"
@@ -2803,6 +2818,9 @@ fn stop_running_dashboard_instances(install_dir: &Path) -> Result<DashboardProce
 
                 // 非監管進程重啟驗證：若為非監管進程，必須確保重啟所需之元資料可用，否則中止更新以防未停止進程即覆寫或重啟失敗
                 if !is_sup {
+                    if !is_process_alive(pid) {
+                        continue;
+                    }
                     if cwd.is_none() {
                         let msg = format!(
                             "非監管進程 (PID: {pid}) 無法可靠取得工作目錄，無法保證安全重啟；更新中止以確保安全 (Fail-Closed)"
@@ -4760,6 +4778,37 @@ update_check_interval: 5 # check every 5 days
         let err = res.unwrap_err();
         assert!(err.contains("符號連結") || err.contains("非正規目錄"));
         assert!(!install_dir.join("malicious.txt").exists());
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_from_backup_rejects_symlink_entries_inside_backup() {
+        let temp = std::env::temp_dir().join(format!(
+            "test-restore-entry-symlink-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let install_dir = temp.join("install");
+        let backup_dir = temp.join("backup");
+        let outside_dir = temp.join("outside");
+
+        fs::create_dir_all(&install_dir).unwrap();
+        fs::create_dir_all(&backup_dir).unwrap();
+        fs::create_dir_all(&outside_dir).unwrap();
+
+        let outside_secret = outside_dir.join("secret.txt");
+        fs::write(&outside_secret, "sensitive data").unwrap();
+        fs::write(backup_dir.join(".manifest"), "secret.txt").unwrap();
+
+        let symlink_entry = backup_dir.join("secret.txt");
+        std::os::unix::fs::symlink(&outside_secret, &symlink_entry).unwrap();
+
+        let res = restore_from_backup(&backup_dir, &install_dir);
+        assert!(res.is_err(), "應拒絕還原備份目錄中的符號連結項目");
+        let err = res.unwrap_err();
+        assert!(err.contains("符號連結項目"));
+        assert!(!install_dir.join("secret.txt").exists());
 
         let _ = fs::remove_dir_all(&temp);
     }
