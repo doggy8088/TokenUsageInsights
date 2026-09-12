@@ -556,7 +556,11 @@ try {
 
     $installTaskToStartupMigrationResult = Invoke-InstallServiceTest -HostAddress "127.0.0.1" -Port 3003 -ServiceInstall:$false -TaskTargetsLegacyInstall -RemoveStartupShortcutBeforeInstall
     Assert-Equal $false ($installTaskToStartupMigrationResult.Events -contains "StartStartupShortcut") "install.ps1 should not convert a task-based service into a Startup shortcut when rerun without -Service."
-    Assert-Equal $false ($installTaskToStartupMigrationResult.Events -contains "StartScheduledTask") "install.ps1 should not restart the scheduled task when rerun without -Service."
+    Assert-True ($installTaskToStartupMigrationResult.Events -contains "StartScheduledTask") "install.ps1 should restart the migrated scheduled task when rerun without -Service."
+
+    $installDualRegistrationResult = Invoke-InstallServiceTest -HostAddress "127.0.0.1" -Port 3003 -ServiceInstall:$false -TaskTargetsLegacyInstall
+    Assert-True ($installDualRegistrationResult.Events -contains "StartScheduledTask") "install.ps1 should prefer the scheduled task when both task and shortcut exist."
+    Assert-Equal $false ($installDualRegistrationResult.Events -contains "StartStartupShortcut") "install.ps1 should suppress Startup shortcut launch when scheduled task is present."
 
     $installWildcardResult = Invoke-InstallServiceTest -HostAddress "::" -Port 3003
     Assert-True ($installWildcardResult.Output -contains "  http://localhost:3003") "install.ps1 should print localhost for unspecified IPv6 dashboard URLs."

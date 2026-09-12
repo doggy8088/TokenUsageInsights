@@ -287,6 +287,53 @@ function Set-StartupShortcutForRunner {
     $Shortcut.Save()
 }
 
+function Register-DashboardScheduledTask {
+    param(
+        [string]$TaskName,
+        [string]$RunnerScript,
+        [string]$InstallDir,
+        [string]$HostAddress,
+        [int]$Port,
+        [string]$AutoUpdate = "",
+        [string]$UpdateIntervalHours = ""
+    )
+
+    $runnerArgs = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$RunnerScript`" -InstallDir `"$InstallDir`" -HostAddress `"$HostAddress`" -Port $Port"
+    if ($AutoUpdate) {
+        $runnerArgs += " -AutoUpdate `"$AutoUpdate`""
+    }
+    if ($UpdateIntervalHours) {
+        $runnerArgs += " -UpdateIntervalHours `"$UpdateIntervalHours`""
+    }
+
+    $taskLogonUser = Get-ScheduledTaskLogonUser
+    $Action = New-ScheduledTaskAction `
+        -Execute "powershell.exe" `
+        -Argument $runnerArgs `
+        -WorkingDirectory $InstallDir
+
+    if ($taskLogonUser) {
+        $Trigger = New-ScheduledTaskTrigger -AtLogOn -User $taskLogonUser
+    } else {
+        $Trigger = New-ScheduledTaskTrigger -AtLogOn
+    }
+
+    $Settings = New-ScheduledTaskSettingsSet `
+        -AllowStartIfOnBatteries `
+        -DontStopIfGoingOnBatteries `
+        -ExecutionTimeLimit ([TimeSpan]::Zero) `
+        -RestartCount 3 `
+        -RestartInterval (New-TimeSpan -Minutes 1)
+
+    Register-ScheduledTask `
+        -TaskName $TaskName `
+        -Action $Action `
+        -Trigger $Trigger `
+        -Settings $Settings `
+        -Description "Token 戰情室 Dashboard Background Service" `
+        -Force | Out-Null
+}
+
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 if (Test-Path (Join-Path $ScriptDir "$AppName.exe")) {
     $ReleaseDir = $ScriptDir
@@ -317,17 +364,22 @@ if ($PSCmdlet.ShouldProcess($InstallDir, "Install Token Usage Insights")) {
 
     $existingTask = $false
     $legacyTaskName = $null
+    $detectedTaskName = $null
     $taskNamesToStop = @($TaskName)
     try {
-        $existingTask = [bool](Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)
+        if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+            $existingTask = $true
+            $detectedTaskName = $TaskName
+        }
         if ($TaskName -ne "TokenUsageInsights") {
-            $legacyTaskName = "TokenUsageInsights"
-            $legacyTask = Get-ScheduledTask -TaskName $legacyTaskName -ErrorAction SilentlyContinue
+            $legacyTask = Get-ScheduledTask -TaskName "TokenUsageInsights" -ErrorAction SilentlyContinue
             if ($legacyTask) {
                 $existingTask = $true
-                $taskNamesToStop += $legacyTaskName
-            } else {
-                $legacyTaskName = $null
+                $legacyTaskName = "TokenUsageInsights"
+                $taskNamesToStop += "TokenUsageInsights"
+                if (-not $detectedTaskName) {
+                    $detectedTaskName = "TokenUsageInsights"
+                }
             }
         }
     } catch {}
@@ -340,12 +392,6 @@ if ($PSCmdlet.ShouldProcess($InstallDir, "Install Token Usage Insights")) {
 
     if ($Service -or $hadPersistentServiceRegistration) {
         Stop-ExistingServiceInstance -TaskNames $taskNamesToStop -ProcessName $AppName -InstallDir $InstallDir
-    }
-
-    if ($legacyTaskName) {
-        try {
-            Unregister-ScheduledTask -TaskName $legacyTaskName -Confirm:$false -ErrorAction SilentlyContinue
-        } catch {}
     }
 
     Copy-Item -Force $BinarySrc (Join-Path $InstallDir "$AppName.exe")
@@ -411,32 +457,14 @@ exit /b %APP_EXIT_CODE%
 
         $taskRegistered = $false
         try {
-            $taskLogonUser = Get-ScheduledTaskLogonUser
-            $Action = New-ScheduledTaskAction `
-                -Execute "powershell.exe" `
-                -Argument $runnerArgs `
-                -WorkingDirectory $InstallDir
-
-            if ($taskLogonUser) {
-                $Trigger = New-ScheduledTaskTrigger -AtLogOn -User $taskLogonUser
-            } else {
-                $Trigger = New-ScheduledTaskTrigger -AtLogOn
-            }
-
-            $Settings = New-ScheduledTaskSettingsSet `
-                -AllowStartIfOnBatteries `
-                -DontStopIfGoingOnBatteries `
-                -ExecutionTimeLimit ([TimeSpan]::Zero) `
-                -RestartCount 3 `
-                -RestartInterval (New-TimeSpan -Minutes 1)
-
-            Register-ScheduledTask `
+            Register-DashboardScheduledTask `
                 -TaskName $TaskName `
-                -Action $Action `
-                -Trigger $Trigger `
-                -Settings $Settings `
-                -Description "Token 戰情室 Dashboard Background Service" `
-                -Force | Out-Null
+                -RunnerScript $RunnerScript `
+                -InstallDir $InstallDir `
+                -HostAddress $HostAddress `
+                -Port $Port `
+                -AutoUpdate $AutoUpdate `
+                -UpdateIntervalHours $UpdateIntervalHours
             $taskRegistered = $true
         } catch {
             Write-Warning "Could not register scheduled task: $($_.Exception.Message). Falling back to Startup folder..."
@@ -477,6 +505,12 @@ exit /b %APP_EXIT_CODE%
                 Write-Warning "Scheduled task registered, but automatic start failed: $($_.Exception.Message)"
             }
 
+            if ($legacyTaskName -and ($legacyTaskName -ne $TaskName)) {
+                try {
+                    Unregister-ScheduledTask -TaskName $legacyTaskName -Confirm:$false -ErrorAction SilentlyContinue
+                } catch {}
+            }
+
             # Registration in Task Scheduler succeeded; remove any stale Startup folder shortcut
             # to avoid dual launches on logon.
             if (Test-Path $startupShortcutPath) {
@@ -491,7 +525,47 @@ exit /b %APP_EXIT_CODE%
         }
     } elseif ($hadPersistentServiceRegistration) {
         $runnerScript = Join-Path (Join-Path $InstallDir "scripts") "run-service.ps1"
-        if ($hadStartupShortcutBeforeStop -and (Test-Path $runnerScript)) {
+        if ($hadScheduledTaskBeforeStop) {
+            # 排程工作為 Windows 優先服務常駐方式。若先前同時殘留 Startup 捷徑，刪除過期捷徑避免雙重常駐搶佔連接埠
+            if (Test-Path $startupShortcutPath) {
+                try {
+                    Remove-Item -Force -Path $startupShortcutPath -ErrorAction SilentlyContinue
+                } catch {}
+            }
+
+            # 嘗試移轉或更新排程工作至目前使用者名稱隔離之 $TaskName
+            $taskToStart = $null
+            $migratedOrUpdated = $false
+            if (Test-Path $runnerScript) {
+                try {
+                    Register-DashboardScheduledTask `
+                        -TaskName $TaskName `
+                        -RunnerScript $runnerScript `
+                        -InstallDir $InstallDir `
+                        -HostAddress $HostAddress `
+                        -Port $Port `
+                        -AutoUpdate $AutoUpdate `
+                        -UpdateIntervalHours $UpdateIntervalHours
+                    $migratedOrUpdated = $true
+                    $taskToStart = $TaskName
+                    if ($legacyTaskName -and ($legacyTaskName -ne $TaskName)) {
+                        try {
+                            Unregister-ScheduledTask -TaskName $legacyTaskName -Confirm:$false -ErrorAction SilentlyContinue
+                        } catch {}
+                    }
+                } catch {}
+            }
+
+            if (-not $migratedOrUpdated) {
+                $taskToStart = $detectedTaskName
+            }
+
+            if ($taskToStart) {
+                try {
+                    Start-ScheduledTask -TaskName $taskToStart
+                } catch {}
+            }
+        } elseif ($hadStartupShortcutBeforeStop -and (Test-Path $runnerScript)) {
             try {
                 $startupShortcutPath = Get-StartupShortcutPath -EnsureDirectory
                 Set-StartupShortcutForRunner `
@@ -503,17 +577,12 @@ exit /b %APP_EXIT_CODE%
                     -AutoUpdate $AutoUpdate `
                     -UpdateIntervalHours $UpdateIntervalHours
             } catch {}
-        }
 
-        if ($hadStartupShortcutBeforeStop -and (Test-Path $startupShortcutPath)) {
-            try {
-                Start-Process $startupShortcutPath
-            } catch {}
-        }
-        if ($hadScheduledTaskBeforeStop) {
-            try {
-                Start-ScheduledTask -TaskName $TaskName
-            } catch {}
+            if (Test-Path $startupShortcutPath) {
+                try {
+                    Start-Process $startupShortcutPath
+                } catch {}
+            }
         }
     }
 

@@ -139,6 +139,69 @@ function Rotate-ServiceLog {
     }
 }
 
+function Wait-ForExecutableReady {
+    param(
+        [string]$InstallDir,
+        [string]$ExePath
+    )
+
+    # 1. 等待更新鎖 (.update.lock) 釋放（確保 updater 程序及任何更新鎖定已完全釋放）
+    $lockFile = Join-Path $InstallDir ".update.lock"
+    $waitCount = 0
+    while ($waitCount -lt 900) {
+        $isLocked = $false
+        if (Test-Path -LiteralPath $lockFile) {
+            try {
+                $stream = [System.IO.File]::Open($lockFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::ReadWrite)
+                try {
+                    $stream.Lock(0, 1)
+                    $stream.Unlock(0, 1)
+                } catch {
+                    $isLocked = $true
+                } finally {
+                    $stream.Dispose()
+                }
+            } catch {
+                $isLocked = $true
+            }
+        }
+
+        if (-not $isLocked) {
+            break
+        }
+        Start-Sleep -Milliseconds 100
+        $waitCount++
+    }
+
+    if ($isLocked) {
+        Write-Error "等待更新程序釋放更新鎖逾時（90 秒），保持停止狀態退出。"
+        exit 1
+    }
+
+    # 2. 等待 self_replace 或替換 helper 完成：確保執行檔存在且可獨占讀取（無寫入鎖定），且無臨時置換殘留檔
+    $readyCount = 0
+    while ($readyCount -lt 150) {
+        if (Test-Path -LiteralPath $ExePath) {
+            try {
+                $exeStream = [System.IO.File]::Open($ExePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+                $exeStream.Dispose()
+                $tempReplacements = @(Get-ChildItem -LiteralPath $InstallDir -Filter "*.__temp__.exe" -ErrorAction SilentlyContinue)
+                if ($tempReplacements.Count -eq 0) {
+                    break
+                }
+            } catch {}
+        }
+        Start-Sleep -Milliseconds 100
+        $readyCount++
+    }
+
+    # 3. 清理更新協商與就緒標記檔
+    $readyMarker = Join-Path $InstallDir ".update_ready"
+    $restartPending = Join-Path $InstallDir ".service_restart_pending"
+    Remove-Item -LiteralPath $readyMarker -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $restartPending -Force -ErrorAction SilentlyContinue
+}
+
 function Wait-ForUpdateCompletion {
     param(
         [string]$InstallDir,
@@ -197,7 +260,7 @@ function Wait-ForUpdateCompletion {
             exit 1
         }
 
-        Remove-Item -LiteralPath $RestartPendingFile -Force -ErrorAction SilentlyContinue
+        Wait-ForExecutableReady -InstallDir $InstallDir -ExePath (Join-Path $InstallDir "$AppName.exe")
         return $true
     }
 
@@ -256,9 +319,10 @@ while ($true) {
         }
     }
 
-    # Exit code 75 indicates the process completed an auto-update and requested the runner to restart it
+    # Exit code 75 indicates the process completed an auto-update and requested the runner to restart it.
+    # 必須以同步協定等待新執行檔完全置換並就緒後才可重啟，防範與 self_replace helper 競爭。
     if ($Process.ExitCode -eq 75) {
-        Remove-Item -LiteralPath $restartPendingFile -Force -ErrorAction SilentlyContinue
+        Wait-ForExecutableReady -InstallDir $InstallDir -ExePath $Exe
         continue
     }
 

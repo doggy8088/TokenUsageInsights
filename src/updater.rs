@@ -240,7 +240,75 @@ fn get_process_cmdline(pid: u32) -> Option<Vec<String>> {
     }
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(target_os = "macos")]
+fn get_process_cmdline(pid: u32) -> Option<Vec<String>> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
+    let mut size: libc::size_t = 0;
+    unsafe {
+        if libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        ) != 0
+            || size <= std::mem::size_of::<libc::c_int>()
+        {
+            return None;
+        }
+
+        let mut buf = vec![0u8; size];
+        if libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        ) != 0
+        {
+            return None;
+        }
+
+        let argc = *(buf.as_ptr() as *const libc::c_int);
+        if argc <= 0 {
+            return None;
+        }
+
+        let mut idx = std::mem::size_of::<libc::c_int>();
+        // Skip the exec_path (null-terminated string)
+        while idx < size && buf[idx] != 0 {
+            idx += 1;
+        }
+        // Skip null padding between exec_path and argv[0]
+        while idx < size && buf[idx] == 0 {
+            idx += 1;
+        }
+
+        let mut args = Vec::new();
+        for _ in 0..argc {
+            if idx >= size {
+                break;
+            }
+            let start = idx;
+            while idx < size && buf[idx] != 0 {
+                idx += 1;
+            }
+            let slice = &buf[start..idx];
+            args.push(String::from_utf8_lossy(slice).to_string());
+            idx += 1; // skip null delimiter
+        }
+
+        if args.is_empty() {
+            None
+        } else {
+            Some(args)
+        }
+    }
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn get_process_cmdline(pid: u32) -> Option<Vec<String>> {
     let output = std::process::Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "command="])
@@ -2263,9 +2331,16 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), UpdateError> {
         perform_startup_recovery().await;
     }
 
+    run_update_in_dir(&install_dir, options).await
+}
+
+pub(crate) async fn run_update_in_dir(
+    install_dir: &Path,
+    options: UpdateOptions,
+) -> Result<(), UpdateError> {
     // 若非純檢查，在開始任何更新操作前先取得安裝目錄之獨占鎖
     let _lock = if !options.check_only {
-        Some(match UpdateLock::try_acquire(&install_dir) {
+        Some(match UpdateLock::try_acquire(install_dir) {
             Ok(l) => l,
             Err(e) => {
                 log_update("ERROR", "LOCK", &e);
@@ -2277,7 +2352,7 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), UpdateError> {
     };
 
     // 取得更新鎖後，重新讀取安裝目錄目前實際之版本，防範排隊等待鎖期間已被其他更新程序完成升級
-    let current_version_str = get_installed_version(&install_dir);
+    let current_version_str = get_installed_version(install_dir);
     let current_version = current_version_str.as_str();
     println!("🔍 正在檢查最新發行版本...");
     log_update(
@@ -2429,7 +2504,7 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), UpdateError> {
     let install_task_res = tokio::task::spawn_blocking({
         let archive_path = archive_path.clone();
         let extract_dir = extract_dir.clone();
-        let install_dir = install_dir.clone();
+        let install_dir = install_dir.to_path_buf();
         let remote_version = remote_version.to_string();
         move || -> Result<(), String> {
             if let Err(e) = extract_archive(&archive_path, &extract_dir, is_zip) {
@@ -3383,6 +3458,9 @@ pub(crate) fn apply_installation_with_rollback(
             b"token-usage-insights:installed",
         )?;
 
+        // 寫入更新就緒標記，供 Windows 服務守護進程確認新執行檔已完全寫入就緒
+        safe_write_file(&install_dir.join(".update_ready"), b"ready")?;
+
         // 寫入提交標記，證明新版資產已全數寫入成功，救援流程不可回滾
         safe_write_file(&backup_dir.join(".committed"), b"committed")?;
 
@@ -3631,6 +3709,17 @@ fn get_target_exe(install_dir: &Path) -> PathBuf {
     install_dir.join(exec_name)
 }
 
+#[allow(dead_code)] // 於 Windows 服務重啟流程使用，並於跨平台單元測試驗證環境變數判定
+fn is_windows_service_runner() -> bool {
+    match std::env::var("TOKEN_USAGE_INSIGHTS_SERVICE") {
+        Ok(val) => {
+            let clean = val.trim();
+            clean == "1" || clean.eq_ignore_ascii_case("true")
+        }
+        Err(_) => false,
+    }
+}
+
 fn restart_current_process(exe_path: &Path, args: &[String]) -> ! {
     let exe = if exe_path.exists() {
         exe_path.to_path_buf()
@@ -3658,7 +3747,11 @@ fn restart_current_process(exe_path: &Path, args: &[String]) -> ! {
 
     #[cfg(windows)]
     {
-        if std::env::var("TOKEN_USAGE_INSIGHTS_SERVICE").is_ok() {
+        if is_windows_service_runner() {
+            if let Some(parent) = exe.parent() {
+                let ready_marker = parent.join(".update_ready");
+                let _ = safe_write_file(&ready_marker, b"ready");
+            }
             log_update(
                 "INFO",
                 "STARTUP_RESTART",
@@ -4311,6 +4404,44 @@ update_check_interval: 5 # check every 5 days
     fn process_alive_check_identifies_current_process() {
         let current_pid = std::process::id();
         assert!(is_process_alive(current_pid));
+    }
+
+    #[test]
+    fn is_windows_service_runner_checks_truthy_values() {
+        std::env::set_var("TOKEN_USAGE_INSIGHTS_SERVICE", "1");
+        assert!(is_windows_service_runner());
+
+        std::env::set_var("TOKEN_USAGE_INSIGHTS_SERVICE", "true");
+        assert!(is_windows_service_runner());
+
+        std::env::set_var("TOKEN_USAGE_INSIGHTS_SERVICE", "TRUE");
+        assert!(is_windows_service_runner());
+
+        std::env::set_var("TOKEN_USAGE_INSIGHTS_SERVICE", "0");
+        assert!(!is_windows_service_runner());
+
+        std::env::set_var("TOKEN_USAGE_INSIGHTS_SERVICE", "false");
+        assert!(!is_windows_service_runner());
+
+        std::env::remove_var("TOKEN_USAGE_INSIGHTS_SERVICE");
+        assert!(!is_windows_service_runner());
+    }
+
+    #[test]
+    fn process_cmdline_current_process_returns_valid_argv() {
+        let current_pid = std::process::id();
+        let cmdline = get_process_cmdline(current_pid);
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            assert!(
+                cmdline.is_some(),
+                "Linux and macOS should reliably retrieve process cmdline"
+            );
+            let args = cmdline.unwrap();
+            assert!(!args.is_empty(), "cmdline should have at least argv[0]");
+            let expected_args: Vec<String> = std::env::args().collect();
+            assert_eq!(args, expected_args, "cmdline should match std::env::args()");
+        }
     }
 
     #[test]
@@ -5188,6 +5319,362 @@ update_check_interval: 5 # check every 5 days
             err.contains("不安全") || err.contains("超出"),
             "應拒絕不安全的 tar 路徑: {err}"
         );
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    struct MockHttpReleaseServer {
+        addr: std::net::SocketAddr,
+        shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl MockHttpReleaseServer {
+        async fn start(
+            archive_name: String,
+            archive_bytes: Vec<u8>,
+            checksums_content: String,
+        ) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                loop {
+                    tokio::select! {
+                        _ = &mut shutdown_rx => break,
+                        accept_res = listener.accept() => {
+                            if let Ok((mut stream, _)) = accept_res {
+                                let mut req_buf = [0u8; 2048];
+                                let n = stream.read(&mut req_buf).await.unwrap_or(0);
+                                let req_str = String::from_utf8_lossy(&req_buf[..n]);
+                                let first_line = req_str.lines().next().unwrap_or("");
+                                let path = first_line.split_whitespace().nth(1).unwrap_or("");
+
+                                let (status, content_type, body): (&str, &str, Vec<u8>) = if path == format!("/{}", archive_name) {
+                                    ("200 OK", "application/octet-stream", archive_bytes.clone())
+                                } else if path == "/SHA256SUMS" {
+                                    ("200 OK", "text/plain", checksums_content.as_bytes().to_vec())
+                                } else {
+                                    ("404 Not Found", "text/plain", b"not found".to_vec())
+                                };
+
+                                let response = format!(
+                                    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                    body.len()
+                                );
+                                let _ = stream.write_all(response.as_bytes()).await;
+                                let _ = stream.write_all(&body).await;
+                                let _ = stream.flush().await;
+                            }
+                        }
+                    }
+                }
+            });
+
+            MockHttpReleaseServer {
+                addr,
+                shutdown_tx: Some(shutdown_tx),
+            }
+        }
+    }
+
+    impl Drop for MockHttpReleaseServer {
+        fn drop(&mut self) {
+            if let Some(tx) = self.shutdown_tx.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    fn create_test_release_archive(version: &str, target: &str) -> (String, Vec<u8>) {
+        use std::io::Write;
+
+        let archive_name = archive_filename(version, target);
+        let prefix = format!("{APP_NAME}-v{version}-{target}");
+        let mut files: Vec<(&str, &[u8], u32)> = vec![
+            ("VERSION", version.as_bytes(), 0o644),
+            ("pricing.csv", b"model,input,output\ntest,1,2\n", 0o644),
+            ("README.md", b"# Updated", 0o644),
+            ("LICENSE", b"MIT", 0o644),
+            ("static/index.html", b"<h1>Dashboard</h1>", 0o644),
+            ("scripts/run-service.ps1", b"# runner", 0o644),
+            ("shell/token-usage-insights.service", b"# service", 0o644),
+            ("install.sh", b"#!/bin/sh\nexit 0\n", 0o755),
+            ("install.ps1", b"# installer\n", 0o644),
+        ];
+        let exec_name = if target.contains("windows") {
+            format!("{APP_NAME}.exe")
+        } else {
+            APP_NAME.to_string()
+        };
+        files.push((&exec_name, b"binary_content_v2", 0o755));
+
+        if archive_name.ends_with(".zip") {
+            let mut buf = std::io::Cursor::new(Vec::new());
+            {
+                let mut zip = zip::ZipWriter::new(&mut buf);
+                let options = zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Deflated);
+                for (name, content, _) in files {
+                    let entry_name = format!("{prefix}/{name}");
+                    zip.start_file(entry_name, options).unwrap();
+                    zip.write_all(content).unwrap();
+                }
+                zip.finish().unwrap();
+            }
+            (archive_name, buf.into_inner())
+        } else {
+            let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            {
+                let mut builder = tar::Builder::new(&mut gz);
+                for (name, content, mode) in files {
+                    let entry_name = format!("{prefix}/{name}");
+                    let mut header = tar::Header::new_gnu();
+                    header.set_size(content.len() as u64);
+                    header.set_mode(mode);
+                    header.set_cksum();
+                    builder
+                        .append_data(&mut header, entry_name, content)
+                        .unwrap();
+                }
+                builder.finish().unwrap();
+            }
+            let bytes = gz.finish().unwrap();
+            (archive_name, bytes)
+        }
+    }
+
+    #[tokio::test]
+    async fn e2e_run_update_success() {
+        let temp = std::env::temp_dir().join(format!(
+            "test-e2e-success-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let install_dir = temp.join("install");
+        fs::create_dir_all(&install_dir).unwrap();
+        fs::write(install_dir.join("VERSION"), "0.9.0\n").unwrap();
+        fs::write(
+            install_dir.join(".install_marker"),
+            "token-usage-insights:installed",
+        )
+        .unwrap();
+        fs::write(
+            install_dir.join("pricing.csv"),
+            "model,input,output\nold,1,2\n",
+        )
+        .unwrap();
+
+        let target = current_target_triple().expect("Target triple must be supported");
+        let new_version = "0.9.1";
+        let (archive_name, archive_bytes) = create_test_release_archive(new_version, target);
+        let mut hasher = Sha256::new();
+        hasher.update(&archive_bytes);
+        let checksum = hex::encode(hasher.finalize());
+        let checksums = format!("{checksum}  {archive_name}\n");
+
+        let server =
+            MockHttpReleaseServer::start(archive_name.clone(), archive_bytes, checksums).await;
+
+        let release = GitHubRelease {
+            tag_name: format!("v{new_version}"),
+            assets: vec![
+                GitHubAsset {
+                    name: archive_name.clone(),
+                    browser_download_url: format!("http://{}/{}", server.addr, archive_name),
+                },
+                GitHubAsset {
+                    name: "SHA256SUMS".to_string(),
+                    browser_download_url: format!("http://{}/SHA256SUMS", server.addr),
+                },
+            ],
+        };
+
+        let options = UpdateOptions {
+            check_only: false,
+            force: true,
+            target_version: Some(new_version.to_string()),
+            prefetched_release: Some(release),
+        };
+
+        let res = run_update_in_dir(&install_dir, options).await;
+        assert!(
+            res.is_ok(),
+            "run_update_in_dir should succeed: {:?}",
+            res.err()
+        );
+
+        // 驗證新版檔案已確實安裝就緒
+        let updated_version = fs::read_to_string(install_dir.join("VERSION")).unwrap();
+        assert_eq!(updated_version.trim(), new_version);
+        assert!(install_dir.join("static").join("index.html").exists());
+        assert!(install_dir.join("pricing.csv").exists());
+        assert!(install_dir.join(".install_marker").exists());
+        assert!(
+            !install_dir.join(".backup").exists(),
+            ".backup 應於成功後清除"
+        );
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[tokio::test]
+    async fn e2e_run_update_checksum_mismatch_triggers_rollback() {
+        let temp = std::env::temp_dir().join(format!(
+            "test-e2e-rollback-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let install_dir = temp.join("install");
+        fs::create_dir_all(&install_dir).unwrap();
+        fs::write(install_dir.join("VERSION"), "0.9.0\n").unwrap();
+        fs::write(
+            install_dir.join(".install_marker"),
+            "token-usage-insights:installed",
+        )
+        .unwrap();
+        fs::write(
+            install_dir.join("pricing.csv"),
+            "model,input,output\noriginal,1,2\n",
+        )
+        .unwrap();
+
+        let target = current_target_triple().expect("Target triple must be supported");
+        let new_version = "0.9.1";
+        let (archive_name, archive_bytes) = create_test_release_archive(new_version, target);
+        // 刻意給予不相符之 SHA256 校驗碼觸發失敗
+        let wrong_checksum = "0000000000000000000000000000000000000000000000000000000000000000";
+        let checksums = format!("{wrong_checksum}  {archive_name}\n");
+
+        let server =
+            MockHttpReleaseServer::start(archive_name.clone(), archive_bytes, checksums).await;
+
+        let release = GitHubRelease {
+            tag_name: format!("v{new_version}"),
+            assets: vec![
+                GitHubAsset {
+                    name: archive_name.clone(),
+                    browser_download_url: format!("http://{}/{}", server.addr, archive_name),
+                },
+                GitHubAsset {
+                    name: "SHA256SUMS".to_string(),
+                    browser_download_url: format!("http://{}/SHA256SUMS", server.addr),
+                },
+            ],
+        };
+
+        let options = UpdateOptions {
+            check_only: false,
+            force: true,
+            target_version: Some(new_version.to_string()),
+            prefetched_release: Some(release),
+        };
+
+        let res = run_update_in_dir(&install_dir, options).await;
+        assert!(res.is_err(), "校驗和不符應回傳錯誤");
+        let err = res.unwrap_err();
+        assert!(
+            err.to_string().contains("校驗") || err.to_string().contains("SHA256"),
+            "錯誤訊息應提及校驗和不符: {err}"
+        );
+
+        // 驗證原版本檔案完好如初
+        let current_version = fs::read_to_string(install_dir.join("VERSION")).unwrap();
+        assert_eq!(current_version.trim(), "0.9.0");
+        let pricing = fs::read_to_string(install_dir.join("pricing.csv")).unwrap();
+        assert!(pricing.contains("original"));
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[tokio::test]
+    async fn e2e_run_update_lock_contention() {
+        let temp = std::env::temp_dir().join(format!(
+            "test-e2e-lock-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let install_dir = temp.join("install");
+        fs::create_dir_all(&install_dir).unwrap();
+        fs::write(install_dir.join("VERSION"), "0.9.0\n").unwrap();
+        fs::write(
+            install_dir.join(".install_marker"),
+            "token-usage-insights:installed",
+        )
+        .unwrap();
+
+        // 在測試中先取得更新鎖
+        let lock = UpdateLock::try_acquire(&install_dir).expect("初始鎖定應成功");
+
+        let options = UpdateOptions {
+            check_only: false,
+            force: true,
+            target_version: Some("0.9.1".to_string()),
+            prefetched_release: None,
+        };
+
+        let res = run_update_in_dir(&install_dir, options).await;
+        assert!(res.is_err(), "更新鎖被占用時應立即失敗");
+        let err = res.unwrap_err();
+        assert!(is_lock_conflict_error(&err.to_string()));
+
+        drop(lock);
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[tokio::test]
+    async fn e2e_run_update_service_handoff_and_ready_protocol() {
+        let temp = std::env::temp_dir().join(format!(
+            "test-e2e-handoff-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let install_dir = temp.join("install");
+        fs::create_dir_all(&install_dir).unwrap();
+        fs::write(install_dir.join("VERSION"), "0.9.0\n").unwrap();
+        fs::write(
+            install_dir.join(".install_marker"),
+            "token-usage-insights:installed",
+        )
+        .unwrap();
+
+        let target = current_target_triple().expect("Target triple must be supported");
+        let new_version = "0.9.1";
+        let (archive_name, archive_bytes) = create_test_release_archive(new_version, target);
+        let mut hasher = Sha256::new();
+        hasher.update(&archive_bytes);
+        let checksum = hex::encode(hasher.finalize());
+        let checksums = format!("{checksum}  {archive_name}\n");
+
+        let server =
+            MockHttpReleaseServer::start(archive_name.clone(), archive_bytes, checksums).await;
+
+        let release = GitHubRelease {
+            tag_name: format!("v{new_version}"),
+            assets: vec![
+                GitHubAsset {
+                    name: archive_name.clone(),
+                    browser_download_url: format!("http://{}/{}", server.addr, archive_name),
+                },
+                GitHubAsset {
+                    name: "SHA256SUMS".to_string(),
+                    browser_download_url: format!("http://{}/SHA256SUMS", server.addr),
+                },
+            ],
+        };
+
+        let options = UpdateOptions {
+            check_only: false,
+            force: true,
+            target_version: Some(new_version.to_string()),
+            prefetched_release: Some(release),
+        };
+
+        let res = run_update_in_dir(&install_dir, options).await;
+        assert!(res.is_ok());
+
+        // 驗證更新就緒標記已產出，確保 Windows 服務守護進程能收到就緒協商信號
+        let ready_file = install_dir.join(".update_ready");
+        assert!(ready_file.exists(), "更新成功後必須產生 .update_ready 標記");
+        let ready_content = fs::read_to_string(&ready_file).unwrap();
+        assert_eq!(ready_content.trim(), "ready");
 
         let _ = fs::remove_dir_all(&temp);
     }
