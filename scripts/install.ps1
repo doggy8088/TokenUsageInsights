@@ -491,8 +491,7 @@ exit /b %APP_EXIT_CODE%
         }
     } elseif ($hadPersistentServiceRegistration) {
         $runnerScript = Join-Path (Join-Path $InstallDir "scripts") "run-service.ps1"
-        $startupShortcutReady = Test-Path $startupShortcutPath
-        if ($hadStartupShortcutBeforeStop -and (Test-Path $runnerScript) -and -not $startupShortcutReady) {
+        if ($hadStartupShortcutBeforeStop -and (Test-Path $runnerScript)) {
             try {
                 $startupShortcutPath = Get-StartupShortcutPath -EnsureDirectory
                 Set-StartupShortcutForRunner `
@@ -503,13 +502,17 @@ exit /b %APP_EXIT_CODE%
                     -Port $Port `
                     -AutoUpdate $AutoUpdate `
                     -UpdateIntervalHours $UpdateIntervalHours
-                $startupShortcutReady = Test-Path $startupShortcutPath
             } catch {}
         }
 
-        if ($hadStartupShortcutBeforeStop -and $startupShortcutReady) {
+        if ($hadStartupShortcutBeforeStop -and (Test-Path $startupShortcutPath)) {
             try {
                 Start-Process $startupShortcutPath
+            } catch {}
+        }
+        if ($hadScheduledTaskBeforeStop) {
+            try {
+                Start-ScheduledTask -TaskName $TaskName
             } catch {}
         }
     }

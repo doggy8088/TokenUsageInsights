@@ -1015,7 +1015,7 @@ pub struct GitHubRelease {
 }
 
 pub fn current_target_triple() -> Option<&'static str> {
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
     {
         Some("x86_64-unknown-linux-gnu")
     }
@@ -1027,15 +1027,15 @@ pub fn current_target_triple() -> Option<&'static str> {
     {
         Some("x86_64-apple-darwin")
     }
-    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    #[cfg(all(target_os = "windows", target_arch = "x86_64", target_env = "msvc"))]
     {
         Some("x86_64-pc-windows-msvc")
     }
     #[cfg(not(any(
-        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"),
         all(target_os = "macos", target_arch = "aarch64"),
         all(target_os = "macos", target_arch = "x86_64"),
-        all(target_os = "windows", target_arch = "x86_64"),
+        all(target_os = "windows", target_arch = "x86_64", target_env = "msvc"),
     )))]
     {
         None
@@ -1897,8 +1897,20 @@ fn backup_installation(install_dir: &Path, backup_dir: &Path) -> Result<(), Stri
 }
 
 fn restore_from_backup(backup_dir: &Path, install_dir: &Path) -> Result<(), String> {
-    if !backup_dir.exists() {
-        return Ok(());
+    match fs::symlink_metadata(backup_dir) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                return Err(format!(
+                    "拒絕在符號連結或非正規目錄之備份目錄上執行還原 ({backup_dir:?})；更新中止以確保安全"
+                ));
+            }
+        }
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                return Ok(());
+            }
+            return Err(format!("無法讀取備份目錄元資料 ({backup_dir:?}): {e}"));
+        }
     }
 
     let manifest_path = backup_dir.join(".manifest");
@@ -3722,8 +3734,32 @@ enum RecoveryStatus {
 
 fn attempt_startup_recovery(install_dir: &Path, args: &[String]) -> RecoveryStatus {
     let backup_dir = install_dir.join(".backup");
-    if !backup_dir.exists() {
-        return RecoveryStatus::CleanedOrNoBackup;
+    match fs::symlink_metadata(&backup_dir) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                eprintln!(
+                    "❌ 偵測到 .backup 為符號連結或非正規目錄 ({backup_dir:?})；救援中止以確保安全 (Fail-Closed)。"
+                );
+                log_update(
+                    "ERROR",
+                    "STARTUP_FATAL",
+                    &format!("拒絕在符號連結或非正規目錄之 .backup 上執行救援 ({backup_dir:?})"),
+                );
+                std::process::exit(1);
+            }
+        }
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                return RecoveryStatus::CleanedOrNoBackup;
+            }
+            eprintln!("❌ 無法讀取 .backup 元資料 ({backup_dir:?}): {e}；救援中止以確保安全。");
+            log_update(
+                "ERROR",
+                "STARTUP_FATAL",
+                &format!("無法讀取 .backup 元資料: {e}"),
+            );
+            std::process::exit(1);
+        }
     }
 
     // 優先嘗試取得更新鎖，若更新鎖被占用代表另有更新程序正在進行，絕不可在此時介入修改或刪除備份目錄
@@ -4535,6 +4571,33 @@ update_check_interval: 5 # check every 5 days
         let meta = fs::symlink_metadata(&link_path).unwrap();
         assert!(!meta.file_type().is_symlink());
         assert_eq!(fs::read_to_string(&link_path).unwrap(), "12345");
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_from_backup_rejects_symlink_backup_dir() {
+        let temp = std::env::temp_dir().join(format!(
+            "test-restore-symlink-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let install_dir = temp.join("install");
+        let outside_dir = temp.join("outside");
+        let backup_link = install_dir.join(".backup");
+
+        fs::create_dir_all(&install_dir).unwrap();
+        fs::create_dir_all(&outside_dir).unwrap();
+        fs::write(outside_dir.join(".manifest"), "malicious.txt").unwrap();
+        fs::write(outside_dir.join("malicious.txt"), "evil").unwrap();
+
+        std::os::unix::fs::symlink(&outside_dir, &backup_link).unwrap();
+
+        let res = restore_from_backup(&backup_link, &install_dir);
+        assert!(res.is_err(), "應拒絕符號連結之備份目錄");
+        let err = res.unwrap_err();
+        assert!(err.contains("符號連結") || err.contains("非正規目錄"));
+        assert!(!install_dir.join("malicious.txt").exists());
 
         let _ = fs::remove_dir_all(&temp);
     }
