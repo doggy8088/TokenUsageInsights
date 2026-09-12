@@ -71,6 +71,27 @@ function Get-RunnerScriptPathFromArguments {
     return [IO.Path]::GetFullPath($expandedRunnerScriptPath)
 }
 
+function Get-RunnerArgumentValue {
+    param(
+        [string]$Arguments,
+        [string]$ParameterName
+    )
+
+    if (-not $Arguments -or -not $ParameterName) {
+        return $null
+    }
+
+    $pattern = '(?i)-(?:' + [regex]::Escape($ParameterName) + ')(?:\s+|:)(?:"([^"]*)"|(\S+))'
+    $match = [regex]::Match($Arguments, $pattern)
+    if ($match.Success) {
+        if ($match.Groups[1].Success) {
+            return $match.Groups[1].Value
+        }
+        return $match.Groups[2].Value
+    }
+    return $null
+}
+
 function Stop-ExistingServiceInstance {
     param(
         [string[]]$TaskNames,
@@ -366,10 +387,18 @@ if ($PSCmdlet.ShouldProcess($InstallDir, "Install Token Usage Insights")) {
     $legacyTaskName = $null
     $detectedTaskName = $null
     $taskNamesToStop = @($TaskName)
+    $existingTaskArguments = $null
     try {
-        if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+        $foundTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        if ($foundTask) {
             $existingTask = $true
             $detectedTaskName = $TaskName
+            if ($foundTask.Actions) {
+                $firstAction = $foundTask.Actions | Select-Object -First 1
+                if ($firstAction) {
+                    $existingTaskArguments = $firstAction.Arguments
+                }
+            }
         }
         if ($TaskName -ne "TokenUsageInsights") {
             $legacyTask = Get-ScheduledTask -TaskName "TokenUsageInsights" -ErrorAction SilentlyContinue
@@ -380,6 +409,12 @@ if ($PSCmdlet.ShouldProcess($InstallDir, "Install Token Usage Insights")) {
                 if (-not $detectedTaskName) {
                     $detectedTaskName = "TokenUsageInsights"
                 }
+                if (-not $existingTaskArguments -and $legacyTask.Actions) {
+                    $firstLegacyAction = $legacyTask.Actions | Select-Object -First 1
+                    if ($firstLegacyAction) {
+                        $existingTaskArguments = $firstLegacyAction.Arguments
+                    }
+                }
             }
         }
     } catch {}
@@ -387,8 +422,41 @@ if ($PSCmdlet.ShouldProcess($InstallDir, "Install Token Usage Insights")) {
     $hadStartupShortcutBeforeStop = $false
     $startupShortcutPath = Get-StartupShortcutPath
     $existingShortcut = Test-Path $startupShortcutPath
+    $existingShortcutArguments = $null
+    if ($existingShortcut) {
+        try {
+            $wshShell = New-Object -ComObject WScript.Shell
+            $shortcutObj = $wshShell.CreateShortcut($startupShortcutPath)
+            if ($shortcutObj) {
+                $existingShortcutArguments = $shortcutObj.Arguments
+            }
+        } catch {}
+    }
     $hadStartupShortcutBeforeStop = $existingShortcut
     $hadPersistentServiceRegistration = $hadScheduledTaskBeforeStop -or $existingShortcut
+
+    # 若未明確指定更新設定，自動繼承既有服務排程或捷徑中的設定，避免重新安裝時遺失原更新策略
+    $autoUpdateProvided = $PSBoundParameters.ContainsKey('AutoUpdate') -or ($null -ne [System.Environment]::GetEnvironmentVariable("TOKEN_USAGE_INSIGHTS_AUTO_UPDATE") -and [System.Environment]::GetEnvironmentVariable("TOKEN_USAGE_INSIGHTS_AUTO_UPDATE") -ne "")
+    $updateIntervalProvided = $PSBoundParameters.ContainsKey('UpdateIntervalHours') -or ($null -ne [System.Environment]::GetEnvironmentVariable("TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS") -and [System.Environment]::GetEnvironmentVariable("TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS") -ne "")
+    $candidateServiceArguments = @($existingTaskArguments, $existingShortcutArguments) | Where-Object { $_ }
+    if (-not $autoUpdateProvided) {
+        foreach ($candArgs in $candidateServiceArguments) {
+            $existingAutoUpdate = Get-RunnerArgumentValue -Arguments $candArgs -ParameterName "AutoUpdate"
+            if ($null -ne $existingAutoUpdate) {
+                $AutoUpdate = $existingAutoUpdate
+                break
+            }
+        }
+    }
+    if (-not $updateIntervalProvided) {
+        foreach ($candArgs in $candidateServiceArguments) {
+            $existingInterval = Get-RunnerArgumentValue -Arguments $candArgs -ParameterName "UpdateIntervalHours"
+            if ($null -ne $existingInterval) {
+                $UpdateIntervalHours = $existingInterval
+                break
+            }
+        }
+    }
 
     if ($Service -or $hadPersistentServiceRegistration) {
         Stop-ExistingServiceInstance -TaskNames $taskNamesToStop -ProcessName $AppName -InstallDir $InstallDir

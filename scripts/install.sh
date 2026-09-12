@@ -112,6 +112,22 @@ if [[ "$install_service" == true ]]; then
       host_systemd="$(systemd_escape_value "$host")"
       port_systemd="$(systemd_escape_value "$port")"
 
+      # 若未於環境變數明確指定更新設定，自動繼承既有 systemd 服務單元之設定
+      if [[ -f "$service_file" ]]; then
+        if [[ -z "${TOKEN_USAGE_INSIGHTS_AUTO_UPDATE+x}" ]]; then
+          existing_auto_update="$(sed -n -E 's/^[[:space:]]*Environment="?TOKEN_USAGE_INSIGHTS_AUTO_UPDATE=([^"]*)"?$/\1/p' "$service_file" | tail -n 1)"
+          if [[ -n "$existing_auto_update" ]]; then
+            TOKEN_USAGE_INSIGHTS_AUTO_UPDATE="$existing_auto_update"
+          fi
+        fi
+        if [[ -z "${TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS+x}" ]]; then
+          existing_interval="$(sed -n -E 's/^[[:space:]]*Environment="?TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS=([^"]*)"?$/\1/p' "$service_file" | tail -n 1)"
+          if [[ -n "$existing_interval" ]]; then
+            TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS="$existing_interval"
+          fi
+        fi
+      fi
+
       extra_env_systemd=""
       if [[ -n "${TOKEN_USAGE_INSIGHTS_AUTO_UPDATE:-}" ]]; then
         extra_env_systemd+="$(printf '\nEnvironment="TOKEN_USAGE_INSIGHTS_AUTO_UPDATE=%s"' "$(systemd_escape_value "$TOKEN_USAGE_INSIGHTS_AUTO_UPDATE")")"
@@ -174,6 +190,20 @@ SERVICE
       port_plist="$(plist_escape "$port")"
       stdout_log_plist="$(plist_escape "${launch_logs_dir}/${launch_label}.out.log")"
       stderr_log_plist="$(plist_escape "${launch_logs_dir}/${launch_label}.err.log")"
+
+      # 若未於環境變數明確指定更新設定，自動繼承既有 launchd agent plist 之設定
+      if [[ -f "$launch_agent_file" ]]; then
+        if [[ -z "${TOKEN_USAGE_INSIGHTS_AUTO_UPDATE+x}" ]]; then
+          if existing_auto_update="$(plutil -extract EnvironmentVariables.TOKEN_USAGE_INSIGHTS_AUTO_UPDATE raw -o - "$launch_agent_file" 2>/dev/null)" && [[ -n "$existing_auto_update" ]]; then
+            TOKEN_USAGE_INSIGHTS_AUTO_UPDATE="$existing_auto_update"
+          fi
+        fi
+        if [[ -z "${TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS+x}" ]]; then
+          if existing_interval="$(plutil -extract EnvironmentVariables.TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS raw -o - "$launch_agent_file" 2>/dev/null)" && [[ -n "$existing_interval" ]]; then
+            TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS="$existing_interval"
+          fi
+        fi
+      fi
 
       extra_env_plist=""
       if [[ -n "${TOKEN_USAGE_INSIGHTS_AUTO_UPDATE:-}" ]]; then

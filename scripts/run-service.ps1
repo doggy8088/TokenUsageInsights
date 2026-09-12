@@ -174,12 +174,13 @@ function Wait-ForExecutableReady {
     }
 
     if ($isLocked) {
-        Write-Error "等待更新程序釋放更新鎖逾時（90 秒），保持停止狀態退出。"
+        Write-Error -Message "等待更新程序釋放更新鎖逾時（90 秒），保持停止狀態退出。"
         exit 1
     }
 
     # 2. 等待 self_replace 或替換 helper 完成：確保執行檔存在且可獨占讀取（無寫入鎖定），且無臨時置換殘留檔
     $readyCount = 0
+    $exeReady = $false
     while ($readyCount -lt 150) {
         if (Test-Path -LiteralPath $ExePath) {
             try {
@@ -187,12 +188,18 @@ function Wait-ForExecutableReady {
                 $exeStream.Dispose()
                 $tempReplacements = @(Get-ChildItem -LiteralPath $InstallDir -Filter "*.__temp__.exe" -ErrorAction SilentlyContinue)
                 if ($tempReplacements.Count -eq 0) {
+                    $exeReady = $true
                     break
                 }
             } catch {}
         }
         Start-Sleep -Milliseconds 100
         $readyCount++
+    }
+
+    if (-not $exeReady) {
+        Write-Error -Message "等待執行檔就緒逾時（15 秒），執行檔仍未就緒或臨時替換檔殘留。保留就緒與重啟標記以利後續復原，保持停止狀態退出。"
+        exit 1
     }
 
     # 3. 清理更新協商與就緒標記檔

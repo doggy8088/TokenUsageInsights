@@ -94,6 +94,10 @@ function Invoke-InstallServiceTest {
         [int]$Port,
         [bool]$ServiceInstall = $true,
         [bool]$SeedStartupShortcut = $true,
+        [string]$SeedTaskActionArguments = $null,
+        [string]$SeedShortcutActionArguments = $null,
+        [string]$AutoUpdate = $null,
+        [string]$UpdateIntervalHours = $null,
         [switch]$FailScheduledTaskAction,
         [switch]$FailStartScheduledTask,
         [switch]$TaskTargetsLegacyInstall,
@@ -133,15 +137,30 @@ function Invoke-InstallServiceTest {
     $global:serviceEvents = New-Object System.Collections.Generic.List[string]
     $global:hostMessages = New-Object System.Collections.Generic.List[string]
     $global:mockShortcuts = @{}
+    if ($SeedShortcutActionArguments) {
+        $global:mockShortcuts[$startupShortcut] = [pscustomobject]@{
+            ShortcutPath = $startupShortcut
+            TargetPath = "powershell.exe"
+            Arguments = $SeedShortcutActionArguments
+            WorkingDirectory = $installDir
+            WindowStyle = 7
+            Description = "Token 戰情室 Dashboard Background Service"
+        }
+    }
     $global:runnerProcessAlive = $true
     $global:otherRunnerProcessAlive = $true
     $global:appProcessAlive = $true
     $global:otherAppProcessAlive = $true
     $global:scheduledTaskTriggerUser = $null
+    $global:lastTaskActionArgument = $null
     $runnerCommandLine = "powershell.exe -File `"$installDir\scripts\run-service.ps1`" -InstallDir `"$installDir`""
     $otherInstallDir = "$installDir-old"
     $otherRunnerCommandLine = "powershell.exe -File `"$otherInstallDir\scripts\run-service.ps1`" -InstallDir `"$otherInstallDir`""
-    $currentTaskActionArguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$installDir\scripts\run-service.ps1`" -InstallDir `"$installDir`" -HostAddress `"$HostAddress`" -Port $Port"
+    $currentTaskActionArguments = if ($SeedTaskActionArguments) {
+        $SeedTaskActionArguments
+    } else {
+        "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$installDir\scripts\run-service.ps1`" -InstallDir `"$installDir`" -HostAddress `"$HostAddress`" -Port $Port"
+    }
     $legacyTaskActionArguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -f:`"$otherInstallDir\scripts\run-service.ps1`" -InstallDir `"$otherInstallDir`" -HostAddress `"127.0.0.1`" -Port 3003"
     $appExecutablePath = "$installDir\token-usage-insights.exe"
     $otherAppExecutablePath = "$otherInstallDir\token-usage-insights.exe"
@@ -257,11 +276,17 @@ function Invoke-InstallServiceTest {
     }
     function New-ScheduledTaskAction {
         [CmdletBinding()]
-        param([Parameter(ValueFromRemainingArguments = $true)]$RemainingArgs)
+        param(
+            [string]$Execute,
+            [string]$Argument,
+            [string]$WorkingDirectory,
+            [Parameter(ValueFromRemainingArguments = $true)]$RemainingArgs
+        )
         if ($FailScheduledTaskAction) {
             throw "Simulated scheduled task action failure."
         }
-        @{ Action = "ok" }
+        $global:lastTaskActionArgument = $Argument
+        @{ Action = "ok"; Arguments = $Argument }
     }
     function Get-ScheduledTask {
         [CmdletBinding()]
@@ -394,6 +419,12 @@ function Invoke-InstallServiceTest {
         if ($ServiceInstall) {
             $arguments["Service"] = $true
         }
+        if ($PSBoundParameters.ContainsKey('AutoUpdate')) {
+            $arguments["AutoUpdate"] = $AutoUpdate
+        }
+        if ($PSBoundParameters.ContainsKey('UpdateIntervalHours')) {
+            $arguments["UpdateIntervalHours"] = $UpdateIntervalHours
+        }
         if ($WhatIf) {
             $arguments["WhatIf"] = $true
         }
@@ -408,6 +439,8 @@ function Invoke-InstallServiceTest {
             OtherAppStopped = (-not $global:otherAppProcessAlive)
             StartupDirectoryExists = (Test-Path -LiteralPath (Split-Path -Parent $startupShortcut))
             StartupShortcutExists = (Test-Path -LiteralPath $startupShortcut)
+            LastRegisteredTaskArguments = $global:lastTaskActionArgument
+            LastSavedShortcutArguments = if ($global:mockShortcuts.ContainsKey($startupShortcut)) { $global:mockShortcuts[$startupShortcut].Arguments } else { $null }
         }
     } finally {
         foreach ($functionName in @(
@@ -429,7 +462,7 @@ function Invoke-InstallServiceTest {
         )) {
             Remove-Item "Function:\$functionName" -ErrorAction SilentlyContinue
         }
-        Remove-Variable serviceEvents, hostMessages, mockShortcuts, runnerProcessAlive, otherRunnerProcessAlive, appProcessAlive, otherAppProcessAlive, scheduledTaskTriggerUser -Scope Global -ErrorAction SilentlyContinue
+        Remove-Variable serviceEvents, hostMessages, mockShortcuts, runnerProcessAlive, otherRunnerProcessAlive, appProcessAlive, otherAppProcessAlive, scheduledTaskTriggerUser, lastTaskActionArgument -Scope Global -ErrorAction SilentlyContinue
         $env:APPDATA = $previousAppData
         $env:USERNAME = $previousUsername
         $env:USERDOMAIN = $previousUserDomain
@@ -581,6 +614,28 @@ try {
     Assert-Equal $false ($installWhatIfResult.Output -contains "Token 戰情室 installed.") "install.ps1 should not output completion message during -WhatIf."
     Assert-Equal $false ($installWhatIfResult.Output -contains "  Registered in:   Startup folder") "install.ps1 should not report service registration during -WhatIf."
 
+    # 5. Service configuration persistence tests
+    $seededTaskArgs = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$installDir\scripts\run-service.ps1`" -InstallDir `"$installDir`" -HostAddress `"127.0.0.1`" -Port 3003 -AutoUpdate `"daily`" -UpdateIntervalHours `"12`""
+    $installPreserveTaskResult = Invoke-InstallServiceTest -HostAddress "127.0.0.1" -Port 3003 -ServiceInstall:$true -SeedTaskActionArguments $seededTaskArgs -HasCurrentAndLegacyTask
+    Assert-True ($installPreserveTaskResult.LastRegisteredTaskArguments -match '-AutoUpdate "daily"') "install.ps1 should preserve AutoUpdate in scheduled task when rerun with -Service."
+    Assert-True ($installPreserveTaskResult.LastRegisteredTaskArguments -match '-UpdateIntervalHours "12"') "install.ps1 should preserve UpdateIntervalHours in scheduled task when rerun with -Service."
+
+    $installPreserveTaskNonServiceResult = Invoke-InstallServiceTest -HostAddress "127.0.0.1" -Port 3003 -ServiceInstall:$false -SeedTaskActionArguments $seededTaskArgs -HasCurrentAndLegacyTask
+    Assert-True ($installPreserveTaskNonServiceResult.LastRegisteredTaskArguments -match '-AutoUpdate "daily"') "install.ps1 should preserve AutoUpdate in scheduled task when rerun without -Service."
+    Assert-True ($installPreserveTaskNonServiceResult.LastRegisteredTaskArguments -match '-UpdateIntervalHours "12"') "install.ps1 should preserve UpdateIntervalHours in scheduled task when rerun without -Service."
+
+    $seededShortcutArgs = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$installDir\scripts\run-service.ps1`" -InstallDir `"$installDir`" -HostAddress `"127.0.0.1`" -Port 3003 -AutoUpdate `"weekly`" -UpdateIntervalHours `"24`""
+    $installPreserveShortcutNonServiceResult = Invoke-InstallServiceTest -HostAddress "127.0.0.1" -Port 3003 -ServiceInstall:$false -SeedStartupShortcut:$true -SeedShortcutActionArguments $seededShortcutArgs
+    Assert-True ($installPreserveShortcutNonServiceResult.LastSavedShortcutArguments -match '-AutoUpdate "weekly"') "install.ps1 should preserve AutoUpdate in Startup shortcut when rerun without -Service."
+    Assert-True ($installPreserveShortcutNonServiceResult.LastSavedShortcutArguments -match '-UpdateIntervalHours "24"') "install.ps1 should preserve UpdateIntervalHours in Startup shortcut when rerun without -Service."
+
+    $installExplicitOverrideResult = Invoke-InstallServiceTest -HostAddress "127.0.0.1" -Port 3003 -ServiceInstall:$true -SeedTaskActionArguments $seededTaskArgs -HasCurrentAndLegacyTask -AutoUpdate "custom"
+    Assert-True ($installExplicitOverrideResult.LastRegisteredTaskArguments -match '-AutoUpdate "custom"') "install.ps1 should respect explicit -AutoUpdate override."
+    Assert-True ($installExplicitOverrideResult.LastRegisteredTaskArguments -match '-UpdateIntervalHours "12"') "install.ps1 should preserve omitted UpdateIntervalHours even when AutoUpdate is overridden."
+
+    $installExplicitResetResult = Invoke-InstallServiceTest -HostAddress "127.0.0.1" -Port 3003 -ServiceInstall:$true -SeedTaskActionArguments $seededTaskArgs -HasCurrentAndLegacyTask -AutoUpdate ""
+    Assert-Equal $false ($installExplicitResetResult.LastRegisteredTaskArguments -match '-AutoUpdate') "install.ps1 should allow explicitly clearing AutoUpdate with empty string."
+
     # Test Rotate-ServiceLog behavior from run-service.ps1
     $runServiceContent = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot "run-service.ps1")
     $ast = [System.Management.Automation.Language.Parser]::ParseInput($runServiceContent, [ref]$null, [ref]$null)
@@ -644,6 +699,39 @@ try {
     Assert-True ("powershell -File $mockInstallDir\run-service.ps1" -match $boundaryPattern) "Boundary regex should match unquoted install dir with leading space."
     Assert-Equal $false ('powershell -File "' + $mockInstallDir + '-old\run-service.ps1"' -match $boundaryPattern) "Boundary regex should not match install dir prefix collision."
     Assert-Equal $false ('powershell -File "' + $mockInstallDir + '2\run-service.ps1"' -match $boundaryPattern) "Boundary regex should not match install dir number suffix."
+
+    # 5. Wait-ForExecutableReady behavior verification
+    $fnDefReady = $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq "Wait-ForExecutableReady" }, $true)
+    Assert-True ($null -ne $fnDefReady -and $fnDefReady.Count -eq 1) "run-service.ps1 should define Wait-ForExecutableReady."
+
+    $readyTestDir = Join-Path $Root "executable-ready-tests"
+    New-Item -ItemType Directory -Force -Path $readyTestDir | Out-Null
+    $readyMarkerFile = Join-Path $readyTestDir ".update_ready"
+    $pendingMarkerFile = Join-Path $readyTestDir ".service_restart_pending"
+    $readyExePath = Join-Path $readyTestDir "token-usage-insights.exe"
+    $tempExePath = Join-Path $readyTestDir "new.__temp__.exe"
+
+    Set-Content -LiteralPath $readyMarkerFile -Value "1"
+    Set-Content -LiteralPath $pendingMarkerFile -Value "1"
+    Set-Content -LiteralPath $readyExePath -Value "binary"
+    Set-Content -LiteralPath $tempExePath -Value "temp"
+
+    $funcCode = $fnDefReady[0].Extent.Text.Replace("900", "2").Replace("150", "2")
+    $testScript = @"
+`$ErrorActionPreference = 'SilentlyContinue'
+$funcCode
+Wait-ForExecutableReady -InstallDir '$readyTestDir' -ExePath '$readyExePath'
+"@
+    $timeoutProc = Start-Process -FilePath $psExe -ArgumentList "-NoProfile", "-Command", $testScript -Wait -PassThru
+    Assert-Equal 1 $timeoutProc.ExitCode "Wait-ForExecutableReady should exit with code 1 on timeout when temp replacement remains."
+    Assert-True (Test-Path -LiteralPath $readyMarkerFile) "Wait-ForExecutableReady should preserve .update_ready marker on timeout."
+    Assert-True (Test-Path -LiteralPath $pendingMarkerFile) "Wait-ForExecutableReady should preserve .service_restart_pending marker on timeout."
+
+    Remove-Item -LiteralPath $tempExePath -Force
+    $successProc = Start-Process -FilePath $psExe -ArgumentList "-NoProfile", "-Command", $testScript -Wait -PassThru
+    Assert-Equal 0 $successProc.ExitCode "Wait-ForExecutableReady should exit with code 0 when executable is ready."
+    Assert-Equal $false (Test-Path -LiteralPath $readyMarkerFile) "Wait-ForExecutableReady should clean up .update_ready on success."
+    Assert-Equal $false (Test-Path -LiteralPath $pendingMarkerFile) "Wait-ForExecutableReady should clean up .service_restart_pending on success."
 
     Write-Host "Windows collector smoke tests passed."
 } finally {
