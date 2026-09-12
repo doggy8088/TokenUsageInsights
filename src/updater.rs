@@ -2661,6 +2661,68 @@ fn stop_running_dashboard_instances(install_dir: &Path) -> Result<DashboardProce
                 log_update("ERROR", "STOP_SERVICE", &err);
                 err
             })?;
+
+            // 針對 Windows 監管進程，必須明確等待所有受監管子進程完全終止，防範檔案替換時發生共享衝突 (sharing violation)
+            let supervised_pids: Vec<u32> = stopped_specs
+                .iter()
+                .filter(|s| s.is_supervised)
+                .map(|s| s.pid)
+                .collect();
+
+            if !supervised_pids.is_empty() {
+                log_update(
+                    "INFO",
+                    "STOP_SERVICE",
+                    &format!("等待 Windows 監管服務子進程安全退出: {supervised_pids:?}"),
+                );
+
+                let wait_start = Instant::now();
+                let sup_timeout = Duration::from_secs(6);
+                let sup_escalation = Duration::from_millis(2500);
+                let mut sup_escalated = false;
+                let mut remaining_sup = supervised_pids;
+
+                while !remaining_sup.is_empty() {
+                    remaining_sup.retain(|&pid| is_process_alive(pid));
+                    if remaining_sup.is_empty() {
+                        break;
+                    }
+
+                    let elapsed = wait_start.elapsed();
+                    if elapsed >= sup_timeout {
+                        let err = format!(
+                            "等待 Windows 監管服務進程 (PID: {remaining_sup:?}) 停止逾時，更新中止以保護檔案安全"
+                        );
+                        log_update("ERROR", "STOP_SERVICE", &err);
+                        let _ = fs::remove_file(&restart_pending_file);
+                        return Err(err);
+                    }
+
+                    if elapsed >= sup_escalation && !sup_escalated {
+                        sup_escalated = true;
+                        log_update(
+                            "WARN",
+                            "STOP_SERVICE",
+                            &format!(
+                                "監管進程未於 2.5 秒內退出，升級強制終止 (PID: {remaining_sup:?})"
+                            ),
+                        );
+                        for &pid in &remaining_sup {
+                            let _ = std::process::Command::new("taskkill")
+                                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                                .output();
+                        }
+                    }
+
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+
+                log_update(
+                    "INFO",
+                    "STOP_SERVICE",
+                    "所有 Windows 監管服務子進程已確認完全退出",
+                );
+            }
         }
     }
 
@@ -2825,6 +2887,181 @@ fn restart_dashboard_instance(spec: &StoppedProcessSpec, install_dir: &Path) -> 
         .map_err(|e| format!("啟動背景看板進程失敗: {e}"))?;
 
     Ok(())
+}
+
+#[cfg(windows)]
+fn is_any_dashboard_running_in_dir(install_dir: &Path) -> bool {
+    let pid_file = install_dir.join(".server.pid");
+    if let Ok(content) = fs::read_to_string(&pid_file) {
+        if let Ok(pid) = content.trim().parse::<u32>() {
+            if is_process_alive(pid) {
+                return true;
+            }
+        }
+    }
+    let insights_pid = crate::db::get_insights_dir().join(".server.pid");
+    if let Ok(content) = fs::read_to_string(&insights_pid) {
+        if let Ok(pid) = content.trim().parse::<u32>() {
+            if is_process_alive(pid) {
+                return true;
+            }
+        }
+    }
+    let exec_name = format!("{APP_NAME}.exe");
+    if let Ok(output) = std::process::Command::new("tasklist")
+        .args([
+            "/FI",
+            &format!("IMAGENAME eq {exec_name}"),
+            "/FO",
+            "CSV",
+            "/NH",
+        ])
+        .output()
+    {
+        let text = String::from_utf8_lossy(&output.stdout);
+        for line in text.lines() {
+            let parts: Vec<&str> = line.split(',').collect();
+            if parts.len() >= 2 {
+                let pid_str = parts[1].trim().trim_matches('"');
+                if let Ok(pid) = pid_str.parse::<u32>() {
+                    if let Some(exe_path) = get_process_exe_path(pid) {
+                        if matches_install_dir(&exe_path, install_dir) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+#[cfg(windows)]
+fn restart_windows_supervised_service(
+    spec: &StoppedProcessSpec,
+    install_dir: &Path,
+) -> Result<(), String> {
+    log_update(
+        "INFO",
+        "RESTART",
+        &format!(
+            "正在為監管進程 (原 PID: {}) 協調重啟或移交服務管理器...",
+            spec.pid
+        ),
+    );
+
+    // 1. 先等待短暫時間 (1.5 秒)，檢查新版 runner 是否仍在運行並已透過協商標記自動重啟看板
+    let start_wait = Instant::now();
+    while start_wait.elapsed() < Duration::from_millis(1500) {
+        if is_any_dashboard_running_in_dir(install_dir) {
+            println!("🔄 服務管理器已自動重新啟動 Token 戰情室背景看板服務。");
+            log_update("INFO", "RESTART", "服務管理器已自動重新啟動背景看板服務");
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // 2. 若看板尚未運行，代表先前為舊版 runner（在子進程終止時已退出）或管理器未自動恢復；
+    // 執行相容交接：依序嘗試以工作排程器 (Scheduled Task) 或重新啟動 run-service.ps1 守護進程
+    println!("🔄 偵測到服務管理器尚未自動重啟，正在啟動相容移交重啟服務...");
+    log_update(
+        "INFO",
+        "RESTART",
+        "服務管理器尚未自動重啟，執行相容移交重啟 (ScheduledTask / run-service.ps1)",
+    );
+
+    let mut started = false;
+
+    // 2a. 嘗試以工作排程器啟動 (TaskName: TokenUsageInsights_<USERNAME> 或 TokenUsageInsights)
+    let username = std::env::var("USERNAME").unwrap_or_default();
+    let mut task_candidates = Vec::new();
+    if !username.is_empty() {
+        task_candidates.push(format!("TokenUsageInsights_{username}"));
+    }
+    task_candidates.push("TokenUsageInsights".to_string());
+
+    for task_name in task_candidates {
+        let output = std::process::Command::new("schtasks")
+            .args(["/Run", "/TN", &task_name])
+            .output();
+        if let Ok(out) = output {
+            if out.status.success() {
+                log_update(
+                    "INFO",
+                    "RESTART",
+                    &format!("成功透過工作排程器 ({task_name}) 啟動服務"),
+                );
+                started = true;
+                break;
+            }
+        }
+    }
+
+    // 2b. 若工作排程器無法啟動（例如使用啟動資料夾 Startup 捷徑安裝之環境），啟動 run-service.ps1 作為守護進程
+    if !started {
+        let runner_script = install_dir.join("scripts").join("run-service.ps1");
+        if runner_script.exists() {
+            let mut cmd = std::process::Command::new("powershell.exe");
+            cmd.args([
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-WindowStyle",
+                "Hidden",
+                "-File",
+            ]);
+            cmd.arg(&runner_script);
+            cmd.args(["-InstallDir"]);
+            cmd.arg(install_dir);
+
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+
+            cmd.stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+
+            if let Ok(_child) = cmd.spawn() {
+                log_update(
+                    "INFO",
+                    "RESTART",
+                    "已透過 PowerShell 背景啟動 run-service.ps1 守護進程",
+                );
+                started = true;
+            } else {
+                log_update(
+                    "WARN",
+                    "RESTART",
+                    "啟動 run-service.ps1 失敗，嘗試直接啟動看板進程",
+                );
+            }
+        }
+    }
+
+    // 2c. 若以上皆未成功，回退直接以 restart_dashboard_instance 啟動看板進程
+    if !started {
+        return restart_dashboard_instance(spec, install_dir);
+    }
+
+    // 3. 等待確認新進程是否成功啟動 (最多等待 5 秒)
+    let verify_start = Instant::now();
+    while verify_start.elapsed() < Duration::from_secs(5) {
+        if is_any_dashboard_running_in_dir(install_dir) {
+            println!("🔄 已確認服務已成功重新啟動。");
+            log_update("INFO", "RESTART", "已確認監管服務重新啟動成功");
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    // 若 5 秒後仍未偵測到看板運行，嘗試直接啟動看板作為最後保障
+    log_update(
+        "WARN",
+        "RESTART",
+        "服務移交後 5 秒內未偵測到看板進程，執行直接啟動",
+    );
+    restart_dashboard_instance(spec, install_dir)
 }
 
 pub(crate) fn apply_installation_with_rollback(
@@ -3090,18 +3327,15 @@ pub(crate) fn apply_installation_with_rollback(
         if spec.is_supervised {
             #[cfg(windows)]
             {
-                println!(
-                    "🔄 Windows 服務管理器將在新版就緒後自動重啟監管進程 (原 PID: {})。",
-                    spec.pid
-                );
-                log_update(
-                    "INFO",
-                    "RESTART",
-                    &format!(
-                        "更新成功，保留標記由 Windows 服務管理器自動重啟監管進程 (原 PID: {})",
+                if let Err(restart_err) = restart_windows_supervised_service(spec, install_dir) {
+                    let msg = format!(
+                        "重啟 Windows 監管服務 (原 PID: {}) 失敗: {restart_err}",
                         spec.pid
-                    ),
-                );
+                    );
+                    eprintln!("⚠️ 更新完成，但無法重新啟動 Windows 監管服務 (原 PID: {}): {restart_err}；請手動啟動服務。", spec.pid);
+                    log_update("ERROR", "RESTART", &msg);
+                    restart_errors.push(msg);
+                }
             }
         } else {
             match restart_dashboard_instance(spec, install_dir) {
@@ -3131,10 +3365,7 @@ pub(crate) fn apply_installation_with_rollback(
 
     #[cfg(windows)]
     {
-        let has_supervised = process_plan.stopped_specs.iter().any(|s| s.is_supervised);
-        if !has_supervised {
-            let _ = fs::remove_file(install_dir.join(".service_restart_pending"));
-        }
+        let _ = fs::remove_file(install_dir.join(".service_restart_pending"));
     }
 
     if !restart_errors.is_empty() {
