@@ -97,8 +97,8 @@ if [[ "$install_service" == true ]]; then
       mkdir -p "$service_dir"
 
       systemd_escape() {
-        # Systemd unit quoting: escape \, ", and $
-        printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\$/\$\$/g'
+        # Systemd unit quoting: escape \, ", $, and %
+        printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\$/\$\$/g' -e 's/%/%%/g'
       }
 
       install_dir_systemd="$(systemd_escape "$install_dir")"

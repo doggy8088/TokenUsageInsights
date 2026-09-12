@@ -135,15 +135,16 @@ fn spawn_usage_sync_task() {
 #[tokio::main]
 async fn main() {
     updater::wait_for_parent_exit_if_requested().await;
+
+    // 啟動前優先檢查並執行本機交易救援（若先前更新意外中斷）
+    updater::perform_startup_recovery().await;
+
     if let Some(code) = cli::run(&std::env::args().collect::<Vec<_>>()).await {
         std::process::exit(code);
     }
     if let Err(error) = initialize_database_schema() {
         eprintln!("❌ 初始化 SQLite 資料庫失敗: {error}");
     }
-
-    // 啟動前優先檢查並執行本機交易救援（若先前更新意外中斷）
-    updater::perform_startup_recovery().await;
 
     // 非同步在背景排程自動更新檢查，絕不延遲 TCP 監聽與服務啟動
     updater::spawn_background_auto_update();

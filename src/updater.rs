@@ -2011,6 +2011,11 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), UpdateError> {
         _ => unreachable!(),
     };
 
+    // 若非純檢查，在開始任何更新操作前先執行啟動救援以還原或清理先前中斷之殘留備份
+    if !options.check_only {
+        perform_startup_recovery().await;
+    }
+
     // 若非純檢查，在開始任何更新操作前先取得安裝目錄之獨占鎖
     let _lock = if !options.check_only {
         Some(match UpdateLock::try_acquire(&install_dir) {

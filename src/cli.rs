@@ -188,7 +188,10 @@ pub(crate) async fn run(args: &[String]) -> Option<i32> {
         "export" => run_export(&args[2..]),
         "export-all" => run_export_all(&args[2..]),
         "import" => run_import(&args[2..]),
-        "update" | "--update" | "-u" => run_update_cli(&args[2..]).await,
+        "update" | "--update" | "-u" => {
+            crate::updater::perform_startup_recovery().await;
+            run_update_cli(&args[2..]).await
+        }
         "-h" | "--help" | "help" => {
             print_help();
             0
