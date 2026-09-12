@@ -877,6 +877,10 @@ pub fn standard_install_dir() -> Option<PathBuf> {
 pub fn detect_environment() -> EnvironmentKind {
     let raw_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from(APP_NAME));
     let exe_path = fs::canonicalize(&raw_exe).unwrap_or(raw_exe);
+    detect_environment_with_path(&exe_path)
+}
+
+pub(crate) fn detect_environment_with_path(exe_path: &Path) -> EnvironmentKind {
     let exe_dir = exe_path.parent().unwrap_or_else(|| Path::new("."));
 
     // 1. 檢查是否由 npm / npx 啟動
@@ -886,23 +890,35 @@ pub fn detect_environment() -> EnvironmentKind {
         || std::env::var_os("npm_config_user_agent").is_some()
         || std::env::var_os("npm_lifecycle_event").is_some()
     {
-        return EnvironmentKind::Npm { exe_path };
+        return EnvironmentKind::Npm {
+            exe_path: exe_path.to_path_buf(),
+        };
     }
 
-    // 2. 檢查標準安裝目錄（包含以 TOKEN_USAGE_INSIGHTS_INSTALL_DIR 明確指定的路徑）
+    // 2. 檢查是否在 Git 或 Cargo 開發原始碼目錄（優先攔截以保護原始碼不被更新機制覆寫）
+    for ancestor in exe_dir.ancestors() {
+        if ancestor.join(".git").exists() || ancestor.join("Cargo.toml").exists() {
+            return EnvironmentKind::GitOrDev {
+                root: ancestor.to_path_buf(),
+                exe_path: exe_path.to_path_buf(),
+            };
+        }
+    }
+
+    // 3. 檢查標準安裝目錄（包含以 TOKEN_USAGE_INSIGHTS_INSTALL_DIR 明確指定的路徑）
     if let Some(std_dir) = standard_install_dir() {
         let canonical_std_dir = fs::canonicalize(&std_dir).unwrap_or(std_dir);
         if let Ok(canonical_exe_dir) = fs::canonicalize(exe_dir) {
             if canonical_exe_dir == canonical_std_dir {
                 return EnvironmentKind::StandardInstalled {
                     install_dir: canonical_std_dir,
-                    exe_path,
+                    exe_path: exe_path.to_path_buf(),
                 };
             }
         }
     }
 
-    // 3. 檢查安裝標記檔（由 install.sh 或 install.ps1 寫入的自訂安裝目錄）
+    // 4. 檢查安裝標記檔（由 install.sh 或 install.ps1 寫入的自訂安裝目錄）
     let marker_path = exe_dir.join(".install_marker");
     if let Ok(meta) = fs::symlink_metadata(&marker_path) {
         if meta.is_file() && !meta.file_type().is_symlink() {
@@ -912,49 +928,30 @@ pub fn detect_environment() -> EnvironmentKind {
                         fs::canonicalize(exe_dir).unwrap_or_else(|_| exe_dir.to_path_buf());
                     return EnvironmentKind::StandardInstalled {
                         install_dir,
-                        exe_path,
+                        exe_path: exe_path.to_path_buf(),
                     };
                 }
             }
         }
     }
 
-    // 4. 兼容舊版既有自訂安裝（在引入 .install_marker 之前建立的安裝目錄）：
-    // 若目錄包含完整必要資產（pricing.csv, VERSION, static/index.html）且非 Cargo target 目錄
+    // 5. 兼容舊版既有自訂安裝（在引入 .install_marker 之前建立的安裝目錄）：
+    // 若目錄包含完整必要資產（pricing.csv, VERSION, static/index.html）
     let has_installed_assets = exe_dir.join("pricing.csv").is_file()
         && exe_dir.join("VERSION").is_file()
         && exe_dir.join("static").join("index.html").is_file();
-    let is_cargo_target = exe_dir
-        .file_name()
-        .and_then(|n| n.to_str())
-        .map(|name| name == "debug" || name == "release")
-        .unwrap_or(false)
-        && exe_dir
-            .parent()
-            .and_then(|p| p.file_name())
-            .and_then(|n| n.to_str())
-            .map(|name| name == "target")
-            .unwrap_or(false);
 
-    if has_installed_assets && !is_cargo_target {
+    if has_installed_assets {
         let install_dir = fs::canonicalize(exe_dir).unwrap_or_else(|_| exe_dir.to_path_buf());
         return EnvironmentKind::StandardInstalled {
             install_dir,
-            exe_path,
+            exe_path: exe_path.to_path_buf(),
         };
     }
 
-    // 5. 檢查是否在 Git 或 Cargo 開發原始碼目錄
-    for ancestor in exe_dir.ancestors() {
-        if ancestor.join(".git").exists() || ancestor.join("Cargo.toml").exists() {
-            return EnvironmentKind::GitOrDev {
-                root: ancestor.to_path_buf(),
-                exe_path,
-            };
-        }
+    EnvironmentKind::Other {
+        exe_path: exe_path.to_path_buf(),
     }
-
-    EnvironmentKind::Other { exe_path }
 }
 
 pub fn parse_semver(v: &str) -> Option<(u32, u32, u32)> {
@@ -1621,13 +1618,23 @@ fn backup_installation(install_dir: &Path, backup_dir: &Path) -> Result<(), Stri
         for &item in MANAGED_ITEMS {
             let src = install_dir.join(item);
             let dst = staging_dir.join(item);
-            if src.exists() {
-                manifest_entries.push(item);
-                if src.is_dir() {
+            if let Ok(meta) = src.symlink_metadata() {
+                if meta.file_type().is_symlink() {
+                    return Err(format!(
+                        "安裝目錄包含不安全的符號連結項目 ({src:?})，已拒絕備份以確保系統安全"
+                    ));
+                }
+                if meta.is_dir() {
+                    manifest_entries.push(item);
                     copy_dir_recursive(&src, &dst)?;
-                } else if src.is_file() {
+                } else if meta.is_file() {
+                    manifest_entries.push(item);
                     safe_replace_file(&src, &dst)
                         .map_err(|e| format!("備份檔案失敗 {item}: {e}"))?;
+                } else {
+                    return Err(format!(
+                        "安裝目錄包含不支援的檔案類型 ({src:?})，已中止備份"
+                    ));
                 }
             }
         }
@@ -4226,5 +4233,76 @@ update_check_interval: 5 # check every 5 days
         std::env::set_var("_TOKEN_USAGE_INSIGHTS_WAIT_PID", "999999999");
         wait_for_parent_exit_if_requested().await;
         assert!(std::env::var("_TOKEN_USAGE_INSIGHTS_WAIT_PID").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_installation_rejects_top_level_symlink() {
+        let temp = std::env::temp_dir().join(format!(
+            "backup-symlink-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let install_dir = temp.join("install");
+        let external_dir = temp.join("external");
+        let backup_dir = temp.join(".backup");
+        fs::create_dir_all(&install_dir).unwrap();
+        fs::create_dir_all(&external_dir).unwrap();
+
+        // 建立指向外部目錄的 top-level symlink "static"
+        std::os::unix::fs::symlink(&external_dir, install_dir.join("static")).unwrap();
+
+        let res = backup_installation(&install_dir, &backup_dir);
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert!(err.contains("符號連結"), "應拒絕包含符號連結的項目: {err}");
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn detect_environment_prioritizes_git_or_dev_over_markers_and_assets() {
+        let temp = std::env::temp_dir().join(format!(
+            "detect-env-test-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let git_root = temp.join("repo");
+        let bin_dir = git_root.join("target").join("release");
+        fs::create_dir_all(git_root.join(".git")).unwrap();
+        fs::create_dir_all(&bin_dir).unwrap();
+
+        // 在 bin_dir 放置 .install_marker 以及所有已安裝資產
+        fs::write(
+            bin_dir.join(".install_marker"),
+            "token-usage-insights:installed",
+        )
+        .unwrap();
+        fs::write(bin_dir.join("pricing.csv"), "model,cost").unwrap();
+        fs::write(bin_dir.join("VERSION"), "0.9.5").unwrap();
+        fs::create_dir_all(bin_dir.join("static")).unwrap();
+        fs::write(bin_dir.join("static").join("index.html"), "<html></html>").unwrap();
+
+        let dummy_exe = bin_dir.join(APP_NAME);
+        let env_kind = detect_environment_with_path(&dummy_exe);
+        assert!(
+            matches!(env_kind, EnvironmentKind::GitOrDev { .. }),
+            "即使殘留 .install_marker 或安裝資產，在 git 儲存庫內執行應優先判定為 GitOrDev"
+        );
+
+        // 在獨立安裝目錄中，且無任何 git 或 cargo ancestor，應判定為 StandardInstalled
+        let standalone_install = temp.join("standalone_app");
+        fs::create_dir_all(&standalone_install).unwrap();
+        fs::write(
+            standalone_install.join(".install_marker"),
+            "token-usage-insights:installed",
+        )
+        .unwrap();
+        let standalone_exe = standalone_install.join(APP_NAME);
+        let standalone_env = detect_environment_with_path(&standalone_exe);
+        assert!(
+            matches!(standalone_env, EnvironmentKind::StandardInstalled { .. }),
+            "無 git/cargo ancestor 且含有效 marker 應判定為 StandardInstalled"
+        );
+
+        let _ = fs::remove_dir_all(&temp);
     }
 }

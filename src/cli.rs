@@ -559,10 +559,6 @@ async fn run_update_cli(args: &[String]) -> i32 {
             }
             "-v" | "--target-version" => {
                 let val = next_flag_value(args, &mut i, "target-version");
-                if val.starts_with('-') {
-                    eprintln!("缺少 --target-version 的值");
-                    return 2;
-                }
                 target_version = Some(val);
             }
             arg => {
@@ -591,10 +587,26 @@ async fn run_update_cli(args: &[String]) -> i32 {
     }
 }
 
+fn is_option_token(val: &str) -> bool {
+    if val == "-" {
+        return false;
+    }
+    if val.starts_with("--") && val.len() > 2 {
+        return true;
+    }
+    if val.starts_with('-')
+        && val.len() == 2
+        && val.chars().nth(1).is_some_and(|c| c.is_ascii_alphabetic())
+    {
+        return true;
+    }
+    false
+}
+
 fn parse_flag_value(args: &[String], i: &mut usize, flag: &str) -> Result<String, String> {
     match args.get(*i + 1) {
         Some(value) => {
-            if value.starts_with('-') {
+            if is_option_token(value) {
                 return Err(format!("缺少 --{flag} 的值"));
             }
             *i += 1;
@@ -896,5 +908,22 @@ mod tests {
         let val = super::parse_flag_value(&args_valid, &mut j, "target-version").unwrap();
         assert_eq!(val, "v0.9.6");
         assert_eq!(j, 2);
+
+        // 驗證以 dash 開頭之合法檔名（如 -report.json、-input.json）與單一 dash (-) 均可正確接受
+        let mut k = 1;
+        let args_dash_file = vec![
+            "export".to_string(),
+            "--out".to_string(),
+            "-report.json".to_string(),
+        ];
+        let val_file = super::parse_flag_value(&args_dash_file, &mut k, "out").unwrap();
+        assert_eq!(val_file, "-report.json");
+        assert_eq!(k, 2);
+
+        let mut m = 1;
+        let args_single_dash = vec!["export".to_string(), "--out".to_string(), "-".to_string()];
+        let val_dash = super::parse_flag_value(&args_single_dash, &mut m, "out").unwrap();
+        assert_eq!(val_dash, "-");
+        assert_eq!(m, 2);
     }
 }
