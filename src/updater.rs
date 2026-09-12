@@ -941,12 +941,12 @@ pub fn create_server_pid_guard() -> ServerPidGuard {
     let env_kind = detect_environment();
     if let EnvironmentKind::StandardInstalled { install_dir, .. } = env_kind {
         let p = install_dir.join(".server.pid");
-        if fs::write(&p, &my_pid).is_ok() {
+        if safe_write_file(&p, my_pid.as_bytes()).is_ok() {
             paths.push(p);
         }
     }
     let insights_pid = crate::db::get_insights_dir().join(".server.pid");
-    if fs::write(&insights_pid, &my_pid).is_ok() {
+    if safe_write_file(&insights_pid, my_pid.as_bytes()).is_ok() {
         paths.push(insights_pid);
     }
 
@@ -1608,9 +1608,16 @@ fn safe_replace_file(src: &Path, dst: &Path) -> Result<(), String> {
 }
 
 fn safe_write_file(dst: &Path, content: &[u8]) -> Result<(), String> {
+    if let Some(parent) = dst.parent() {
+        if !parent.exists() {
+            let _ = fs::create_dir_all(parent);
+        }
+    }
     if let Ok(meta) = dst.symlink_metadata() {
         if meta.file_type().is_symlink() {
             let _ = fs::remove_file(dst);
+        } else if meta.is_dir() {
+            return Err(format!("目標路徑為目錄，無法覆寫檔案 ({dst:?})"));
         }
     }
     let tmp = dst.with_extension(format!("tmp.{}", std::process::id()));
@@ -3011,6 +3018,65 @@ fn is_any_dashboard_running_in_dir(install_dir: &Path) -> bool {
     false
 }
 
+#[allow(dead_code)] // 於 Windows 服務重啟流程使用，並於跨平台單元測試驗證環境變數與參數傳遞
+fn configure_windows_runner_command(
+    cmd: &mut std::process::Command,
+    runner_script: &Path,
+    install_dir: &Path,
+    spec: &StoppedProcessSpec,
+) {
+    cmd.args([
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-WindowStyle",
+        "Hidden",
+        "-File",
+    ]);
+    cmd.arg(runner_script);
+    cmd.args(["-InstallDir"]);
+    cmd.arg(install_dir);
+
+    let get_env = |target: &str| -> Option<&str> {
+        spec.envs
+            .iter()
+            .find(|(k, _)| k == target)
+            .map(|(_, v)| v.as_str())
+    };
+
+    if let Some(host) = get_env("HOST") {
+        cmd.args(["-HostAddress", host]);
+    }
+    if let Some(port) = get_env("PORT") {
+        cmd.args(["-Port", port]);
+    }
+    if let Some(auto_update) = get_env("TOKEN_USAGE_INSIGHTS_AUTO_UPDATE") {
+        cmd.args(["-AutoUpdate", auto_update]);
+    }
+    if let Some(interval) = get_env("TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS") {
+        cmd.args(["-UpdateIntervalHours", interval]);
+    }
+
+    let cwd = match &spec.cwd {
+        Some(c) => c.as_path(),
+        None => install_dir,
+    };
+    cmd.current_dir(cwd);
+
+    // 先從繼承的環境中移除所有相關環境變數，確保守護進程不受更新器自身環境污染
+    for &key in RELEVANT_ENV_VARS {
+        cmd.env_remove(key);
+    }
+    // 套用從目標進程記憶體讀取的原始環境變數 (含 INSIGHTS_DIR, 自訂資料庫路徑等)
+    for (k, v) in &spec.envs {
+        cmd.env(k, v);
+    }
+
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+}
+
 #[cfg(windows)]
 fn restart_windows_supervised_service(
     spec: &StoppedProcessSpec,
@@ -3095,25 +3161,11 @@ fn restart_windows_supervised_service(
         let runner_script = install_dir.join("scripts").join("run-service.ps1");
         if runner_script.exists() {
             let mut cmd = std::process::Command::new("powershell.exe");
-            cmd.args([
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-WindowStyle",
-                "Hidden",
-                "-File",
-            ]);
-            cmd.arg(&runner_script);
-            cmd.args(["-InstallDir"]);
-            cmd.arg(install_dir);
+            configure_windows_runner_command(&mut cmd, &runner_script, install_dir, spec);
 
             use std::os::windows::process::CommandExt;
             const CREATE_NO_WINDOW: u32 = 0x08000000;
             cmd.creation_flags(CREATE_NO_WINDOW);
-
-            cmd.stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null());
 
             if let Ok(_child) = cmd.spawn() {
                 log_update(
@@ -4427,7 +4479,7 @@ update_check_interval: 5 # check every 5 days
             let _guard = ServerPidGuard {
                 paths: vec![pid_path.clone()],
             };
-            fs::write(&pid_path, std::process::id().to_string()).unwrap();
+            safe_write_file(&pid_path, std::process::id().to_string().as_bytes()).unwrap();
             assert!(pid_path.exists());
         }
 
@@ -4435,6 +4487,35 @@ update_check_interval: 5 # check every 5 days
             !pid_path.exists(),
             ".server.pid should be removed when guard is dropped"
         );
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn safe_write_file_replaces_symlink_without_modifying_target() {
+        let temp = std::env::temp_dir().join(format!(
+            "safe-write-symlink-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        fs::create_dir_all(&temp).unwrap();
+
+        let sensitive_target = temp.join("sensitive.txt");
+        fs::write(&sensitive_target, "sensitive content").unwrap();
+
+        let link_path = temp.join(".server.pid");
+        std::os::unix::fs::symlink(&sensitive_target, &link_path).unwrap();
+
+        assert!(safe_write_file(&link_path, b"12345").is_ok());
+
+        // 敏感目標檔案內容絕不能被竄改
+        let target_content = fs::read_to_string(&sensitive_target).unwrap();
+        assert_eq!(target_content, "sensitive content");
+
+        // 符號連結應已被替換為正規檔案，且內容為新寫入之內容
+        let meta = fs::symlink_metadata(&link_path).unwrap();
+        assert!(!meta.file_type().is_symlink());
+        assert_eq!(fs::read_to_string(&link_path).unwrap(), "12345");
+
         let _ = fs::remove_dir_all(&temp);
     }
 
@@ -4743,6 +4824,69 @@ update_check_interval: 5 # check every 5 days
         assert!(res_missing.unwrap_err().contains("找不到執行檔"));
 
         let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn configure_windows_runner_command_preserves_envs_and_arguments() {
+        let install_dir = PathBuf::from("C:\\Program Files\\TokenUsageInsights");
+        let runner_script = install_dir.join("scripts").join("run-service.ps1");
+        let envs = vec![
+            ("HOST".to_string(), "127.0.0.1".to_string()),
+            ("PORT".to_string(), "8080".to_string()),
+            ("INSIGHTS_DIR".to_string(), "C:\\data\\insights".to_string()),
+            (
+                "TOKEN_USAGE_INSIGHTS_AUTO_UPDATE".to_string(),
+                "1".to_string(),
+            ),
+            (
+                "TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS".to_string(),
+                "12".to_string(),
+            ),
+        ];
+
+        let spec = StoppedProcessSpec {
+            pid: 1234,
+            exe_path: install_dir.join("token-usage-insights.exe"),
+            cwd: Some(PathBuf::from("C:\\working")),
+            args: Some(vec!["token-usage-insights".to_string()]),
+            envs,
+            is_server: true,
+            is_supervised: true,
+            supervisor_pid: None,
+        };
+
+        let mut cmd = std::process::Command::new("powershell.exe");
+        configure_windows_runner_command(&mut cmd, &runner_script, &install_dir, &spec);
+
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|s| s.to_string_lossy().to_string())
+            .collect();
+        assert!(args.contains(&"-File".to_string()));
+        assert!(args.contains(&"-InstallDir".to_string()));
+        assert!(args.contains(&"-HostAddress".to_string()));
+        assert!(args.contains(&"127.0.0.1".to_string()));
+        assert!(args.contains(&"-Port".to_string()));
+        assert!(args.contains(&"8080".to_string()));
+        assert!(args.contains(&"-AutoUpdate".to_string()));
+        assert!(args.contains(&"1".to_string()));
+        assert!(args.contains(&"-UpdateIntervalHours".to_string()));
+        assert!(args.contains(&"12".to_string()));
+
+        let env_map: std::collections::HashMap<String, Option<String>> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().to_string(),
+                    v.map(|s| s.to_string_lossy().to_string()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            env_map.get("INSIGHTS_DIR").and_then(|v| v.as_deref()),
+            Some("C:\\data\\insights")
+        );
+        assert_eq!(cmd.get_current_dir(), Some(Path::new("C:\\working")));
     }
 
     #[test]
