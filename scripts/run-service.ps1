@@ -283,7 +283,14 @@ function Wait-ForUpdateCompletion {
     return $false
 }
 
+$readyMarker = Join-Path $InstallDir ".update_ready"
+$restartPendingFile = Join-Path $InstallDir ".service_restart_pending"
+
 while ($true) {
+    if ((Test-Path -LiteralPath $readyMarker) -or (Test-Path -LiteralPath $restartPendingFile)) {
+        Wait-ForExecutableReady -InstallDir $InstallDir -ExePath $Exe
+    }
+
     Rotate-ServiceLog `
         -CurrentLogPath $OutLog `
         -PreviousLogPath (Join-Path $LogDir "$AppName.prev.out.log") `
@@ -301,7 +308,6 @@ while ($true) {
         -RedirectStandardError $ErrLog `
         -PassThru
 
-    $restartPendingFile = Join-Path $InstallDir ".service_restart_pending"
     $restartForLogRotation = $false
     try {
         while (-not $Process.WaitForExit(1000)) {

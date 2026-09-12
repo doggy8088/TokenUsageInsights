@@ -675,7 +675,12 @@ exit /b %APP_EXIT_CODE%
             }
 
             if (-not $migratedOrUpdated) {
-                $taskToStart = $detectedTaskName
+                # 若移轉失敗且舊版排程工作仍存在，退回啟動舊版工作以防服務離線；否則啟動原偵測之工作
+                if ($legacyTaskName -and [bool](Get-ScheduledTask -TaskName $legacyTaskName -ErrorAction SilentlyContinue)) {
+                    $taskToStart = $legacyTaskName
+                } else {
+                    $taskToStart = $detectedTaskName
+                }
             }
 
             if ($taskToStart) {

@@ -656,6 +656,11 @@ try {
     Assert-Equal $false ($nonServiceFailedLegacyResult.RemainingTasks -contains "TokenUsageInsights_test-user") "install.ps1 should revert user task when legacy unregistration fails in non-Service path."
     Assert-True ($nonServiceFailedLegacyResult.Events -contains "StartScheduledTask") "install.ps1 should fall back to starting the detected legacy task when migration fails."
 
+    $nonServiceBothTasksFailedLegacyResult = Invoke-InstallServiceTest -HostAddress "127.0.0.1" -Port 3003 -ServiceInstall:$false -HasCurrentAndLegacyTask -FailUnregisterLegacyTask -RemoveStartupShortcutBeforeInstall
+    Assert-True ($nonServiceBothTasksFailedLegacyResult.RemainingTasks -contains "TokenUsageInsights") "install.ps1 should preserve legacy task when unregistration fails while both tasks exist."
+    Assert-Equal $false ($nonServiceBothTasksFailedLegacyResult.RemainingTasks -contains "TokenUsageInsights_test-user") "install.ps1 should revert user task when legacy unregistration fails while both tasks exist."
+    Assert-True ($nonServiceBothTasksFailedLegacyResult.Events -contains "StartScheduledTask") "install.ps1 should fall back to starting legacy task instead of removed user task."
+
     $threwFallbackCleanup = $false
     try {
         Invoke-InstallServiceTest -HostAddress "127.0.0.1" -Port 3003 -TaskTargetsLegacyInstall -FailScheduledTaskAction -FailUnregisterLegacyTask
@@ -793,6 +798,14 @@ Wait-ForExecutableReady -InstallDir '$readyTestDir' -ExePath '$readyExePath'
     Assert-Equal 0 $successProc.ExitCode "Wait-ForExecutableReady should exit with code 0 when executable is ready."
     Assert-Equal $false (Test-Path -LiteralPath $readyMarkerFile) "Wait-ForExecutableReady should clean up .update_ready on success."
     Assert-Equal $false (Test-Path -LiteralPath $pendingMarkerFile) "Wait-ForExecutableReady should clean up .service_restart_pending on success."
+
+    # 6. Verify run-service.ps1 loop gates launch when update markers exist
+    $loopGateAst = [System.Management.Automation.Language.Parser]::ParseInput($runServiceContent, [ref]$null, [ref]$null)
+    $allWhileLoops = $loopGateAst.FindAll({ $args[0] -is [System.Management.Automation.Language.WhileStatementAst] }, $true)
+    $mainServiceLoop = $allWhileLoops | Where-Object { $_.Body.Extent.Text -match 'Rotate-ServiceLog' -and $_.Body.Extent.Text -match 'Start-Process' }
+    Assert-True ($null -ne $mainServiceLoop) "run-service.ps1 should contain main service while loop."
+    $whileBodyText = $mainServiceLoop.Body.Extent.Text
+    Assert-True ($whileBodyText -match '(?s)Wait-ForExecutableReady.*Start-Process') "run-service.ps1 main while loop must gate launch with Wait-ForExecutableReady before Start-Process."
 
     Write-Host "Windows collector smoke tests passed."
 } finally {
