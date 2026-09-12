@@ -2585,10 +2585,13 @@ fn stop_running_dashboard_instances(install_dir: &Path) -> Result<DashboardProce
                     }
                 }
             }
+            Ok(output) if output.status.code() == Some(1) => {
+                // pgrep 回傳 1 代表系統中無任何匹配之進程，為正常狀態
+            }
             _ => {
-                // pgrep 未匹配或失敗時，嘗試 ps 作為回退；若兩者皆失敗則 fail closed
+                // pgrep 執行失敗或未安裝時，嘗試 ps 作為回退；若兩者皆失敗則 fail closed
                 let ps_res = std::process::Command::new("ps")
-                    .args(["-axo", "pid="])
+                    .args(["-axo", "pid,command"])
                     .output()
                     .map_err(|pe| format!("進程列舉失敗 (ps: {pe})；更新中止以確保安全"))?;
                 if !ps_res.status.success() {
@@ -2596,9 +2599,14 @@ fn stop_running_dashboard_instances(install_dir: &Path) -> Result<DashboardProce
                 }
                 let text = String::from_utf8_lossy(&ps_res.stdout);
                 for line in text.lines() {
-                    if let Ok(pid) = line.trim().parse::<u32>() {
-                        if pid != my_pid {
-                            candidate_pids.insert(pid);
+                    if line.contains(APP_NAME) {
+                        let trimmed = line.trim_start();
+                        if let Some((pid_str, _)) = trimmed.split_once(' ') {
+                            if let Ok(pid) = pid_str.trim().parse::<u32>() {
+                                if pid != my_pid {
+                                    candidate_pids.insert(pid);
+                                }
+                            }
                         }
                     }
                 }
@@ -2648,76 +2656,88 @@ fn stop_running_dashboard_instances(install_dir: &Path) -> Result<DashboardProce
 
     for pid in candidate_pids {
         if is_process_alive(pid) {
-            if let Some(exe_path) = get_process_exe_path(pid) {
-                if matches_install_dir(&exe_path, install_dir)
-                    && is_dashboard_server_process(pid, &server_pids)
-                {
-                    let supervisor_pid = get_process_supervisor_pid(pid);
-                    let is_sup = is_process_supervised(pid, install_dir);
-                    let is_server = server_pids.contains(&pid);
-                    let args = get_process_cmdline_with_retry(pid);
-                    let envs = get_process_relevant_envs_with_retry(pid);
-                    let cwd = get_process_cwd_with_retry(pid);
-
-                    // 非監管進程重啟驗證：若為非監管進程，必須確保重啟所需之元資料可用，否則絕不冒險停止進程
-                    if !is_sup {
-                        if cwd.is_none() {
-                            log_update(
-                                "WARN",
-                                "STOP_SERVICE",
-                                &format!("非監管進程 (PID: {pid}) 無法可靠取得工作目錄，略過停止以防重啟失敗或組態偏離"),
-                            );
-                            continue;
-                        }
-                        if args.is_none() && !is_server {
-                            log_update(
-                                "WARN",
-                                "STOP_SERVICE",
-                                &format!("非監管進程 (PID: {pid}) 無法取得命令列參數且非已知服務，略過停止以防組態重設"),
-                            );
-                            continue;
-                        }
-                        if envs.is_none() {
-                            log_update(
-                                "WARN",
-                                "STOP_SERVICE",
-                                &format!("非監管進程 (PID: {pid}) 無法讀取目標進程環境變數，略過停止以防重啟後繼承錯誤環境"),
-                            );
-                            continue;
-                        }
-                    }
-
-                    let spec = StoppedProcessSpec {
-                        pid,
-                        is_supervised: is_sup,
-                        supervisor_pid,
-                        is_server,
-                        exe_path,
-                        args: args.or_else(|| {
-                            if is_server {
-                                Some(vec![APP_NAME.to_string()])
-                            } else {
-                                None
-                            }
-                        }),
-                        envs: envs.unwrap_or_default(),
-                        cwd,
-                    };
-
-                    #[cfg(unix)]
-                    if is_sup {
-                        log_update(
-                            "INFO",
-                            "STOP_SERVICE",
-                            &format!("進程 (PID: {pid}) 受到 Unix 服務管理器監管；將在檔案替換提交後再發送 SIGTERM 以免舊版搶先重啟"),
-                        );
-                        supervised_unix_pids.push(pid);
-                        continue;
-                    }
-
-                    pids_to_stop.push(pid);
-                    stopped_specs.push(spec);
+            let exe_path = match get_process_exe_path(pid) {
+                Some(p) => p,
+                None => {
+                    let msg = format!(
+                        "無法驗證活躍候選進程 (PID: {pid}) 之執行檔路徑；為防在服務執行中覆寫檔案，更新中止以確保安全 (Fail-Closed)"
+                    );
+                    log_update("ERROR", "STOP_SERVICE", &msg);
+                    return Err(msg);
                 }
+            };
+
+            if matches_install_dir(&exe_path, install_dir) {
+                if !is_dashboard_server_process(pid, &server_pids) {
+                    let msg = format!(
+                        "偵測到有 Token 戰情室指令進程 (PID: {pid}) 正在安裝目錄中執行；為防檔案衝突，更新中止以確保安全 (Fail-Closed)"
+                    );
+                    log_update("ERROR", "STOP_SERVICE", &msg);
+                    return Err(msg);
+                }
+
+                let supervisor_pid = get_process_supervisor_pid(pid);
+                let is_sup = is_process_supervised(pid, install_dir);
+                let is_server = server_pids.contains(&pid);
+                let args = get_process_cmdline_with_retry(pid);
+                let envs = get_process_relevant_envs_with_retry(pid);
+                let cwd = get_process_cwd_with_retry(pid);
+
+                // 非監管進程重啟驗證：若為非監管進程，必須確保重啟所需之元資料可用，否則中止更新以防未停止進程即覆寫或重啟失敗
+                if !is_sup {
+                    if cwd.is_none() {
+                        let msg = format!(
+                            "非監管進程 (PID: {pid}) 無法可靠取得工作目錄，無法保證安全重啟；更新中止以確保安全 (Fail-Closed)"
+                        );
+                        log_update("ERROR", "STOP_SERVICE", &msg);
+                        return Err(msg);
+                    }
+                    if args.is_none() && !is_server {
+                        let msg = format!(
+                            "非監管進程 (PID: {pid}) 無法取得命令列參數且非已知服務，無法保證安全重啟；更新中止以確保安全 (Fail-Closed)"
+                        );
+                        log_update("ERROR", "STOP_SERVICE", &msg);
+                        return Err(msg);
+                    }
+                    if envs.is_none() {
+                        let msg = format!(
+                            "非監管進程 (PID: {pid}) 無法讀取目標進程環境變數，無法保證安全重啟；更新中止以確保安全 (Fail-Closed)"
+                        );
+                        log_update("ERROR", "STOP_SERVICE", &msg);
+                        return Err(msg);
+                    }
+                }
+
+                let spec = StoppedProcessSpec {
+                    pid,
+                    is_supervised: is_sup,
+                    supervisor_pid,
+                    is_server,
+                    exe_path,
+                    args: args.or_else(|| {
+                        if is_server {
+                            Some(vec![APP_NAME.to_string()])
+                        } else {
+                            None
+                        }
+                    }),
+                    envs: envs.unwrap_or_default(),
+                    cwd,
+                };
+
+                #[cfg(unix)]
+                if is_sup {
+                    log_update(
+                        "INFO",
+                        "STOP_SERVICE",
+                        &format!("進程 (PID: {pid}) 受到 Unix 服務管理器監管；將在檔案替換提交後再發送 SIGTERM 以免舊版搶先重啟"),
+                    );
+                    supervised_unix_pids.push(pid);
+                    continue;
+                }
+
+                pids_to_stop.push(pid);
+                stopped_specs.push(spec);
             }
         }
     }
