@@ -78,7 +78,6 @@ done
 
   marker_path="${install_dir}/.install_marker"
   marker_tmp="${install_dir}/.install_marker.tmp.$$"
-  rm -f "$marker_path"
   printf "token-usage-insights:installed" > "$marker_tmp"
   mv -f "$marker_tmp" "$marker_path"
 

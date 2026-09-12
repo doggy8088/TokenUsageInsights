@@ -176,28 +176,36 @@ struct UsageDayImportPayload {
 
 // None means start the dashboard; commands finish before server initialization.
 pub(crate) async fn run(args: &[String]) -> Option<i32> {
-    if args.len() < 2 {
-        return None;
-    }
-
-    if args.len() == 2 && args[1] == "--no-auto-update" {
-        return None;
-    }
-
-    Some(match args[1].as_str() {
-        "export" => run_export(&args[2..]),
-        "export-all" => run_export_all(&args[2..]),
-        "import" => run_import(&args[2..]),
-        "update" | "--update" | "-u" => {
-            crate::updater::perform_startup_recovery().await;
-            run_update_cli(&args[2..]).await
+    // 過濾全域旗標 --no-auto-update（該旗標已由 is_auto_update_disabled 識別），
+    // 允許 --no-auto-update 與其他子命令自由組合（如 --no-auto-update --help、--no-auto-update update --check）
+    let filtered_args: Vec<String> = if args.len() > 1 {
+        let mut v = Vec::with_capacity(args.len());
+        v.push(args[0].clone());
+        for arg in &args[1..] {
+            if arg != "--no-auto-update" {
+                v.push(arg.clone());
+            }
         }
+        v
+    } else {
+        args.to_vec()
+    };
+
+    if filtered_args.len() < 2 {
+        return None;
+    }
+
+    Some(match filtered_args[1].as_str() {
+        "export" => run_export(&filtered_args[2..]),
+        "export-all" => run_export_all(&filtered_args[2..]),
+        "import" => run_import(&filtered_args[2..]),
+        "update" | "--update" | "-u" => run_update_cli(&filtered_args[2..]).await,
         "-h" | "--help" | "help" => {
             print_help();
             0
         }
         _ => {
-            eprintln!("未知指令：{}", args[1]);
+            eprintln!("未知指令：{}", filtered_args[1]);
             print_help();
             2
         }
@@ -973,5 +981,31 @@ mod tests {
             super::parse_flag_value(&args_missing_out, &mut err_idx, "out").unwrap_err();
         assert_eq!(err_missing, "缺少 --out 的值");
         assert_eq!(err_idx, 1);
+    }
+
+    #[tokio::test]
+    async fn cli_run_normalizes_no_auto_update_combinations() {
+        // 單獨使用 --no-auto-update 應啟動服務器（回傳 None）
+        let single = vec![
+            "token-usage-insights".to_string(),
+            "--no-auto-update".to_string(),
+        ];
+        assert_eq!(super::run(&single).await, None);
+
+        // 結合 --help 應正常印出說明並以 0 結束
+        let with_help = vec![
+            "token-usage-insights".to_string(),
+            "--no-auto-update".to_string(),
+            "--help".to_string(),
+        ];
+        assert_eq!(super::run(&with_help).await, Some(0));
+
+        // 結合不存在之子命令應以 2 結束
+        let with_invalid = vec![
+            "token-usage-insights".to_string(),
+            "--no-auto-update".to_string(),
+            "nonexistent-cmd".to_string(),
+        ];
+        assert_eq!(super::run(&with_invalid).await, Some(2));
     }
 }

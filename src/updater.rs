@@ -384,7 +384,41 @@ fn get_process_ppid(pid: u32) -> Option<u32> {
 }
 
 #[cfg(windows)]
+fn get_process_supervisor_pid(pid: u32) -> Option<u32> {
+    if let Some(ppid) = get_process_ppid(pid) {
+        if is_process_alive(ppid) {
+            if let Some(parent_exe) = get_process_exe_path(ppid) {
+                let file_name = parent_exe
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                if file_name == "powershell.exe" || file_name == "pwsh.exe" {
+                    if let Some(cmd) = get_process_cmdline(ppid) {
+                        if cmd
+                            .iter()
+                            .any(|arg| arg.to_lowercase().contains("run-service.ps1"))
+                        {
+                            return Some(ppid);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(windows))]
+fn get_process_supervisor_pid(_pid: u32) -> Option<u32> {
+    None
+}
+
+#[cfg(windows)]
 fn is_process_supervised(pid: u32, _install_dir: &Path) -> bool {
+    if get_process_supervisor_pid(pid).is_some() {
+        return true;
+    }
     if let Some(ppid) = get_process_ppid(pid) {
         if is_process_alive(ppid) {
             if let Some(parent_exe) = get_process_exe_path(ppid) {
@@ -395,16 +429,6 @@ fn is_process_supervised(pid: u32, _install_dir: &Path) -> bool {
                     .to_lowercase();
                 if file_name == "services.exe" {
                     return true;
-                }
-                if file_name == "powershell.exe" || file_name == "pwsh.exe" {
-                    if let Some(cmd) = get_process_cmdline(ppid) {
-                        if cmd
-                            .iter()
-                            .any(|arg| arg.to_lowercase().contains("run-service.ps1"))
-                        {
-                            return true;
-                        }
-                    }
                 }
             }
         }
@@ -2437,6 +2461,7 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), UpdateError> {
 pub(crate) struct StoppedProcessSpec {
     pub pid: u32,
     pub is_supervised: bool,
+    pub supervisor_pid: Option<u32>,
     pub is_server: bool,
     pub exe_path: PathBuf,
     pub args: Option<Vec<String>>,
@@ -2582,6 +2607,7 @@ fn stop_running_dashboard_instances(install_dir: &Path) -> Result<DashboardProce
                 if matches_install_dir(&exe_path, install_dir)
                     && is_dashboard_server_process(pid, &server_pids)
                 {
+                    let supervisor_pid = get_process_supervisor_pid(pid);
                     let is_sup = is_process_supervised(pid, install_dir);
                     let is_server = server_pids.contains(&pid);
                     let args = get_process_cmdline_with_retry(pid);
@@ -2619,6 +2645,7 @@ fn stop_running_dashboard_instances(install_dir: &Path) -> Result<DashboardProce
                     let spec = StoppedProcessSpec {
                         pid,
                         is_supervised: is_sup,
+                        supervisor_pid,
                         is_server,
                         exe_path,
                         args: args.or_else(|| {
@@ -2891,10 +2918,14 @@ fn restart_dashboard_instance(spec: &StoppedProcessSpec, install_dir: &Path) -> 
 
 #[cfg(windows)]
 fn is_any_dashboard_running_in_dir(install_dir: &Path) -> bool {
+    let my_pid = std::process::id();
+    let mut server_pids = std::collections::HashSet::new();
+
     let pid_file = install_dir.join(".server.pid");
     if let Ok(content) = fs::read_to_string(&pid_file) {
         if let Ok(pid) = content.trim().parse::<u32>() {
-            if is_process_alive(pid) {
+            if pid != my_pid && is_process_alive(pid) {
+                server_pids.insert(pid);
                 return true;
             }
         }
@@ -2902,7 +2933,8 @@ fn is_any_dashboard_running_in_dir(install_dir: &Path) -> bool {
     let insights_pid = crate::db::get_insights_dir().join(".server.pid");
     if let Ok(content) = fs::read_to_string(&insights_pid) {
         if let Ok(pid) = content.trim().parse::<u32>() {
-            if is_process_alive(pid) {
+            if pid != my_pid && is_process_alive(pid) {
+                server_pids.insert(pid);
                 return true;
             }
         }
@@ -2924,8 +2956,13 @@ fn is_any_dashboard_running_in_dir(install_dir: &Path) -> bool {
             if parts.len() >= 2 {
                 let pid_str = parts[1].trim().trim_matches('"');
                 if let Ok(pid) = pid_str.parse::<u32>() {
+                    if pid == my_pid || !is_process_alive(pid) {
+                        continue;
+                    }
                     if let Some(exe_path) = get_process_exe_path(pid) {
-                        if matches_install_dir(&exe_path, install_dir) {
+                        if matches_install_dir(&exe_path, install_dir)
+                            && is_dashboard_server_process(pid, &server_pids)
+                        {
                             return true;
                         }
                     }
@@ -2950,7 +2987,25 @@ fn restart_windows_supervised_service(
         ),
     );
 
-    // 1. 先等待短暫時間 (1.5 秒)，檢查新版 runner 是否仍在運行並已透過協商標記自動重啟看板
+    // 若原服務守護進程 (PowerShell runner) 仍活躍，代表其正持有 .service_restart_pending 標記並等待 .update.lock 釋放；
+    // 將該守護進程指定為唯一重啟權擁有者，避免啟動第二個 runner 或看板進程造成端口衝突與重複執行
+    if let Some(sup_pid) = spec.supervisor_pid {
+        if is_process_alive(sup_pid) {
+            log_update(
+                "INFO",
+                "RESTART",
+                &format!(
+                    "偵測到原服務守護進程 (PID: {sup_pid}) 仍活躍並正在等待更新鎖釋放；交由其獨佔自動重啟權，略過外部重複重啟"
+                ),
+            );
+            println!(
+                "🔄 服務守護進程 (PID: {sup_pid}) 仍在運行，將在更新鎖釋放後自動重新啟動看板服務。"
+            );
+            return Ok(());
+        }
+    }
+
+    // 1. 先等待短暫時間 (1.5 秒)，檢查 runner 是否仍在運行並已透過協商標記自動重啟看板
     let start_wait = Instant::now();
     while start_wait.elapsed() < Duration::from_millis(1500) {
         if is_any_dashboard_running_in_dir(install_dir) {
@@ -4455,6 +4510,7 @@ update_check_interval: 5 # check every 5 days
                 StoppedProcessSpec {
                     pid: 1234,
                     is_supervised: false,
+                    supervisor_pid: None,
                     is_server: false,
                     exe_path: PathBuf::from("/opt/token-usage-insights/token-usage-insights"),
                     args: Some(vec![
@@ -4467,6 +4523,7 @@ update_check_interval: 5 # check every 5 days
                 StoppedProcessSpec {
                     pid: 5678,
                     is_supervised: true,
+                    supervisor_pid: Some(4321),
                     is_server: true,
                     exe_path: PathBuf::from("/opt/token-usage-insights/token-usage-insights"),
                     args: None,
@@ -4480,6 +4537,7 @@ update_check_interval: 5 # check every 5 days
 
         assert_eq!(plan.stopped_specs.len(), 2);
         assert!(!plan.stopped_specs[0].is_supervised);
+        assert_eq!(plan.stopped_specs[0].supervisor_pid, None);
         assert!(!plan.stopped_specs[0].is_server);
         assert_eq!(plan.stopped_specs[0].pid, 1234);
         assert_eq!(
@@ -4494,6 +4552,7 @@ update_check_interval: 5 # check every 5 days
             vec![("PORT".to_string(), "3003".to_string())]
         );
         assert!(plan.stopped_specs[1].is_supervised);
+        assert_eq!(plan.stopped_specs[1].supervisor_pid, Some(4321));
         assert!(plan.stopped_specs[1].is_server);
         assert_eq!(plan.stopped_specs[1].pid, 5678);
 
@@ -4525,6 +4584,7 @@ update_check_interval: 5 # check every 5 days
         let spec_no_args = StoppedProcessSpec {
             pid: 1111,
             is_supervised: false,
+            supervisor_pid: None,
             is_server: false,
             exe_path: dummy_exe.clone(),
             args: None,
@@ -4541,6 +4601,7 @@ update_check_interval: 5 # check every 5 days
         let spec_server_fallback = StoppedProcessSpec {
             pid: 1112,
             is_supervised: false,
+            supervisor_pid: None,
             is_server: true,
             exe_path: dummy_exe.clone(),
             args: None,
@@ -4559,6 +4620,7 @@ update_check_interval: 5 # check every 5 days
         let spec_subcommand = StoppedProcessSpec {
             pid: 2222,
             is_supervised: false,
+            supervisor_pid: None,
             is_server: false,
             exe_path: dummy_exe.clone(),
             args: Some(vec![APP_NAME.to_string(), "export-all".to_string()]),
@@ -4575,6 +4637,7 @@ update_check_interval: 5 # check every 5 days
         let spec_no_cwd = StoppedProcessSpec {
             pid: 3333,
             is_supervised: false,
+            supervisor_pid: None,
             is_server: false,
             exe_path: dummy_exe.clone(),
             args: Some(vec![APP_NAME.to_string()]),
@@ -4592,6 +4655,7 @@ update_check_interval: 5 # check every 5 days
         let spec_missing_exe = StoppedProcessSpec {
             pid: 4444,
             is_supervised: false,
+            supervisor_pid: None,
             is_server: false,
             exe_path: empty_dir.join("nonexistent_exe"),
             args: Some(vec![APP_NAME.to_string()]),
@@ -4753,5 +4817,20 @@ update_check_interval: 5 # check every 5 days
         );
 
         let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn process_supervisor_pid_default_behavior() {
+        let my_pid = std::process::id();
+        #[cfg(not(windows))]
+        {
+            assert_eq!(get_process_supervisor_pid(my_pid), None);
+        }
+        #[cfg(windows)]
+        {
+            // Windows 環境下，非由 run-service.ps1 啟動之測試進程應回傳 None
+            let sup = get_process_supervisor_pid(my_pid);
+            let _ = sup;
+        }
     }
 }

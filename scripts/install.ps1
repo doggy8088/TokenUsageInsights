@@ -358,11 +358,16 @@ if ($PSCmdlet.ShouldProcess($InstallDir, "Install Token Usage Insights")) {
 
     $MarkerFile = Join-Path $InstallDir ".install_marker"
     $MarkerTmp = Join-Path $InstallDir ".install_marker.tmp.$PID"
-    if (Test-Path -LiteralPath $MarkerFile) {
-        Remove-Item -LiteralPath $MarkerFile -Force -ErrorAction SilentlyContinue
-    }
     Set-Content -LiteralPath $MarkerTmp -Value "token-usage-insights:installed" -NoNewline -Encoding Ascii
-    Move-Item -LiteralPath $MarkerTmp -Destination $MarkerFile -Force
+    if (Test-Path -LiteralPath $MarkerFile) {
+        try {
+            [System.IO.File]::Replace($MarkerTmp, $MarkerFile, $null)
+        } catch {
+            Move-Item -LiteralPath $MarkerTmp -Destination $MarkerFile -Force
+        }
+    } else {
+        Move-Item -LiteralPath $MarkerTmp -Destination $MarkerFile -Force
+    }
 
     $Shim = Join-Path $BinDir "$AppName.cmd"
     $BatchInstallDir = $InstallDir.Replace("%", "%%")
