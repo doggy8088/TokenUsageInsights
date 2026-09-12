@@ -698,8 +698,32 @@ fn is_cli_subcommand(arg: &str) -> bool {
     )
 }
 
+fn get_process_cmdline_with_retry(pid: u32) -> Option<Vec<String>> {
+    for attempt in 0..3 {
+        if let Some(cmd) = get_process_cmdline(pid) {
+            return Some(cmd);
+        }
+        if attempt < 2 {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+    }
+    None
+}
+
+fn get_process_cwd_with_retry(pid: u32) -> Option<PathBuf> {
+    for attempt in 0..3 {
+        if let Some(cwd) = get_process_cwd(pid) {
+            return Some(cwd);
+        }
+        if attempt < 2 {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+    }
+    None
+}
+
 fn is_dashboard_server_process(pid: u32, server_pids: &std::collections::HashSet<u32>) -> bool {
-    if let Some(cmdline) = get_process_cmdline(pid) {
+    if let Some(cmdline) = get_process_cmdline_with_retry(pid) {
         if cmdline.iter().skip(1).any(|arg| is_cli_subcommand(arg)) {
             return false;
         }
@@ -965,11 +989,7 @@ pub fn is_newer_version(remote: &str, current: &str) -> bool {
 }
 
 pub fn archive_filename(tag: &str, target: &str) -> String {
-    let tag = if tag.starts_with('v') || tag.starts_with('V') {
-        tag.to_string()
-    } else {
-        format!("v{tag}")
-    };
+    let tag = tag.trim();
 
     #[cfg(windows)]
     {
@@ -2024,10 +2044,15 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), UpdateError> {
     })?;
 
     let archive_name = archive_filename(remote_version, target);
+    let alt_name = if let Some(stripped) = remote_version.strip_prefix('v') {
+        archive_filename(stripped, target)
+    } else {
+        archive_filename(&format!("v{remote_version}"), target)
+    };
     let asset = release
         .assets
         .iter()
-        .find(|a| a.name == archive_name)
+        .find(|a| a.name == archive_name || a.name == alt_name)
         .ok_or_else(|| {
             let err = format!("Release {remote_version} 缺少目標發行包: {archive_name}");
             log_update("ERROR", "DOWNLOAD", &err);
@@ -2054,9 +2079,9 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), UpdateError> {
         }
     };
 
-    println!("⬇️ 正在下載發行包: {archive_name} ...");
-    log_update("INFO", "DOWNLOAD", &format!("開始串流下載 {archive_name}"));
-    let archive_path = tmp_guard.path.join(&archive_name);
+    println!("⬇️ 正在下載發行包: {} ...", asset.name);
+    log_update("INFO", "DOWNLOAD", &format!("開始串流下載 {}", asset.name));
+    let archive_path = tmp_guard.path.join(&asset.name);
     let actual_hash = match download_to_file_with_hash(
         &asset.browser_download_url,
         &archive_path,
@@ -2084,10 +2109,10 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), UpdateError> {
             }
         };
 
-    let expected_hash = match parse_checksum(&sums_text, &archive_name) {
+    let expected_hash = match parse_checksum(&sums_text, &asset.name) {
         Some(h) => h,
         None => {
-            let err = format!("SHA256SUMS 中未找到 {archive_name} 的校驗碼");
+            let err = format!("SHA256SUMS 中未找到 {} 的校驗碼", asset.name);
             log_update("ERROR", "VERIFY", &err);
             return Err(err.into());
         }
@@ -2102,7 +2127,7 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), UpdateError> {
     println!("✅ SHA256 校驗通過！");
     log_update("INFO", "VERIFY", "SHA256 校驗通過");
 
-    let is_zip = archive_name.ends_with(".zip");
+    let is_zip = asset.name.ends_with(".zip");
     let extract_dir = tmp_guard.path.join("extracted");
     println!("📦 正在解壓縮檔案...");
 
@@ -2199,6 +2224,7 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), UpdateError> {
 pub(crate) struct StoppedProcessSpec {
     pub pid: u32,
     pub is_supervised: bool,
+    pub is_server: bool,
     pub exe_path: PathBuf,
     pub args: Option<Vec<String>>,
     pub envs: Vec<(String, String)>,
@@ -2344,14 +2370,43 @@ fn stop_running_dashboard_instances(install_dir: &Path) -> Result<DashboardProce
                     && is_dashboard_server_process(pid, &server_pids)
                 {
                     let is_sup = is_process_supervised(pid, install_dir);
-                    let args = get_process_cmdline(pid);
+                    let is_server = server_pids.contains(&pid);
+                    let args = get_process_cmdline_with_retry(pid);
                     let envs = get_process_relevant_envs(pid);
-                    let cwd = get_process_cwd(pid);
+                    let cwd = get_process_cwd_with_retry(pid);
+
+                    // 非監管進程重啟驗證：若為非監管進程，必須確保重啟所需之元資料可用，否則絕不冒險停止進程
+                    if !is_sup {
+                        if cwd.is_none() {
+                            log_update(
+                                "WARN",
+                                "STOP_SERVICE",
+                                &format!("非監管進程 (PID: {pid}) 無法可靠取得工作目錄，略過停止以防重啟失敗或組態偏離"),
+                            );
+                            continue;
+                        }
+                        if args.is_none() && !is_server {
+                            log_update(
+                                "WARN",
+                                "STOP_SERVICE",
+                                &format!("非監管進程 (PID: {pid}) 無法取得命令列參數且非已知服務，略過停止以防組態重設"),
+                            );
+                            continue;
+                        }
+                    }
+
                     let spec = StoppedProcessSpec {
                         pid,
                         is_supervised: is_sup,
+                        is_server,
                         exe_path,
-                        args,
+                        args: args.or_else(|| {
+                            if is_server {
+                                Some(vec![APP_NAME.to_string()])
+                            } else {
+                                None
+                            }
+                        }),
                         envs,
                         cwd,
                     };
@@ -2497,8 +2552,10 @@ fn restart_dashboard_instance(spec: &StoppedProcessSpec, install_dir: &Path) -> 
         return Err(format!("找不到執行檔: {exe:?}"));
     }
 
+    let fallback_args = vec![APP_NAME.to_string()];
     let args = match &spec.args {
         Some(a) => a,
+        None if spec.is_server => &fallback_args,
         None => {
             return Err("無法可靠取得先前進程之命令列參數，略過自動重啟以防組態重設".to_string());
         }
@@ -3446,17 +3503,30 @@ a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2  token-usage-in
     #[test]
     fn archive_filename_formats_correctly() {
         let target = "aarch64-apple-darwin";
-        let filename = archive_filename("v0.9.5", target);
+        let filename_v = archive_filename("v0.9.5", target);
+        let filename_raw = archive_filename("0.9.5", target);
         #[cfg(windows)]
-        assert_eq!(
-            filename,
-            "token-usage-insights-v0.9.5-aarch64-apple-darwin.zip"
-        );
+        {
+            assert_eq!(
+                filename_v,
+                "token-usage-insights-v0.9.5-aarch64-apple-darwin.zip"
+            );
+            assert_eq!(
+                filename_raw,
+                "token-usage-insights-0.9.5-aarch64-apple-darwin.zip"
+            );
+        }
         #[cfg(not(windows))]
-        assert_eq!(
-            filename,
-            "token-usage-insights-v0.9.5-aarch64-apple-darwin.tar.gz"
-        );
+        {
+            assert_eq!(
+                filename_v,
+                "token-usage-insights-v0.9.5-aarch64-apple-darwin.tar.gz"
+            );
+            assert_eq!(
+                filename_raw,
+                "token-usage-insights-0.9.5-aarch64-apple-darwin.tar.gz"
+            );
+        }
     }
 
     #[test]
@@ -3887,6 +3957,7 @@ update_check_interval: 5 # check every 5 days
                 StoppedProcessSpec {
                     pid: 1234,
                     is_supervised: false,
+                    is_server: false,
                     exe_path: PathBuf::from("/opt/token-usage-insights/token-usage-insights"),
                     args: Some(vec![
                         "/opt/token-usage-insights/token-usage-insights".to_string(),
@@ -3898,6 +3969,7 @@ update_check_interval: 5 # check every 5 days
                 StoppedProcessSpec {
                     pid: 5678,
                     is_supervised: true,
+                    is_server: true,
                     exe_path: PathBuf::from("/opt/token-usage-insights/token-usage-insights"),
                     args: None,
                     envs: vec![],
@@ -3910,6 +3982,7 @@ update_check_interval: 5 # check every 5 days
 
         assert_eq!(plan.stopped_specs.len(), 2);
         assert!(!plan.stopped_specs[0].is_supervised);
+        assert!(!plan.stopped_specs[0].is_server);
         assert_eq!(plan.stopped_specs[0].pid, 1234);
         assert_eq!(
             plan.stopped_specs[0].args.as_ref().unwrap(),
@@ -3923,6 +3996,7 @@ update_check_interval: 5 # check every 5 days
             vec![("PORT".to_string(), "3003".to_string())]
         );
         assert!(plan.stopped_specs[1].is_supervised);
+        assert!(plan.stopped_specs[1].is_server);
         assert_eq!(plan.stopped_specs[1].pid, 5678);
 
         #[cfg(unix)]
@@ -3949,10 +4023,11 @@ update_check_interval: 5 # check every 5 days
         let dummy_exe = temp.join(APP_NAME);
         let _ = fs::write(&dummy_exe, b"");
 
-        // 1. args 為 None 時應拒絕重啟
+        // 1. args 為 None 且非已知服務時應拒絕重啟
         let spec_no_args = StoppedProcessSpec {
             pid: 1111,
             is_supervised: false,
+            is_server: false,
             exe_path: dummy_exe.clone(),
             args: None,
             envs: vec![],
@@ -3964,10 +4039,29 @@ update_check_interval: 5 # check every 5 days
             .unwrap_err()
             .contains("無法可靠取得先前進程之命令列參數"));
 
+        // 1b. args 為 None 但 is_server 為 true 時，應採用安全回退預設參數重啟（不因缺少 args 而在參數校驗階段拒絕）
+        let spec_server_fallback = StoppedProcessSpec {
+            pid: 1112,
+            is_supervised: false,
+            is_server: true,
+            exe_path: dummy_exe.clone(),
+            args: None,
+            envs: vec![],
+            cwd: Some(temp.clone()),
+        };
+        let res_server = restart_dashboard_instance(&spec_server_fallback, &temp);
+        if let Err(e) = res_server {
+            assert!(
+                !e.contains("無法可靠取得先前進程之命令列參數"),
+                "已知服務在 args 為 None 時應採用回退參數，實際錯誤: {e}"
+            );
+        }
+
         // 2. args 包含 CLI subcommand 時應拒絕重啟
         let spec_subcommand = StoppedProcessSpec {
             pid: 2222,
             is_supervised: false,
+            is_server: false,
             exe_path: dummy_exe.clone(),
             args: Some(vec![APP_NAME.to_string(), "export-all".to_string()]),
             envs: vec![],
@@ -3983,6 +4077,7 @@ update_check_interval: 5 # check every 5 days
         let spec_no_cwd = StoppedProcessSpec {
             pid: 3333,
             is_supervised: false,
+            is_server: false,
             exe_path: dummy_exe.clone(),
             args: Some(vec![APP_NAME.to_string()]),
             envs: vec![],
@@ -3999,6 +4094,7 @@ update_check_interval: 5 # check every 5 days
         let spec_missing_exe = StoppedProcessSpec {
             pid: 4444,
             is_supervised: false,
+            is_server: false,
             exe_path: empty_dir.join("nonexistent_exe"),
             args: Some(vec![APP_NAME.to_string()]),
             envs: vec![],
