@@ -1437,6 +1437,12 @@ fn extract_archive(archive_path: &Path, dest_dir: &Path, is_zip: bool) -> Result
                 .to_path_buf();
             let outpath = dest_dir.join(enclosed);
 
+            if let Some(mode) = entry.unix_mode() {
+                if mode & 0o170000 == 0o120000 {
+                    return Err(format!("ZIP 包含不安全的符號連結: {:?}", entry.name()));
+                }
+            }
+
             if entry.is_dir() {
                 fs::create_dir_all(&outpath)
                     .map_err(|e| format!("建立目錄失敗 ({outpath:?}): {e}"))?;
@@ -1495,6 +1501,10 @@ fn extract_archive(archive_path: &Path, dest_dir: &Path, is_zip: bool) -> Result
             {
                 return Err(format!("tar 包含不安全的檔案路徑: {path:?}"));
             }
+            let entry_type = entry.header().entry_type();
+            if entry_type.is_symlink() || entry_type.is_hard_link() {
+                return Err(format!("tar 包含不安全的連結項目: {path:?}"));
+            }
             let outpath = dest_dir.join(&path);
 
             if entry.header().entry_type().is_dir() {
@@ -1546,7 +1556,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
     if let Ok(meta) = dst.symlink_metadata() {
         if meta.file_type().is_symlink() {
             let _ = fs::remove_file(dst);
-            let _ = fs::remove_dir_all(dst);
+            let _ = fs::remove_dir(dst);
         }
     }
     fs::create_dir_all(dst).map_err(|e| format!("建立目標目錄失敗 {dst:?}: {e}"))?;
@@ -1557,11 +1567,14 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
         let file_type = entry
             .file_type()
             .map_err(|e| format!("讀取檔案類型失敗: {e}"))?;
+        if file_type.is_symlink() {
+            continue;
+        }
         if file_type.is_dir() {
             if let Ok(meta) = dst_path.symlink_metadata() {
                 if meta.file_type().is_symlink() {
                     let _ = fs::remove_file(&dst_path);
-                    let _ = fs::remove_dir_all(&dst_path);
+                    let _ = fs::remove_dir(&dst_path);
                 }
             }
             copy_dir_recursive(&src_path, &dst_path)?;
@@ -1663,14 +1676,16 @@ fn restore_from_backup(backup_dir: &Path, install_dir: &Path) -> Result<(), Stri
     for &item in MANAGED_ITEMS {
         if !original_items.contains(item) {
             let path = install_dir.join(item);
-            if path.is_dir() {
-                if path.exists() {
+            if let Ok(meta) = path.symlink_metadata() {
+                if meta.file_type().is_symlink() {
+                    let _ = fs::remove_file(&path);
+                    let _ = fs::remove_dir(&path);
+                } else if meta.is_dir() {
                     fs::remove_dir_all(&path)
                         .map_err(|e| format!("回滾清理新增目錄失敗 {path:?}: {e}"))?;
+                } else {
+                    let _ = fs::remove_file(&path);
                 }
-            } else if path.is_file() {
-                fs::remove_file(&path)
-                    .map_err(|e| format!("回滾清理新增檔案失敗 {path:?}: {e}"))?;
             }
         }
     }
@@ -1689,7 +1704,7 @@ fn restore_from_backup(backup_dir: &Path, install_dir: &Path) -> Result<(), Stri
             if let Ok(meta) = dst.symlink_metadata() {
                 if meta.file_type().is_symlink() {
                     let _ = fs::remove_file(&dst);
-                    let _ = fs::remove_dir_all(&dst);
+                    let _ = fs::remove_dir(&dst);
                 }
             }
             if dst.exists() {
@@ -1897,7 +1912,7 @@ fn print_and_log_check_result(
 
 pub(crate) fn get_installed_version(install_dir: &Path) -> String {
     if let Ok(content) = fs::read_to_string(install_dir.join("VERSION")) {
-        let v = content.trim().trim_start_matches('v');
+        let v = content.trim().trim_start_matches(['v', 'V']);
         if !v.is_empty() {
             return v.to_string();
         }
@@ -2696,6 +2711,13 @@ pub(crate) fn apply_installation_with_rollback(
                 }
                 copy_dir_recursive(&src, &staging)?;
 
+                if let Ok(meta) = dst.symlink_metadata() {
+                    if meta.file_type().is_symlink() {
+                        let _ = fs::remove_file(&dst);
+                        let _ = fs::remove_dir(&dst);
+                    }
+                }
+
                 if dst.exists() {
                     let old = install_dir.join(format!(".{folder}-old-{}", std::process::id()));
                     if old.exists() {
@@ -2972,12 +2994,26 @@ pub async fn wait_for_parent_exit_if_requested() {
     }
 }
 
-fn restart_current_process(args: &[String]) -> ! {
+fn get_target_exe(install_dir: &Path) -> PathBuf {
+    let exec_name = if cfg!(windows) {
+        format!("{APP_NAME}.exe")
+    } else {
+        APP_NAME.to_string()
+    };
+    install_dir.join(exec_name)
+}
+
+fn restart_current_process(exe_path: &Path, args: &[String]) -> ! {
+    let exe = if exe_path.exists() {
+        exe_path.to_path_buf()
+    } else {
+        std::env::current_exe().unwrap_or_else(|_| PathBuf::from(&args[0]))
+    };
+
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        let current_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from(&args[0]));
-        let mut cmd = std::process::Command::new(current_exe);
+        let mut cmd = std::process::Command::new(exe);
         if args.len() > 1 {
             cmd.args(&args[1..]);
         }
@@ -3002,8 +3038,7 @@ fn restart_current_process(args: &[String]) -> ! {
             );
             std::process::exit(75);
         } else {
-            let current_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from(&args[0]));
-            let mut cmd = std::process::Command::new(current_exe);
+            let mut cmd = std::process::Command::new(exe);
             if args.len() > 1 {
                 cmd.args(&args[1..]);
             }
@@ -3033,6 +3068,7 @@ fn restart_current_process(args: &[String]) -> ! {
 
     #[cfg(not(any(unix, windows)))]
     {
+        let _ = exe;
         std::process::exit(0);
     }
 }
@@ -3074,6 +3110,19 @@ fn attempt_startup_recovery(install_dir: &Path, args: &[String]) -> RecoveryStat
         return RecoveryStatus::CleanedOrNoBackup;
     }
 
+    // 優先嘗試取得更新鎖，若更新鎖被占用代表另有更新程序正在進行，絕不可在此時介入修改或刪除備份目錄
+    let recovery_lock = match UpdateLock::try_acquire(install_dir) {
+        Ok(l) => l,
+        Err(e) => {
+            log_update(
+                "INFO",
+                "STARTUP_RECOVERY",
+                &format!("目前更新鎖被占用，暫緩救援: {e}"),
+            );
+            return RecoveryStatus::LockContended;
+        }
+    };
+
     // 若存在 .committed 標記，代表更新早已成功完成，僅備份目錄在最後刪除時中斷
     // 此時絕不能回滾新版本，直接清理備份目錄即可
     if backup_dir.join(".committed").exists() {
@@ -3087,6 +3136,7 @@ fn attempt_startup_recovery(install_dir: &Path, args: &[String]) -> RecoveryStat
             let cleanup_name = format!(".backup-cleaned-{}", Utc::now().timestamp());
             let _ = fs::rename(&backup_dir, install_dir.join(&cleanup_name));
         }
+        drop(recovery_lock);
         return RecoveryStatus::CleanedOrNoBackup;
     }
 
@@ -3097,19 +3147,6 @@ fn attempt_startup_recovery(install_dir: &Path, args: &[String]) -> RecoveryStat
         log_update("ERROR", "STARTUP_FATAL", "先前回滾失敗，程序終止");
         std::process::exit(1);
     }
-
-    println!("⚠️ 偵測到先前更新殘留之備份目錄，正在取得更新鎖定以進行檢查與救援還原...");
-    let recovery_lock = match UpdateLock::try_acquire(install_dir) {
-        Ok(l) => l,
-        Err(e) => {
-            log_update(
-                "INFO",
-                "STARTUP_RECOVERY",
-                &format!("目前更新鎖被占用，暫緩救援: {e}"),
-            );
-            return RecoveryStatus::LockContended;
-        }
-    };
 
     let manifest_path = backup_dir.join(".manifest");
     if !manifest_path.exists() {
@@ -3132,6 +3169,7 @@ fn attempt_startup_recovery(install_dir: &Path, args: &[String]) -> RecoveryStat
                 std::process::exit(1);
             }
         }
+        drop(recovery_lock);
         return RecoveryStatus::CleanedOrNoBackup;
     }
 
@@ -3172,7 +3210,8 @@ fn attempt_startup_recovery(install_dir: &Path, args: &[String]) -> RecoveryStat
 
     println!("✅ 已成功自動還原至健全版本，正在重新啟動 Token 戰情室...");
     log_update("INFO", "STARTUP_RECOVERY", "自動救援還原成功，重啟進程");
-    restart_current_process(args);
+    let target_exe = get_target_exe(install_dir);
+    restart_current_process(&target_exe, args);
     #[allow(unreachable_code)]
     RecoveryStatus::SuccessRestored
 }
@@ -3218,7 +3257,7 @@ pub async fn perform_startup_recovery() {
                             continue;
                         }
                         let installed = get_installed_version(install_dir);
-                        if is_newer_version(&installed, env!("CARGO_PKG_VERSION")) {
+                        if parse_semver(&installed) != parse_semver(env!("CARGO_PKG_VERSION")) {
                             println!(
                                 "🔄 更新程序已完成，正在重新啟動 Token 戰情室至新版 v{installed}..."
                             );
@@ -3227,7 +3266,8 @@ pub async fn perform_startup_recovery() {
                                 "STARTUP_RESTART",
                                 &format!("其他程序更新完成，重啟至 v{installed}"),
                             );
-                            restart_current_process(&args);
+                            let target_exe = get_target_exe(install_dir);
+                            restart_current_process(&target_exe, &args);
                         }
                     }
                     break;
@@ -3339,14 +3379,15 @@ async fn run_background_auto_update() {
             }
 
             let installed = get_installed_version(&install_dir);
-            if is_newer_version(&installed, env!("CARGO_PKG_VERSION")) {
+            if parse_semver(&installed) != parse_semver(env!("CARGO_PKG_VERSION")) {
                 println!("🔄 更新完成，正在自動重啟 Token 戰情室至新版 v{installed}...");
                 log_update(
                     "INFO",
                     "STARTUP_RESTART",
                     &format!("更新完成，重啟至 v{installed}"),
                 );
-                restart_current_process(&args);
+                let target_exe = get_target_exe(&install_dir);
+                restart_current_process(&target_exe, &args);
             } else {
                 log_update("INFO", "STARTUP_CHECK", "目前進程與磁碟版本相符，無需重啟");
             }
@@ -3388,7 +3429,7 @@ async fn run_background_auto_update() {
                                 continue;
                             }
                             let installed = get_installed_version(&install_dir);
-                            if is_newer_version(&installed, env!("CARGO_PKG_VERSION")) {
+                            if parse_semver(&installed) != parse_semver(env!("CARGO_PKG_VERSION")) {
                                 println!(
                                     "🔄 更新已由另一程序完成，正在重新啟動 Token 戰情室至新版 v{installed}..."
                                 );
@@ -3397,7 +3438,8 @@ async fn run_background_auto_update() {
                                     "STARTUP_RESTART",
                                     &format!("另一程序更新完成，重啟至 v{installed}"),
                                 );
-                                restart_current_process(&args);
+                                let target_exe = get_target_exe(&install_dir);
+                                restart_current_process(&target_exe, &args);
                             }
                             break;
                         }
@@ -4167,8 +4209,11 @@ update_check_interval: 5 # check every 5 days
         let _ = fs::remove_dir_all(&temp);
     }
 
+    static ENV_TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[tokio::test]
     async fn wait_for_parent_exit_returns_immediately_when_no_env() {
+        let _guard = ENV_TEST_MUTEX.lock().await;
         std::env::remove_var("_TOKEN_USAGE_INSIGHTS_WAIT_PID");
         wait_for_parent_exit_if_requested().await;
         assert!(std::env::var("_TOKEN_USAGE_INSIGHTS_WAIT_PID").is_err());
@@ -4176,6 +4221,7 @@ update_check_interval: 5 # check every 5 days
 
     #[tokio::test]
     async fn wait_for_parent_exit_cleans_env_when_pid_not_alive() {
+        let _guard = ENV_TEST_MUTEX.lock().await;
         // 使用一個極不可能存活的 PID
         std::env::set_var("_TOKEN_USAGE_INSIGHTS_WAIT_PID", "999999999");
         wait_for_parent_exit_if_requested().await;
