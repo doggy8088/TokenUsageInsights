@@ -40,6 +40,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      - name: Verify release tag matches Cargo.toml version
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_version="$(grep '^version' Cargo.toml | head -n1 | cut -d'"' -f2)"
+          tag_version="${GITHUB_REF_NAME#v}"
+          if [[ "$tag_version" != "$cargo_version" ]]; then
+            echo "::error::Tag version ($tag_version) does not match Cargo.toml version ($cargo_version)"
+            exit 1
+          fi
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:

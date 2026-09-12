@@ -3435,7 +3435,10 @@ pub(crate) fn apply_installation_with_rollback(
 
     #[cfg(windows)]
     {
-        let _ = fs::remove_file(install_dir.join(".service_restart_pending"));
+        let has_supervised = process_plan.stopped_specs.iter().any(|s| s.is_supervised);
+        if !has_supervised {
+            let _ = fs::remove_file(install_dir.join(".service_restart_pending"));
+        }
     }
 
     if !restart_errors.is_empty() {
@@ -3775,7 +3778,7 @@ pub async fn perform_startup_recovery() {
                             continue;
                         }
                         let installed = get_installed_version(install_dir);
-                        if parse_semver(&installed) != parse_semver(env!("CARGO_PKG_VERSION")) {
+                        if parse_semver(&installed) > parse_semver(env!("CARGO_PKG_VERSION")) {
                             println!(
                                 "🔄 更新程序已完成，正在重新啟動 Token 戰情室至新版 v{installed}..."
                             );
@@ -3861,7 +3864,8 @@ async fn run_background_auto_update() {
         }
     };
 
-    let current_version = env!("CARGO_PKG_VERSION");
+    let current_version_str = get_installed_version(&install_dir);
+    let current_version = current_version_str.as_str();
     if !is_newer_version(&release.tag_name, current_version) {
         if let Ok(conn) = crate::db::get_db_conn() {
             let now_str = Utc::now().to_rfc3339();
@@ -3897,7 +3901,7 @@ async fn run_background_auto_update() {
             }
 
             let installed = get_installed_version(&install_dir);
-            if parse_semver(&installed) != parse_semver(env!("CARGO_PKG_VERSION")) {
+            if parse_semver(&installed) > parse_semver(env!("CARGO_PKG_VERSION")) {
                 println!("🔄 更新完成，正在自動重啟 Token 戰情室至新版 v{installed}...");
                 log_update(
                     "INFO",

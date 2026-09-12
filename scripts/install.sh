@@ -112,6 +112,14 @@ if [[ "$install_service" == true ]]; then
       host_systemd="$(systemd_escape_value "$host")"
       port_systemd="$(systemd_escape_value "$port")"
 
+      extra_env_systemd=""
+      if [[ -n "${TOKEN_USAGE_INSIGHTS_AUTO_UPDATE:-}" ]]; then
+        extra_env_systemd+="$(printf '\nEnvironment="TOKEN_USAGE_INSIGHTS_AUTO_UPDATE=%s"' "$(systemd_escape_value "$TOKEN_USAGE_INSIGHTS_AUTO_UPDATE")")"
+      fi
+      if [[ -n "${TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS:-}" ]]; then
+        extra_env_systemd+="$(printf '\nEnvironment="TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS=%s"' "$(systemd_escape_value "$TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS")")"
+      fi
+
       cat > "$service_file" <<SERVICE
 [Unit]
 Description=Token 戰情室 Dashboard Service
@@ -125,7 +133,7 @@ Restart=always
 RestartSec=5
 Environment="PORT=${port_systemd}"
 Environment="HOST=${host_systemd}"
-Environment="TOKEN_USAGE_INSIGHTS_INSTALL_DIR=${install_dir_systemd}"
+Environment="TOKEN_USAGE_INSIGHTS_INSTALL_DIR=${install_dir_systemd}"${extra_env_systemd}
 
 [Install]
 WantedBy=default.target
@@ -167,6 +175,16 @@ SERVICE
       stdout_log_plist="$(plist_escape "${launch_logs_dir}/${launch_label}.out.log")"
       stderr_log_plist="$(plist_escape "${launch_logs_dir}/${launch_label}.err.log")"
 
+      extra_env_plist=""
+      if [[ -n "${TOKEN_USAGE_INSIGHTS_AUTO_UPDATE:-}" ]]; then
+        auto_update_plist="$(plist_escape "$TOKEN_USAGE_INSIGHTS_AUTO_UPDATE")"
+        extra_env_plist+="$(printf '\n    <key>TOKEN_USAGE_INSIGHTS_AUTO_UPDATE</key>\n    <string>%s</string>' "$auto_update_plist")"
+      fi
+      if [[ -n "${TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS:-}" ]]; then
+        interval_plist="$(plist_escape "$TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS")"
+        extra_env_plist+="$(printf '\n    <key>TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS</key>\n    <string>%s</string>' "$interval_plist")"
+      fi
+
       cat > "$launch_agent_file" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -187,7 +205,7 @@ SERVICE
     <key>PORT</key>
     <string>${port_plist}</string>
     <key>TOKEN_USAGE_INSIGHTS_INSTALL_DIR</key>
-    <string>${install_dir_plist}</string>
+    <string>${install_dir_plist}</string>${extra_env_plist}
   </dict>
   <key>RunAtLoad</key>
   <true/>
