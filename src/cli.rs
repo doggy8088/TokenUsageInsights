@@ -561,7 +561,7 @@ async fn run_update_cli(args: &[String]) -> i32 {
                 force = true;
             }
             "-v" | "--target-version" => {
-                let val = next_flag_value(args, &mut i, "target-version");
+                let val = next_update_flag_value(args, &mut i, "target-version");
                 target_version = Some(val);
             }
             arg => {
@@ -591,19 +591,17 @@ async fn run_update_cli(args: &[String]) -> i32 {
 }
 
 fn is_option_token(val: &str) -> bool {
-    if val == "-" {
-        return false;
-    }
-    if val.starts_with("--") && val.len() > 2 {
-        return true;
-    }
-    if val.starts_with('-')
-        && val.len() == 2
-        && val.chars().nth(1).is_some_and(|c| c.is_ascii_alphabetic())
-    {
-        return true;
-    }
-    false
+    // 一般 CLI 旗標值解析器僅將以 '--' 開頭之長選項視為旗標（如 --agent, --out），
+    // 允許任意以 '-' 開頭之合法檔名（如 -f、-report.json、-）作為參數值
+    val.starts_with("--") && val.len() > 2
+}
+
+fn is_update_option_token(val: &str) -> bool {
+    // update 子命令專屬選項判斷：拒絕已知 update 選項作為 --target-version 的值
+    matches!(
+        val,
+        "-c" | "--check" | "-f" | "--force" | "-v" | "--target-version" | "-h" | "--help"
+    ) || (val.starts_with("--") && val.len() > 2)
 }
 
 fn parse_flag_value(args: &[String], i: &mut usize, flag: &str) -> Result<String, String> {
@@ -621,6 +619,29 @@ fn parse_flag_value(args: &[String], i: &mut usize, flag: &str) -> Result<String
 
 fn next_flag_value(args: &[String], i: &mut usize, flag: &str) -> String {
     match parse_flag_value(args, i, flag) {
+        Ok(val) => val,
+        Err(err) => {
+            eprintln!("{err}");
+            std::process::exit(2);
+        }
+    }
+}
+
+fn parse_update_flag_value(args: &[String], i: &mut usize, flag: &str) -> Result<String, String> {
+    match args.get(*i + 1) {
+        Some(value) => {
+            if is_update_option_token(value) {
+                return Err(format!("缺少 --{flag} 的值"));
+            }
+            *i += 1;
+            Ok(value.clone())
+        }
+        None => Err(format!("缺少 --{flag} 的值")),
+    }
+}
+
+fn next_update_flag_value(args: &[String], i: &mut usize, flag: &str) -> String {
+    match parse_update_flag_value(args, i, flag) {
         Ok(val) => val,
         Err(err) => {
             eprintln!("{err}");
@@ -888,9 +909,11 @@ mod tests {
 
     #[test]
     fn parse_flag_value_rejects_missing_and_option_like_values() {
+        // 1. update 子命令旗標解析測試
         let mut i = 0;
         let args_short = vec!["update".to_string(), "-v".to_string(), "-f".to_string()];
-        let err_short = super::parse_flag_value(&args_short, &mut i, "target-version").unwrap_err();
+        let err_short =
+            super::parse_update_flag_value(&args_short, &mut i, "target-version").unwrap_err();
         assert_eq!(err_short, "缺少 --target-version 的值");
         assert_eq!(i, 0);
 
@@ -899,20 +922,29 @@ mod tests {
             "-v".to_string(),
             "--force".to_string(),
         ];
-        let err_long = super::parse_flag_value(&args_long, &mut i, "target-version").unwrap_err();
+        let err_long =
+            super::parse_update_flag_value(&args_long, &mut i, "target-version").unwrap_err();
         assert_eq!(err_long, "缺少 --target-version 的值");
 
         let args_end = vec!["update".to_string(), "-v".to_string()];
-        let err_end = super::parse_flag_value(&args_end, &mut i, "target-version").unwrap_err();
+        let err_end =
+            super::parse_update_flag_value(&args_end, &mut i, "target-version").unwrap_err();
         assert_eq!(err_end, "缺少 --target-version 的值");
 
         let mut j = 1;
         let args_valid = vec!["update".to_string(), "-v".to_string(), "v0.9.6".to_string()];
-        let val = super::parse_flag_value(&args_valid, &mut j, "target-version").unwrap();
+        let val = super::parse_update_flag_value(&args_valid, &mut j, "target-version").unwrap();
         assert_eq!(val, "v0.9.6");
         assert_eq!(j, 2);
 
-        // 驗證以 dash 開頭之合法檔名（如 -report.json、-input.json）與單一 dash (-) 均可正確接受
+        // 2. 一般命令（如 export/import）旗標解析測試：
+        // 驗證以 - 開頭之檔名（如 -f、-report.json）與單一 dash (-) 均為合法路徑值，不得誤判為缺少值
+        let mut f_idx = 1;
+        let args_f = vec!["export".to_string(), "--out".to_string(), "-f".to_string()];
+        let val_f = super::parse_flag_value(&args_f, &mut f_idx, "out").unwrap();
+        assert_eq!(val_f, "-f");
+        assert_eq!(f_idx, 2);
+
         let mut k = 1;
         let args_dash_file = vec![
             "export".to_string(),
@@ -928,5 +960,18 @@ mod tests {
         let val_dash = super::parse_flag_value(&args_single_dash, &mut m, "out").unwrap();
         assert_eq!(val_dash, "-");
         assert_eq!(m, 2);
+
+        // 驗證一般命令遇到 -- 開頭之其他旗標時仍會正確拒絕
+        let mut err_idx = 1;
+        let args_missing_out = vec![
+            "export".to_string(),
+            "--out".to_string(),
+            "--agent".to_string(),
+            "claude".to_string(),
+        ];
+        let err_missing =
+            super::parse_flag_value(&args_missing_out, &mut err_idx, "out").unwrap_err();
+        assert_eq!(err_missing, "缺少 --out 的值");
+        assert_eq!(err_idx, 1);
     }
 }

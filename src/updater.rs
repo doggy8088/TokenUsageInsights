@@ -583,10 +583,7 @@ fn get_process_relevant_envs(pid: u32) -> Option<Vec<(String, String)>> {
         }
         let nt_query: NtQueryInformationProcessFn = std::mem::transmute(func_ptr);
 
-        let mut handle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid);
-        if handle.is_null() {
-            handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-        }
+        let handle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid);
         if handle.is_null() {
             return None;
         }
@@ -642,31 +639,68 @@ fn get_process_relevant_envs(pid: u32) -> Option<Vec<(String, String)>> {
             return None;
         }
 
-        let bytes_to_page_end = 4096 - ((env_ptr as usize) & 0xFFF);
-        let read_size = bytes_to_page_end.max(512).min(4096);
-        let mut env_buf = vec![0u8; read_size];
-        let ok3 = ReadProcessMemory(
-            handle,
-            env_ptr,
-            env_buf.as_mut_ptr() as *mut std::ffi::c_void,
-            read_size,
-            &mut bytes_read,
-        );
+        // 循環逐頁讀取完整以雙重 NUL 結尾的環境變數區塊。
+        // 若在緩衝區上限或讀取錯誤前未出現雙重 NUL 結尾，拒絕不完整的捕獲以防重啟時遺漏關鍵環境變數。
+        let mut all_u16: Vec<u16> = Vec::new();
+        let mut curr_ptr = env_ptr as usize;
+        let mut block_terminated = false;
+        const MAX_ENV_BYTES: usize = 128 * 1024; // 上限 128 KB，防範異常超大或損壞區塊
+
+        while all_u16.len() * 2 < MAX_ENV_BYTES {
+            let bytes_to_page_end = 4096 - (curr_ptr & 0xFFF);
+            let read_size = bytes_to_page_end.max(512).min(4096);
+            let mut page_buf = vec![0u8; read_size];
+            let mut chunk_bytes_read = 0usize;
+
+            let ok = ReadProcessMemory(
+                handle,
+                curr_ptr as *const std::ffi::c_void,
+                page_buf.as_mut_ptr() as *mut std::ffi::c_void,
+                read_size,
+                &mut chunk_bytes_read,
+            );
+
+            if ok == 0 || chunk_bytes_read < 2 {
+                break;
+            }
+
+            let u16_chunk: &[u16] =
+                std::slice::from_raw_parts(page_buf.as_ptr() as *const u16, chunk_bytes_read / 2);
+            all_u16.extend_from_slice(u16_chunk);
+            curr_ptr += chunk_bytes_read;
+
+            // 檢查是否已出現雙重 NUL 結尾
+            let mut start = 0;
+            for i in 0..all_u16.len() {
+                if all_u16[i] == 0 {
+                    if i == start {
+                        block_terminated = true;
+                        break;
+                    }
+                    start = i + 1;
+                }
+            }
+
+            if block_terminated {
+                break;
+            }
+
+            if chunk_bytes_read < read_size {
+                break;
+            }
+        }
         CloseHandle(handle);
 
-        if ok3 == 0 || bytes_read < 4 {
+        if !block_terminated {
             return None;
         }
 
-        let u16_slice: &[u16] =
-            std::slice::from_raw_parts(env_buf.as_ptr() as *const u16, bytes_read / 2);
-
         let mut results = Vec::new();
         let mut start = 0;
-        for i in 0..u16_slice.len() {
-            if u16_slice[i] == 0 {
+        for i in 0..all_u16.len() {
+            if all_u16[i] == 0 {
                 if i > start {
-                    let entry = String::from_utf16_lossy(&u16_slice[start..i]);
+                    let entry = String::from_utf16_lossy(&all_u16[start..i]);
                     if let Some((k, v)) = entry.split_once('=') {
                         if RELEVANT_ENV_VARS.contains(&k) {
                             results.push((k.to_string(), v.to_string()));
