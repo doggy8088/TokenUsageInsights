@@ -100,6 +100,7 @@ function Invoke-InstallServiceTest {
         [string]$UpdateIntervalHours = $null,
         [switch]$FailScheduledTaskAction,
         [switch]$FailStartScheduledTask,
+        [switch]$FailUnregisterLegacyTask,
         [switch]$TaskTargetsLegacyInstall,
         [switch]$HasCurrentAndLegacyTask,
         [switch]$RemoveStartupShortcutBeforeInstall,
@@ -137,6 +138,7 @@ function Invoke-InstallServiceTest {
     $global:serviceEvents = New-Object System.Collections.Generic.List[string]
     $global:hostMessages = New-Object System.Collections.Generic.List[string]
     $global:mockShortcuts = @{}
+    $global:mockTasks = @{}
     if ($SeedShortcutActionArguments) {
         $global:mockShortcuts[$startupShortcut] = [pscustomobject]@{
             ShortcutPath = $startupShortcut
@@ -164,6 +166,19 @@ function Invoke-InstallServiceTest {
     $legacyTaskActionArguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -f:`"$otherInstallDir\scripts\run-service.ps1`" -InstallDir `"$otherInstallDir`" -HostAddress `"127.0.0.1`" -Port 3003"
     $appExecutablePath = "$installDir\token-usage-insights.exe"
     $otherAppExecutablePath = "$otherInstallDir\token-usage-insights.exe"
+
+    if ($HasCurrentAndLegacyTask) {
+        $global:mockTasks["TokenUsageInsights_test-user"] = [pscustomobject]@{
+            Actions = @([pscustomobject]@{ Arguments = $currentTaskActionArguments })
+        }
+        $global:mockTasks["TokenUsageInsights"] = [pscustomobject]@{
+            Actions = @([pscustomobject]@{ Arguments = $legacyTaskActionArguments })
+        }
+    } elseif ($TaskTargetsLegacyInstall) {
+        $global:mockTasks["TokenUsageInsights"] = [pscustomobject]@{
+            Actions = @([pscustomobject]@{ Arguments = $legacyTaskActionArguments })
+        }
+    }
 
     function Stop-ScheduledTask {
         [CmdletBinding()]
@@ -291,28 +306,9 @@ function Invoke-InstallServiceTest {
     function Get-ScheduledTask {
         [CmdletBinding()]
         param([string]$TaskName)
-        if ($HasCurrentAndLegacyTask) {
-            if ($TaskName -eq "TokenUsageInsights_test-user") {
-                return [pscustomobject]@{
-                    Actions = @([pscustomobject]@{ Arguments = $currentTaskActionArguments })
-                }
-            }
-            if ($TaskName -eq "TokenUsageInsights") {
-                return [pscustomobject]@{
-                    Actions = @([pscustomobject]@{ Arguments = $legacyTaskActionArguments })
-                }
-            }
-            return $null
+        if ($global:mockTasks.ContainsKey($TaskName)) {
+            return $global:mockTasks[$TaskName]
         }
-        if ($TaskTargetsLegacyInstall) {
-            if ($TaskName -eq "TokenUsageInsights") {
-                return [pscustomobject]@{
-                    Actions = @([pscustomobject]@{ Arguments = $legacyTaskActionArguments })
-                }
-            }
-            return $null
-        }
-
         return $null
     }
     function New-ScheduledTaskTrigger {
@@ -336,6 +332,9 @@ function Invoke-InstallServiceTest {
             [Parameter(ValueFromRemainingArguments = $true)]$RemainingArgs
         )
         $global:serviceEvents.Add("RegisterScheduledTask")
+        $global:mockTasks[$TaskName] = [pscustomobject]@{
+            Actions = @([pscustomobject]@{ Arguments = $global:lastTaskActionArgument })
+        }
     }
     function Start-ScheduledTask {
         [CmdletBinding()]
@@ -349,6 +348,10 @@ function Invoke-InstallServiceTest {
         [CmdletBinding()]
         param([string]$TaskName, [switch]$Confirm)
         $global:serviceEvents.Add("UnregisterScheduledTask")
+        if ($FailUnregisterLegacyTask -and ($TaskName -eq "TokenUsageInsights")) {
+            return
+        }
+        $global:mockTasks.Remove($TaskName)
     }
     function New-Object {
         [CmdletBinding()]
@@ -441,6 +444,7 @@ function Invoke-InstallServiceTest {
             StartupShortcutExists = (Test-Path -LiteralPath $startupShortcut)
             LastRegisteredTaskArguments = $global:lastTaskActionArgument
             LastSavedShortcutArguments = if ($global:mockShortcuts.ContainsKey($startupShortcut)) { $global:mockShortcuts[$startupShortcut].Arguments } else { $null }
+            RemainingTasks = @($global:mockTasks.Keys)
         }
     } finally {
         foreach ($functionName in @(
@@ -462,7 +466,7 @@ function Invoke-InstallServiceTest {
         )) {
             Remove-Item "Function:\$functionName" -ErrorAction SilentlyContinue
         }
-        Remove-Variable serviceEvents, hostMessages, mockShortcuts, runnerProcessAlive, otherRunnerProcessAlive, appProcessAlive, otherAppProcessAlive, scheduledTaskTriggerUser, lastTaskActionArgument -Scope Global -ErrorAction SilentlyContinue
+        Remove-Variable serviceEvents, hostMessages, mockShortcuts, mockTasks, runnerProcessAlive, otherRunnerProcessAlive, appProcessAlive, otherAppProcessAlive, scheduledTaskTriggerUser, lastTaskActionArgument -Scope Global -ErrorAction SilentlyContinue
         $env:APPDATA = $previousAppData
         $env:USERNAME = $previousUsername
         $env:USERDOMAIN = $previousUserDomain
@@ -576,6 +580,8 @@ try {
     $installLegacyTaskResult = Invoke-InstallServiceTest -HostAddress "127.0.0.1" -Port 3003 -TaskTargetsLegacyInstall
     Assert-Equal $true $installLegacyTaskResult.OtherRunnerStopped "install.ps1 should stop the runner tied to an existing scheduled task from a previous install directory."
     Assert-Equal $true $installLegacyTaskResult.OtherAppStopped "install.ps1 should stop the executable tied to an existing scheduled task from a previous install directory."
+    Assert-True ($installLegacyTaskResult.RemainingTasks -contains "TokenUsageInsights_test-user") "install.ps1 should register the per-user scheduled task."
+    Assert-Equal $false ($installLegacyTaskResult.RemainingTasks -contains "TokenUsageInsights") "install.ps1 should unregister the legacy task after user task is registered."
 
     $installCurrentAndLegacyTaskResult = Invoke-InstallServiceTest -HostAddress "127.0.0.1" -Port 3003 -SeedStartupShortcut:$false -HasCurrentAndLegacyTask
     Assert-Equal $true $installCurrentAndLegacyTaskResult.OtherRunnerStopped "install.ps1 should stop the runner tied to a legacy scheduled task even when the current user-scoped task also exists."
@@ -634,7 +640,62 @@ try {
     Assert-True ($installExplicitOverrideResult.LastRegisteredTaskArguments -match '-UpdateIntervalHours "12"') "install.ps1 should preserve omitted UpdateIntervalHours even when AutoUpdate is overridden."
 
     $installExplicitResetResult = Invoke-InstallServiceTest -HostAddress "127.0.0.1" -Port 3003 -ServiceInstall:$true -SeedTaskActionArguments $seededTaskArgs -HasCurrentAndLegacyTask -AutoUpdate ""
-    Assert-Equal $false ($installExplicitResetResult.LastRegisteredTaskArguments -match '-AutoUpdate') "install.ps1 should allow explicitly clearing AutoUpdate with empty string."
+    Assert-True ($installExplicitResetResult.LastRegisteredTaskArguments -match '-AutoUpdate ""') "install.ps1 should persist explicit empty string AutoUpdate to clear inherited environment."
+
+    # 6. Legacy task removal failure verification
+    $threwLegacyCleanup = $false
+    try {
+        Invoke-InstallServiceTest -HostAddress "127.0.0.1" -Port 3003 -TaskTargetsLegacyInstall -FailUnregisterLegacyTask
+    } catch {
+        $threwLegacyCleanup = ($_.Exception.Message -match "failed to unregister legacy task")
+    }
+    Assert-True $threwLegacyCleanup "install.ps1 should abort when legacy task unregistration fails during -Service install."
+
+    $nonServiceFailedLegacyResult = Invoke-InstallServiceTest -HostAddress "127.0.0.1" -Port 3003 -ServiceInstall:$false -TaskTargetsLegacyInstall -FailUnregisterLegacyTask -RemoveStartupShortcutBeforeInstall
+    Assert-True ($nonServiceFailedLegacyResult.RemainingTasks -contains "TokenUsageInsights") "install.ps1 should preserve legacy task when unregistration fails in non-Service path."
+    Assert-Equal $false ($nonServiceFailedLegacyResult.RemainingTasks -contains "TokenUsageInsights_test-user") "install.ps1 should revert user task when legacy unregistration fails in non-Service path."
+    Assert-True ($nonServiceFailedLegacyResult.Events -contains "StartScheduledTask") "install.ps1 should fall back to starting the detected legacy task when migration fails."
+
+    $threwFallbackCleanup = $false
+    try {
+        Invoke-InstallServiceTest -HostAddress "127.0.0.1" -Port 3003 -TaskTargetsLegacyInstall -FailScheduledTaskAction -FailUnregisterLegacyTask
+    } catch {
+        $threwFallbackCleanup = ($_.Exception.Message -match "failed to unregister existing task")
+    }
+    Assert-True $threwFallbackCleanup "install.ps1 should fail closed and not create fallback shortcut when existing task unregistration fails."
+
+    # 7. run-service.ps1 parameter handling and environment cleanup verification
+    $runServicePath = Join-Path $PSScriptRoot "run-service.ps1"
+    $testEnvRunner = @'
+param([string]$RunServicePath)
+$env:TOKEN_USAGE_INSIGHTS_AUTO_UPDATE = 'daily'
+$env:TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS = '12'
+$content = Get-Content -Raw -LiteralPath $RunServicePath
+$ast = [System.Management.Automation.Language.Parser]::ParseInput($content, [ref]$null, [ref]$null)
+$paramBlock = $ast.ParamBlock.Extent.Text
+$statements = @($ast.EndBlock.Statements | Where-Object {
+    $_.Extent.Text -match 'TOKEN_USAGE_INSIGHTS_AUTO_UPDATE' -or
+    $_.Extent.Text -match 'TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS'
+} | ForEach-Object { $_.Extent.Text })
+$newline = [Environment]::NewLine
+$testScript = $paramBlock + $newline + ($statements -join $newline)
+$sb = [scriptblock]::Create($testScript)
+& $sb -InstallDir "/tmp" -AutoUpdate "" -UpdateIntervalHours ""
+if ($env:TOKEN_USAGE_INSIGHTS_AUTO_UPDATE) { throw "TOKEN_USAGE_INSIGHTS_AUTO_UPDATE was not cleared" }
+if ($env:TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS) { throw "TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS was not cleared" }
+
+& $sb -InstallDir "/tmp" -AutoUpdate "weekly" -UpdateIntervalHours "24"
+if ($env:TOKEN_USAGE_INSIGHTS_AUTO_UPDATE -ne "weekly") { throw "TOKEN_USAGE_INSIGHTS_AUTO_UPDATE was not set to weekly" }
+if ($env:TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS -ne "24") { throw "TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS was not set to 24" }
+'@
+    $origAutoUpdate = $env:TOKEN_USAGE_INSIGHTS_AUTO_UPDATE
+    $origUpdateInterval = $env:TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS
+    try {
+        & ([scriptblock]::Create($testEnvRunner)) $runServicePath
+    } finally {
+        $env:TOKEN_USAGE_INSIGHTS_AUTO_UPDATE = $origAutoUpdate
+        $env:TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS = $origUpdateInterval
+    }
 
     # Test Rotate-ServiceLog behavior from run-service.ps1
     $runServiceContent = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot "run-service.ps1")

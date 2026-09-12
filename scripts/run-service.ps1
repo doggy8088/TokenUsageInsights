@@ -7,8 +7,8 @@ param(
     [string]$InstallDir = (Split-Path -Parent $PSScriptRoot),
     [string]$HostAddress = $(if ($env:HOST) { $env:HOST } else { "0.0.0.0" }),
     [int]$Port = $(if ($env:PORT) { [int]$env:PORT } else { 3003 }),
-    [string]$AutoUpdate = $(if ($env:TOKEN_USAGE_INSIGHTS_AUTO_UPDATE) { $env:TOKEN_USAGE_INSIGHTS_AUTO_UPDATE } else { "" }),
-    [string]$UpdateIntervalHours = $(if ($env:TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS) { $env:TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS } else { "" })
+    [AllowNull()][string]$AutoUpdate = $null,
+    [AllowNull()][string]$UpdateIntervalHours = $null
 )
 
 $ErrorActionPreference = "Stop"
@@ -19,11 +19,20 @@ $env:PORT = "$Port"
 $env:HOST = "$HostAddress"
 $env:TOKEN_USAGE_INSIGHTS_SERVICE = "1"
 $env:TOKEN_USAGE_INSIGHTS_INSTALL_DIR = "$InstallDir"
-if ($AutoUpdate) {
-    $env:TOKEN_USAGE_INSIGHTS_AUTO_UPDATE = "$AutoUpdate"
+if ($PSBoundParameters.ContainsKey('AutoUpdate')) {
+    if ($AutoUpdate) {
+        $env:TOKEN_USAGE_INSIGHTS_AUTO_UPDATE = "$AutoUpdate"
+    } else {
+        Remove-Item Env:\TOKEN_USAGE_INSIGHTS_AUTO_UPDATE -ErrorAction SilentlyContinue
+    }
 }
-if ($UpdateIntervalHours) {
-    $env:TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS = "$UpdateIntervalHours"
+
+if ($PSBoundParameters.ContainsKey('UpdateIntervalHours')) {
+    if ($UpdateIntervalHours) {
+        $env:TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS = "$UpdateIntervalHours"
+    } else {
+        Remove-Item Env:\TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS -ErrorAction SilentlyContinue
+    }
 }
 
 $Exe = Join-Path $InstallDir "$AppName.exe"

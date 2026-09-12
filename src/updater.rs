@@ -2067,11 +2067,46 @@ async fn fetch_release_with_logging(
     }
 }
 
-async fn fetch_release(tag_opt: Option<&str>, timeout_secs: u64) -> Result<GitHubRelease, String> {
-    let client = reqwest::Client::builder()
+fn validate_download_url(url: &str) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(url).map_err(|e| format!("無效的下載網址 ({url}): {e}"))?;
+    let scheme = parsed.scheme();
+    let host = parsed.host_str().unwrap_or_default();
+    let is_loopback =
+        host == "127.0.0.1" || host == "localhost" || host == "::1" || host == "[::1]";
+
+    if scheme == "https" || (scheme == "http" && (cfg!(test) || is_loopback)) {
+        Ok(())
+    } else {
+        Err(format!("拒絕使用非 HTTPS 下載網址以維護傳輸安全: {url}"))
+    }
+}
+
+fn build_secure_http_client(timeout_secs: u64) -> Result<reqwest::Client, String> {
+    let redirect_policy = reqwest::redirect::Policy::custom(|attempt| {
+        let scheme = attempt.url().scheme();
+        let host = attempt.url().host_str().unwrap_or_default();
+        let is_loopback =
+            host == "127.0.0.1" || host == "localhost" || host == "::1" || host == "[::1]";
+        if scheme == "https" || (scheme == "http" && (cfg!(test) || is_loopback)) {
+            if attempt.previous().len() >= 10 {
+                attempt.error("超過重新導向次數上限 (10)")
+            } else {
+                attempt.follow()
+            }
+        } else {
+            attempt.error("拒絕重新導向至非加密 HTTP 協定")
+        }
+    });
+
+    reqwest::Client::builder()
         .timeout(Duration::from_secs(timeout_secs))
+        .redirect(redirect_policy)
         .build()
-        .map_err(|e| format!("建立 HTTP 用戶端失敗: {e}"))?;
+        .map_err(|e| format!("建立 HTTP 用戶端失敗: {e}"))
+}
+
+async fn fetch_release(tag_opt: Option<&str>, timeout_secs: u64) -> Result<GitHubRelease, String> {
+    let client = build_secure_http_client(timeout_secs)?;
 
     let url = match tag_opt {
         Some(tag) => {
@@ -2110,10 +2145,8 @@ async fn download_to_file_with_hash(
     max_bytes: usize,
     timeout_secs: u64,
 ) -> Result<String, String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(timeout_secs))
-        .build()
-        .map_err(|e| format!("建立 HTTP 用戶端失敗: {e}"))?;
+    validate_download_url(url)?;
+    let client = build_secure_http_client(timeout_secs)?;
 
     let mut resp = client
         .get(url)
@@ -2166,10 +2199,8 @@ async fn download_text_capped(
     max_bytes: usize,
     timeout_secs: u64,
 ) -> Result<String, String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(timeout_secs))
-        .build()
-        .map_err(|e| format!("建立 HTTP 用戶端失敗: {e}"))?;
+    validate_download_url(url)?;
+    let client = build_secure_http_client(timeout_secs)?;
 
     let mut resp = client
         .get(url)
@@ -5677,5 +5708,21 @@ update_check_interval: 5 # check every 5 days
         assert_eq!(ready_content.trim(), "ready");
 
         let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn validate_download_url_enforces_https_or_loopback() {
+        assert!(validate_download_url(
+            "https://github.com/doggy8088/TokenUsageInsights/releases/download/v0.9.1/file.zip"
+        )
+        .is_ok());
+        assert!(validate_download_url(
+            "https://objects.githubusercontent.com/github-production-release-asset-2e65be/file.zip"
+        )
+        .is_ok());
+        assert!(validate_download_url("http://127.0.0.1:8080/archive.zip").is_ok());
+        assert!(validate_download_url("http://localhost:3000/archive.zip").is_ok());
+        assert!(validate_download_url("not a url").is_err());
+        assert!(validate_download_url("ftp://example.com/file.zip").is_err());
     }
 }

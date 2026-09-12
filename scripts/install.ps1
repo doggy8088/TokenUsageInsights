@@ -286,15 +286,15 @@ function Set-StartupShortcutForRunner {
         [string]$InstallDir,
         [string]$HostAddress,
         [int]$Port,
-        [string]$AutoUpdate = "",
-        [string]$UpdateIntervalHours = ""
+        [AllowNull()][string]$AutoUpdate = $null,
+        [AllowNull()][string]$UpdateIntervalHours = $null
     )
 
     $runnerArgs = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$RunnerScript`" -InstallDir `"$InstallDir`" -HostAddress `"$HostAddress`" -Port $Port"
-    if ($AutoUpdate) {
+    if ($null -ne $AutoUpdate) {
         $runnerArgs += " -AutoUpdate `"$AutoUpdate`""
     }
-    if ($UpdateIntervalHours) {
+    if ($null -ne $UpdateIntervalHours) {
         $runnerArgs += " -UpdateIntervalHours `"$UpdateIntervalHours`""
     }
 
@@ -315,15 +315,15 @@ function Register-DashboardScheduledTask {
         [string]$InstallDir,
         [string]$HostAddress,
         [int]$Port,
-        [string]$AutoUpdate = "",
-        [string]$UpdateIntervalHours = ""
+        [AllowNull()][string]$AutoUpdate = $null,
+        [AllowNull()][string]$UpdateIntervalHours = $null
     )
 
     $runnerArgs = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$RunnerScript`" -InstallDir `"$InstallDir`" -HostAddress `"$HostAddress`" -Port $Port"
-    if ($AutoUpdate) {
+    if ($null -ne $AutoUpdate) {
         $runnerArgs += " -AutoUpdate `"$AutoUpdate`""
     }
-    if ($UpdateIntervalHours) {
+    if ($null -ne $UpdateIntervalHours) {
         $runnerArgs += " -UpdateIntervalHours `"$UpdateIntervalHours`""
     }
 
@@ -436,22 +436,36 @@ if ($PSCmdlet.ShouldProcess($InstallDir, "Install Token Usage Insights")) {
     $hadPersistentServiceRegistration = $hadScheduledTaskBeforeStop -or $existingShortcut
 
     # 若未明確指定更新設定，自動繼承既有服務排程或捷徑中的設定，避免重新安裝時遺失原更新策略
-    $autoUpdateProvided = $PSBoundParameters.ContainsKey('AutoUpdate') -or ($null -ne [System.Environment]::GetEnvironmentVariable("TOKEN_USAGE_INSIGHTS_AUTO_UPDATE") -and [System.Environment]::GetEnvironmentVariable("TOKEN_USAGE_INSIGHTS_AUTO_UPDATE") -ne "")
-    $updateIntervalProvided = $PSBoundParameters.ContainsKey('UpdateIntervalHours') -or ($null -ne [System.Environment]::GetEnvironmentVariable("TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS") -and [System.Environment]::GetEnvironmentVariable("TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS") -ne "")
+    $persistedAutoUpdate = $null
+    if ($PSBoundParameters.ContainsKey('AutoUpdate')) {
+        $persistedAutoUpdate = $AutoUpdate
+    } elseif ($null -ne [System.Environment]::GetEnvironmentVariable("TOKEN_USAGE_INSIGHTS_AUTO_UPDATE") -and [System.Environment]::GetEnvironmentVariable("TOKEN_USAGE_INSIGHTS_AUTO_UPDATE") -ne "") {
+        $persistedAutoUpdate = $AutoUpdate
+    }
+
+    $persistedUpdateInterval = $null
+    if ($PSBoundParameters.ContainsKey('UpdateIntervalHours')) {
+        $persistedUpdateInterval = $UpdateIntervalHours
+    } elseif ($null -ne [System.Environment]::GetEnvironmentVariable("TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS") -and [System.Environment]::GetEnvironmentVariable("TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS") -ne "") {
+        $persistedUpdateInterval = $UpdateIntervalHours
+    }
+
     $candidateServiceArguments = @($existingTaskArguments, $existingShortcutArguments) | Where-Object { $_ }
-    if (-not $autoUpdateProvided) {
+    if ($null -eq $persistedAutoUpdate) {
         foreach ($candArgs in $candidateServiceArguments) {
             $existingAutoUpdate = Get-RunnerArgumentValue -Arguments $candArgs -ParameterName "AutoUpdate"
             if ($null -ne $existingAutoUpdate) {
+                $persistedAutoUpdate = $existingAutoUpdate
                 $AutoUpdate = $existingAutoUpdate
                 break
             }
         }
     }
-    if (-not $updateIntervalProvided) {
+    if ($null -eq $persistedUpdateInterval) {
         foreach ($candArgs in $candidateServiceArguments) {
             $existingInterval = Get-RunnerArgumentValue -Arguments $candArgs -ParameterName "UpdateIntervalHours"
             if ($null -ne $existingInterval) {
+                $persistedUpdateInterval = $existingInterval
                 $UpdateIntervalHours = $existingInterval
                 break
             }
@@ -516,11 +530,11 @@ exit /b %APP_EXIT_CODE%
         }
 
         $runnerArgs = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$RunnerScript`" -InstallDir `"$InstallDir`" -HostAddress `"$HostAddress`" -Port $Port"
-        if ($AutoUpdate) {
-            $runnerArgs += " -AutoUpdate `"$AutoUpdate`""
+        if ($null -ne $persistedAutoUpdate) {
+            $runnerArgs += " -AutoUpdate `"$persistedAutoUpdate`""
         }
-        if ($UpdateIntervalHours) {
-            $runnerArgs += " -UpdateIntervalHours `"$UpdateIntervalHours`""
+        if ($null -ne $persistedUpdateInterval) {
+            $runnerArgs += " -UpdateIntervalHours `"$persistedUpdateInterval`""
         }
 
         $taskRegistered = $false
@@ -531,8 +545,8 @@ exit /b %APP_EXIT_CODE%
                 -InstallDir $InstallDir `
                 -HostAddress $HostAddress `
                 -Port $Port `
-                -AutoUpdate $AutoUpdate `
-                -UpdateIntervalHours $UpdateIntervalHours
+                -AutoUpdate $persistedAutoUpdate `
+                -UpdateIntervalHours $persistedUpdateInterval
             $taskRegistered = $true
         } catch {
             Write-Warning "Could not register scheduled task: $($_.Exception.Message). Falling back to Startup folder..."
@@ -540,13 +554,22 @@ exit /b %APP_EXIT_CODE%
                 Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
             } catch {}
 
+            if ($legacyTaskName -and ($legacyTaskName -ne $TaskName)) {
+                try {
+                    Unregister-ScheduledTask -TaskName $legacyTaskName -Confirm:$false -ErrorAction SilentlyContinue
+                } catch {}
+            }
+
             $taskStillExists = $false
             try {
                 $taskStillExists = [bool](Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)
+                if (-not $taskStillExists -and $legacyTaskName -and ($legacyTaskName -ne $TaskName)) {
+                    $taskStillExists = [bool](Get-ScheduledTask -TaskName $legacyTaskName -ErrorAction SilentlyContinue)
+                }
             } catch {}
 
             if ($taskStillExists) {
-                throw "Could not register scheduled task and failed to unregister existing task '$TaskName'. Aborting fallback to prevent duplicate execution."
+                throw "Could not register scheduled task and failed to unregister existing task. Aborting fallback to prevent duplicate execution."
             }
 
             $startupShortcutPath = Get-StartupShortcutPath -EnsureDirectory
@@ -556,8 +579,8 @@ exit /b %APP_EXIT_CODE%
                 -InstallDir $InstallDir `
                 -HostAddress $HostAddress `
                 -Port $Port `
-                -AutoUpdate $AutoUpdate `
-                -UpdateIntervalHours $UpdateIntervalHours
+                -AutoUpdate $persistedAutoUpdate `
+                -UpdateIntervalHours $persistedUpdateInterval
 
             Start-Process -FilePath "powershell.exe" `
                 -ArgumentList $runnerArgs `
@@ -567,16 +590,28 @@ exit /b %APP_EXIT_CODE%
         if ($taskRegistered) {
             $registeredAsTask = $true
 
-            try {
-                Start-ScheduledTask -TaskName $TaskName
-            } catch {
-                Write-Warning "Scheduled task registered, but automatic start failed: $($_.Exception.Message)"
-            }
-
             if ($legacyTaskName -and ($legacyTaskName -ne $TaskName)) {
                 try {
                     Unregister-ScheduledTask -TaskName $legacyTaskName -Confirm:$false -ErrorAction SilentlyContinue
                 } catch {}
+
+                $legacyStillExists = $false
+                try {
+                    $legacyStillExists = [bool](Get-ScheduledTask -TaskName $legacyTaskName -ErrorAction SilentlyContinue)
+                } catch {}
+
+                if ($legacyStillExists) {
+                    try {
+                        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+                    } catch {}
+                    throw "Scheduled task '$TaskName' registered, but failed to unregister legacy task '$legacyTaskName'. Aborting to prevent duplicate execution."
+                }
+            }
+
+            try {
+                Start-ScheduledTask -TaskName $TaskName
+            } catch {
+                Write-Warning "Scheduled task registered, but automatic start failed: $($_.Exception.Message)"
             }
 
             # Registration in Task Scheduler succeeded; remove any stale Startup folder shortcut
@@ -612,14 +647,29 @@ exit /b %APP_EXIT_CODE%
                         -InstallDir $InstallDir `
                         -HostAddress $HostAddress `
                         -Port $Port `
-                        -AutoUpdate $AutoUpdate `
-                        -UpdateIntervalHours $UpdateIntervalHours
-                    $migratedOrUpdated = $true
-                    $taskToStart = $TaskName
+                        -AutoUpdate $persistedAutoUpdate `
+                        -UpdateIntervalHours $persistedUpdateInterval
+                    $taskRegisteredSuccessfully = $true
                     if ($legacyTaskName -and ($legacyTaskName -ne $TaskName)) {
                         try {
                             Unregister-ScheduledTask -TaskName $legacyTaskName -Confirm:$false -ErrorAction SilentlyContinue
                         } catch {}
+
+                        $legacyStillExists = $false
+                        try {
+                            $legacyStillExists = [bool](Get-ScheduledTask -TaskName $legacyTaskName -ErrorAction SilentlyContinue)
+                        } catch {}
+
+                        if ($legacyStillExists) {
+                            try {
+                                Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+                            } catch {}
+                            $taskRegisteredSuccessfully = $false
+                        }
+                    }
+                    if ($taskRegisteredSuccessfully) {
+                        $migratedOrUpdated = $true
+                        $taskToStart = $TaskName
                     }
                 } catch {}
             }
@@ -642,8 +692,8 @@ exit /b %APP_EXIT_CODE%
                     -InstallDir $InstallDir `
                     -HostAddress $HostAddress `
                     -Port $Port `
-                    -AutoUpdate $AutoUpdate `
-                    -UpdateIntervalHours $UpdateIntervalHours
+                    -AutoUpdate $persistedAutoUpdate `
+                    -UpdateIntervalHours $persistedUpdateInterval
             } catch {}
 
             if (Test-Path $startupShortcutPath) {
