@@ -171,6 +171,13 @@ extern "system" {
     fn GetModuleHandleA(lpModuleName: *const u8) -> WinHandle;
     fn GetProcAddress(hModule: WinHandle, lpProcName: *const u8) -> *mut std::ffi::c_void;
     fn LocalFree(hMem: WinHandle) -> WinHandle;
+    fn ReadProcessMemory(
+        hProcess: WinHandle,
+        lpBaseAddress: *const std::ffi::c_void,
+        lpBuffer: *mut std::ffi::c_void,
+        nSize: usize,
+        lpNumberOfBytesRead: *mut usize,
+    ) -> i32;
 }
 
 #[cfg(windows)]
@@ -554,8 +561,112 @@ fn get_process_relevant_envs(_pid: u32) -> Vec<(String, String)> {
 }
 
 #[cfg(windows)]
-fn get_process_cwd(_pid: u32) -> Option<PathBuf> {
-    None
+fn get_process_cwd(pid: u32) -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+
+    unsafe {
+        let ntdll = GetModuleHandleA(b"ntdll.dll\0".as_ptr());
+        if ntdll.is_null() {
+            return None;
+        }
+        let func_ptr = GetProcAddress(ntdll, b"NtQueryInformationProcess\0".as_ptr());
+        if func_ptr.is_null() {
+            return None;
+        }
+        let nt_query: NtQueryInformationProcessFn = std::mem::transmute(func_ptr);
+
+        let mut handle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid);
+        if handle.is_null() {
+            handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        }
+        if handle.is_null() {
+            return None;
+        }
+
+        let mut pbi = std::mem::zeroed::<ProcessBasicInformation>();
+        let mut return_len = 0u32;
+        let status = nt_query(
+            handle,
+            0, // ProcessBasicInformation
+            &mut pbi as *mut _ as *mut std::ffi::c_void,
+            std::mem::size_of::<ProcessBasicInformation>() as u32,
+            &mut return_len,
+        );
+
+        if status != 0 || pbi.peb_base_address.is_null() {
+            CloseHandle(handle);
+            return None;
+        }
+
+        #[cfg(target_pointer_width = "64")]
+        let (proc_params_offset, curdir_offset) = (0x20usize, 0x38usize);
+        #[cfg(target_pointer_width = "32")]
+        let (proc_params_offset, curdir_offset) = (0x10usize, 0x24usize);
+
+        let peb_ptr = pbi.peb_base_address as usize;
+        let mut params_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut bytes_read = 0usize;
+
+        let ok1 = ReadProcessMemory(
+            handle,
+            (peb_ptr + proc_params_offset) as *const std::ffi::c_void,
+            &mut params_ptr as *mut _ as *mut std::ffi::c_void,
+            std::mem::size_of::<*mut std::ffi::c_void>(),
+            &mut bytes_read,
+        );
+
+        if ok1 == 0 || params_ptr.is_null() {
+            CloseHandle(handle);
+            return None;
+        }
+
+        let mut unicode_str = UnicodeString {
+            length: 0,
+            maximum_length: 0,
+            buffer: std::ptr::null_mut(),
+        };
+
+        let ok2 = ReadProcessMemory(
+            handle,
+            (params_ptr as usize + curdir_offset) as *const std::ffi::c_void,
+            &mut unicode_str as *mut _ as *mut std::ffi::c_void,
+            std::mem::size_of::<UnicodeString>(),
+            &mut bytes_read,
+        );
+
+        if ok2 == 0 || unicode_str.buffer.is_null() || unicode_str.length == 0 {
+            CloseHandle(handle);
+            return None;
+        }
+
+        let char_len = (unicode_str.length as usize) / 2;
+        if char_len > 4096 {
+            CloseHandle(handle);
+            return None;
+        }
+
+        let mut wide_buf = vec![0u16; char_len];
+        let ok3 = ReadProcessMemory(
+            handle,
+            unicode_str.buffer as *const std::ffi::c_void,
+            wide_buf.as_mut_ptr() as *mut std::ffi::c_void,
+            unicode_str.length as usize,
+            &mut bytes_read,
+        );
+        CloseHandle(handle);
+
+        if ok3 == 0 || bytes_read < unicode_str.length as usize {
+            return None;
+        }
+
+        let os_str = std::ffi::OsString::from_wide(&wide_buf);
+        let path = PathBuf::from(os_str.to_string_lossy().trim().to_string());
+        if path.is_dir() {
+            Some(path)
+        } else {
+            None
+        }
+    }
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -1015,22 +1126,47 @@ fn unlock_file(file: &fs::File) -> Result<(), std::io::Error> {
 fn try_lock_file_exclusive(file: &fs::File) -> Result<bool, std::io::Error> {
     use std::os::windows::io::AsRawHandle;
     type Handle = *mut std::ffi::c_void;
+
+    #[repr(C)]
+    struct Overlapped {
+        internal: usize,
+        internal_high: usize,
+        offset: u32,
+        offset_high: u32,
+        event: Handle,
+    }
+
+    const LOCKFILE_FAIL_IMMEDIATELY: u32 = 0x00000001;
+    const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x00000002;
+    const ERROR_LOCK_VIOLATION: i32 = 33;
+
     extern "system" {
-        fn LockFile(
+        fn LockFileEx(
             hFile: Handle,
-            dwFileOffsetLow: u32,
-            dwFileOffsetHigh: u32,
+            dwFlags: u32,
+            dwReserved: u32,
             nNumberOfBytesToLockLow: u32,
             nNumberOfBytesToLockHigh: u32,
+            lpOverlapped: *mut Overlapped,
         ) -> i32;
     }
     let handle = file.as_raw_handle() as Handle;
-    let ret = unsafe { LockFile(handle, 0, 0, 1, 0) };
+    let mut overlapped = std::mem::MaybeUninit::<Overlapped>::zeroed();
+    let ret = unsafe {
+        LockFileEx(
+            handle,
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            1,
+            0,
+            overlapped.as_mut_ptr(),
+        )
+    };
     if ret != 0 {
         Ok(true)
     } else {
         let err = std::io::Error::last_os_error();
-        if err.raw_os_error() == Some(33) {
+        if err.raw_os_error() == Some(ERROR_LOCK_VIOLATION) {
             Ok(false)
         } else {
             Err(err)
@@ -2377,7 +2513,14 @@ fn restart_dashboard_instance(spec: &StoppedProcessSpec, install_dir: &Path) -> 
     let mut cmd = std::process::Command::new(&exe);
     cmd.args(child_args);
 
-    let cwd = spec.cwd.as_deref().unwrap_or(install_dir);
+    let cwd = match &spec.cwd {
+        Some(c) => c.as_path(),
+        None => {
+            return Err(
+                "無法可靠取得先前進程之工作目錄，略過自動重啟以防資料與組態偏離".to_string(),
+            );
+        }
+    };
     cmd.current_dir(cwd);
 
     for (k, v) in &spec.envs {
@@ -3813,7 +3956,7 @@ update_check_interval: 5 # check every 5 days
             exe_path: dummy_exe.clone(),
             args: None,
             envs: vec![],
-            cwd: None,
+            cwd: Some(temp.clone()),
         };
         let res_no_args = restart_dashboard_instance(&spec_no_args, &temp);
         assert!(res_no_args.is_err());
@@ -3828,7 +3971,7 @@ update_check_interval: 5 # check every 5 days
             exe_path: dummy_exe.clone(),
             args: Some(vec![APP_NAME.to_string(), "export-all".to_string()]),
             envs: vec![],
-            cwd: None,
+            cwd: Some(temp.clone()),
         };
         let res_subcommand = restart_dashboard_instance(&spec_subcommand, &temp);
         assert!(res_subcommand.is_err());
@@ -3836,15 +3979,30 @@ update_check_interval: 5 # check every 5 days
             .unwrap_err()
             .contains("先前進程包含非看板 CLI 子命令"));
 
-        // 3. 執行檔不存在時應報錯
+        // 3. cwd 為 None 時應拒絕重啟以防組態偏離
+        let spec_no_cwd = StoppedProcessSpec {
+            pid: 3333,
+            is_supervised: false,
+            exe_path: dummy_exe.clone(),
+            args: Some(vec![APP_NAME.to_string()]),
+            envs: vec![],
+            cwd: None,
+        };
+        let res_no_cwd = restart_dashboard_instance(&spec_no_cwd, &temp);
+        assert!(res_no_cwd.is_err());
+        assert!(res_no_cwd
+            .unwrap_err()
+            .contains("無法可靠取得先前進程之工作目錄"));
+
+        // 4. 執行檔不存在時應報錯
         let empty_dir = temp.join("empty_dir");
         let spec_missing_exe = StoppedProcessSpec {
-            pid: 3333,
+            pid: 4444,
             is_supervised: false,
             exe_path: empty_dir.join("nonexistent_exe"),
             args: Some(vec![APP_NAME.to_string()]),
             envs: vec![],
-            cwd: None,
+            cwd: Some(temp.clone()),
         };
         let res_missing = restart_dashboard_instance(&spec_missing_exe, &empty_dir);
         assert!(res_missing.is_err());
