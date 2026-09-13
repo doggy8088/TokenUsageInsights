@@ -922,27 +922,31 @@ mod tests {
 
     #[test]
     fn parse_flag_value_rejects_missing_and_option_like_values() {
-        // 1. update 子命令旗標解析測試
-        let mut i = 0;
+        // 1. update 子命令旗標解析測試（驗證指向旗標位置 index 1 時，對後續參數值之正確解析與拒絕）
+        let mut i1 = 1;
         let args_short = vec!["update".to_string(), "-v".to_string(), "-f".to_string()];
         let err_short =
-            super::parse_update_flag_value(&args_short, &mut i, "target-version").unwrap_err();
+            super::parse_update_flag_value(&args_short, &mut i1, "target-version").unwrap_err();
         assert_eq!(err_short, "缺少 --target-version 的值");
-        assert_eq!(i, 0);
+        assert_eq!(i1, 1);
 
+        let mut i2 = 1;
         let args_long = vec![
             "update".to_string(),
             "-v".to_string(),
             "--force".to_string(),
         ];
         let err_long =
-            super::parse_update_flag_value(&args_long, &mut i, "target-version").unwrap_err();
+            super::parse_update_flag_value(&args_long, &mut i2, "target-version").unwrap_err();
         assert_eq!(err_long, "缺少 --target-version 的值");
+        assert_eq!(i2, 1);
 
+        let mut i3 = 1;
         let args_end = vec!["update".to_string(), "-v".to_string()];
         let err_end =
-            super::parse_update_flag_value(&args_end, &mut i, "target-version").unwrap_err();
+            super::parse_update_flag_value(&args_end, &mut i3, "target-version").unwrap_err();
         assert_eq!(err_end, "缺少 --target-version 的值");
+        assert_eq!(i3, 1);
 
         let mut j = 1;
         let args_valid = vec!["update".to_string(), "-v".to_string(), "v0.9.6".to_string()];

@@ -217,11 +217,34 @@ function Wait-ForExecutableReady {
     if (Test-Path -LiteralPath $versionFile) {
         $expectedVer = (Get-Content -LiteralPath $versionFile -Raw).Trim().TrimStart('v').TrimStart('V')
         if ($expectedVer) {
-            $verOutput = (& $ExePath --version 2>&1 | Out-String).Trim()
-            $tokens = $verOutput -split '\s+'
-            $actualVer = if ($tokens.Count -gt 0) { $tokens[-1].TrimStart('v').TrimStart('V') } else { '' }
-            if ($actualVer -ne $expectedVer) {
-                Write-Error -Message "執行檔版本 ($verOutput) 與 VERSION 檔案 ($expectedVer) 不符，中止啟動以確保安全。"
+            $pinfo = New-Object System.Diagnostics.ProcessStartInfo
+            $pinfo.FileName = $ExePath
+            $pinfo.Arguments = '--version'
+            $pinfo.RedirectStandardOutput = $true
+            $pinfo.RedirectStandardError = $true
+            $pinfo.UseShellExecute = $false
+            $pinfo.CreateNoWindow = $true
+
+            $proc = New-Object System.Diagnostics.Process
+            $proc.StartInfo = $pinfo
+            if ($proc.Start()) {
+                $exited = $proc.WaitForExit(5000)
+                if (-not $exited) {
+                    try { $proc.Kill() } catch {}
+                    Write-Error -Message "執行檔版本檢查逾時（5 秒），二進位檔可能異常；中止啟動以確保安全。"
+                    exit 1
+                }
+                $stdout = $proc.StandardOutput.ReadToEnd()
+                $stderr = $proc.StandardError.ReadToEnd()
+                $verOutput = if ($stdout) { $stdout.Trim() } else { $stderr.Trim() }
+                $tokens = $verOutput -split '\s+'
+                $actualVer = if ($tokens.Count -gt 0) { $tokens[-1].TrimStart('v').TrimStart('V') } else { '' }
+                if ($actualVer -ne $expectedVer) {
+                    Write-Error -Message "執行檔版本 ($verOutput) 與 VERSION 檔案 ($expectedVer) 不符，中止啟動以確保安全。"
+                    exit 1
+                }
+            } else {
+                Write-Error -Message "無法啟動執行檔進行版本檢查，中止啟動以確保安全。"
                 exit 1
             }
         }

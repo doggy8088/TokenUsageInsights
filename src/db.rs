@@ -1129,10 +1129,17 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
 pub fn get_system_metadata(conn: &Connection, key: &str) -> Result<Option<String>, String> {
     let mut stmt = conn
         .prepare("SELECT value FROM system_metadata WHERE key = ?1")
-        .map_err(|e| e.to_string())?;
-    let mut rows = stmt.query(params![key]).map_err(|e| e.to_string())?;
-    if let Some(row) = rows.next().map_err(|e| e.to_string())? {
-        let val: String = row.get(0).map_err(|e| e.to_string())?;
+        .map_err(|e| format!("準備查詢 system_metadata (key: {key}) 失敗: {e}"))?;
+    let mut rows = stmt
+        .query(params![key])
+        .map_err(|e| format!("執行查詢 system_metadata (key: {key}) 失敗: {e}"))?;
+    if let Some(row) = rows
+        .next()
+        .map_err(|e| format!("讀取 system_metadata (key: {key}) 結果失敗: {e}"))?
+    {
+        let val: String = row
+            .get(0)
+            .map_err(|e| format!("取得 system_metadata (key: {key}) 欄位值失敗: {e}"))?;
         Ok(Some(val))
     } else {
         Ok(None)
@@ -1146,7 +1153,7 @@ pub fn set_system_metadata(conn: &Connection, key: &str, value: &str) -> Result<
          ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
         params![key, value, now],
     )
-    .map_err(|e| format!("更新 system_metadata 失敗: {e}"))?;
+    .map_err(|e| format!("寫入 system_metadata (key: {key}) 失敗: {e}"))?;
     Ok(())
 }
 

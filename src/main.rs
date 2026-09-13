@@ -251,7 +251,7 @@ async fn main() {
 
     // HTTP 先開始監聽；可能耗時的遷移與 transcript 同步在 blocking thread 執行。
     spawn_usage_sync_task();
-    let _pid_guard = updater::create_server_pid_guard();
+    let pid_guard = updater::create_server_pid_guard();
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             let _ = graceful_rx.await;
@@ -259,7 +259,7 @@ async fn main() {
         .await
         .unwrap();
 
-    drop(_pid_guard);
+    drop(pid_guard);
 
     let shutdown_reason = shutdown_reason_task
         .await

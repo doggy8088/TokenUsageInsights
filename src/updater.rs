@@ -3560,12 +3560,30 @@ $versionMatched = $false
 $vCheckCount = 0
 while ($vCheckCount -lt 50) {
     try {
-        $out = (& $exePath --version 2>&1 | Out-String).Trim()
-        $tokens = $out -split '\s+'
-        $actualVer = if ($tokens.Count -gt 0) { $tokens[-1].TrimStart('v').TrimStart('V') } else { '' }
-        if ($actualVer -eq $expectedVersion) {
-            $versionMatched = $true
-            break
+        $pinfo = New-Object System.Diagnostics.ProcessStartInfo
+        $pinfo.FileName = $exePath
+        $pinfo.Arguments = '--version'
+        $pinfo.RedirectStandardOutput = $true
+        $pinfo.RedirectStandardError = $true
+        $pinfo.UseShellExecute = $false
+        $pinfo.CreateNoWindow = $true
+
+        $proc = New-Object System.Diagnostics.Process
+        $proc.StartInfo = $pinfo
+        if ($proc.Start()) {
+            if ($proc.WaitForExit(3000)) {
+                $stdout = $proc.StandardOutput.ReadToEnd()
+                $stderr = $proc.StandardError.ReadToEnd()
+                $out = if ($stdout) { $stdout.Trim() } else { $stderr.Trim() }
+                $tokens = $out -split '\s+'
+                $actualVer = if ($tokens.Count -gt 0) { $tokens[-1].TrimStart('v').TrimStart('V') } else { '' }
+                if ($actualVer -eq $expectedVersion) {
+                    $versionMatched = $true
+                    break
+                }
+            } else {
+                try { $proc.Kill() } catch {}
+            }
         }
     } catch {}
     Start-Sleep -Milliseconds 100
@@ -6434,7 +6452,8 @@ update_check_interval: 5 # check every 5 days
         assert!(script.contains("*.__relocated__.exe"));
 
         // 驗證腳本包含 --version 執行與精確版本驗證
-        assert!(script.contains("& $exePath --version"));
+        assert!(script.contains("$pinfo.Arguments = '--version'"));
+        assert!(script.contains("WaitForExit(3000)"));
         assert!(script.contains("$expectedVersion = '0.9.6';"));
         assert!(script.contains("$actualVer -eq $expectedVersion"));
 
