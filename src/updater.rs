@@ -1064,6 +1064,7 @@ pub fn create_server_pid_guard() -> ServerPidGuard {
 pub enum UpdateError {
     SafeRejection(String),
     Failure(String),
+    RollbackFailed(String),
 }
 
 impl std::fmt::Display for UpdateError {
@@ -1071,6 +1072,7 @@ impl std::fmt::Display for UpdateError {
         match self {
             UpdateError::SafeRejection(msg) => write!(f, "{msg}"),
             UpdateError::Failure(msg) => write!(f, "{msg}"),
+            UpdateError::RollbackFailed(msg) => write!(f, "{msg}"),
         }
     }
 }
@@ -2154,25 +2156,25 @@ fn restore_from_backup(backup_dir: &Path, install_dir: &Path) -> Result<(), Stri
             }
         }
         Err(e) => {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                return Ok(());
-            }
-            return Err(format!("無法讀取備份目錄元資料 ({backup_dir:?}): {e}"));
+            return Err(format!(
+                "備份目錄不存在或無法讀取元資料 ({backup_dir:?}): {e}；無法執行安全回滾復原"
+            ));
         }
     }
 
     let manifest_path = backup_dir.join(".manifest");
-    let original_items: std::collections::HashSet<String> = if manifest_path.exists() {
-        let content = fs::read_to_string(&manifest_path)
-            .map_err(|e| format!("讀取備份清單失敗 ({manifest_path:?}): {e}"))?;
-        content
-            .lines()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect()
-    } else {
-        std::collections::HashSet::new()
-    };
+    if !manifest_path.exists() {
+        return Err(format!(
+            "備份清單檔案不存在 ({manifest_path:?})，無法確認原始檔案結構以執行安全回滾"
+        ));
+    }
+    let content = fs::read_to_string(&manifest_path)
+        .map_err(|e| format!("讀取備份清單失敗 ({manifest_path:?}): {e}"))?;
+    let original_items: std::collections::HashSet<String> = content
+        .lines()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
 
     // 1. 移除更新期間新增、但原始安裝中並不存在的受管理項目
     for &item in MANAGED_ITEMS {
@@ -2736,10 +2738,10 @@ pub(crate) async fn run_update_in_dir(
         let extract_dir = extract_dir.clone();
         let install_dir = install_dir.to_path_buf();
         let remote_version = remote_version.to_string();
-        move || -> Result<bool, String> {
+        move || -> Result<bool, UpdateError> {
             if let Err(e) = extract_archive(&archive_path, &extract_dir, is_zip) {
                 log_update("ERROR", "EXTRACT", &e);
-                return Err(e);
+                return Err(UpdateError::Failure(e));
             }
 
             // 尋找解壓後的根目錄（可能有一層子目錄）
@@ -2767,7 +2769,7 @@ pub(crate) async fn run_update_in_dir(
                     None => {
                         let err = "解壓後的目錄中未找到執行檔".to_string();
                         log_update("ERROR", "EXTRACT", &err);
-                        return Err(err);
+                        return Err(UpdateError::Failure(err));
                     }
                 }
             };
@@ -2793,7 +2795,7 @@ pub(crate) async fn run_update_in_dir(
                 if !release_root.join(required).exists() {
                     let err = format!("解壓發行包缺少必要資源: {required}");
                     log_update("ERROR", "VERIFY", &err);
-                    return Err(err);
+                    return Err(UpdateError::Failure(err));
                 }
             }
 
@@ -2811,8 +2813,12 @@ pub(crate) async fn run_update_in_dir(
 
     let server_restarted = match install_task_res {
         Ok(Ok(restarted)) => restarted,
-        Ok(Err(e)) => return Err(e.into()),
-        Err(join_err) => return Err(format!("安裝任務執行異常: {join_err}").into()),
+        Ok(Err(e)) => return Err(e),
+        Err(join_err) => {
+            return Err(UpdateError::Failure(format!(
+                "安裝任務執行異常: {join_err}"
+            )))
+        }
     };
 
     let _ = tmp_guard.cleanup();
@@ -3623,6 +3629,10 @@ $logTime = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
 
 if ($versionMatched) {
     Add-Content -LiteralPath $logFile -Value "[$logTime] [INFO] [RESTART] 移交守護進程已確認新版執行檔版本 ($expectedVersion)，正在重新啟動看板服務..."
+    $backupDir = Join-Path $installDir '.backup'
+    if (Test-Path -LiteralPath $backupDir) {
+        Remove-Item -LiteralPath $backupDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
     if ($argList.Count -gt 0) {
         Start-Process -FilePath $exePath -ArgumentList $argList -WorkingDirectory $cwd -WindowStyle Hidden
     } else {
@@ -3833,11 +3843,11 @@ pub(crate) fn apply_installation_with_rollback(
     release_root: &Path,
     install_dir: &Path,
     backup_dir: &Path,
-) -> Result<bool, String> {
+) -> Result<bool, UpdateError> {
     println!("💾 正在備份現有安裝...");
     if let Err(e) = backup_installation(install_dir, backup_dir) {
         log_update("ERROR", "BACKUP", &e);
-        return Err(e);
+        return Err(UpdateError::Failure(e));
     }
 
     println!("⏸️ 正在協調停止現有執行中之服務...");
@@ -3852,7 +3862,7 @@ pub(crate) fn apply_installation_with_rollback(
                 "STOP_SERVICE",
                 &format!("停止服務進程失敗，已清理備份目錄: {err}"),
             );
-            return Err(err);
+            return Err(UpdateError::Failure(err));
         }
     };
 
@@ -3981,15 +3991,17 @@ pub(crate) fn apply_installation_with_rollback(
         eprintln!("❌ 安裝失敗，正在自動回滾: {err}");
         log_update("ERROR", "INSTALL", &format!("安裝失敗: {err}，開始回滾"));
         if let Err(rollback_err) = restore_from_backup(backup_dir, install_dir) {
-            let _ = fs::write(backup_dir.join(".rollback_failed"), &rollback_err);
+            let marker_content = format!("rollback_error: {rollback_err}\ninstall_error: {err}");
+            let _ = fs::write(backup_dir.join(".rollback_failed"), &marker_content);
+            let _ = fs::write(install_dir.join(".rollback_failed"), &marker_content);
             eprintln!(
                 "❌ 自動回滾失敗: {rollback_err}；請保留備份目錄 {:?} 進行手動還原",
                 backup_dir
             );
             log_update("ERROR", "ROLLBACK", &format!("回滾失敗: {rollback_err}"));
-            return Err(format!(
+            return Err(UpdateError::RollbackFailed(format!(
                 "安裝失敗 ({err}) 且回滾失敗 ({rollback_err})；備份已保留於 {backup_dir:?}"
-            ));
+            )));
         } else {
             println!("✅ 已成功回滾至先前版本。");
             log_update("INFO", "ROLLBACK", "回滾成功");
@@ -4057,7 +4069,7 @@ pub(crate) fn apply_installation_with_rollback(
                 }
             }
         }
-        return Err(err);
+        return Err(UpdateError::Failure(err));
     }
 
     let expected_version = fs::read_to_string(install_dir.join("VERSION")).unwrap_or_default();
@@ -4074,6 +4086,8 @@ pub(crate) fn apply_installation_with_rollback(
     let _ = is_current_exe;
 
     let mut server_restarted = false;
+    let mut restart_errors: Vec<String> = Vec::new();
+    let mut spawned_pids: Vec<u32> = Vec::new();
 
     // 1. Unix 上在檔案寫入完成後，通知先前記錄之監管服務進程退出以讓 supervisor 自動載入新版執行檔
     #[cfg(unix)]
@@ -4088,15 +4102,52 @@ pub(crate) fn apply_installation_with_rollback(
                 unsafe {
                     libc::kill(pid as libc::pid_t, libc::SIGTERM);
                 }
-                println!("🔄 已通知服務管理器重啟 (PID: {pid})，將由 supervisor 自動載入新版。");
-                server_restarted = true;
+                println!("🔄 已通知服務管理器重啟 (PID: {pid})，等待 supervisor 自動載入新版...");
+
+                // 等待舊進程退出
+                let exit_deadline = Instant::now() + Duration::from_secs(5);
+                while is_process_alive(pid) && Instant::now() < exit_deadline {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+
+                // 驗證 supervisor 是否已成功啟動新版進程（檢查 .server.pid 檔案或進程存活）
+                let start_deadline = Instant::now() + Duration::from_secs(5);
+                let mut supervisor_restarted = false;
+                while Instant::now() < start_deadline {
+                    for pid_file in &[
+                        install_dir.join(".server.pid"),
+                        crate::db::get_insights_dir().join(".server.pid"),
+                    ] {
+                        if let Ok(content) = fs::read_to_string(pid_file) {
+                            if let Ok(new_pid) = content.trim().parse::<u32>() {
+                                if new_pid != pid && is_process_alive(new_pid) {
+                                    supervisor_restarted = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if supervisor_restarted {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+
+                if supervisor_restarted {
+                    println!("✅ Unix 服務管理器已成功啟動新版服務。");
+                    log_update("INFO", "RESTART", "Unix 服務管理器已成功啟動新版服務");
+                    server_restarted = true;
+                } else {
+                    let err_msg = format!("已通知 Unix 服務管理器 (原 PID: {pid}) 重啟，但逾時未偵測到新版服務進程啟動");
+                    eprintln!("⚠️ {err_msg}");
+                    log_update("ERROR", "RESTART", &err_msg);
+                    restart_errors.push(err_msg);
+                }
             }
         }
     }
 
     // 2. 逐一處理先前停止之進程，獨立處理監管與非監管進程（保留備份直至重啟確認成功）
-    let mut restart_errors: Vec<String> = Vec::new();
-    let mut spawned_pids: Vec<u32> = Vec::new();
     for spec in &process_plan.stopped_specs {
         if spec.is_supervised {
             #[cfg(windows)]
@@ -4267,15 +4318,18 @@ pub(crate) fn apply_installation_with_rollback(
         }
 
         if let Err(rollback_err) = restore_from_backup(backup_dir, install_dir) {
-            let _ = fs::write(backup_dir.join(".rollback_failed"), &rollback_err);
+            let marker_content =
+                format!("rollback_error: {rollback_err}\nrestart_errors: {combined}");
+            let _ = fs::write(backup_dir.join(".rollback_failed"), &marker_content);
+            let _ = fs::write(install_dir.join(".rollback_failed"), &marker_content);
             eprintln!(
                 "❌ 自動回滾失敗: {rollback_err}；請保留備份目錄 {:?} 進行手動還原",
                 backup_dir
             );
             log_update("ERROR", "ROLLBACK", &format!("回滾失敗: {rollback_err}"));
-            return Err(format!(
+            return Err(UpdateError::RollbackFailed(format!(
                 "重啟失敗 ({combined}) 且回滾失敗 ({rollback_err})；備份已保留於 {backup_dir:?}"
-            ));
+            )));
         } else {
             println!("✅ 已成功回滾至先前版本。正在恢復原服務...");
             log_update("INFO", "ROLLBACK", "回滾成功，正在恢復原服務");
@@ -4371,14 +4425,44 @@ pub(crate) fn apply_installation_with_rollback(
                 }
             }
 
-            return Err(format!(
+            return Err(UpdateError::Failure(format!(
                 "更新檔案替換成功，但重啟新版服務失敗 ({combined})；已自動回滾至先前版本並恢復原服務。"
-            ));
+            )));
         }
     }
 
     // 4. 重啟確認成功後，才標記提交並清理備份目錄
-    let _ = safe_write_file(&backup_dir.join(".committed"), b"committed");
+    let is_async_restart = {
+        #[cfg(windows)]
+        {
+            is_current_exe
+                || process_plan.stopped_specs.iter().any(|s| s.is_supervised)
+                || is_windows_service_runner()
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    };
+
+    if is_async_restart {
+        log_update(
+            "INFO",
+            "CLEANUP",
+            "Windows 非同步/監管重啟已就緒；保留備份目錄直至服務管理器或移交守護進程驗證新版就緒後清理",
+        );
+        return Ok(server_restarted);
+    }
+
+    if let Err(commit_err) = safe_write_file(&backup_dir.join(".committed"), b"committed") {
+        let msg = format!(
+            "寫入提交確認標記失敗 ({commit_err})；為避免啟動復原錯誤回滾，保留備份目錄 {backup_dir:?}"
+        );
+        eprintln!("⚠️ {msg}");
+        log_update("WARN", "CLEANUP", &msg);
+        return Err(UpdateError::Failure(msg));
+    }
+
     if backup_dir.exists() {
         if let Err(e) = fs::remove_dir_all(backup_dir) {
             log_update("WARN", "CLEANUP", &format!("清理備份目錄失敗: {e}"));
@@ -4679,9 +4763,10 @@ fn attempt_startup_recovery(install_dir: &Path, args: &[String]) -> RecoveryStat
         return RecoveryStatus::CleanedOrNoBackup;
     }
 
-    if backup_dir.join(".rollback_failed").exists() {
+    if backup_dir.join(".rollback_failed").exists() || install_dir.join(".rollback_failed").exists()
+    {
         eprintln!(
-            "❌ 偵測到先前更新回滾失敗標記 ({backup_dir:?})；為防止讀取損毀狀態，程序終止。請依備份手動還原。"
+            "❌ 偵測到先前更新回滾失敗標記；為防止讀取損毀狀態，程序終止。請依備份手動還原。"
         );
         log_update("ERROR", "STARTUP_FATAL", "先前回滾失敗，程序終止");
         std::process::exit(1);
@@ -5469,6 +5554,43 @@ update_check_interval: 5 # check every 5 days
         let err = res.unwrap_err();
         assert!(err.contains("符號連結項目"));
         assert!(!install_dir.join("secret.txt").exists());
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn restore_from_backup_fails_when_backup_dir_missing() {
+        let temp = std::env::temp_dir().join(format!(
+            "test-restore-missing-dir-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let backup_dir = temp.join(".backup");
+        let install_dir = temp.join("install");
+        fs::create_dir_all(&install_dir).unwrap();
+
+        let res = restore_from_backup(&backup_dir, &install_dir);
+        assert!(res.is_err(), "備份目錄不存在時應報告錯誤以阻斷不安全啟動");
+        let err = res.unwrap_err();
+        assert!(err.contains("備份目錄不存在或無法讀取元資料"));
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn restore_from_backup_fails_when_manifest_missing() {
+        let temp = std::env::temp_dir().join(format!(
+            "test-restore-missing-manifest-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let backup_dir = temp.join(".backup");
+        let install_dir = temp.join("install");
+        fs::create_dir_all(&backup_dir).unwrap();
+        fs::create_dir_all(&install_dir).unwrap();
+
+        let res = restore_from_backup(&backup_dir, &install_dir);
+        assert!(res.is_err(), "備份清單不存在時應報告錯誤以阻斷不安全啟動");
+        let err = res.unwrap_err();
+        assert!(err.contains("備份清單檔案不存在"));
 
         let _ = fs::remove_dir_all(&temp);
     }
@@ -6557,6 +6679,7 @@ update_check_interval: 5 # check every 5 days
 
     #[tokio::test]
     async fn run_background_auto_update_exits_early_when_restarted_flag_set() {
+        let _guard = ENV_TEST_MUTEX.lock().await;
         std::env::set_var("_TOKEN_USAGE_INSIGHTS_RESTARTED", "1");
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         run_background_auto_update(tx).await;
@@ -6566,6 +6689,7 @@ update_check_interval: 5 # check every 5 days
 
     #[tokio::test]
     async fn perform_startup_recovery_runs_even_when_restarted_flag_set() {
+        let _guard = ENV_TEST_MUTEX.lock().await;
         std::env::set_var("_TOKEN_USAGE_INSIGHTS_RESTARTED", "1");
         // perform_startup_recovery 即使在 _TOKEN_USAGE_INSIGHTS_RESTARTED 設定下亦不應提早 return，
         // 確保救援與損毀檢查（如 .rollback_failed）不會被跳過。在正常環境下應安全完成。

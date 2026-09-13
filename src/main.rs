@@ -298,8 +298,24 @@ async fn main() {
                     );
                     updater::restart_current_process(&target_exe, &args);
                 }
+                Err(updater::UpdateError::RollbackFailed(err)) => {
+                    eprintln!(
+                        "❌ 自動更新失敗且回滾復原亦失敗: {err}；為防止載入損毀狀態，中止重啟以保留備份 ({backup_dir:?})。請依備份手動復原。"
+                    );
+                    updater::log_update(
+                        "ERROR",
+                        "RESTART",
+                        &format!("更新失敗且回滾失敗 ({err})，中止重啟以保留備份狀態"),
+                    );
+                    std::process::exit(1);
+                }
                 Err(err) => {
-                    if backup_dir.join(".rollback_failed").exists() {
+                    let has_rollback_failed = backup_dir.join(".rollback_failed").exists()
+                        || install_dir
+                            .as_ref()
+                            .map(|d| d.join(".rollback_failed").exists())
+                            .unwrap_or(false);
+                    if has_rollback_failed {
                         eprintln!(
                             "❌ 自動更新失敗且回滾復原亦失敗；為防止載入損毀狀態，中止重啟以保留備份 ({backup_dir:?})。請依備份手動復原。"
                         );

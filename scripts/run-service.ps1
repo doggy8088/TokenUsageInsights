@@ -157,6 +157,16 @@ function Exit-WithError {
     exit 1
 }
 
+function Test-IsRollbackFailed {
+    param(
+        [string]$InstallDir
+    )
+
+    $rollbackFailedMarker = Join-Path $InstallDir ".backup\.rollback_failed"
+    $directFailedMarker = Join-Path $InstallDir ".rollback_failed"
+    return ((Test-Path -LiteralPath $rollbackFailedMarker) -or (Test-Path -LiteralPath $directFailedMarker))
+}
+
 function Test-IsUpdateLockHeld {
     param(
         [string]$LockFile
@@ -205,6 +215,11 @@ function Wait-ForExecutableReady {
         [string]$InstallDir,
         [string]$ExePath
     )
+
+    # 0. 優先檢查是否存有更新回滾失敗標記；若回滾失敗，立即終止並保留備份以供手動修復
+    if (Test-IsRollbackFailed -InstallDir $InstallDir) {
+        Exit-WithError -Message "偵測到先前更新回滾失敗標記 (.backup\.rollback_failed)；為防止載入損毀之安裝狀態，服務終止運行並保留備份以供手動修復。"
+    }
 
     # 1. 等待更新鎖 (.update.lock) 釋放（確保 updater 程序及任何更新鎖定已完全釋放）
     $lockFile = Join-Path $InstallDir ".update.lock"
@@ -271,7 +286,11 @@ function Wait-ForExecutableReady {
         }
     }
 
-    # 3. 清理更新協商與就緒標記檔
+    # 3. 版本與執行檔驗證成功後，清理備份目錄與更新協商就緒標記檔
+    $backupDir = Join-Path $InstallDir ".backup"
+    if (Test-Path -LiteralPath $backupDir) {
+        Remove-Item -LiteralPath $backupDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
     $readyMarker = Join-Path $InstallDir ".update_ready"
     $restartPending = Join-Path $InstallDir ".service_restart_pending"
     Remove-Item -LiteralPath $readyMarker -Force -ErrorAction SilentlyContinue
@@ -289,6 +308,10 @@ function Wait-ForUpdateCompletion {
     $isLocked = Test-IsUpdateLockHeld -LockFile $lockFile
 
     if ($hasPendingMarker -or $isLocked) {
+        if (Test-IsRollbackFailed -InstallDir $InstallDir) {
+            Exit-WithError -Message "偵測到更新程序遺留之回滾失敗標記 (.backup\.rollback_failed)；中止重啟以確保安全，保持停止狀態退出。"
+        }
+
         if (-not (Wait-ForUpdateLockRelease -LockFile $lockFile -MaxWaitDeciseconds 900)) {
             Exit-WithError -Message "等待更新程序完成逾時（90 秒），更新鎖仍未釋放。為防止損毀安裝目錄，保持停止狀態退出。"
         }
@@ -304,6 +327,10 @@ $readyMarker = Join-Path $InstallDir ".update_ready"
 $restartPendingFile = Join-Path $InstallDir ".service_restart_pending"
 
 while ($true) {
+    if (Test-IsRollbackFailed -InstallDir $InstallDir) {
+        Exit-WithError -Message "偵測到先前更新回滾失敗標記 (.backup\.rollback_failed)；為防止載入損毀之安裝狀態，服務終止運行並保留備份以供手動修復。"
+    }
+
     if ((Test-Path -LiteralPath $readyMarker) -or (Test-Path -LiteralPath $restartPendingFile)) {
         Wait-ForExecutableReady -InstallDir $InstallDir -ExePath $Exe
     }
@@ -316,6 +343,10 @@ while ($true) {
         -CurrentLogPath $ErrLog `
         -PreviousLogPath (Join-Path $LogDir "$AppName.prev.err.log") `
         -HistoryLogPath (Join-Path $LogDir "$AppName.history.err.log")
+
+    if (Test-IsRollbackFailed -InstallDir $InstallDir) {
+        Exit-WithError -Message "偵測到先前更新回滾失敗標記 (.backup\.rollback_failed)；為防止載入損毀之安裝狀態，服務終止運行並保留備份以供手動修復。"
+    }
 
     $Process = $null
     $Process = Start-Process -FilePath $Exe `

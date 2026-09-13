@@ -606,6 +606,10 @@ async fn run_update_cli(args: &[String]) -> i32 {
             eprintln!("❌ 更新失敗：{err}");
             1
         }
+        Err(crate::updater::UpdateError::RollbackFailed(err)) => {
+            eprintln!("❌ 更新失敗且自動回滾失敗：{err}");
+            1
+        }
     }
 }
 

@@ -782,6 +782,9 @@ if ($env:TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS -ne "24") { throw "TOKEN_USA
     $fnDefExitWithError = $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq "Exit-WithError" }, $true)
     Assert-True ($null -ne $fnDefExitWithError -and $fnDefExitWithError.Count -eq 1) "run-service.ps1 should define Exit-WithError."
 
+    $fnDefRollbackFailed = $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq "Test-IsRollbackFailed" }, $true)
+    Assert-True ($null -ne $fnDefRollbackFailed -and $fnDefRollbackFailed.Count -eq 1) "run-service.ps1 should define Test-IsRollbackFailed."
+
     $fnDefLockHeld = $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq "Test-IsUpdateLockHeld" }, $true)
     Assert-True ($null -ne $fnDefLockHeld -and $fnDefLockHeld.Count -eq 1) "run-service.ps1 should define Test-IsUpdateLockHeld."
 
@@ -803,7 +806,7 @@ if ($env:TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS -ne "24") { throw "TOKEN_USA
     Set-Content -LiteralPath $readyExePath -Value "binary"
     Set-Content -LiteralPath $tempExePath -Value "temp"
 
-    $helperFunctions = @("Exit-WithError", "Test-IsUpdateLockHeld", "Wait-ForUpdateLockRelease", "Wait-ForExecutableReady")
+    $helperFunctions = @("Exit-WithError", "Test-IsRollbackFailed", "Test-IsUpdateLockHeld", "Wait-ForUpdateLockRelease", "Wait-ForExecutableReady")
     $fnDefs = $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and ($args[0].Name -in $helperFunctions) }, $true)
     $funcCode = (($fnDefs | ForEach-Object { $_.Extent.Text }) -join "`n`n").Replace("900", "2").Replace("150", "2")
     $testScript = @"
@@ -815,6 +818,15 @@ Wait-ForExecutableReady -InstallDir '$readyTestDir' -ExePath '$readyExePath'
     Assert-Equal 1 $timeoutProc.ExitCode "Wait-ForExecutableReady should exit with code 1 on timeout when temp replacement remains."
     Assert-True (Test-Path -LiteralPath $readyMarkerFile) "Wait-ForExecutableReady should preserve .update_ready marker on timeout."
     Assert-True (Test-Path -LiteralPath $pendingMarkerFile) "Wait-ForExecutableReady should preserve .service_restart_pending marker on timeout."
+
+    # 驗證存在 .backup/.rollback_failed 時 Wait-ForExecutableReady 立即 exit 1
+    $testBackupDir = Join-Path $readyTestDir ".backup"
+    New-Item -ItemType Directory -Force -Path $testBackupDir | Out-Null
+    $testRollbackFailedFile = Join-Path $testBackupDir ".rollback_failed"
+    Set-Content -LiteralPath $testRollbackFailedFile -Value "error"
+    $rollbackFailProc = Start-Process -FilePath $psExe -ArgumentList "-NoProfile", "-Command", $testScript -Wait -PassThru
+    Assert-Equal 1 $rollbackFailProc.ExitCode "Wait-ForExecutableReady should exit with code 1 immediately when .rollback_failed exists."
+    Remove-Item -LiteralPath $testBackupDir -Recurse -Force
 
     Remove-Item -LiteralPath $tempExePath -Force
     $successProc = Start-Process -FilePath $psExe -ArgumentList "-NoProfile", "-Command", $testScript -Wait -PassThru
