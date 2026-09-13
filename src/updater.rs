@@ -3054,7 +3054,10 @@ fn stop_running_dashboard_instances(install_dir: &Path) -> Result<DashboardProce
     })
 }
 
-fn restart_dashboard_instance(spec: &StoppedProcessSpec, install_dir: &Path) -> Result<(), String> {
+fn restart_dashboard_instance(
+    spec: &StoppedProcessSpec,
+    install_dir: &Path,
+) -> Result<u32, String> {
     let exec_name = if cfg!(windows) {
         format!("{APP_NAME}.exe")
     } else {
@@ -3121,12 +3124,14 @@ fn restart_dashboard_instance(spec: &StoppedProcessSpec, install_dir: &Path) -> 
         .spawn()
         .map_err(|e| format!("啟動背景看板進程失敗: {e}"))?;
 
+    let child_pid = child.id();
+
     std::thread::sleep(Duration::from_millis(50));
     if let Ok(Some(status)) = child.try_wait() {
         return Err(format!("背景看板進程啟動後立即異常退出: {status}"));
     }
 
-    Ok(())
+    Ok(child_pid)
 }
 
 #[cfg(windows)]
@@ -3139,7 +3144,13 @@ fn is_any_dashboard_running_in_dir(install_dir: &Path) -> bool {
         if let Ok(pid) = content.trim().parse::<u32>() {
             if pid != my_pid && is_process_alive(pid) {
                 server_pids.insert(pid);
-                return true;
+                if let Some(exe_path) = get_process_exe_path(pid) {
+                    if matches_install_dir(&exe_path, install_dir)
+                        && is_dashboard_server_process(pid, &server_pids)
+                    {
+                        return true;
+                    }
+                }
             }
         }
     }
@@ -3148,7 +3159,13 @@ fn is_any_dashboard_running_in_dir(install_dir: &Path) -> bool {
         if let Ok(pid) = content.trim().parse::<u32>() {
             if pid != my_pid && is_process_alive(pid) {
                 server_pids.insert(pid);
-                return true;
+                if let Some(exe_path) = get_process_exe_path(pid) {
+                    if matches_install_dir(&exe_path, install_dir)
+                        && is_dashboard_server_process(pid, &server_pids)
+                    {
+                        return true;
+                    }
+                }
             }
         }
     }
@@ -3249,7 +3266,7 @@ fn configure_windows_runner_command(
 fn restart_windows_supervised_service(
     spec: &StoppedProcessSpec,
     install_dir: &Path,
-) -> Result<(), String> {
+) -> Result<Option<u32>, String> {
     log_update(
         "INFO",
         "RESTART",
@@ -3273,7 +3290,7 @@ fn restart_windows_supervised_service(
             println!(
                 "🔄 服務守護進程 (PID: {sup_pid}) 仍在運行，將在更新鎖釋放後自動重新啟動看板服務。"
             );
-            return Ok(());
+            return Ok(None);
         }
     }
 
@@ -3283,7 +3300,7 @@ fn restart_windows_supervised_service(
         if is_any_dashboard_running_in_dir(install_dir) {
             println!("🔄 服務管理器已自動重新啟動 Token 戰情室背景看板服務。");
             log_update("INFO", "RESTART", "服務管理器已自動重新啟動背景看板服務");
-            return Ok(());
+            return Ok(None);
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -3298,6 +3315,7 @@ fn restart_windows_supervised_service(
     );
 
     let mut started = false;
+    let mut runner_pid = None;
 
     // 2a. 嘗試以工作排程器啟動 (TaskName: TokenUsageInsights_<USERNAME> 或 TokenUsageInsights)
     let username = std::env::var("USERNAME").unwrap_or_default();
@@ -3335,12 +3353,13 @@ fn restart_windows_supervised_service(
             const CREATE_NO_WINDOW: u32 = 0x08000000;
             cmd.creation_flags(CREATE_NO_WINDOW);
 
-            if let Ok(_child) = cmd.spawn() {
+            if let Ok(child) = cmd.spawn() {
                 log_update(
                     "INFO",
                     "RESTART",
                     "已透過 PowerShell 背景啟動 run-service.ps1 守護進程",
                 );
+                runner_pid = Some(child.id());
                 started = true;
             } else {
                 log_update(
@@ -3354,7 +3373,7 @@ fn restart_windows_supervised_service(
 
     // 2c. 若以上皆未成功，回退直接以 restart_dashboard_instance 啟動看板進程
     if !started {
-        return restart_dashboard_instance(spec, install_dir);
+        return restart_dashboard_instance(spec, install_dir).map(Some);
     }
 
     // 3. 等待確認新進程是否成功啟動 (最多等待 5 秒)
@@ -3363,7 +3382,7 @@ fn restart_windows_supervised_service(
         if is_any_dashboard_running_in_dir(install_dir) {
             println!("🔄 已確認服務已成功重新啟動。");
             log_update("INFO", "RESTART", "已確認監管服務重新啟動成功");
-            return Ok(());
+            return Ok(runner_pid);
         }
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -3374,7 +3393,7 @@ fn restart_windows_supervised_service(
         "RESTART",
         "服務移交後 5 秒內未偵測到看板進程，執行直接啟動",
     );
-    restart_dashboard_instance(spec, install_dir)
+    restart_dashboard_instance(spec, install_dir).map(Some)
 }
 
 pub(crate) fn apply_installation_with_rollback(
@@ -3556,7 +3575,7 @@ pub(crate) fn apply_installation_with_rollback(
                     }
                 } else {
                     match restart_dashboard_instance(spec, install_dir) {
-                        Ok(()) => {
+                        Ok(_) => {
                             println!(
                                 "🔄 回滾完成，已重新啟動 PID {} 對應之 Token 戰情室背景看板服務。",
                                 spec.pid
@@ -3616,32 +3635,41 @@ pub(crate) fn apply_installation_with_rollback(
 
     // 2. 逐一處理先前停止之進程，獨立處理監管與非監管進程（保留備份直至重啟確認成功）
     let mut restart_errors: Vec<String> = Vec::new();
+    let mut spawned_pids: Vec<u32> = Vec::new();
     for spec in &process_plan.stopped_specs {
         if spec.is_supervised {
             #[cfg(windows)]
             {
-                if let Err(restart_err) = restart_windows_supervised_service(spec, install_dir) {
-                    let msg = format!(
-                        "重啟 Windows 監管服務 (原 PID: {}) 失敗: {restart_err}",
-                        spec.pid
-                    );
-                    eprintln!("⚠️ 更新完成，但無法重新啟動 Windows 監管服務 (原 PID: {}): {restart_err}；請手動啟動服務。", spec.pid);
-                    log_update("ERROR", "RESTART", &msg);
-                    restart_errors.push(msg);
+                match restart_windows_supervised_service(spec, install_dir) {
+                    Ok(maybe_pid) => {
+                        if let Some(pid) = maybe_pid {
+                            spawned_pids.push(pid);
+                        }
+                    }
+                    Err(restart_err) => {
+                        let msg = format!(
+                            "重啟 Windows 監管服務 (原 PID: {}) 失敗: {restart_err}",
+                            spec.pid
+                        );
+                        eprintln!("⚠️ 更新完成，但無法重新啟動 Windows 監管服務 (原 PID: {}): {restart_err}；請手動啟動服務。", spec.pid);
+                        log_update("ERROR", "RESTART", &msg);
+                        restart_errors.push(msg);
+                    }
                 }
             }
         } else {
             match restart_dashboard_instance(spec, install_dir) {
-                Ok(()) => {
+                Ok(child_pid) => {
+                    spawned_pids.push(child_pid);
                     println!(
-                        "🔄 已重新啟動 PID {} 對應之 Token 戰情室背景看板服務。",
+                        "🔄 已重新啟動 PID {} 對應之 Token 戰情室背景看板服務 (新 PID: {child_pid})。",
                         spec.pid
                     );
                     log_update(
                         "INFO",
                         "RESTART",
                         &format!(
-                            "更新成功，已重新啟動非監管背景看板進程 (原 PID: {})",
+                            "更新成功，已重新啟動非監管背景看板進程 (原 PID: {}, 新 PID: {child_pid})",
                             spec.pid
                         ),
                     );
@@ -3673,6 +3701,42 @@ pub(crate) fn apply_installation_with_rollback(
             "RESTART",
             &format!("重啟新版服務失敗: {combined}，開始回滾"),
         );
+
+        // 回滾前先終止本輪重啟已成功啟動之新版子進程，避免新舊進程同時存活導致連接埠衝突或重複執行
+        for &spawned_pid in &spawned_pids {
+            if is_process_alive(spawned_pid) {
+                log_update(
+                    "INFO",
+                    "ROLLBACK",
+                    &format!("回滾前停止本輪已啟動之新版子進程 (PID: {spawned_pid})"),
+                );
+                #[cfg(unix)]
+                unsafe {
+                    libc::kill(spawned_pid as libc::pid_t, libc::SIGTERM);
+                }
+                #[cfg(windows)]
+                {
+                    let _ = std::process::Command::new("taskkill")
+                        .args(["/PID", &spawned_pid.to_string(), "/T", "/F"])
+                        .output();
+                }
+            }
+        }
+
+        let stop_deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < stop_deadline && spawned_pids.iter().any(|&p| is_process_alive(p)) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        #[cfg(unix)]
+        for &spawned_pid in &spawned_pids {
+            if is_process_alive(spawned_pid) {
+                unsafe {
+                    libc::kill(spawned_pid as libc::pid_t, libc::SIGKILL);
+                }
+            }
+        }
+
         if let Err(rollback_err) = restore_from_backup(backup_dir, install_dir) {
             let _ = fs::write(backup_dir.join(".rollback_failed"), &rollback_err);
             eprintln!(
