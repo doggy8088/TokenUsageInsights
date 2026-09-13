@@ -76,9 +76,32 @@ for file in pricing.csv README.md LICENSE VERSION; do
   fi
 done
 
+  marker_path="${install_dir}/.install_marker"
+  marker_tmp="${install_dir}/.install_marker.tmp.$$"
+  printf "token-usage-insights:installed" > "$marker_tmp"
+  mv -f "$marker_tmp" "$marker_path"
+
 ln -sfn "${install_dir}/${app_name}" "${bin_dir}/${app_name}"
 
 if [[ "$install_service" == true ]]; then
+  runtime_vars=(
+    INSIGHTS_DIR
+    ANTIGRAVITY_DIR
+    COPILOT_DIR
+    COPILOT_APP_DIR
+    CODEX_DIR
+    CLAUDE_DIR
+    CURSOR_DIR
+    CURSOR_STATE_DB
+    GROK_DIR
+    PI_DIR
+    OMP_DIR
+    MUSE_DIR
+    VSCODE_DIR
+    VSCODE_USER_DATA_DIR
+    VSCODE_PORTABLE_DATA_DIR
+    CORS_ALLOWED_ORIGINS
+  )
   case "$(uname -s)" in
     Linux)
       if ! command -v systemctl >/dev/null 2>&1; then
@@ -89,6 +112,68 @@ if [[ "$install_service" == true ]]; then
       service_dir="${HOME}/.config/systemd/user"
       service_file="${service_dir}/${app_name}.service"
       mkdir -p "$service_dir"
+
+      # General unit value escaping (for WorkingDirectory and Environment):
+      # Escapes \, ", and % (specifier expansion)
+      systemd_escape_value() {
+        printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/%/%%/g'
+      }
+
+      # Command-line escaping (for ExecStart):
+      # Escapes \, ", %, and $ (which systemd expands in ExecStart command lines)
+      systemd_escape_exec() {
+        printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\$/\$\$/g' -e 's/%/%%/g'
+      }
+
+      install_dir_systemd="$(systemd_escape_value "$install_dir")"
+      executable_systemd="$(systemd_escape_exec "${install_dir}/${app_name}")"
+      host_systemd="$(systemd_escape_value "$host")"
+      port_systemd="$(systemd_escape_value "$port")"
+
+      # 若未於環境變數明確指定更新設定，自動繼承既有 systemd 服務單元之設定
+      if [[ -f "$service_file" ]]; then
+        if [[ -z "${TOKEN_USAGE_INSIGHTS_AUTO_UPDATE+x}" ]]; then
+          existing_auto_update="$(sed -n -E 's/^[[:space:]]*Environment="?TOKEN_USAGE_INSIGHTS_AUTO_UPDATE=([^"]*)"?$/\1/p' "$service_file" | tail -n 1)"
+          if [[ -n "$existing_auto_update" ]]; then
+            TOKEN_USAGE_INSIGHTS_AUTO_UPDATE="$existing_auto_update"
+          fi
+        fi
+        if [[ -z "${TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS+x}" ]]; then
+          existing_interval="$(sed -n -E 's/^[[:space:]]*Environment="?TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS=([^"]*)"?$/\1/p' "$service_file" | tail -n 1)"
+          if [[ -n "$existing_interval" ]]; then
+            TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS="$existing_interval"
+          fi
+        fi
+        for var in "${runtime_vars[@]}"; do
+          if [[ -z "${!var+x}" ]]; then
+            existing_val="$(sed -n -E "s/^[[:space:]]*Environment=\"?${var}=([^\"]*)\"?\$/\\1/p" "$service_file" | tail -n 1)"
+            if [[ -n "$existing_val" ]]; then
+              printf -v "$var" '%s' "$existing_val"
+            fi
+          fi
+        done
+        if [[ -z "${CORS_ALLOWED_ORIGINS:-}" && -z "${CORS_ALLOWED_ORIGINS+x}" ]]; then
+          legacy_cors="$(sed -n -E 's/^[[:space:]]*Environment="?CORS_ALLOW_ORIGIN=([^"]*)"?$/\1/p' "$service_file" | tail -n 1)"
+          if [[ -n "$legacy_cors" ]]; then
+            CORS_ALLOWED_ORIGINS="$legacy_cors"
+          fi
+        fi
+      fi
+
+      extra_env_systemd=""
+      if [[ -n "${TOKEN_USAGE_INSIGHTS_AUTO_UPDATE:-}" ]]; then
+        extra_env_systemd+="$(printf '\nEnvironment="TOKEN_USAGE_INSIGHTS_AUTO_UPDATE=%s"' "$(systemd_escape_value "$TOKEN_USAGE_INSIGHTS_AUTO_UPDATE")")"
+      fi
+      if [[ -n "${TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS:-}" ]]; then
+        extra_env_systemd+="$(printf '\nEnvironment="TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS=%s"' "$(systemd_escape_value "$TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS")")"
+      fi
+      for var in "${runtime_vars[@]}"; do
+        val="${!var:-}"
+        if [[ -n "$val" ]]; then
+          extra_env_systemd+="$(printf '\nEnvironment="%s=%s"' "$var" "$(systemd_escape_value "$val")")"
+        fi
+      done
+
       cat > "$service_file" <<SERVICE
 [Unit]
 Description=Token 戰情室 Dashboard Service
@@ -96,12 +181,13 @@ After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=${install_dir}
-ExecStart=${install_dir}/${app_name}
+WorkingDirectory="${install_dir_systemd}"
+ExecStart="${executable_systemd}"
 Restart=always
-RestartSec=5
-Environment=PORT=${port}
-Environment=HOST=${host}
+RestartSec=2
+Environment="PORT=${port_systemd}"
+Environment="HOST=${host_systemd}"
+Environment="TOKEN_USAGE_INSIGHTS_INSTALL_DIR=${install_dir_systemd}"${extra_env_systemd}
 
 [Install]
 WantedBy=default.target
@@ -143,6 +229,49 @@ SERVICE
       stdout_log_plist="$(plist_escape "${launch_logs_dir}/${launch_label}.out.log")"
       stderr_log_plist="$(plist_escape "${launch_logs_dir}/${launch_label}.err.log")"
 
+      # 若未於環境變數明確指定更新設定，自動繼承既有 launchd agent plist 之設定
+      if [[ -f "$launch_agent_file" ]]; then
+        if [[ -z "${TOKEN_USAGE_INSIGHTS_AUTO_UPDATE+x}" ]]; then
+          if existing_auto_update="$(plutil -extract EnvironmentVariables.TOKEN_USAGE_INSIGHTS_AUTO_UPDATE raw -o - "$launch_agent_file" 2>/dev/null)" && [[ -n "$existing_auto_update" ]]; then
+            TOKEN_USAGE_INSIGHTS_AUTO_UPDATE="$existing_auto_update"
+          fi
+        fi
+        if [[ -z "${TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS+x}" ]]; then
+          if existing_interval="$(plutil -extract EnvironmentVariables.TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS raw -o - "$launch_agent_file" 2>/dev/null)" && [[ -n "$existing_interval" ]]; then
+            TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS="$existing_interval"
+          fi
+        fi
+        for var in "${runtime_vars[@]}"; do
+          if [[ -z "${!var+x}" ]]; then
+            if existing_val="$(plutil -extract "EnvironmentVariables.${var}" raw -o - "$launch_agent_file" 2>/dev/null)" && [[ -n "$existing_val" ]]; then
+              printf -v "$var" '%s' "$existing_val"
+            fi
+          fi
+        done
+        if [[ -z "${CORS_ALLOWED_ORIGINS:-}" && -z "${CORS_ALLOWED_ORIGINS+x}" ]]; then
+          if legacy_cors="$(plutil -extract EnvironmentVariables.CORS_ALLOW_ORIGIN raw -o - "$launch_agent_file" 2>/dev/null)" && [[ -n "$legacy_cors" ]]; then
+            CORS_ALLOWED_ORIGINS="$legacy_cors"
+          fi
+        fi
+      fi
+
+      extra_env_plist=""
+      if [[ -n "${TOKEN_USAGE_INSIGHTS_AUTO_UPDATE:-}" ]]; then
+        auto_update_plist="$(plist_escape "$TOKEN_USAGE_INSIGHTS_AUTO_UPDATE")"
+        extra_env_plist+="$(printf '\n    <key>TOKEN_USAGE_INSIGHTS_AUTO_UPDATE</key>\n    <string>%s</string>' "$auto_update_plist")"
+      fi
+      if [[ -n "${TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS:-}" ]]; then
+        interval_plist="$(plist_escape "$TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS")"
+        extra_env_plist+="$(printf '\n    <key>TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS</key>\n    <string>%s</string>' "$interval_plist")"
+      fi
+      for var in "${runtime_vars[@]}"; do
+        val="${!var:-}"
+        if [[ -n "$val" ]]; then
+          val_plist="$(plist_escape "$val")"
+          extra_env_plist+="$(printf '\n    <key>%s</key>\n    <string>%s</string>' "$var" "$val_plist")"
+        fi
+      done
+
       cat > "$launch_agent_file" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -162,6 +291,8 @@ SERVICE
     <string>${host_plist}</string>
     <key>PORT</key>
     <string>${port_plist}</string>
+    <key>TOKEN_USAGE_INSIGHTS_INSTALL_DIR</key>
+    <string>${install_dir_plist}</string>${extra_env_plist}
   </dict>
   <key>RunAtLoad</key>
   <true/>

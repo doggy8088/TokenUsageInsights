@@ -5,18 +5,36 @@ use std::fs;
 use std::path::PathBuf;
 
 const EXPORT_VERSION: u8 = 1;
-const HELP_TEXT: &str = r#"Token 戰情室：看板與使用量匯入 / 匯出
+const HELP_TEXT: &str = r#"Token 戰情室：看板、使用量匯入 / 匯出與自我更新
 
 用法:
   token-usage-insights [子命令] [參數]
   不帶參數時啟動看板；HOST 預設 0.0.0.0，PORT 預設 3003。
   INSIGHTS_DIR 可指定資料庫目錄。
   --help, -h         顯示此說明
+  --version, -V      顯示版本資訊
+  --no-auto-update   啟動看板時略過自動更新檢查
 
 用途:
-  export  匯出指定日、月或年的資料為 JSON（可重複匯入且支援重複資料去重）
+  update      更新 Token 戰情室至最新版本（亦可使用 --update 或 -u）
+  export      匯出指定日、月或年的資料為 JSON（可重複匯入且支援重複資料去重）
   export-all  一次匯出資料庫中所有 Agent、所有日期的使用量記錄
-  import  匯入 JSON 檔內的所有資料（每筆資料依 timestamp 決定日期）
+  import      匯入 JSON 檔內的所有資料（每筆資料依 timestamp 決定日期）
+
+更新:
+  token-usage-insights update [參數]
+  token-usage-insights --update [參數]
+  token-usage-insights -u [參數]
+  例如:
+  token-usage-insights update
+  token-usage-insights update --check
+  token-usage-insights update --force
+  token-usage-insights update --target-version v0.9.6
+
+參數:
+  -c, --check                 僅檢查是否有新版本，不進行下載與安裝
+  -f, --force                 強制重新下載並覆蓋現有安裝（即使已是最新版本）
+  -v, --target-version <TAG>  指定安裝特定版本標籤（例如 v0.9.6）
 
 共用參數:
   --agent <name>      助理名稱: antigravity / copilot / codex / claude / cursor / grok / pi / omp / muse
@@ -158,21 +176,47 @@ struct UsageDayImportPayload {
 }
 
 // None means start the dashboard; commands finish before server initialization.
-pub(crate) fn run(args: &[String]) -> Option<i32> {
-    if args.len() < 2 {
+pub(crate) async fn run(args: &[String]) -> Option<i32> {
+    if args.is_empty() {
         return None;
     }
 
-    Some(match args[1].as_str() {
-        "export" => run_export(&args[2..]),
-        "export-all" => run_export_all(&args[2..]),
-        "import" => run_import(&args[2..]),
+    // 解析並消耗位於子命令前的全域旗標（如 --no-auto-update），或直到遇到 `--` end-of-options。
+    // 任何在子命令或 `--` 之後出現的 token 均原樣保留交由對應子命令解析，避免誤傷合法參數值。
+    let mut idx = 1;
+    while idx < args.len() {
+        let arg = &args[idx];
+        if arg == "--" {
+            idx += 1;
+            break;
+        }
+        if arg == "--no-auto-update" {
+            idx += 1;
+            continue;
+        }
+        break;
+    }
+
+    let subcmd_args = &args[idx..];
+    if subcmd_args.is_empty() {
+        return None;
+    }
+
+    Some(match subcmd_args[0].as_str() {
+        "export" => run_export(&subcmd_args[1..]),
+        "export-all" => run_export_all(&subcmd_args[1..]),
+        "import" => run_import(&subcmd_args[1..]),
+        "update" | "--update" | "-u" => run_update_cli(&subcmd_args[1..]).await,
+        "-V" | "--version" | "version" => {
+            println!("token-usage-insights {}", env!("CARGO_PKG_VERSION"));
+            0
+        }
         "-h" | "--help" | "help" => {
             print_help();
             0
         }
         _ => {
-            eprintln!("未知指令：{}", args[1]);
+            eprintln!("未知指令：{}", subcmd_args[0]);
             print_help();
             2
         }
@@ -502,18 +546,128 @@ fn run_import(args: &[String]) -> i32 {
     0
 }
 
-fn next_flag_value(args: &[String], i: &mut usize, flag: &str) -> String {
+fn print_update_help() {
+    println!(
+        r#"update usage:
+  token-usage-insights update [參數]
+
+參數:
+  -c, --check                 僅檢查是否有新版本，不進行下載與安裝
+  -f, --force                 強制重新下載並覆蓋現有安裝（即使已是最新版本）
+  -v, --target-version <TAG>  指定安裝特定版本標籤（例如 v0.9.6）
+  -h, --help                  顯示此說明
+"#
+    );
+}
+
+async fn run_update_cli(args: &[String]) -> i32 {
+    if has_help(args) {
+        print_update_help();
+        return 0;
+    }
+
+    let mut check_only = false;
+    let mut force = false;
+    let mut target_version = None;
+
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-c" | "--check" => {
+                check_only = true;
+            }
+            "-f" | "--force" => {
+                force = true;
+            }
+            "-v" | "--target-version" => {
+                let val = next_update_flag_value(args, &mut i, "target-version");
+                target_version = Some(val);
+            }
+            arg => {
+                eprintln!("未知參數: {arg}");
+                print_update_help();
+                return 2;
+            }
+        }
+        i += 1;
+    }
+
+    let opts = crate::updater::UpdateOptions {
+        check_only,
+        force,
+        target_version,
+        prefetched_release: None,
+    };
+
+    match crate::updater::run_update(opts).await {
+        Ok(_) => 0,
+        Err(crate::updater::UpdateError::SafeRejection(_)) => 2,
+        Err(crate::updater::UpdateError::Failure(err)) => {
+            eprintln!("❌ 更新失敗：{err}");
+            1
+        }
+        Err(crate::updater::UpdateError::RollbackFailed(err)) => {
+            eprintln!("❌ 更新失敗且自動回滾失敗：{err}");
+            1
+        }
+    }
+}
+
+fn is_option_token(val: &str) -> bool {
+    // 一般 CLI 旗標值解析器僅將以 '--' 開頭之長選項視為旗標（如 --agent, --out），
+    // 允許任意以 '-' 開頭之合法檔名（如 -f、-report.json、-）作為參數值
+    val.starts_with("--") && val.len() > 2
+}
+
+fn is_update_option_token(val: &str) -> bool {
+    // update 子命令專屬選項判斷：拒絕已知 update 選項作為 --target-version 的值
+    matches!(
+        val,
+        "-c" | "--check" | "-f" | "--force" | "-v" | "--target-version" | "-h" | "--help"
+    ) || (val.starts_with("--") && val.len() > 2)
+}
+
+fn parse_flag_value(args: &[String], i: &mut usize, flag: &str) -> Result<String, String> {
     match args.get(*i + 1) {
         Some(value) => {
-            if value.starts_with("--") {
-                eprintln!("缺少 --{flag} 的值");
-                std::process::exit(2);
+            if is_option_token(value) {
+                return Err(format!("缺少 --{flag} 的值"));
             }
             *i += 1;
-            value.clone()
+            Ok(value.clone())
         }
-        None => {
-            eprintln!("缺少 --{flag} 的值");
+        None => Err(format!("缺少 --{flag} 的值")),
+    }
+}
+
+fn next_flag_value(args: &[String], i: &mut usize, flag: &str) -> String {
+    match parse_flag_value(args, i, flag) {
+        Ok(val) => val,
+        Err(err) => {
+            eprintln!("{err}");
+            std::process::exit(2);
+        }
+    }
+}
+
+fn parse_update_flag_value(args: &[String], i: &mut usize, flag: &str) -> Result<String, String> {
+    match args.get(*i + 1) {
+        Some(value) => {
+            if is_update_option_token(value) {
+                return Err(format!("缺少 --{flag} 的值"));
+            }
+            *i += 1;
+            Ok(value.clone())
+        }
+        None => Err(format!("缺少 --{flag} 的值")),
+    }
+}
+
+fn next_update_flag_value(args: &[String], i: &mut usize, flag: &str) -> String {
+    match parse_update_flag_value(args, i, flag) {
+        Ok(val) => val,
+        Err(err) => {
+            eprintln!("{err}");
             std::process::exit(2);
         }
     }
@@ -774,5 +928,151 @@ mod tests {
             validate_import_source_assistant("codex", None).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn parse_flag_value_rejects_missing_and_option_like_values() {
+        // 1. update 子命令旗標解析測試（驗證指向旗標位置 index 1 時，對後續參數值之正確解析與拒絕）
+        let mut i1 = 1;
+        let args_short = vec!["update".to_string(), "-v".to_string(), "-f".to_string()];
+        let err_short =
+            super::parse_update_flag_value(&args_short, &mut i1, "target-version").unwrap_err();
+        assert_eq!(err_short, "缺少 --target-version 的值");
+        assert_eq!(i1, 1);
+
+        let mut i2 = 1;
+        let args_long = vec![
+            "update".to_string(),
+            "-v".to_string(),
+            "--force".to_string(),
+        ];
+        let err_long =
+            super::parse_update_flag_value(&args_long, &mut i2, "target-version").unwrap_err();
+        assert_eq!(err_long, "缺少 --target-version 的值");
+        assert_eq!(i2, 1);
+
+        let mut i3 = 1;
+        let args_end = vec!["update".to_string(), "-v".to_string()];
+        let err_end =
+            super::parse_update_flag_value(&args_end, &mut i3, "target-version").unwrap_err();
+        assert_eq!(err_end, "缺少 --target-version 的值");
+        assert_eq!(i3, 1);
+
+        let mut j = 1;
+        let args_valid = vec!["update".to_string(), "-v".to_string(), "v0.9.6".to_string()];
+        let val = super::parse_update_flag_value(&args_valid, &mut j, "target-version").unwrap();
+        assert_eq!(val, "v0.9.6");
+        assert_eq!(j, 2);
+
+        // 2. 一般命令（如 export/import）旗標解析測試：
+        // 驗證以 - 開頭之檔名（如 -f、-report.json）與單一 dash (-) 均為合法路徑值，不得誤判為缺少值
+        let mut f_idx = 1;
+        let args_f = vec!["export".to_string(), "--out".to_string(), "-f".to_string()];
+        let val_f = super::parse_flag_value(&args_f, &mut f_idx, "out").unwrap();
+        assert_eq!(val_f, "-f");
+        assert_eq!(f_idx, 2);
+
+        let mut k = 1;
+        let args_dash_file = vec![
+            "export".to_string(),
+            "--out".to_string(),
+            "-report.json".to_string(),
+        ];
+        let val_file = super::parse_flag_value(&args_dash_file, &mut k, "out").unwrap();
+        assert_eq!(val_file, "-report.json");
+        assert_eq!(k, 2);
+
+        let mut m = 1;
+        let args_single_dash = vec!["export".to_string(), "--out".to_string(), "-".to_string()];
+        let val_dash = super::parse_flag_value(&args_single_dash, &mut m, "out").unwrap();
+        assert_eq!(val_dash, "-");
+        assert_eq!(m, 2);
+
+        // 驗證一般命令遇到 -- 開頭之其他旗標時仍會正確拒絕
+        let mut err_idx = 1;
+        let args_missing_out = vec![
+            "export".to_string(),
+            "--out".to_string(),
+            "--agent".to_string(),
+            "claude".to_string(),
+        ];
+        let err_missing =
+            super::parse_flag_value(&args_missing_out, &mut err_idx, "out").unwrap_err();
+        assert_eq!(err_missing, "缺少 --out 的值");
+        assert_eq!(err_idx, 1);
+    }
+
+    #[tokio::test]
+    async fn cli_run_normalizes_no_auto_update_combinations() {
+        // 單獨使用 --no-auto-update 應啟動服務器（回傳 None）
+        let single = vec![
+            "token-usage-insights".to_string(),
+            "--no-auto-update".to_string(),
+        ];
+        assert_eq!(super::run(&single).await, None);
+
+        // 結合 --help 應正常印出說明並以 0 結束
+        let with_help = vec![
+            "token-usage-insights".to_string(),
+            "--no-auto-update".to_string(),
+            "--help".to_string(),
+        ];
+        assert_eq!(super::run(&with_help).await, Some(0));
+
+        // 結合不存在之子命令應以 2 結束
+        let with_invalid = vec![
+            "token-usage-insights".to_string(),
+            "--no-auto-update".to_string(),
+            "nonexistent-cmd".to_string(),
+        ];
+        assert_eq!(super::run(&with_invalid).await, Some(2));
+    }
+
+    #[tokio::test]
+    async fn cli_run_version_flag_returns_zero() {
+        let version_long = vec!["token-usage-insights".to_string(), "--version".to_string()];
+        assert_eq!(super::run(&version_long).await, Some(0));
+
+        let version_short = vec!["token-usage-insights".to_string(), "-V".to_string()];
+        assert_eq!(super::run(&version_short).await, Some(0));
+
+        let version_cmd = vec!["token-usage-insights".to_string(), "version".to_string()];
+        assert_eq!(super::run(&version_cmd).await, Some(0));
+    }
+
+    #[tokio::test]
+    async fn cli_run_handles_end_of_options_and_subcommand_arguments() {
+        // 在 -- 之後的 --no-auto-update 應被視為子命令而非全域旗標
+        let after_delimiter = vec![
+            "token-usage-insights".to_string(),
+            "--".to_string(),
+            "--no-auto-update".to_string(),
+        ];
+        assert_eq!(super::run(&after_delimiter).await, Some(2));
+
+        // 單獨 -- 應啟動看板（回傳 None）
+        let delimiter_only = vec!["token-usage-insights".to_string(), "--".to_string()];
+        assert_eq!(super::run(&delimiter_only).await, None);
+
+        // 空參數應啟動看板
+        assert_eq!(super::run(&[]).await, None);
+
+        // 全域旗標在子命令前被消耗，子命令與參數保持完整傳遞
+        let update_with_flag = vec![
+            "token-usage-insights".to_string(),
+            "--no-auto-update".to_string(),
+            "update".to_string(),
+            "--help".to_string(),
+        ];
+        assert_eq!(super::run(&update_with_flag).await, Some(0));
+
+        // 未知子命令在全域旗標之後正確被辨識
+        let invalid_after_flag = vec![
+            "token-usage-insights".to_string(),
+            "--no-auto-update".to_string(),
+            "unknown-cmd".to_string(),
+            "--no-auto-update".to_string(),
+        ];
+        assert_eq!(super::run(&invalid_after_flag).await, Some(2));
     }
 }

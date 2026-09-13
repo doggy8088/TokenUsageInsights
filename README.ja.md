@@ -501,10 +501,14 @@ cargo build --release --bin token-usage-insights
 ```
 
 ```bash
-# 取得 CLI usage 說明
+# CLI usage 説明の取得
 ./target/release/token-usage-insights --help
+./target/release/token-usage-insights update --help
 ./target/release/token-usage-insights export --help
 ./target/release/token-usage-insights import --help
+
+# 新バージョンの確認（注意: 開発およびソースディレクトリでは安全保護のため --check のみ対応しています。直接更新は拒否されるため、インストール後に token-usage-insights update を使用してください）
+./target/release/token-usage-insights update --check
 ```
 
 データ形式はフロントエンドと同じで、次のフィールドを含みます：
@@ -528,6 +532,9 @@ cargo build --release --bin token-usage-insights
 | `HOST` | `0.0.0.0` | ダッシュボードサービスがバインドする IPv4 または IPv6 アドレス |
 | `PORT` | `3003` | ダッシュボードサービスのポート番号 |
 | `INSIGHTS_DIR` | Windows: `%LOCALAPPDATA%\TokenUsageInsights`; その他のプラットフォーム: `~/.token-usage-insights` | SQLite データベースディレクトリ |
+| `TOKEN_USAGE_INSIGHTS_AUTO_UPDATE` | `true` | 起動時に自動更新をチェックするかどうか（`0`、`false`、`no`、`off` で無効化） |
+| `TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS` | `24` | 自動更新チェックの間隔（時間単位、有効範囲 1 〜 87600） |
+| `TOKEN_USAGE_INSIGHTS_INSTALL_DIR` | 自動検出 | カスタムインストールディレクトリ。更新対象と環境の識別に利用 |
 | `ANTIGRAVITY_DIR` | `~/.gemini/antigravity-cli` | Antigravity CLI データディレクトリ |
 | `COPILOT_DIR` | `~/.copilot` | Copilot CLI データディレクトリ |
 | `COPILOT_APP_DIR` | `COPILOT_DIR` と同じ | Copilot App（デスクトップアプリ）のデータディレクトリ。`data.db` と `session-store.db` を含む必要があります |
@@ -542,6 +549,18 @@ cargo build --release --bin token-usage-insights
 | `OMP_DIR` | `~/.omp` | OMP データディレクトリ |
 | `MUSE_DIR` | `~/.local/share/muse` | Muse Code データディレクトリ。`sessions` を含む必要があります |
 | `CORS_ALLOWED_ORIGINS` | `http://localhost:<PORT>,http://127.0.0.1:<PORT>` | カンマ区切りの許可 CORS オリジン |
+
+### 設定ファイル (config.yaml)
+
+環境変数やコマンドラインフラグ（`--no-auto-update` など）に加えて、`~/.token-usage-insights/config.yaml`（Windows では `%LOCALAPPDATA%\TokenUsageInsights\config.yaml`）でも更新動作を設定できます：
+
+```yaml
+# ~/.token-usage-insights/config.yaml
+auto_update: true          # サービス起動時に自動更新をチェックするかどうか（--no-auto-update や環境変数で上書き可能）
+update_check_interval: 1   # 更新チェックの間隔（日数）
+```
+
+優先順位：コマンドラインフラグ（例: `--no-auto-update`） > 環境変数（例: `TOKEN_USAGE_INSIGHTS_AUTO_UPDATE`） > `config.yaml` 設定ファイル > デフォルト値。
 
 > **デフォルトのバインド先は `0.0.0.0` で、同じローカルネットワーク上の他のデバイスからダッシュボードに接続できる可能性があります。ローカルだけで閲覧する場合は `HOST` を `127.0.0.1` に設定してください。**
 
@@ -727,7 +746,16 @@ Windows PowerShell で常駐サービスも同時にインストールして有�
 インストール後に実行します（Linux/macOS では `bin_dir` が `PATH` に含まれることを確認してください。Windows では `.cmd` shim が作成されます）：
 
 ```bash
+# ダッシュボードサービスの起動
 token-usage-insights
+
+# 新バージョンの確認
+token-usage-insights update --check
+
+# 最新バージョンへの自動更新（--force、--target-version にも対応）
+token-usage-insights update
+token-usage-insights update --force
+token-usage-insights update --target-version v0.9.6
 ```
 
 環境変数でバージョンとインストール先を指定できます（すべて任意）：

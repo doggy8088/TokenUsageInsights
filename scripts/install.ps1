@@ -7,7 +7,9 @@ param(
     [string]$BinDir = $(Join-Path $HOME "bin"),
     [string]$HostAddress = $(if ($env:HOST) { $env:HOST } else { "0.0.0.0" }),
     [int]$Port = $(if ($env:PORT) { [int]$env:PORT } else { 3003 }),
-    [switch]$Service
+    [switch]$Service,
+    [string]$AutoUpdate = $(if ($env:TOKEN_USAGE_INSIGHTS_AUTO_UPDATE) { $env:TOKEN_USAGE_INSIGHTS_AUTO_UPDATE } else { "" }),
+    [string]$UpdateIntervalHours = $(if ($env:TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS) { $env:TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS } else { "" })
 )
 
 $ErrorActionPreference = "Stop"
@@ -67,6 +69,27 @@ function Get-RunnerScriptPathFromArguments {
 
     $expandedRunnerScriptPath = [Environment]::ExpandEnvironmentVariables($runnerScriptPath)
     return [IO.Path]::GetFullPath($expandedRunnerScriptPath)
+}
+
+function Get-RunnerArgumentValue {
+    param(
+        [string]$Arguments,
+        [string]$ParameterName
+    )
+
+    if (-not $Arguments -or -not $ParameterName) {
+        return $null
+    }
+
+    $pattern = '(?i)-(?:' + [regex]::Escape($ParameterName) + ')(?:\s+|:)(?:"([^"]*)"|(\S+))'
+    $match = [regex]::Match($Arguments, $pattern)
+    if ($match.Success) {
+        if ($match.Groups[1].Success) {
+            return $match.Groups[1].Value
+        }
+        return $match.Groups[2].Value
+    }
+    return $null
 }
 
 function Stop-ExistingServiceInstance {
@@ -256,23 +279,115 @@ function Get-ScheduledTaskLogonUser {
     return $null
 }
 
+function Format-RunnerArgumentValue([string]$value) {
+    if ($null -eq $value) {
+        return '""'
+    }
+    # 跳脫值內的反引號與雙引號，防範參數注入與引號截斷
+    $escaped = $value.Replace('`', '``').Replace('"', '\"')
+    return "`"$escaped`""
+}
+
+function Format-RunnerArgumentString {
+    param(
+        [string]$RunnerScript,
+        [string]$InstallDir,
+        [string]$HostAddress,
+        [int]$Port,
+        [AllowNull()][string]$AutoUpdate = $null,
+        [AllowNull()][string]$UpdateIntervalHours = $null
+    )
+
+    $runnerScriptQuoted = Format-RunnerArgumentValue $RunnerScript
+    $installDirQuoted = Format-RunnerArgumentValue $InstallDir
+    $hostAddressQuoted = Format-RunnerArgumentValue $HostAddress
+
+    $runnerArgs = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File $runnerScriptQuoted -InstallDir $installDirQuoted -HostAddress $hostAddressQuoted -Port $Port"
+    if ($null -ne $AutoUpdate) {
+        $autoUpdateQuoted = Format-RunnerArgumentValue $AutoUpdate
+        $runnerArgs += " -AutoUpdate $autoUpdateQuoted"
+    }
+    if ($null -ne $UpdateIntervalHours) {
+        $updateIntervalHoursQuoted = Format-RunnerArgumentValue $UpdateIntervalHours
+        $runnerArgs += " -UpdateIntervalHours $updateIntervalHoursQuoted"
+    }
+    return $runnerArgs
+}
+
 function Set-StartupShortcutForRunner {
     param(
         [string]$ShortcutPath,
         [string]$RunnerScript,
         [string]$InstallDir,
         [string]$HostAddress,
-        [int]$Port
+        [int]$Port,
+        [AllowNull()][string]$AutoUpdate = $null,
+        [AllowNull()][string]$UpdateIntervalHours = $null
     )
+
+    $runnerArgs = Format-RunnerArgumentString `
+        -RunnerScript $RunnerScript `
+        -InstallDir $InstallDir `
+        -HostAddress $HostAddress `
+        -Port $Port `
+        -AutoUpdate $AutoUpdate `
+        -UpdateIntervalHours $UpdateIntervalHours
 
     $WshShell = New-Object -ComObject WScript.Shell
     $Shortcut = $WshShell.CreateShortcut($ShortcutPath)
     $Shortcut.TargetPath = "powershell.exe"
-    $Shortcut.Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$RunnerScript`" -InstallDir `"$InstallDir`" -HostAddress `"$HostAddress`" -Port $Port"
+    $Shortcut.Arguments = $runnerArgs
     $Shortcut.WorkingDirectory = $InstallDir
     $Shortcut.WindowStyle = 7
     $Shortcut.Description = "Token 戰情室 Dashboard Background Service"
     $Shortcut.Save()
+}
+
+function Register-DashboardScheduledTask {
+    param(
+        [string]$TaskName,
+        [string]$RunnerScript,
+        [string]$InstallDir,
+        [string]$HostAddress,
+        [int]$Port,
+        [AllowNull()][string]$AutoUpdate = $null,
+        [AllowNull()][string]$UpdateIntervalHours = $null
+    )
+
+    $runnerArgs = Format-RunnerArgumentString `
+        -RunnerScript $RunnerScript `
+        -InstallDir $InstallDir `
+        -HostAddress $HostAddress `
+        -Port $Port `
+        -AutoUpdate $AutoUpdate `
+        -UpdateIntervalHours $UpdateIntervalHours
+
+    $taskLogonUser = Get-ScheduledTaskLogonUser
+    $Action = New-ScheduledTaskAction `
+        -Execute "powershell.exe" `
+        -Argument $runnerArgs `
+        -WorkingDirectory $InstallDir
+
+    if ($taskLogonUser) {
+        $Trigger = New-ScheduledTaskTrigger -AtLogOn -User $taskLogonUser
+    } else {
+        $Trigger = New-ScheduledTaskTrigger -AtLogOn
+    }
+
+    $Settings = New-ScheduledTaskSettingsSet `
+        -AllowStartIfOnBatteries `
+        -DontStopIfGoingOnBatteries `
+        -ExecutionTimeLimit ([TimeSpan]::Zero) `
+        -RestartCount 3 `
+        -RestartInterval (New-TimeSpan -Minutes 1)
+
+    Register-ScheduledTask `
+        -TaskName $TaskName `
+        -Action $Action `
+        -Trigger $Trigger `
+        -Settings $Settings `
+        -Description "Token 戰情室 Dashboard Background Service" `
+        -Force | Out-Null
 }
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -305,17 +420,40 @@ if ($PSCmdlet.ShouldProcess($InstallDir, "Install Token Usage Insights")) {
 
     $existingTask = $false
     $legacyTaskName = $null
+    $detectedTaskName = $null
     $taskNamesToStop = @($TaskName)
+    $existingTaskArguments = $null
+    $legacyTaskArguments = $null
     try {
-        $existingTask = [bool](Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)
+        $foundTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        if ($foundTask) {
+            $existingTask = $true
+            $detectedTaskName = $TaskName
+            if ($foundTask.Actions) {
+                $firstAction = $foundTask.Actions | Select-Object -First 1
+                if ($firstAction) {
+                    $existingTaskArguments = $firstAction.Arguments
+                }
+            }
+        }
         if ($TaskName -ne "TokenUsageInsights") {
-            $legacyTaskName = "TokenUsageInsights"
-            $legacyTask = Get-ScheduledTask -TaskName $legacyTaskName -ErrorAction SilentlyContinue
+            $legacyTask = Get-ScheduledTask -TaskName "TokenUsageInsights" -ErrorAction SilentlyContinue
             if ($legacyTask) {
                 $existingTask = $true
-                $taskNamesToStop += $legacyTaskName
-            } else {
-                $legacyTaskName = $null
+                $legacyTaskName = "TokenUsageInsights"
+                $taskNamesToStop += "TokenUsageInsights"
+                if (-not $detectedTaskName) {
+                    $detectedTaskName = "TokenUsageInsights"
+                }
+                if ($legacyTask.Actions) {
+                    $firstLegacyAction = $legacyTask.Actions | Select-Object -First 1
+                    if ($firstLegacyAction) {
+                        $legacyTaskArguments = $firstLegacyAction.Arguments
+                        if (-not $existingTaskArguments) {
+                            $existingTaskArguments = $firstLegacyAction.Arguments
+                        }
+                    }
+                }
             }
         }
     } catch {}
@@ -323,17 +461,58 @@ if ($PSCmdlet.ShouldProcess($InstallDir, "Install Token Usage Insights")) {
     $hadStartupShortcutBeforeStop = $false
     $startupShortcutPath = Get-StartupShortcutPath
     $existingShortcut = Test-Path $startupShortcutPath
+    $existingShortcutArguments = $null
+    if ($existingShortcut) {
+        try {
+            $wshShell = New-Object -ComObject WScript.Shell
+            $shortcutObj = $wshShell.CreateShortcut($startupShortcutPath)
+            if ($shortcutObj) {
+                $existingShortcutArguments = $shortcutObj.Arguments
+            }
+        } catch {}
+    }
     $hadStartupShortcutBeforeStop = $existingShortcut
     $hadPersistentServiceRegistration = $hadScheduledTaskBeforeStop -or $existingShortcut
 
-    if ($Service -or $hadPersistentServiceRegistration) {
-        Stop-ExistingServiceInstance -TaskNames $taskNamesToStop -ProcessName $AppName -InstallDir $InstallDir
+    # 若未明確指定更新設定，自動繼承既有服務排程或捷徑中的設定，避免重新安裝時遺失原更新策略
+    $persistedAutoUpdate = $null
+    if ($PSBoundParameters.ContainsKey('AutoUpdate')) {
+        $persistedAutoUpdate = $AutoUpdate
+    } elseif ($null -ne [System.Environment]::GetEnvironmentVariable("TOKEN_USAGE_INSIGHTS_AUTO_UPDATE") -and [System.Environment]::GetEnvironmentVariable("TOKEN_USAGE_INSIGHTS_AUTO_UPDATE") -ne "") {
+        $persistedAutoUpdate = $AutoUpdate
     }
 
-    if ($legacyTaskName) {
-        try {
-            Unregister-ScheduledTask -TaskName $legacyTaskName -Confirm:$false -ErrorAction SilentlyContinue
-        } catch {}
+    $persistedUpdateInterval = $null
+    if ($PSBoundParameters.ContainsKey('UpdateIntervalHours')) {
+        $persistedUpdateInterval = $UpdateIntervalHours
+    } elseif ($null -ne [System.Environment]::GetEnvironmentVariable("TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS") -and [System.Environment]::GetEnvironmentVariable("TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS") -ne "") {
+        $persistedUpdateInterval = $UpdateIntervalHours
+    }
+
+    $candidateServiceArguments = @($existingTaskArguments, $legacyTaskArguments, $existingShortcutArguments) | Where-Object { $_ }
+    if ($null -eq $persistedAutoUpdate) {
+        foreach ($candArgs in $candidateServiceArguments) {
+            $existingAutoUpdate = Get-RunnerArgumentValue -Arguments $candArgs -ParameterName "AutoUpdate"
+            if ($null -ne $existingAutoUpdate) {
+                $persistedAutoUpdate = $existingAutoUpdate
+                $AutoUpdate = $existingAutoUpdate
+                break
+            }
+        }
+    }
+    if ($null -eq $persistedUpdateInterval) {
+        foreach ($candArgs in $candidateServiceArguments) {
+            $existingInterval = Get-RunnerArgumentValue -Arguments $candArgs -ParameterName "UpdateIntervalHours"
+            if ($null -ne $existingInterval) {
+                $persistedUpdateInterval = $existingInterval
+                $UpdateIntervalHours = $existingInterval
+                break
+            }
+        }
+    }
+
+    if ($Service -or $hadPersistentServiceRegistration) {
+        Stop-ExistingServiceInstance -TaskNames $taskNamesToStop -ProcessName $AppName -InstallDir $InstallDir
     }
 
     Copy-Item -Force $BinarySrc (Join-Path $InstallDir "$AppName.exe")
@@ -356,6 +535,19 @@ if ($PSCmdlet.ShouldProcess($InstallDir, "Install Token Usage Insights")) {
         }
     }
 
+    $MarkerFile = Join-Path $InstallDir ".install_marker"
+    $MarkerTmp = Join-Path $InstallDir ".install_marker.tmp.$PID"
+    Set-Content -LiteralPath $MarkerTmp -Value "token-usage-insights:installed" -NoNewline -Encoding Ascii
+    if (Test-Path -LiteralPath $MarkerFile) {
+        try {
+            [System.IO.File]::Replace($MarkerTmp, $MarkerFile, $null)
+        } catch {
+            Move-Item -LiteralPath $MarkerTmp -Destination $MarkerFile -Force
+        }
+    } else {
+        Move-Item -LiteralPath $MarkerTmp -Destination $MarkerFile -Force
+    }
+
     $Shim = Join-Path $BinDir "$AppName.cmd"
     $BatchInstallDir = $InstallDir.Replace("%", "%%")
     @"
@@ -376,34 +568,75 @@ exit /b %APP_EXIT_CODE%
             throw "Missing background service runner script: $RunnerScript"
         }
 
+        # 持久化服務執行期環境變數至 .service.env，確保開機或排程啟動時能正確載入自訂目錄與設定
+        $serviceEnvFile = Join-Path $InstallDir ".service.env"
+        $runtimeEnvVars = @(
+            "INSIGHTS_DIR",
+            "ANTIGRAVITY_DIR",
+            "COPILOT_DIR",
+            "COPILOT_APP_DIR",
+            "CODEX_DIR",
+            "CLAUDE_DIR",
+            "CURSOR_DIR",
+            "CURSOR_STATE_DB",
+            "GROK_DIR",
+            "PI_DIR",
+            "OMP_DIR",
+            "MUSE_DIR",
+            "VSCODE_DIR",
+            "VSCODE_USER_DATA_DIR",
+            "VSCODE_PORTABLE_DATA_DIR",
+            "CORS_ALLOWED_ORIGINS"
+        )
+        $persistedEnvs = @{}
+        if (Test-Path -LiteralPath $serviceEnvFile) {
+            try {
+                Get-Content -LiteralPath $serviceEnvFile | ForEach-Object {
+                    $line = $_.Trim()
+                    if ($line -and (-not $line.StartsWith("#")) -and ($line -match '^([^=]+)=(.*)$')) {
+                        $persistedEnvs[$matches[1].Trim()] = $matches[2]
+                    }
+                }
+            } catch {}
+        }
+        if ($persistedEnvs.ContainsKey("CORS_ALLOW_ORIGIN")) {
+            if (-not $persistedEnvs.ContainsKey("CORS_ALLOWED_ORIGINS")) {
+                $persistedEnvs["CORS_ALLOWED_ORIGINS"] = $persistedEnvs["CORS_ALLOW_ORIGIN"]
+            }
+            $persistedEnvs.Remove("CORS_ALLOW_ORIGIN")
+        }
+        foreach ($var in $runtimeEnvVars) {
+            $envVal = [Environment]::GetEnvironmentVariable($var, "Process")
+            if ($null -ne $envVal -and $envVal -ne "") {
+                $persistedEnvs[$var] = $envVal
+            }
+        }
+        if ($persistedEnvs.Count -gt 0) {
+            $envLines = @()
+            foreach ($k in ($persistedEnvs.Keys | Sort-Object)) {
+                $envLines += "$k=$($persistedEnvs[$k])"
+            }
+            Set-Content -LiteralPath $serviceEnvFile -Value $envLines -Encoding UTF8
+        }
+
+        $runnerArgs = Format-RunnerArgumentString `
+            -RunnerScript $RunnerScript `
+            -InstallDir $InstallDir `
+            -HostAddress $HostAddress `
+            -Port $Port `
+            -AutoUpdate $persistedAutoUpdate `
+            -UpdateIntervalHours $persistedUpdateInterval
+
         $taskRegistered = $false
         try {
-            $taskLogonUser = Get-ScheduledTaskLogonUser
-            $Action = New-ScheduledTaskAction `
-                -Execute "powershell.exe" `
-                -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$RunnerScript`" -InstallDir `"$InstallDir`" -HostAddress `"$HostAddress`" -Port $Port" `
-                -WorkingDirectory $InstallDir
-
-            if ($taskLogonUser) {
-                $Trigger = New-ScheduledTaskTrigger -AtLogOn -User $taskLogonUser
-            } else {
-                $Trigger = New-ScheduledTaskTrigger -AtLogOn
-            }
-
-            $Settings = New-ScheduledTaskSettingsSet `
-                -AllowStartIfOnBatteries `
-                -DontStopIfGoingOnBatteries `
-                -ExecutionTimeLimit ([TimeSpan]::Zero) `
-                -RestartCount 3 `
-                -RestartInterval (New-TimeSpan -Minutes 1)
-
-            Register-ScheduledTask `
+            Register-DashboardScheduledTask `
                 -TaskName $TaskName `
-                -Action $Action `
-                -Trigger $Trigger `
-                -Settings $Settings `
-                -Description "Token 戰情室 Dashboard Background Service" `
-                -Force | Out-Null
+                -RunnerScript $RunnerScript `
+                -InstallDir $InstallDir `
+                -HostAddress $HostAddress `
+                -Port $Port `
+                -AutoUpdate $persistedAutoUpdate `
+                -UpdateIntervalHours $persistedUpdateInterval
             $taskRegistered = $true
         } catch {
             Write-Warning "Could not register scheduled task: $($_.Exception.Message). Falling back to Startup folder..."
@@ -411,13 +644,27 @@ exit /b %APP_EXIT_CODE%
                 Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
             } catch {}
 
-            $taskStillExists = $false
+            if ($legacyTaskName -and ($legacyTaskName -ne $TaskName)) {
+                try {
+                    Unregister-ScheduledTask -TaskName $legacyTaskName -Confirm:$false -ErrorAction SilentlyContinue
+                } catch {}
+            }
+
+            $survivingTask = $null
             try {
-                $taskStillExists = [bool](Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)
+                if ([bool](Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)) {
+                    $survivingTask = $TaskName
+                } elseif ($legacyTaskName -and ($legacyTaskName -ne $TaskName) -and [bool](Get-ScheduledTask -TaskName $legacyTaskName -ErrorAction SilentlyContinue)) {
+                    $survivingTask = $legacyTaskName
+                }
             } catch {}
 
-            if ($taskStillExists) {
-                throw "Could not register scheduled task and failed to unregister existing task '$TaskName'. Aborting fallback to prevent duplicate execution."
+            if ($survivingTask) {
+                # Stop-ExistingServiceInstance 已先停止既有服務；在拋出例外中止 fallback 前嘗試重啟留存之排程工作，避免服務離線
+                try {
+                    Start-ScheduledTask -TaskName $survivingTask -ErrorAction SilentlyContinue
+                } catch {}
+                throw "Could not register scheduled task and failed to unregister existing task. Aborting fallback to prevent duplicate execution."
             }
 
             $startupShortcutPath = Get-StartupShortcutPath -EnsureDirectory
@@ -426,15 +673,39 @@ exit /b %APP_EXIT_CODE%
                 -RunnerScript $RunnerScript `
                 -InstallDir $InstallDir `
                 -HostAddress $HostAddress `
-                -Port $Port
+                -Port $Port `
+                -AutoUpdate $persistedAutoUpdate `
+                -UpdateIntervalHours $persistedUpdateInterval
 
             Start-Process -FilePath "powershell.exe" `
-                -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$RunnerScript`" -InstallDir `"$InstallDir`" -HostAddress `"$HostAddress`" -Port $Port" `
+                -ArgumentList $runnerArgs `
                 -WorkingDirectory $InstallDir -WindowStyle Hidden
         }
 
         if ($taskRegistered) {
             $registeredAsTask = $true
+
+            if ($legacyTaskName -and ($legacyTaskName -ne $TaskName)) {
+                try {
+                    Unregister-ScheduledTask -TaskName $legacyTaskName -Confirm:$false -ErrorAction SilentlyContinue
+                } catch {}
+
+                $legacyStillExists = $false
+                try {
+                    $legacyStillExists = [bool](Get-ScheduledTask -TaskName $legacyTaskName -ErrorAction SilentlyContinue)
+                } catch {}
+
+                if ($legacyStillExists) {
+                    try {
+                        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+                    } catch {}
+                    # Stop-ExistingServiceInstance 已先停止 legacy task；回滾新 task 註冊後，恢復啟動 legacy task 以免服務離線
+                    try {
+                        Start-ScheduledTask -TaskName $legacyTaskName -ErrorAction SilentlyContinue
+                    } catch {}
+                    throw "Scheduled task '$TaskName' registered, but failed to unregister legacy task '$legacyTaskName'. Aborting to prevent duplicate execution."
+                }
+            }
 
             try {
                 Start-ScheduledTask -TaskName $TaskName
@@ -456,8 +727,67 @@ exit /b %APP_EXIT_CODE%
         }
     } elseif ($hadPersistentServiceRegistration) {
         $runnerScript = Join-Path (Join-Path $InstallDir "scripts") "run-service.ps1"
-        $startupShortcutReady = Test-Path $startupShortcutPath
-        if ($hadStartupShortcutBeforeStop -and (Test-Path $runnerScript) -and -not $startupShortcutReady) {
+        if ($hadScheduledTaskBeforeStop) {
+            # 排程工作為 Windows 優先服務常駐方式。若先前同時殘留 Startup 捷徑，刪除過期捷徑避免雙重常駐搶佔連接埠
+            if (Test-Path $startupShortcutPath) {
+                try {
+                    Remove-Item -Force -Path $startupShortcutPath -ErrorAction SilentlyContinue
+                } catch {}
+            }
+
+            # 嘗試移轉或更新排程工作至目前使用者名稱隔離之 $TaskName
+            $taskToStart = $null
+            $migratedOrUpdated = $false
+            if (Test-Path $runnerScript) {
+                try {
+                    Register-DashboardScheduledTask `
+                        -TaskName $TaskName `
+                        -RunnerScript $runnerScript `
+                        -InstallDir $InstallDir `
+                        -HostAddress $HostAddress `
+                        -Port $Port `
+                        -AutoUpdate $persistedAutoUpdate `
+                        -UpdateIntervalHours $persistedUpdateInterval
+                    $taskRegisteredSuccessfully = $true
+                    if ($legacyTaskName -and ($legacyTaskName -ne $TaskName)) {
+                        try {
+                            Unregister-ScheduledTask -TaskName $legacyTaskName -Confirm:$false -ErrorAction SilentlyContinue
+                        } catch {}
+
+                        $legacyStillExists = $false
+                        try {
+                            $legacyStillExists = [bool](Get-ScheduledTask -TaskName $legacyTaskName -ErrorAction SilentlyContinue)
+                        } catch {}
+
+                        if ($legacyStillExists) {
+                            try {
+                                Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+                            } catch {}
+                            $taskRegisteredSuccessfully = $false
+                        }
+                    }
+                    if ($taskRegisteredSuccessfully) {
+                        $migratedOrUpdated = $true
+                        $taskToStart = $TaskName
+                    }
+                } catch {}
+            }
+
+            if (-not $migratedOrUpdated) {
+                # 若移轉失敗且舊版排程工作仍存在，退回啟動舊版工作以防服務離線；否則啟動原偵測之工作
+                if ($legacyTaskName -and [bool](Get-ScheduledTask -TaskName $legacyTaskName -ErrorAction SilentlyContinue)) {
+                    $taskToStart = $legacyTaskName
+                } else {
+                    $taskToStart = $detectedTaskName
+                }
+            }
+
+            if ($taskToStart) {
+                try {
+                    Start-ScheduledTask -TaskName $taskToStart
+                } catch {}
+            }
+        } elseif ($hadStartupShortcutBeforeStop -and (Test-Path $runnerScript)) {
             try {
                 $startupShortcutPath = Get-StartupShortcutPath -EnsureDirectory
                 Set-StartupShortcutForRunner `
@@ -465,15 +795,16 @@ exit /b %APP_EXIT_CODE%
                     -RunnerScript $runnerScript `
                     -InstallDir $InstallDir `
                     -HostAddress $HostAddress `
-                    -Port $Port
-                $startupShortcutReady = Test-Path $startupShortcutPath
+                    -Port $Port `
+                    -AutoUpdate $persistedAutoUpdate `
+                    -UpdateIntervalHours $persistedUpdateInterval
             } catch {}
-        }
 
-        if ($hadStartupShortcutBeforeStop -and $startupShortcutReady) {
-            try {
-                Start-Process $startupShortcutPath
-            } catch {}
+            if (Test-Path $startupShortcutPath) {
+                try {
+                    Start-Process $startupShortcutPath
+                } catch {}
+            }
         }
     }
 

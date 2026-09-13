@@ -22,6 +22,7 @@ mod paths;
 mod pi;
 mod pricing;
 mod timeline;
+mod updater;
 mod vscode;
 
 use handlers::*;
@@ -133,12 +134,40 @@ fn spawn_usage_sync_task() {
 
 #[tokio::main]
 async fn main() {
-    if let Some(code) = cli::run(&std::env::args().collect::<Vec<_>>()) {
+    updater::wait_for_parent_exit_if_requested().await;
+
+    if let Some(code) = cli::run(&std::env::args().collect::<Vec<_>>()).await {
         std::process::exit(code);
     }
+
+    // 看板服務啟動前優先檢查並執行本機交易救援（若先前更新意外中斷）
+    updater::perform_startup_recovery().await;
+
     if let Err(error) = initialize_database_schema() {
         eprintln!("❌ 初始化 SQLite 資料庫失敗: {error}");
     }
+
+    // 建立協調式優雅停機通知通道，供系統終止信號與背景自動更新任務協同使用
+    let (shutdown_reason_tx, mut shutdown_reason_rx) =
+        tokio::sync::mpsc::channel::<updater::ShutdownReason>(1);
+    let (graceful_tx, graceful_rx) = tokio::sync::oneshot::channel::<()>();
+
+    // 啟動背景非阻塞自動更新檢查（若非標準安裝或檢查間隔未滿將自動略過）
+    updater::spawn_background_auto_update(shutdown_reason_tx.clone());
+
+    let signal_tx = shutdown_reason_tx.clone();
+    tokio::spawn(async move {
+        shutdown_signal(signal_tx).await;
+    });
+
+    let shutdown_reason_task = tokio::spawn(async move {
+        let reason = shutdown_reason_rx
+            .recv()
+            .await
+            .unwrap_or(updater::ShutdownReason::Signal);
+        let _ = graceful_tx.send(());
+        reason
+    });
 
     let static_dir = get_static_dir();
     println!("📂 正在服務靜態檔案，目錄來源: {:?}", static_dir);
@@ -222,7 +251,119 @@ async fn main() {
 
     // HTTP 先開始監聽；可能耗時的遷移與 transcript 同步在 blocking thread 執行。
     spawn_usage_sync_task();
-    axum::serve(listener, app).await.unwrap();
+    let pid_guard = updater::create_server_pid_guard();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            let _ = graceful_rx.await;
+        })
+        .await
+        .unwrap();
+
+    drop(pid_guard);
+
+    let shutdown_reason = shutdown_reason_task
+        .await
+        .unwrap_or(updater::ShutdownReason::Signal);
+    match shutdown_reason {
+        updater::ShutdownReason::Signal => {
+            println!("👋 接收到終止信號，Token 戰情室已安全停止。");
+        }
+        updater::ShutdownReason::AutoUpdate(opts) => {
+            println!("🔄 看板服務已完成優雅停機，正在執行自動更新並套用新版本...");
+            updater::log_update("INFO", "RESTART", "服務已優雅停機，開始執行自動更新");
+            let (target_exe, backup_dir, install_dir) = match updater::detect_environment() {
+                updater::EnvironmentKind::StandardInstalled { install_dir, .. } => (
+                    updater::get_target_exe(&install_dir),
+                    install_dir.join(".backup"),
+                    Some(install_dir),
+                ),
+                _ => (
+                    std::env::current_exe().unwrap_or_else(|_| PathBuf::from(updater::APP_NAME)),
+                    PathBuf::from(".backup"),
+                    None,
+                ),
+            };
+            let args: Vec<String> = std::env::args().collect();
+            match updater::run_update(opts).await {
+                Ok(_outcome) => {
+                    let installed = install_dir
+                        .as_deref()
+                        .map(updater::get_installed_version)
+                        .unwrap_or_else(|| "最新版".to_string());
+                    println!("🔄 更新完成，正在自動重啟 Token 戰情室至新版 v{installed}...");
+                    updater::log_update(
+                        "INFO",
+                        "RESTART",
+                        &format!("更新完成，重啟目前服務至 v{installed}"),
+                    );
+                    updater::restart_current_process(&target_exe, &args);
+                }
+                Err(updater::UpdateError::RollbackFailed(err)) => {
+                    eprintln!(
+                        "❌ 自動更新失敗且回滾復原亦失敗: {err}；為防止載入損毀狀態，中止重啟以保留備份 ({backup_dir:?})。請依備份手動復原。"
+                    );
+                    updater::log_update(
+                        "ERROR",
+                        "RESTART",
+                        &format!("更新失敗且回滾失敗 ({err})，中止重啟以保留備份狀態"),
+                    );
+                    std::process::exit(1);
+                }
+                Err(err) => {
+                    let has_rollback_failed = backup_dir.join(".rollback_failed").exists()
+                        || install_dir
+                            .as_ref()
+                            .map(|d| d.join(".rollback_failed").exists())
+                            .unwrap_or(false);
+                    if has_rollback_failed {
+                        eprintln!(
+                            "❌ 自動更新失敗且回滾復原亦失敗；為防止載入損毀狀態，中止重啟以保留備份 ({backup_dir:?})。請依備份手動復原。"
+                        );
+                        updater::log_update(
+                            "ERROR",
+                            "RESTART",
+                            "更新失敗且回滾失敗，中止重啟以保留備份狀態",
+                        );
+                        std::process::exit(1);
+                    }
+                    eprintln!("❌ 自動更新失敗: {err}；正在重啟以維持服務運作...");
+                    updater::log_update(
+                        "ERROR",
+                        "RESTART",
+                        &format!("自動更新失敗: {err}；重啟原服務"),
+                    );
+                    updater::restart_current_process(&target_exe, &args);
+                }
+            }
+        }
+    }
+}
+
+async fn shutdown_signal(shutdown_tx: tokio::sync::mpsc::Sender<updater::ShutdownReason>) {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        if let Ok(mut sig) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            sig.recv().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+
+    let _ = shutdown_tx.send(updater::ShutdownReason::Signal).await;
 }
 
 /// 獲取靜態檔案的基準路徑

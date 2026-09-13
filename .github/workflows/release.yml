@@ -40,6 +40,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      - name: Verify release tag matches Cargo.toml version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF_NAME" != v* ]]; then
+            echo "::error::Release tag ($GITHUB_REF_NAME) must start with 'v'"
+            exit 1
+          fi
+          cargo_version="$(grep '^version' Cargo.toml | head -n1 | cut -d'"' -f2)"
+          if [[ "$GITHUB_REF_NAME" != "v$cargo_version" ]]; then
+            echo "::error::Tag ($GITHUB_REF_NAME) does not match Cargo.toml version (v$cargo_version)"
+            exit 1
+          fi
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -150,7 +164,7 @@ jobs:
 
           "${bin_dir}/token-usage-insights" --help | grep -Fq 'export-all'
 
-          PORT=39103 INSIGHTS_DIR="$insights_dir" "${bin_dir}/token-usage-insights" &
+          PORT=39103 INSIGHTS_DIR="$insights_dir" TOKEN_USAGE_INSIGHTS_AUTO_UPDATE=0 "${bin_dir}/token-usage-insights" --no-auto-update &
           server_pid=$!
 
           response=""
@@ -189,6 +203,7 @@ jobs:
           $binDir = Join-Path $testRoot "Command Files"
           $env:INSIGHTS_DIR = Join-Path $testRoot "資料庫"
           $env:PORT = '39103'
+          $env:TOKEN_USAGE_INSIGHTS_AUTO_UPDATE = '0'
 
           try {
             & (Join-Path $stage 'install.ps1') -InstallDir $installDir -BinDir $binDir -Port 39103
@@ -196,7 +211,7 @@ jobs:
             if ($LASTEXITCODE -ne 0 -or !($help -match 'export-all')) {
               throw 'Installed Windows release did not expose the unified CLI help.'
             }
-            $process = Start-Process -FilePath (Join-Path $installDir 'token-usage-insights.exe') -WorkingDirectory $env:RUNNER_TEMP -WindowStyle Hidden -PassThru
+            $process = Start-Process -FilePath (Join-Path $installDir 'token-usage-insights.exe') -ArgumentList '--no-auto-update' -WorkingDirectory $env:RUNNER_TEMP -WindowStyle Hidden -PassThru
             try {
               $response = $null
               foreach ($attempt in 1..30) {

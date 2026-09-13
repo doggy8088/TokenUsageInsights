@@ -501,10 +501,14 @@ cargo build --release --bin token-usage-insights
 ```
 
 ```bash
-# 取得 CLI usage 說明
+# 获取 CLI usage 说明
 ./target/release/token-usage-insights --help
+./target/release/token-usage-insights update --help
 ./target/release/token-usage-insights export --help
 ./target/release/token-usage-insights import --help
+
+# 检查是否有新版本（注意：开发与源码目录受安全防护限制仅支持 --check；直接执行更新会被安全拒绝并退出，正式原地更新请在安装后使用 token-usage-insights update）
+./target/release/token-usage-insights update --check
 ```
 
 数据格式与前端一致，包含以下字段：
@@ -528,6 +532,9 @@ cargo build --release --bin token-usage-insights
 | `HOST` | `0.0.0.0` | 看板服务绑定的 IPv4 或 IPv6 地址 |
 | `PORT` | `3003` | 看板服务端口号 |
 | `INSIGHTS_DIR` | Windows: `%LOCALAPPDATA%\TokenUsageInsights`; 其他平台：`~/.token-usage-insights` | SQLite 数据库目录 |
+| `TOKEN_USAGE_INSIGHTS_AUTO_UPDATE` | `true` | 是否在启动时自动检查更新（设为 `0`、`false`、`no` 或 `off` 可停用） |
+| `TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS` | `24` | 自动检查更新的间隔周期（小时，有效范围 1 至 87600） |
+| `TOKEN_USAGE_INSIGHTS_INSTALL_DIR` | 自动检测 | 自定义安装目录，作为更新目标与环境识别依据 |
 | `ANTIGRAVITY_DIR` | `~/.gemini/antigravity-cli` | Antigravity CLI 数据目录 |
 | `COPILOT_DIR` | `~/.copilot` | Copilot CLI 数据目录 |
 | `COPILOT_APP_DIR` | 同 `COPILOT_DIR` | Copilot App（桌面应用）数据目录，应包含 `data.db` 与 `session-store.db` |
@@ -542,6 +549,18 @@ cargo build --release --bin token-usage-insights
 | `OMP_DIR` | `~/.omp` | OMP 数据目录 |
 | `MUSE_DIR` | `~/.local/share/muse` | Muse Code 数据目录，应包含 `sessions` |
 | `CORS_ALLOWED_ORIGINS` | `http://localhost:<PORT>,http://127.0.0.1:<PORT>` | 允许的 CORS 来源，以逗号分隔 |
+
+### 配置文件 (config.yaml)
+
+除环境变量与命令行标志（如 `--no-auto-update`）外，亦可在 `~/.token-usage-insights/config.yaml`（Windows 为 `%LOCALAPPDATA%\TokenUsageInsights\config.yaml`）中设置更新行为：
+
+```yaml
+# ~/.token-usage-insights/config.yaml
+auto_update: true          # 是否在服务启动时自动检查并更新（可通过 --no-auto-update 或环境变量覆盖）
+update_check_interval: 1   # 自动检查更新的间隔周期（天）
+```
+
+优先级：命令行标志（如 `--no-auto-update`） > 环境变量（如 `TOKEN_USAGE_INSIGHTS_AUTO_UPDATE`） > `config.yaml` 配置文件 > 默认值。
 
 > **默认绑定 `0.0.0.0`，同一局域网内的其他设备可能连接到看板。只需在本机浏览时，请将 `HOST` 设置为 `127.0.0.1`。**
 
@@ -727,7 +746,16 @@ Windows PowerShell 如需同时安装并启用常驻服务：
 安装完成后即可运行（Linux/macOS 需确认 `bin_dir` 已加入 `PATH`；Windows 会创建 `.cmd` shim）：
 
 ```bash
+# 启动看板服务
 token-usage-insights
+
+# 检查是否有新版本
+token-usage-insights update --check
+
+# 原地自我更新至最新版本（亦支持 --force 强制覆盖、--target-version 指定版本）
+token-usage-insights update
+token-usage-insights update --force
+token-usage-insights update --target-version v0.9.6
 ```
 
 环境变量可控制版本与安装路径（均为可选）：

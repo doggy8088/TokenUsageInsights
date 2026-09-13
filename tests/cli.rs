@@ -10,7 +10,13 @@ fn help_and_invalid_commands_exit_without_initializing_the_server() {
             .unwrap()
             .as_nanos()
     ));
-    for command in [None, Some("export"), Some("export-all"), Some("import")] {
+    for command in [
+        None,
+        Some("export"),
+        Some("export-all"),
+        Some("import"),
+        Some("update"),
+    ] {
         for flag in ["--help", "-h"] {
             let mut process = Command::new(env!("CARGO_BIN_EXE_token-usage-insights"));
             process
@@ -33,6 +39,9 @@ fn help_and_invalid_commands_exit_without_initializing_the_server() {
         vec!["export"],
         vec!["import"],
         vec!["export-all", "--out"],
+        vec!["update", "--unknown"],
+        vec!["update", "-v", "-f"],
+        vec!["update", "--target-version", "--check"],
     ] {
         let result = Command::new(env!("CARGO_BIN_EXE_token-usage-insights"))
             .env("INSIGHTS_DIR", &missing_dir)
@@ -42,4 +51,37 @@ fn help_and_invalid_commands_exit_without_initializing_the_server() {
         assert_eq!(result.status.code(), Some(2));
         assert!(!missing_dir.exists());
     }
+}
+
+#[test]
+fn update_safety_rejection_in_source_checkout_creates_isolated_log() {
+    let missing_dir = std::env::temp_dir().join(format!(
+        "insights-update-safety-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+
+    // In a git repository checkout, `update`, `--update`, and `-u` should be rejected by safety check (exit code 2)
+    for cmd in ["update", "--update", "-u"] {
+        let result = Command::new(env!("CARGO_BIN_EXE_token-usage-insights"))
+            .env_remove("npm_config_user_agent")
+            .env_remove("npm_lifecycle_event")
+            .env_remove("npm_package_json")
+            .env("INSIGHTS_DIR", &missing_dir)
+            .arg(cmd)
+            .output()
+            .unwrap();
+        assert_eq!(result.status.code(), Some(2));
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains("開發目錄")
+                || stderr.contains("非標準安裝目錄")
+                || stderr.contains("npm")
+        );
+    }
+    assert!(missing_dir.join("update.log").exists());
+    let _ = std::fs::remove_dir_all(&missing_dir);
 }
