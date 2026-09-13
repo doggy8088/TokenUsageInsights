@@ -147,8 +147,27 @@ async fn main() {
         eprintln!("❌ 初始化 SQLite 資料庫失敗: {error}");
     }
 
-    // 在綁定 TCP 監聽與服務靜態檔案前執行啟動自動更新檢查；若有新版本並完成替換，將重啟至新版並退出目前進程，避免在伺服中覆寫資產導致檔案鎖定與版本不一致衝突
-    updater::run_startup_auto_update().await;
+    // 建立協調式優雅停機通知通道，供系統終止信號與背景自動更新任務協同使用
+    let (shutdown_reason_tx, mut shutdown_reason_rx) =
+        tokio::sync::mpsc::channel::<updater::ShutdownReason>(1);
+    let (graceful_tx, graceful_rx) = tokio::sync::oneshot::channel::<()>();
+
+    // 啟動背景非阻塞自動更新檢查（若非標準安裝或檢查間隔未滿將自動略過）
+    updater::spawn_background_auto_update(shutdown_reason_tx.clone());
+
+    let signal_tx = shutdown_reason_tx.clone();
+    tokio::spawn(async move {
+        shutdown_signal(signal_tx).await;
+    });
+
+    let shutdown_reason_task = tokio::spawn(async move {
+        let reason = shutdown_reason_rx
+            .recv()
+            .await
+            .unwrap_or(updater::ShutdownReason::Signal);
+        let _ = graceful_tx.send(());
+        reason
+    });
 
     let static_dir = get_static_dir();
     println!("📂 正在服務靜態檔案，目錄來源: {:?}", static_dir);
@@ -234,12 +253,83 @@ async fn main() {
     spawn_usage_sync_task();
     let _pid_guard = updater::create_server_pid_guard();
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            let _ = graceful_rx.await;
+        })
         .await
         .unwrap();
+
+    drop(_pid_guard);
+
+    let shutdown_reason = shutdown_reason_task
+        .await
+        .unwrap_or(updater::ShutdownReason::Signal);
+    match shutdown_reason {
+        updater::ShutdownReason::Signal => {
+            println!("👋 接收到終止信號，Token 戰情室已安全停止。");
+        }
+        updater::ShutdownReason::AutoUpdate(opts) => {
+            println!("🔄 看板服務已完成優雅停機，正在執行自動更新並套用新版本...");
+            updater::log_update("INFO", "RESTART", "服務已優雅停機，開始執行自動更新");
+            match updater::run_update(opts).await {
+                Ok(outcome) => {
+                    let install_dir = match updater::detect_environment() {
+                        updater::EnvironmentKind::StandardInstalled { install_dir, .. } => {
+                            install_dir
+                        }
+                        _ => return,
+                    };
+                    let installed = updater::get_installed_version(&install_dir);
+                    if updater::parse_semver(&installed)
+                        > updater::parse_semver(env!("CARGO_PKG_VERSION"))
+                    {
+                        if outcome.server_restarted {
+                            println!(
+                                "🔄 既有 Token 戰情室背景服務已由更新流程重啟至新版 v{installed}。"
+                            );
+                            updater::log_update(
+                                "INFO",
+                                "RESTART",
+                                "既有看板服務已自動重啟完成，目前程序安全退出",
+                            );
+                        } else {
+                            println!(
+                                "🔄 更新完成，正在自動重啟 Token 戰情室至新版 v{installed}..."
+                            );
+                            updater::log_update(
+                                "INFO",
+                                "RESTART",
+                                &format!("更新完成，重啟至 v{installed}"),
+                            );
+                            let target_exe = updater::get_target_exe(&install_dir);
+                            let args: Vec<String> = std::env::args().collect();
+                            updater::restart_current_process(&target_exe, &args);
+                        }
+                    }
+                }
+                Err(err) => {
+                    eprintln!("❌ 自動更新失敗: {err}；正在重啟以維持服務運作...");
+                    updater::log_update(
+                        "ERROR",
+                        "RESTART",
+                        &format!("自動更新失敗: {err}；重啟原服務"),
+                    );
+                    let install_dir = match updater::detect_environment() {
+                        updater::EnvironmentKind::StandardInstalled { install_dir, .. } => {
+                            install_dir
+                        }
+                        _ => return,
+                    };
+                    let target_exe = updater::get_target_exe(&install_dir);
+                    let args: Vec<String> = std::env::args().collect();
+                    updater::restart_current_process(&target_exe, &args);
+                }
+            }
+        }
+    }
 }
 
-async fn shutdown_signal() {
+async fn shutdown_signal(shutdown_tx: tokio::sync::mpsc::Sender<updater::ShutdownReason>) {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
     };
@@ -262,6 +352,8 @@ async fn shutdown_signal() {
         _ = ctrl_c => {},
         _ = terminate => {},
     }
+
+    let _ = shutdown_tx.send(updater::ShutdownReason::Signal).await;
 }
 
 /// 獲取靜態檔案的基準路徑

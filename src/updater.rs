@@ -14,11 +14,22 @@ const USER_AGENT: &str = "token-usage-insights-updater";
 const DEFAULT_UPDATE_INTERVAL_HOURS: i64 = 24;
 const STARTUP_CHECK_TIMEOUT_SECS: u64 = 4;
 const STARTUP_AUTO_UPDATE_TOTAL_TIMEOUT_SECS: u64 = 60;
-const LAST_CHECK_KEY: &str = "last_update_check_at";
+pub const LAST_CHECK_KEY: &str = "last_update_check_at";
 const MAX_ARCHIVE_BYTES: usize = 150 * 1024 * 1024; // 150 MB 上限
 const MAX_CHECKSUM_BYTES: usize = 1024 * 1024; // 1 MB 上限
 const MAX_EXTRACTED_BYTES: u64 = 300 * 1024 * 1024; // 300 MB 解壓縮展開上限
 const MAX_EXTRACTED_ENTRIES: usize = 10_000; // 最多 10,000 個檔案/目錄
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UpdateOutcome {
+    pub server_restarted: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum ShutdownReason {
+    Signal,
+    AutoUpdate(UpdateOptions),
+}
 
 #[cfg(unix)]
 fn is_process_alive(pid: u32) -> bool {
@@ -2423,7 +2434,7 @@ pub(crate) fn get_installed_version(install_dir: &Path) -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 
-pub async fn run_update(options: UpdateOptions) -> Result<(), UpdateError> {
+pub async fn run_update(options: UpdateOptions) -> Result<UpdateOutcome, UpdateError> {
     let env_kind = detect_environment();
 
     match &env_kind {
@@ -2438,7 +2449,9 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), UpdateError> {
                     current_version,
                     Some("💡 發現新版本！可執行 npx token-usage-insights@latest 使用最新版。"),
                 );
-                return Ok(());
+                return Ok(UpdateOutcome {
+                    server_restarted: false,
+                });
             }
             let msg = r#"⚠️ 偵測到目前透過 npm / npx 執行，不支援直接原地自我更新。
 👉 請使用以下指令取得或執行最新版本：
@@ -2462,7 +2475,9 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), UpdateError> {
                     current_version,
                     Some("💡 發現新版本！請使用 git pull / cargo build 進行更新。"),
                 );
-                return Ok(());
+                return Ok(UpdateOutcome {
+                    server_restarted: false,
+                });
             }
             let msg = format!(
                 "錯誤：目前執行檔位於開發目錄中 ({root:?})，不支援直接更新。\n請使用 git pull / cargo build 進行更新。"
@@ -2484,7 +2499,9 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), UpdateError> {
                     current_version,
                     Some("💡 發現新版本！請在標準安裝目錄中執行更新。"),
                 );
-                return Ok(());
+                return Ok(UpdateOutcome {
+                    server_restarted: false,
+                });
             }
             let msg = format!(
                 "錯誤：目前執行檔位於非標準安裝目錄 ({exe_path:?})。\n請在標準安裝目錄中執行更新。"
@@ -2518,7 +2535,7 @@ pub async fn run_update(options: UpdateOptions) -> Result<(), UpdateError> {
 pub(crate) async fn run_update_in_dir(
     install_dir: &Path,
     options: UpdateOptions,
-) -> Result<(), UpdateError> {
+) -> Result<UpdateOutcome, UpdateError> {
     // 若非純檢查，在開始任何更新操作前先取得安裝目錄之獨占鎖
     let _lock = if !options.check_only {
         Some(match UpdateLock::try_acquire(install_dir) {
@@ -2554,7 +2571,9 @@ pub(crate) async fn run_update_in_dir(
             None => Some("💡 發現新版本！但目前作業系統/硬體架構無預編譯發行包，需手動編譯。"),
         };
         print_and_log_check_result(remote_version, current_version, hint);
-        return Ok(());
+        return Ok(UpdateOutcome {
+            server_restarted: false,
+        });
     }
 
     let is_newer = is_newer_version(remote_version, current_version);
@@ -2564,7 +2583,9 @@ pub(crate) async fn run_update_in_dir(
     if !is_newer && !options.force && options.target_version.is_none() {
         println!("✅ 目前已是最新版本 ({remote_version})。使用 --force 可強制重新安裝。");
         log_update("INFO", "CHECK", "已是最新版本，略過更新");
-        return Ok(());
+        return Ok(UpdateOutcome {
+            server_restarted: false,
+        });
     }
 
     let target = current_target_triple().ok_or_else(|| {
@@ -2687,7 +2708,7 @@ pub(crate) async fn run_update_in_dir(
         let extract_dir = extract_dir.clone();
         let install_dir = install_dir.to_path_buf();
         let remote_version = remote_version.to_string();
-        move || -> Result<(), String> {
+        move || -> Result<bool, String> {
             if let Err(e) = extract_archive(&archive_path, &extract_dir, is_zip) {
                 log_update("ERROR", "EXTRACT", &e);
                 return Err(e);
@@ -2749,25 +2770,26 @@ pub(crate) async fn run_update_in_dir(
             }
 
             let backup_dir = install_dir.join(".backup");
-            apply_installation_with_rollback(&release_root, &install_dir, &backup_dir)?;
+            let server_restarted =
+                apply_installation_with_rollback(&release_root, &install_dir, &backup_dir)?;
 
             println!("🎉 成功更新至版本 {remote_version}！");
             log_update("INFO", "INSTALL", &format!("成功更新至 {remote_version}"));
 
-            Ok(())
+            Ok(server_restarted)
         }
     })
     .await;
 
-    match install_task_res {
-        Ok(Ok(())) => {}
+    let server_restarted = match install_task_res {
+        Ok(Ok(restarted)) => restarted,
         Ok(Err(e)) => return Err(e.into()),
         Err(join_err) => return Err(format!("安裝任務執行異常: {join_err}").into()),
-    }
+    };
 
     let _ = tmp_guard.cleanup();
 
-    Ok(())
+    Ok(UpdateOutcome { server_restarted })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3495,6 +3517,18 @@ while ($waitCount -lt 300) {
     $waitCount++
 }
 
+$logDir = Join-Path $installDir 'logs'
+if (!(Test-Path -LiteralPath $logDir)) {
+    New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+}
+$logFile = Join-Path $installDir 'update.log'
+
+if ($isLocked) {
+    $logTime = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+    Add-Content -LiteralPath $logFile -Value "[$logTime] [ERROR] [RESTART] 移交守護進程等待更新鎖釋放逾時，中止啟動以保留復原標記供後續救援。"
+    exit 1
+}
+
 # 3. 等待 self_replace 臨時置換檔完全清理且執行檔可獨占讀取
 $readyCount = 0
 $exeReady = $false
@@ -3515,6 +3549,12 @@ while ($readyCount -lt 150) {
     $readyCount++
 }
 
+if (-not $exeReady) {
+    $logTime = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+    Add-Content -LiteralPath $logFile -Value "[$logTime] [ERROR] [RESTART] 移交守護進程等待執行檔就緒逾時，中止啟動以保留復原標記供後續救援。"
+    exit 1
+}
+
 # 4. 驗證執行檔版本是否已為新版
 $versionMatched = $false
 $vCheckCount = 0
@@ -3533,11 +3573,6 @@ while ($vCheckCount -lt 50) {
 }
 
 # 5. 依版本驗證結果決定啟動或拒絕載入舊版
-$logDir = Join-Path $installDir 'logs'
-if (!(Test-Path -LiteralPath $logDir)) {
-    New-Item -ItemType Directory -Force -Path $logDir | Out-Null
-}
-$logFile = Join-Path $installDir 'update.log'
 $logTime = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
 
 if ($versionMatched) {
@@ -3752,7 +3787,7 @@ pub(crate) fn apply_installation_with_rollback(
     release_root: &Path,
     install_dir: &Path,
     backup_dir: &Path,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     println!("💾 正在備份現有安裝...");
     if let Err(e) = backup_installation(install_dir, backup_dir) {
         log_update("ERROR", "BACKUP", &e);
@@ -3992,6 +4027,8 @@ pub(crate) fn apply_installation_with_rollback(
     let _ = &expected_version;
     let _ = is_current_exe;
 
+    let mut server_restarted = false;
+
     // 1. Unix 上在檔案寫入完成後，通知先前記錄之監管服務進程退出以讓 supervisor 自動載入新版執行檔
     #[cfg(unix)]
     {
@@ -4006,6 +4043,7 @@ pub(crate) fn apply_installation_with_rollback(
                     libc::kill(pid as libc::pid_t, libc::SIGTERM);
                 }
                 println!("🔄 已通知服務管理器重啟 (PID: {pid})，將由 supervisor 自動載入新版。");
+                server_restarted = true;
             }
         }
     }
@@ -4027,6 +4065,7 @@ pub(crate) fn apply_installation_with_rollback(
                         if let Some(pid) = maybe_pid {
                             spawned_pids.push(pid);
                         }
+                        server_restarted = true;
                     }
                     Err(restart_err) => {
                         let msg = format!(
@@ -4056,6 +4095,7 @@ pub(crate) fn apply_installation_with_rollback(
                                 spec.pid
                             ),
                         );
+                        server_restarted = true;
                     }
                     Err(err) => {
                         let msg = format!(
@@ -4073,6 +4113,9 @@ pub(crate) fn apply_installation_with_rollback(
             match restart_dashboard_instance(spec, install_dir) {
                 Ok(child_pid) => {
                     spawned_pids.push(child_pid);
+                    if spec.is_server {
+                        server_restarted = true;
+                    }
                     println!(
                         "🔄 已重新啟動 PID {} 對應之 Token 戰情室背景看板服務 (新 PID: {child_pid})。",
                         spec.pid
@@ -4310,7 +4353,7 @@ pub(crate) fn apply_installation_with_rollback(
         }
     }
 
-    Ok(())
+    Ok(server_restarted)
 }
 
 fn get_update_check_interval_secs() -> i64 {
@@ -4346,6 +4389,7 @@ fn is_update_check_interval_elapsed() -> bool {
     true
 }
 
+#[allow(dead_code)] // 於單元測試及整合測試中用於斷言更新鎖衝突
 fn is_lock_conflict_error(err: &str) -> bool {
     err.contains("已有另一個更新程序正在執行中")
 }
@@ -4377,7 +4421,7 @@ pub async fn wait_for_parent_exit_if_requested() {
     }
 }
 
-fn get_target_exe(install_dir: &Path) -> PathBuf {
+pub(crate) fn get_target_exe(install_dir: &Path) -> PathBuf {
     let exec_name = if cfg!(windows) {
         format!("{APP_NAME}.exe")
     } else {
@@ -4397,7 +4441,7 @@ fn is_windows_service_runner() -> bool {
     }
 }
 
-fn restart_current_process(exe_path: &Path, args: &[String]) -> ! {
+pub(crate) fn restart_current_process(exe_path: &Path, args: &[String]) -> ! {
     let exe = if exe_path.exists() {
         exe_path.to_path_buf()
     } else {
@@ -4704,20 +4748,15 @@ pub async fn perform_startup_recovery() {
     }
 }
 
-/// 於伺服器綁定 TCP 監聽與服務靜態檔案前執行啟動自動更新檢查；
-/// 若發現新版本並完成替換，將重啟至新版並退出目前進程，避免在對外提供 HTTP 服務期間覆寫磁碟檔案導致檔案鎖定或資源不一致衝突。
-pub async fn run_startup_auto_update() {
-    run_startup_auto_update_impl().await;
-}
-
-#[allow(dead_code)] // 供相容性保留或外部呼叫
-pub fn spawn_background_auto_update() {
-    tokio::spawn(async {
-        run_startup_auto_update_impl().await;
+pub fn spawn_background_auto_update(shutdown_tx: tokio::sync::mpsc::Sender<ShutdownReason>) {
+    tokio::spawn(async move {
+        // 延遲 1 秒執行，確保主服務監聽與 TCP 綁定先行就緒，離線或慢速網路零阻塞
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        run_background_auto_update(shutdown_tx).await;
     });
 }
 
-async fn run_startup_auto_update_impl() {
+async fn run_background_auto_update(shutdown_tx: tokio::sync::mpsc::Sender<ShutdownReason>) {
     if std::env::var_os("_TOKEN_USAGE_INSIGHTS_RESTARTED").is_some() {
         return;
     }
@@ -4770,24 +4809,28 @@ async fn run_startup_auto_update_impl() {
         }
     };
 
+    if let Ok(conn) = crate::db::get_db_conn() {
+        let now_str = Utc::now().to_rfc3339();
+        let _ = crate::db::set_system_metadata(&conn, LAST_CHECK_KEY, &now_str);
+    }
+
     let current_version_str = get_installed_version(&install_dir);
     let current_version = current_version_str.as_str();
     if !is_newer_version(&release.tag_name, current_version) {
-        if let Ok(conn) = crate::db::get_db_conn() {
-            let now_str = Utc::now().to_rfc3339();
-            let _ = crate::db::set_system_metadata(&conn, LAST_CHECK_KEY, &now_str);
-        }
         return;
     }
 
     println!(
-        "🚀 發現新版本 {}（目前為 v{}），正在自動更新...",
+        "🚀 發現新版本 {}（目前為 v{}），協調服務優雅停機以執行自動更新...",
         release.tag_name, current_version
     );
     log_update(
         "INFO",
         "STARTUP_CHECK",
-        &format!("觸發啟動自動更新至 {}", release.tag_name),
+        &format!(
+            "發現新版本 {}，發送優雅停機訊號以協調更新",
+            release.tag_name
+        ),
     );
 
     let update_opts = UpdateOptions {
@@ -4797,102 +4840,9 @@ async fn run_startup_auto_update_impl() {
         prefetched_release: Some(release.clone()),
     };
 
-    let update_result = run_update(update_opts).await;
-
-    match update_result {
-        Ok(()) => {
-            if let Ok(conn) = crate::db::get_db_conn() {
-                let now_str = Utc::now().to_rfc3339();
-                let _ = crate::db::set_system_metadata(&conn, LAST_CHECK_KEY, &now_str);
-            }
-
-            let installed = get_installed_version(&install_dir);
-            if parse_semver(&installed) > parse_semver(env!("CARGO_PKG_VERSION")) {
-                println!("🔄 更新完成，正在自動重啟 Token 戰情室至新版 v{installed}...");
-                log_update(
-                    "INFO",
-                    "STARTUP_RESTART",
-                    &format!("更新完成，重啟至 v{installed}"),
-                );
-                let target_exe = get_target_exe(&install_dir);
-                restart_current_process(&target_exe, &args);
-            } else {
-                log_update("INFO", "STARTUP_CHECK", "目前進程與磁碟版本相符，無需重啟");
-            }
-        }
-        Err(e) => {
-            let err_msg = e.to_string();
-            if is_lock_conflict_error(&err_msg) {
-                println!("⏳ 偵測到已有更新程序正在進行中，等待更新完成...");
-                log_update("INFO", "STARTUP_WAIT", "遇到更新鎖競爭，等待另一程序完成");
-                let start_time = tokio::time::Instant::now();
-                let total_timeout = Duration::from_secs(STARTUP_AUTO_UPDATE_TOTAL_TIMEOUT_SECS);
-                loop {
-                    if UpdateLock::is_locked(&install_dir) {
-                        let elapsed = start_time.elapsed();
-                        if elapsed >= total_timeout {
-                            // 背景自動更新任務中遇到鎖競爭超時，記錄警告並放棄本輪更新；
-                            // 絕不在背景任務中呼叫 process::exit，以免強制終止正在服務的看板程序
-                            eprintln!("⚠️ 等待更新程序超時；本輪背景更新略過，看板服務繼續運行。");
-                            log_update(
-                                "WARN",
-                                "STARTUP_LOCK",
-                                "背景更新等待更新鎖超時，放棄本輪更新，不終止程序",
-                            );
-                            return;
-                        }
-                        let remaining = total_timeout - elapsed;
-                        if let Err(wait_err) = wait_for_lock_release(&install_dir, remaining).await
-                        {
-                            eprintln!(
-                                "⚠️ 等待更新程序超時: {wait_err}；本輪背景更新略過，看板服務繼續運行。"
-                            );
-                            log_update(
-                                "WARN",
-                                "STARTUP_LOCK",
-                                &format!(
-                                    "背景更新等待更新鎖超時: {wait_err}，放棄本輪更新，不終止程序"
-                                ),
-                            );
-                            return;
-                        }
-                    }
-
-                    match attempt_startup_recovery(&install_dir, &args) {
-                        RecoveryStatus::SuccessRestored => return,
-                        RecoveryStatus::CleanedOrNoBackup => {
-                            if UpdateLock::is_locked(&install_dir) {
-                                continue;
-                            }
-                            let installed = get_installed_version(&install_dir);
-                            if parse_semver(&installed) != parse_semver(env!("CARGO_PKG_VERSION")) {
-                                println!(
-                                    "🔄 更新已由另一程序完成，正在重新啟動 Token 戰情室至新版 v{installed}..."
-                                );
-                                log_update(
-                                    "INFO",
-                                    "STARTUP_RESTART",
-                                    &format!("另一程序更新完成，重啟至 v{installed}"),
-                                );
-                                let target_exe = get_target_exe(&install_dir);
-                                restart_current_process(&target_exe, &args);
-                            }
-                            break;
-                        }
-                        RecoveryStatus::LockContended => continue,
-                    }
-                }
-            } else {
-                attempt_startup_recovery(&install_dir, &args);
-                eprintln!("⚠️ 自動更新失敗: {err_msg}，將繼續以現有健全版本啟動服務。");
-                log_update(
-                    "WARN",
-                    "STARTUP_UPDATE",
-                    &format!("自動更新失敗: {err_msg}"),
-                );
-            }
-        }
-    }
+    let _ = shutdown_tx
+        .send(ShutdownReason::AutoUpdate(update_opts))
+        .await;
 }
 
 #[cfg(test)]
@@ -6492,15 +6442,25 @@ update_check_interval: 5 # check every 5 days
         assert!(script.contains("移交守護進程驗證新版執行檔版本失敗"));
         assert!(script.contains("中止啟動以防載入舊版"));
 
+        // 驗證等待更新鎖或執行檔逾時時終止啟動並保留復原標記
+        assert!(
+            script.contains("移交守護進程等待更新鎖釋放逾時，中止啟動以保留復原標記供後續救援。")
+        );
+        assert!(
+            script.contains("移交守護進程等待執行檔就緒逾時，中止啟動以保留復原標記供後續救援。")
+        );
+
         // 驗證版本相符時才以原參數啟動
         assert!(script.contains("移交守護進程已確認新版執行檔版本"));
         assert!(script.contains("Start-Process -FilePath $exePath"));
     }
 
     #[tokio::test]
-    async fn run_startup_auto_update_exits_early_when_restarted_flag_set() {
+    async fn run_background_auto_update_exits_early_when_restarted_flag_set() {
         std::env::set_var("_TOKEN_USAGE_INSIGHTS_RESTARTED", "1");
-        run_startup_auto_update().await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        run_background_auto_update(tx).await;
+        assert!(rx.try_recv().is_err());
         std::env::remove_var("_TOKEN_USAGE_INSIGHTS_RESTARTED");
     }
 }
