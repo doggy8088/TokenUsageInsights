@@ -7,7 +7,7 @@ Type=simple
 WorkingDirectory=<PROJECT_DIR>
 ExecStart=<PROJECT_DIR>/target/release/token-usage-insights
 Restart=always
-RestartSec=5
+RestartSec=2
 Environment=HOST=0.0.0.0
 Environment=PORT=3003
 

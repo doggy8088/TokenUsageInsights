@@ -580,6 +580,100 @@ fn is_process_supervised(pid: u32, _install_dir: &Path) -> bool {
     false
 }
 
+#[cfg(target_os = "linux")]
+fn check_systemd_supervised_new_pid(old_pid: u32) -> Option<u32> {
+    let check_cmd = |args: &[&str]| -> Option<u32> {
+        let output = std::process::Command::new("systemctl")
+            .args(args)
+            .output()
+            .ok()?;
+        if output.status.success() {
+            let text = String::from_utf8_lossy(&output.stdout);
+            let mut main_pid = 0u32;
+            let mut is_active = false;
+            for line in text.lines() {
+                if let Some((k, v)) = line.split_once('=') {
+                    match k.trim() {
+                        "MainPID" => {
+                            if let Ok(p) = v.trim().parse::<u32>() {
+                                main_pid = p;
+                            }
+                        }
+                        "ActiveState" => {
+                            let state = v.trim();
+                            if state == "active" || state == "activating" {
+                                is_active = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if main_pid != 0 && main_pid != old_pid && is_active && is_process_alive(main_pid) {
+                return Some(main_pid);
+            }
+        }
+        None
+    };
+
+    check_cmd(&[
+        "--user",
+        "show",
+        "token-usage-insights.service",
+        "--property=MainPID,ActiveState",
+    ])
+    .or_else(|| {
+        check_cmd(&[
+            "show",
+            "token-usage-insights.service",
+            "--property=MainPID,ActiveState",
+        ])
+    })
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn check_launchd_supervised_new_pid(old_pid: u32) -> Option<u32> {
+    if let Ok(output) = std::process::Command::new("launchctl")
+        .args(["list", "com.tokenusageinsights"])
+        .output()
+    {
+        if output.status.success() {
+            let text = String::from_utf8_lossy(&output.stdout);
+            for line in text.lines() {
+                let line = line.trim();
+                if line.starts_with("\"PID\" =") {
+                    let pid_str = line
+                        .trim_start_matches("\"PID\" =")
+                        .trim()
+                        .trim_matches(';')
+                        .trim();
+                    if let Ok(p) = pid_str.parse::<u32>() {
+                        if p != 0 && p != old_pid && is_process_alive(p) {
+                            return Some(p);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Ok(output) = std::process::Command::new("launchctl").arg("list").output() {
+        if output.status.success() {
+            let text = String::from_utf8_lossy(&output.stdout);
+            for line in text.lines() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 3 && parts[2] == "com.tokenusageinsights" {
+                    if let Ok(p) = parts[0].parse::<u32>() {
+                        if p != 0 && p != old_pid && is_process_alive(p) {
+                            return Some(p);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 #[cfg(not(any(unix, windows)))]
 fn get_process_cmdline(_pid: u32) -> Option<Vec<String>> {
     None
@@ -4113,8 +4207,9 @@ pub(crate) fn apply_installation_with_rollback(
                     std::thread::sleep(Duration::from_millis(50));
                 }
 
-                // 驗證 supervisor 是否已成功啟動新版進程（檢查 .server.pid 檔案或進程存活）
-                let start_deadline = Instant::now() + Duration::from_secs(5);
+                // 驗證 supervisor 是否已成功啟動新版進程（檢查 .server.pid 檔案、進程存活，或向服務管理器查詢狀態）
+                // 由於 systemd 等服務管理器通常設定有 RestartSec（如 5 秒），驗證逾時需顯著大於 supervisor 重啟延遲（設定為 15 秒）
+                let start_deadline = Instant::now() + Duration::from_secs(15);
                 let mut supervisor_restarted = false;
                 while Instant::now() < start_deadline {
                     for pid_file in &[
@@ -4133,6 +4228,19 @@ pub(crate) fn apply_installation_with_rollback(
                     if supervisor_restarted {
                         break;
                     }
+
+                    #[cfg(target_os = "linux")]
+                    if let Some(_new_pid) = check_systemd_supervised_new_pid(pid) {
+                        supervisor_restarted = true;
+                        break;
+                    }
+
+                    #[cfg(all(unix, not(target_os = "linux")))]
+                    if let Some(_new_pid) = check_launchd_supervised_new_pid(pid) {
+                        supervisor_restarted = true;
+                        break;
+                    }
+
                     std::thread::sleep(Duration::from_millis(100));
                 }
 

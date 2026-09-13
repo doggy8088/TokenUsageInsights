@@ -574,13 +574,19 @@ exit /b %APP_EXIT_CODE%
             "INSIGHTS_DIR",
             "ANTIGRAVITY_DIR",
             "COPILOT_DIR",
+            "COPILOT_APP_DIR",
             "CODEX_DIR",
             "CLAUDE_DIR",
             "CURSOR_DIR",
+            "CURSOR_STATE_DB",
             "GROK_DIR",
             "PI_DIR",
             "OMP_DIR",
-            "CORS_ALLOW_ORIGIN"
+            "MUSE_DIR",
+            "VSCODE_DIR",
+            "VSCODE_USER_DATA_DIR",
+            "VSCODE_PORTABLE_DATA_DIR",
+            "CORS_ALLOWED_ORIGINS"
         )
         $persistedEnvs = @{}
         if (Test-Path -LiteralPath $serviceEnvFile) {
@@ -592,6 +598,12 @@ exit /b %APP_EXIT_CODE%
                     }
                 }
             } catch {}
+        }
+        if ($persistedEnvs.ContainsKey("CORS_ALLOW_ORIGIN")) {
+            if (-not $persistedEnvs.ContainsKey("CORS_ALLOWED_ORIGINS")) {
+                $persistedEnvs["CORS_ALLOWED_ORIGINS"] = $persistedEnvs["CORS_ALLOW_ORIGIN"]
+            }
+            $persistedEnvs.Remove("CORS_ALLOW_ORIGIN")
         }
         foreach ($var in $runtimeEnvVars) {
             $envVal = [Environment]::GetEnvironmentVariable($var, "Process")

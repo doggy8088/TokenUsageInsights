@@ -857,6 +857,29 @@ Wait-ForExecutableReady -InstallDir '$readyTestDir' -ExePath '$readyExePath'
     $surroundingLegacyBlock = $failedLegacyTaskThrow.Parent
     Assert-True ($surroundingLegacyBlock.Extent.Text -match '(?s)Start-ScheduledTask.*throw') "install.ps1 should restart legacy task before throwing on legacy task unregister failure."
 
+    # 8. Verify .service.env runtimeEnvVars list and legacy key migration
+    $runtimeVarArrayAst = $installAst.FindAll({
+        $args[0] -is [System.Management.Automation.Language.VariableExpressionAst] -and
+        $args[0].VariablePath.UserPath -eq "runtimeEnvVars"
+    }, $true)
+    Assert-True ($null -ne $runtimeVarArrayAst -and $runtimeVarArrayAst.Count -gt 0) "install.ps1 should define runtimeEnvVars."
+    $runtimeVarAssign = $runtimeVarArrayAst[0].Parent
+    $runtimeVarText = $runtimeVarAssign.Extent.Text
+    Assert-True ($runtimeVarText -match '"CORS_ALLOWED_ORIGINS"') "install.ps1 runtimeEnvVars should contain CORS_ALLOWED_ORIGINS."
+    Assert-True (-not ($runtimeVarText -match '"CORS_ALLOW_ORIGIN"')) "install.ps1 runtimeEnvVars should not contain legacy CORS_ALLOW_ORIGIN."
+    Assert-True ($runtimeVarText -match '"COPILOT_APP_DIR"') "install.ps1 runtimeEnvVars should contain COPILOT_APP_DIR."
+    Assert-True ($runtimeVarText -match '"CURSOR_STATE_DB"') "install.ps1 runtimeEnvVars should contain CURSOR_STATE_DB."
+    Assert-True ($runtimeVarText -match '"MUSE_DIR"') "install.ps1 runtimeEnvVars should contain MUSE_DIR."
+    Assert-True ($runtimeVarText -match '"VSCODE_USER_DATA_DIR"') "install.ps1 runtimeEnvVars should contain VSCODE_USER_DATA_DIR."
+    Assert-True ($runtimeVarText -match '"VSCODE_PORTABLE_DATA_DIR"') "install.ps1 runtimeEnvVars should contain VSCODE_PORTABLE_DATA_DIR."
+
+    # Test .service.env loading in run-service.ps1
+    $runServiceAst = [System.Management.Automation.Language.Parser]::ParseInput($runServiceContent, [ref]$null, [ref]$null)
+    $serviceEnvLoad = $runServiceAst.FindAll({
+        $args[0].Extent.Text -match '\.service\.env'
+    }, $true)
+    Assert-True ($null -ne $serviceEnvLoad -and $serviceEnvLoad.Count -gt 0) "run-service.ps1 should load .service.env."
+
     Write-Host "Windows collector smoke tests passed."
 } finally {
     $env:ANTIGRAVITY_DIR = $PreviousAntigravityDir

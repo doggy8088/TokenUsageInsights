@@ -84,6 +84,24 @@ done
 ln -sfn "${install_dir}/${app_name}" "${bin_dir}/${app_name}"
 
 if [[ "$install_service" == true ]]; then
+  runtime_vars=(
+    INSIGHTS_DIR
+    ANTIGRAVITY_DIR
+    COPILOT_DIR
+    COPILOT_APP_DIR
+    CODEX_DIR
+    CLAUDE_DIR
+    CURSOR_DIR
+    CURSOR_STATE_DB
+    GROK_DIR
+    PI_DIR
+    OMP_DIR
+    MUSE_DIR
+    VSCODE_DIR
+    VSCODE_USER_DATA_DIR
+    VSCODE_PORTABLE_DATA_DIR
+    CORS_ALLOWED_ORIGINS
+  )
   case "$(uname -s)" in
     Linux)
       if ! command -v systemctl >/dev/null 2>&1; then
@@ -113,18 +131,6 @@ if [[ "$install_service" == true ]]; then
       port_systemd="$(systemd_escape_value "$port")"
 
       # 若未於環境變數明確指定更新設定，自動繼承既有 systemd 服務單元之設定
-      runtime_vars=(
-        INSIGHTS_DIR
-        ANTIGRAVITY_DIR
-        COPILOT_DIR
-        CODEX_DIR
-        CLAUDE_DIR
-        CURSOR_DIR
-        GROK_DIR
-        PI_DIR
-        OMP_DIR
-        CORS_ALLOW_ORIGIN
-      )
       if [[ -f "$service_file" ]]; then
         if [[ -z "${TOKEN_USAGE_INSIGHTS_AUTO_UPDATE+x}" ]]; then
           existing_auto_update="$(sed -n -E 's/^[[:space:]]*Environment="?TOKEN_USAGE_INSIGHTS_AUTO_UPDATE=([^"]*)"?$/\1/p' "$service_file" | tail -n 1)"
@@ -146,6 +152,12 @@ if [[ "$install_service" == true ]]; then
             fi
           fi
         done
+        if [[ -z "${CORS_ALLOWED_ORIGINS:-}" && -z "${CORS_ALLOWED_ORIGINS+x}" ]]; then
+          legacy_cors="$(sed -n -E 's/^[[:space:]]*Environment="?CORS_ALLOW_ORIGIN=([^"]*)"?$/\1/p' "$service_file" | tail -n 1)"
+          if [[ -n "$legacy_cors" ]]; then
+            CORS_ALLOWED_ORIGINS="$legacy_cors"
+          fi
+        fi
       fi
 
       extra_env_systemd=""
@@ -172,7 +184,7 @@ Type=simple
 WorkingDirectory="${install_dir_systemd}"
 ExecStart="${executable_systemd}"
 Restart=always
-RestartSec=5
+RestartSec=2
 Environment="PORT=${port_systemd}"
 Environment="HOST=${host_systemd}"
 Environment="TOKEN_USAGE_INSIGHTS_INSTALL_DIR=${install_dir_systemd}"${extra_env_systemd}
@@ -236,6 +248,11 @@ SERVICE
             fi
           fi
         done
+        if [[ -z "${CORS_ALLOWED_ORIGINS:-}" && -z "${CORS_ALLOWED_ORIGINS+x}" ]]; then
+          if legacy_cors="$(plutil -extract EnvironmentVariables.CORS_ALLOW_ORIGIN raw -o - "$launch_agent_file" 2>/dev/null)" && [[ -n "$legacy_cors" ]]; then
+            CORS_ALLOWED_ORIGINS="$legacy_cors"
+          fi
+        fi
       fi
 
       extra_env_plist=""
