@@ -51,6 +51,18 @@ fn help_and_invalid_commands_exit_without_initializing_the_server() {
         assert_eq!(result.status.code(), Some(2));
         assert!(!missing_dir.exists());
     }
+}
+
+#[test]
+fn update_safety_rejection_in_source_checkout_creates_isolated_log() {
+    let missing_dir = std::env::temp_dir().join(format!(
+        "insights-update-safety-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
 
     // In a git repository checkout, `update`, `--update`, and `-u` should be rejected by safety check (exit code 2)
     for cmd in ["update", "--update", "-u"] {

@@ -279,6 +279,41 @@ function Get-ScheduledTaskLogonUser {
     return $null
 }
 
+function Format-RunnerArgumentValue([string]$value) {
+    if ($null -eq $value) {
+        return '""'
+    }
+    # 跳脫值內的反引號與雙引號，防範參數注入與引號截斷
+    $escaped = $value.Replace('`', '``').Replace('"', '\"')
+    return "`"$escaped`""
+}
+
+function Format-RunnerArgumentString {
+    param(
+        [string]$RunnerScript,
+        [string]$InstallDir,
+        [string]$HostAddress,
+        [int]$Port,
+        [AllowNull()][string]$AutoUpdate = $null,
+        [AllowNull()][string]$UpdateIntervalHours = $null
+    )
+
+    $runnerScriptQuoted = Format-RunnerArgumentValue $RunnerScript
+    $installDirQuoted = Format-RunnerArgumentValue $InstallDir
+    $hostAddressQuoted = Format-RunnerArgumentValue $HostAddress
+
+    $runnerArgs = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File $runnerScriptQuoted -InstallDir $installDirQuoted -HostAddress $hostAddressQuoted -Port $Port"
+    if ($null -ne $AutoUpdate) {
+        $autoUpdateQuoted = Format-RunnerArgumentValue $AutoUpdate
+        $runnerArgs += " -AutoUpdate $autoUpdateQuoted"
+    }
+    if ($null -ne $UpdateIntervalHours) {
+        $updateIntervalHoursQuoted = Format-RunnerArgumentValue $UpdateIntervalHours
+        $runnerArgs += " -UpdateIntervalHours $updateIntervalHoursQuoted"
+    }
+    return $runnerArgs
+}
+
 function Set-StartupShortcutForRunner {
     param(
         [string]$ShortcutPath,
@@ -290,13 +325,13 @@ function Set-StartupShortcutForRunner {
         [AllowNull()][string]$UpdateIntervalHours = $null
     )
 
-    $runnerArgs = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$RunnerScript`" -InstallDir `"$InstallDir`" -HostAddress `"$HostAddress`" -Port $Port"
-    if ($null -ne $AutoUpdate) {
-        $runnerArgs += " -AutoUpdate `"$AutoUpdate`""
-    }
-    if ($null -ne $UpdateIntervalHours) {
-        $runnerArgs += " -UpdateIntervalHours `"$UpdateIntervalHours`""
-    }
+    $runnerArgs = Format-RunnerArgumentString `
+        -RunnerScript $RunnerScript `
+        -InstallDir $InstallDir `
+        -HostAddress $HostAddress `
+        -Port $Port `
+        -AutoUpdate $AutoUpdate `
+        -UpdateIntervalHours $UpdateIntervalHours
 
     $WshShell = New-Object -ComObject WScript.Shell
     $Shortcut = $WshShell.CreateShortcut($ShortcutPath)
@@ -319,13 +354,13 @@ function Register-DashboardScheduledTask {
         [AllowNull()][string]$UpdateIntervalHours = $null
     )
 
-    $runnerArgs = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$RunnerScript`" -InstallDir `"$InstallDir`" -HostAddress `"$HostAddress`" -Port $Port"
-    if ($null -ne $AutoUpdate) {
-        $runnerArgs += " -AutoUpdate `"$AutoUpdate`""
-    }
-    if ($null -ne $UpdateIntervalHours) {
-        $runnerArgs += " -UpdateIntervalHours `"$UpdateIntervalHours`""
-    }
+    $runnerArgs = Format-RunnerArgumentString `
+        -RunnerScript $RunnerScript `
+        -InstallDir $InstallDir `
+        -HostAddress $HostAddress `
+        -Port $Port `
+        -AutoUpdate $AutoUpdate `
+        -UpdateIntervalHours $UpdateIntervalHours
 
     $taskLogonUser = Get-ScheduledTaskLogonUser
     $Action = New-ScheduledTaskAction `
