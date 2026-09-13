@@ -225,6 +225,67 @@ function Wait-ForUpdateLockRelease {
     return (-not (Test-IsUpdateLockHeld -LockFile $LockFile))
 }
 
+function Test-IsProcessHealthy {
+    param(
+        [System.Diagnostics.Process]$Process,
+        [string]$InstallDir,
+        [int]$TimeoutSeconds = 5
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $pidFile = Join-Path $InstallDir ".server.pid"
+    while ((Get-Date) -lt $deadline) {
+        if ($Process.HasExited) {
+            return $false
+        }
+        if (Test-Path -LiteralPath $pidFile) {
+            try {
+                $pidContent = (Get-Content -LiteralPath $pidFile -Raw).Trim()
+                if ($pidContent -eq "$($Process.Id)") {
+                    return $true
+                }
+            } catch {}
+        }
+        Start-Sleep -Milliseconds 100
+    }
+    return (-not $Process.HasExited)
+}
+
+function Restore-ServiceBackup {
+    param(
+        [string]$InstallDir
+    )
+
+    $backupDir = Join-Path $InstallDir ".backup"
+    $manifest = Join-Path $backupDir ".manifest"
+    if (-not (Test-Path -LiteralPath $manifest)) {
+        return $false
+    }
+
+    try {
+        Get-Content -LiteralPath $manifest | ForEach-Object {
+            $rel = $_.Trim()
+            if ($rel) {
+                $src = Join-Path $backupDir $rel
+                $dst = Join-Path $InstallDir $rel
+                if (Test-Path -LiteralPath $src) {
+                    $parent = Split-Path -Parent $dst
+                    if ($parent -and -not (Test-Path -LiteralPath $parent)) {
+                        New-Item -ItemType Directory -Force -Path $parent | Out-Null
+                    }
+                    Copy-Item -LiteralPath $src -Destination $dst -Force -Recurse
+                }
+            }
+        }
+        Remove-Item -LiteralPath $backupDir -Recurse -Force -ErrorAction SilentlyContinue
+        return $true
+    } catch {
+        $marker = Join-Path $backupDir ".rollback_failed"
+        Set-Content -LiteralPath $marker -Value "run-service rollback failed: $_"
+        return $false
+    }
+}
+
 function Wait-ForExecutableReady {
     param(
         [string]$InstallDir,
@@ -301,11 +362,7 @@ function Wait-ForExecutableReady {
         }
     }
 
-    # 3. 版本與執行檔驗證成功後，清理備份目錄與更新協商就緒標記檔
-    $backupDir = Join-Path $InstallDir ".backup"
-    if (Test-Path -LiteralPath $backupDir) {
-        Remove-Item -LiteralPath $backupDir -Recurse -Force -ErrorAction SilentlyContinue
-    }
+    # 3. 版本與執行檔初步驗證成功後，移除更新協商標記檔（保留 .backup 目錄直至新進程確認健康啟動）
     $readyMarker = Join-Path $InstallDir ".update_ready"
     $restartPending = Join-Path $InstallDir ".service_restart_pending"
     Remove-Item -LiteralPath $readyMarker -Force -ErrorAction SilentlyContinue
@@ -370,6 +427,29 @@ while ($true) {
         -RedirectStandardOutput $OutLog `
         -RedirectStandardError $ErrLog `
         -PassThru
+
+    # 若存在更新備份目錄 (.backup)，監控新版服務進程是否確認健康就緒；若確認健康始清理備份，若啟動失敗則自備份自動回滾
+    $backupDir = Join-Path $InstallDir ".backup"
+    if (Test-Path -LiteralPath $backupDir) {
+        $isHealthy = Test-IsProcessHealthy -Process $Process -InstallDir $InstallDir -TimeoutSeconds 5
+        if ($isHealthy) {
+            Write-Host "新版服務進程已確認健康就緒，清理更新備份目錄..."
+            Remove-Item -LiteralPath $backupDir -Recurse -Force -ErrorAction SilentlyContinue
+        } else {
+            Write-Warning "新版服務進程啟動後異常或未能及時就緒，執行自備份自動回滾至先前版本..."
+            if ($Process -and -not $Process.HasExited) {
+                Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue
+                try { $null = $Process.WaitForExit(5000) } catch {}
+            }
+            $restored = Restore-ServiceBackup -InstallDir $InstallDir
+            if ($restored) {
+                Write-Host "已成功自備份回滾至先前版本，重新啟動原版服務..."
+                continue
+            } else {
+                Exit-WithError -Message "新版服務進程啟動失敗且回滾失敗，已保留備份目錄以供手動修復。"
+            }
+        }
+    }
 
     $restartForLogRotation = $false
     try {

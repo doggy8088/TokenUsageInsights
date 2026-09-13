@@ -44,10 +44,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          if [[ "$GITHUB_REF_NAME" != v* ]]; then
+            echo "::error::Release tag ($GITHUB_REF_NAME) must start with 'v'"
+            exit 1
+          fi
           cargo_version="$(grep '^version' Cargo.toml | head -n1 | cut -d'"' -f2)"
-          tag_version="${GITHUB_REF_NAME#v}"
-          if [[ "$tag_version" != "$cargo_version" ]]; then
-            echo "::error::Tag version ($tag_version) does not match Cargo.toml version ($cargo_version)"
+          if [[ "$GITHUB_REF_NAME" != "v$cargo_version" ]]; then
+            echo "::error::Tag ($GITHUB_REF_NAME) does not match Cargo.toml version (v$cargo_version)"
             exit 1
           fi
 

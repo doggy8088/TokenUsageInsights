@@ -3412,9 +3412,52 @@ fn restart_dashboard_instance(
 
     let child_pid = child.id();
 
-    std::thread::sleep(Duration::from_millis(50));
+    // 等待服務就緒訊號：確認進程未在初始化、資料庫遷移或 socket 綁定階段崩潰退出
+    let ready_deadline = Instant::now() + Duration::from_secs(5);
+    let mut is_ready = false;
+
+    while Instant::now() < ready_deadline {
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(format!("背景看板進程啟動後異常退出: {status}"));
+        }
+
+        if spec.is_server {
+            for pid_file in &[
+                install_dir.join(".server.pid"),
+                crate::db::get_insights_dir().join(".server.pid"),
+            ] {
+                if let Ok(content) = fs::read_to_string(pid_file) {
+                    if let Ok(p) = content.trim().parse::<u32>() {
+                        if p == child_pid && is_process_alive(child_pid) {
+                            is_ready = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if is_ready {
+                break;
+            }
+        } else {
+            // 非伺服器進程：觀察至少 1.5 秒確保其未於啟動初期崩潰
+            if ready_deadline - Instant::now() <= Duration::from_millis(3500) {
+                is_ready = true;
+                break;
+            }
+        }
+
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
     if let Ok(Some(status)) = child.try_wait() {
-        return Err(format!("背景看板進程啟動後立即異常退出: {status}"));
+        return Err(format!("背景看板進程啟動後異常退出: {status}"));
+    }
+
+    if spec.is_server && !is_ready {
+        if !is_process_alive(child_pid) {
+            return Err("背景看板進程未能完成 socket 綁定與就緒初始化並已終止".to_string());
+        }
+        return Err("等待背景看板進程完成 socket 綁定與就緒標記逾時 (5 秒)".to_string());
     }
 
     Ok(child_pid)

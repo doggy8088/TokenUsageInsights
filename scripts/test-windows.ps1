@@ -880,6 +880,16 @@ Wait-ForExecutableReady -InstallDir '$readyTestDir' -ExePath '$readyExePath'
     }, $true)
     Assert-True ($null -ne $serviceEnvLoad -and $serviceEnvLoad.Count -gt 0) "run-service.ps1 should load .service.env."
 
+    # 9. Verify run-service.ps1 defines Test-IsProcessHealthy and Restore-ServiceBackup, and does not delete .backup before Start-Process
+    $fnDefHealth = $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq "Test-IsProcessHealthy" }, $true)
+    Assert-True ($null -ne $fnDefHealth -and $fnDefHealth.Count -eq 1) "run-service.ps1 should define Test-IsProcessHealthy."
+
+    $fnDefRestore = $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq "Restore-ServiceBackup" }, $true)
+    Assert-True ($null -ne $fnDefRestore -and $fnDefRestore.Count -eq 1) "run-service.ps1 should define Restore-ServiceBackup."
+
+    Assert-True ($whileBodyText -match '(?s)Start-Process.*Test-IsProcessHealthy.*Restore-ServiceBackup') "run-service.ps1 main while loop must verify process health before committing backup and restore on failure."
+    Assert-True (-not ($fnDefReady[0].Extent.Text -match 'Remove-Item.*\.backup')) "Wait-ForExecutableReady must not delete .backup before process launch."
+
     Write-Host "Windows collector smoke tests passed."
 } finally {
     $env:ANTIGRAVITY_DIR = $PreviousAntigravityDir
