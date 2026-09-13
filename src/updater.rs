@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 
 const GITHUB_OWNER: &str = "doggy8088";
 const GITHUB_REPO: &str = "TokenUsageInsights";
-const APP_NAME: &str = "token-usage-insights";
+pub(crate) const APP_NAME: &str = "token-usage-insights";
 const USER_AGENT: &str = "token-usage-insights-updater";
 const DEFAULT_UPDATE_INTERVAL_HOURS: i64 = 24;
 const STARTUP_CHECK_TIMEOUT_SECS: u64 = 4;
@@ -4478,13 +4478,22 @@ pub(crate) fn get_target_exe(install_dir: &Path) -> PathBuf {
 
 #[allow(dead_code)] // 於 Windows 服務重啟流程使用，並於跨平台單元測試驗證環境變數判定
 fn is_windows_service_runner() -> bool {
-    match std::env::var("TOKEN_USAGE_INSIGHTS_SERVICE") {
-        Ok(val) => {
-            let clean = val.trim();
-            clean == "1" || clean.eq_ignore_ascii_case("true")
+    if let Ok(val) = std::env::var("TOKEN_USAGE_INSIGHTS_SERVICE") {
+        let clean = val.trim();
+        if clean == "0" || clean.eq_ignore_ascii_case("false") {
+            return false;
         }
-        Err(_) => false,
+        if clean == "1" || clean.eq_ignore_ascii_case("true") {
+            return true;
+        }
     }
+    #[cfg(windows)]
+    {
+        if get_process_supervisor_pid(std::process::id()).is_some() {
+            return true;
+        }
+    }
+    false
 }
 
 pub(crate) fn restart_current_process(exe_path: &Path, args: &[String]) -> ! {
@@ -4747,10 +4756,6 @@ fn attempt_startup_recovery(install_dir: &Path, args: &[String]) -> RecoveryStat
 }
 
 pub async fn perform_startup_recovery() {
-    if std::env::var_os("_TOKEN_USAGE_INSIGHTS_RESTARTED").is_some() {
-        return;
-    }
-
     let args: Vec<String> = std::env::args().collect();
     let env_kind = detect_environment();
 
@@ -6556,6 +6561,15 @@ update_check_interval: 5 # check every 5 days
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         run_background_auto_update(tx).await;
         assert!(rx.try_recv().is_err());
+        std::env::remove_var("_TOKEN_USAGE_INSIGHTS_RESTARTED");
+    }
+
+    #[tokio::test]
+    async fn perform_startup_recovery_runs_even_when_restarted_flag_set() {
+        std::env::set_var("_TOKEN_USAGE_INSIGHTS_RESTARTED", "1");
+        // perform_startup_recovery 即使在 _TOKEN_USAGE_INSIGHTS_RESTARTED 設定下亦不應提早 return，
+        // 確保救援與損毀檢查（如 .rollback_failed）不會被跳過。在正常環境下應安全完成。
+        perform_startup_recovery().await;
         std::env::remove_var("_TOKEN_USAGE_INSIGHTS_RESTARTED");
     }
 }

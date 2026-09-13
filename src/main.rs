@@ -271,57 +271,51 @@ async fn main() {
         updater::ShutdownReason::AutoUpdate(opts) => {
             println!("🔄 看板服務已完成優雅停機，正在執行自動更新並套用新版本...");
             updater::log_update("INFO", "RESTART", "服務已優雅停機，開始執行自動更新");
+            let (target_exe, backup_dir, install_dir) = match updater::detect_environment() {
+                updater::EnvironmentKind::StandardInstalled { install_dir, .. } => (
+                    updater::get_target_exe(&install_dir),
+                    install_dir.join(".backup"),
+                    Some(install_dir),
+                ),
+                _ => (
+                    std::env::current_exe().unwrap_or_else(|_| PathBuf::from(updater::APP_NAME)),
+                    PathBuf::from(".backup"),
+                    None,
+                ),
+            };
+            let args: Vec<String> = std::env::args().collect();
             match updater::run_update(opts).await {
-                Ok(outcome) => {
-                    let install_dir = match updater::detect_environment() {
-                        updater::EnvironmentKind::StandardInstalled { install_dir, .. } => {
-                            install_dir
-                        }
-                        _ => return,
-                    };
-                    let installed = updater::get_installed_version(&install_dir);
-                    if updater::parse_semver(&installed)
-                        > updater::parse_semver(env!("CARGO_PKG_VERSION"))
-                    {
-                        if outcome.server_restarted {
-                            println!(
-                                "🔄 既有 Token 戰情室背景服務已由更新流程重啟至新版 v{installed}。"
-                            );
-                            updater::log_update(
-                                "INFO",
-                                "RESTART",
-                                "既有看板服務已自動重啟完成，目前程序安全退出",
-                            );
-                        } else {
-                            println!(
-                                "🔄 更新完成，正在自動重啟 Token 戰情室至新版 v{installed}..."
-                            );
-                            updater::log_update(
-                                "INFO",
-                                "RESTART",
-                                &format!("更新完成，重啟至 v{installed}"),
-                            );
-                            let target_exe = updater::get_target_exe(&install_dir);
-                            let args: Vec<String> = std::env::args().collect();
-                            updater::restart_current_process(&target_exe, &args);
-                        }
-                    }
+                Ok(_outcome) => {
+                    let installed = install_dir
+                        .as_deref()
+                        .map(updater::get_installed_version)
+                        .unwrap_or_else(|| "最新版".to_string());
+                    println!("🔄 更新完成，正在自動重啟 Token 戰情室至新版 v{installed}...");
+                    updater::log_update(
+                        "INFO",
+                        "RESTART",
+                        &format!("更新完成，重啟目前服務至 v{installed}"),
+                    );
+                    updater::restart_current_process(&target_exe, &args);
                 }
                 Err(err) => {
+                    if backup_dir.join(".rollback_failed").exists() {
+                        eprintln!(
+                            "❌ 自動更新失敗且回滾復原亦失敗；為防止載入損毀狀態，中止重啟以保留備份 ({backup_dir:?})。請依備份手動復原。"
+                        );
+                        updater::log_update(
+                            "ERROR",
+                            "RESTART",
+                            "更新失敗且回滾失敗，中止重啟以保留備份狀態",
+                        );
+                        std::process::exit(1);
+                    }
                     eprintln!("❌ 自動更新失敗: {err}；正在重啟以維持服務運作...");
                     updater::log_update(
                         "ERROR",
                         "RESTART",
                         &format!("自動更新失敗: {err}；重啟原服務"),
                     );
-                    let install_dir = match updater::detect_environment() {
-                        updater::EnvironmentKind::StandardInstalled { install_dir, .. } => {
-                            install_dir
-                        }
-                        _ => return,
-                    };
-                    let target_exe = updater::get_target_exe(&install_dir);
-                    let args: Vec<String> = std::env::args().collect();
                     updater::restart_current_process(&target_exe, &args);
                 }
             }
