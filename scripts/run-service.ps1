@@ -217,8 +217,10 @@ function Wait-ForExecutableReady {
     if (Test-Path -LiteralPath $versionFile) {
         $expectedVer = (Get-Content -LiteralPath $versionFile -Raw).Trim().TrimStart('v').TrimStart('V')
         if ($expectedVer) {
-            $verOutput = & $ExePath --version 2>&1
-            if ($verOutput -notmatch [regex]::Escape($expectedVer)) {
+            $verOutput = (& $ExePath --version 2>&1 | Out-String).Trim()
+            $tokens = $verOutput -split '\s+'
+            $actualVer = if ($tokens.Count -gt 0) { $tokens[-1].TrimStart('v').TrimStart('V') } else { '' }
+            if ($actualVer -ne $expectedVer) {
                 Write-Error -Message "執行檔版本 ($verOutput) 與 VERSION 檔案 ($expectedVer) 不符，中止啟動以確保安全。"
                 exit 1
             }

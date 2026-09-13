@@ -3520,8 +3520,10 @@ $versionMatched = $false
 $vCheckCount = 0
 while ($vCheckCount -lt 50) {
     try {
-        $out = & $exePath --version 2>&1
-        if ($out -match [regex]::Escape($expectedVersion)) {
+        $out = (& $exePath --version 2>&1 | Out-String).Trim()
+        $tokens = $out -split '\s+'
+        $actualVer = if ($tokens.Count -gt 0) { $tokens[-1].TrimStart('v').TrimStart('V') } else { '' }
+        if ($actualVer -eq $expectedVersion) {
             $versionMatched = $true
             break
         }
@@ -4112,37 +4114,65 @@ pub(crate) fn apply_installation_with_rollback(
             &format!("重啟新版服務失敗: {combined}，開始回滾"),
         );
 
-        // 回滾前先終止本輪重啟已成功啟動之新版子進程，避免新舊進程同時存活導致連接埠衝突或重複執行
-        for &spawned_pid in &spawned_pids {
-            if is_process_alive(spawned_pid) {
+        // 回滾前先終止本輪重啟已成功啟動之新版子進程及可能已由 Unix 監管者重啟之新版進程，避免新舊進程同時存活導致連接埠衝突或重複執行
+        let mut rollback_stop_pids = spawned_pids.clone();
+        #[cfg(unix)]
+        {
+            for &sup_pid in &process_plan.supervised_unix_pids {
+                if !rollback_stop_pids.contains(&sup_pid) {
+                    rollback_stop_pids.push(sup_pid);
+                }
+            }
+            for pid_file in &[
+                install_dir.join(".server.pid"),
+                crate::db::get_insights_dir().join(".server.pid"),
+            ] {
+                if let Ok(content) = fs::read_to_string(pid_file) {
+                    if let Ok(pid) = content.trim().parse::<u32>() {
+                        if pid != std::process::id()
+                            && is_process_alive(pid)
+                            && is_process_supervised(pid, install_dir)
+                            && !rollback_stop_pids.contains(&pid)
+                        {
+                            rollback_stop_pids.push(pid);
+                        }
+                    }
+                }
+            }
+        }
+
+        for &stop_pid in &rollback_stop_pids {
+            if is_process_alive(stop_pid) {
                 log_update(
                     "INFO",
                     "ROLLBACK",
-                    &format!("回滾前停止本輪已啟動之新版子進程 (PID: {spawned_pid})"),
+                    &format!("回滾前停止本輪已啟動或監管之新版進程 (PID: {stop_pid})"),
                 );
                 #[cfg(unix)]
                 unsafe {
-                    libc::kill(spawned_pid as libc::pid_t, libc::SIGTERM);
+                    libc::kill(stop_pid as libc::pid_t, libc::SIGTERM);
                 }
                 #[cfg(windows)]
                 {
                     let _ = std::process::Command::new("taskkill")
-                        .args(["/PID", &spawned_pid.to_string(), "/T", "/F"])
+                        .args(["/PID", &stop_pid.to_string(), "/T", "/F"])
                         .output();
                 }
             }
         }
 
         let stop_deadline = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < stop_deadline && spawned_pids.iter().any(|&p| is_process_alive(p)) {
+        while Instant::now() < stop_deadline
+            && rollback_stop_pids.iter().any(|&p| is_process_alive(p))
+        {
             std::thread::sleep(Duration::from_millis(50));
         }
 
         #[cfg(unix)]
-        for &spawned_pid in &spawned_pids {
-            if is_process_alive(spawned_pid) {
+        for &stop_pid in &rollback_stop_pids {
+            if is_process_alive(stop_pid) {
                 unsafe {
-                    libc::kill(spawned_pid as libc::pid_t, libc::SIGKILL);
+                    libc::kill(stop_pid as libc::pid_t, libc::SIGKILL);
                 }
             }
         }
@@ -4173,6 +4203,23 @@ pub(crate) fn apply_installation_with_rollback(
                             &format!("回滾完成，保留標記由 Windows 服務管理器自動重啟監管進程 (原 PID: {})", spec.pid),
                         );
                     }
+                    #[cfg(unix)]
+                    {
+                        if is_process_alive(spec.pid) {
+                            log_update(
+                                "INFO",
+                                "ROLLBACK",
+                                &format!(
+                                    "回滾完成，通知 Unix 服務管理器重啟以載入舊版服務 (PID: {})",
+                                    spec.pid
+                                ),
+                            );
+                            unsafe {
+                                libc::kill(spec.pid as libc::pid_t, libc::SIGTERM);
+                            }
+                            println!("🔄 回滾完成，已通知 Unix 服務管理器重啟 (PID: {}) 以載入舊版服務。", spec.pid);
+                        }
+                    }
                 } else {
                     #[cfg(windows)]
                     if is_current_exe {
@@ -4183,6 +4230,47 @@ pub(crate) fn apply_installation_with_rollback(
                         continue;
                     }
                     let _ = restart_dashboard_instance(spec, install_dir);
+                }
+            }
+
+            #[cfg(unix)]
+            {
+                let mut unix_pids_to_notify = std::collections::HashSet::new();
+                for &pid in &process_plan.supervised_unix_pids {
+                    unix_pids_to_notify.insert(pid);
+                }
+                for pid_file in &[
+                    install_dir.join(".server.pid"),
+                    crate::db::get_insights_dir().join(".server.pid"),
+                ] {
+                    if let Ok(content) = fs::read_to_string(pid_file) {
+                        if let Ok(pid) = content.trim().parse::<u32>() {
+                            if pid != std::process::id()
+                                && is_process_alive(pid)
+                                && is_process_supervised(pid, install_dir)
+                            {
+                                unix_pids_to_notify.insert(pid);
+                            }
+                        }
+                    }
+                }
+
+                for pid in unix_pids_to_notify {
+                    if is_process_alive(pid) {
+                        log_update(
+                            "INFO",
+                            "ROLLBACK",
+                            &format!(
+                                "回滾完成，通知 Unix 服務管理器重啟以載入舊版服務 (PID: {pid})"
+                            ),
+                        );
+                        unsafe {
+                            libc::kill(pid as libc::pid_t, libc::SIGTERM);
+                        }
+                        println!(
+                            "🔄 回滾完成，已通知 Unix 服務管理器重啟 (PID: {pid}) 以載入舊版服務。"
+                        );
+                    }
                 }
             }
 
@@ -6390,10 +6478,10 @@ update_check_interval: 5 # check every 5 days
         assert!(script.contains("*.__temp__.exe"));
         assert!(script.contains("*.__relocated__.exe"));
 
-        // 驗證腳本包含 --version 執行與版本驗證
+        // 驗證腳本包含 --version 執行與精確版本驗證
         assert!(script.contains("& $exePath --version"));
         assert!(script.contains("$expectedVersion = '0.9.6';"));
-        assert!(script.contains("out -match [regex]::Escape($expectedVersion)"));
+        assert!(script.contains("$actualVer -eq $expectedVersion"));
 
         // 驗證版本不符時拒絕啟動並記錄錯誤
         assert!(script.contains("移交守護進程驗證新版執行檔版本失敗"));
