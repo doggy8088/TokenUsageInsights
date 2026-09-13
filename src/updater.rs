@@ -4704,15 +4704,20 @@ pub async fn perform_startup_recovery() {
     }
 }
 
+/// 於伺服器綁定 TCP 監聽與服務靜態檔案前執行啟動自動更新檢查；
+/// 若發現新版本並完成替換，將重啟至新版並退出目前進程，避免在對外提供 HTTP 服務期間覆寫磁碟檔案導致檔案鎖定或資源不一致衝突。
+pub async fn run_startup_auto_update() {
+    run_startup_auto_update_impl().await;
+}
+
+#[allow(dead_code)] // 供相容性保留或外部呼叫
 pub fn spawn_background_auto_update() {
     tokio::spawn(async {
-        // 延遲 1 秒執行，確保主服務監聽與 TCP 綁定先行就緒，離線或慢速網路零阻塞
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        run_background_auto_update().await;
+        run_startup_auto_update_impl().await;
     });
 }
 
-async fn run_background_auto_update() {
+async fn run_startup_auto_update_impl() {
     if std::env::var_os("_TOKEN_USAGE_INSIGHTS_RESTARTED").is_some() {
         return;
     }
@@ -6490,5 +6495,12 @@ update_check_interval: 5 # check every 5 days
         // 驗證版本相符時才以原參數啟動
         assert!(script.contains("移交守護進程已確認新版執行檔版本"));
         assert!(script.contains("Start-Process -FilePath $exePath"));
+    }
+
+    #[tokio::test]
+    async fn run_startup_auto_update_exits_early_when_restarted_flag_set() {
+        std::env::set_var("_TOKEN_USAGE_INSIGHTS_RESTARTED", "1");
+        run_startup_auto_update().await;
+        std::env::remove_var("_TOKEN_USAGE_INSIGHTS_RESTARTED");
     }
 }

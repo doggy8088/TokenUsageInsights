@@ -147,8 +147,8 @@ async fn main() {
         eprintln!("❌ 初始化 SQLite 資料庫失敗: {error}");
     }
 
-    // 非同步在背景排程自動更新檢查，絕不延遲 TCP 監聽與服務啟動
-    updater::spawn_background_auto_update();
+    // 在綁定 TCP 監聽與服務靜態檔案前執行啟動自動更新檢查；若有新版本並完成替換，將重啟至新版並退出目前進程，避免在伺服中覆寫資產導致檔案鎖定與版本不一致衝突
+    updater::run_startup_auto_update().await;
 
     let static_dir = get_static_dir();
     println!("📂 正在服務靜態檔案，目錄來源: {:?}", static_dir);
