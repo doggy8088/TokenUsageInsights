@@ -1868,7 +1868,9 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
             .file_type()
             .map_err(|e| format!("讀取檔案類型失敗: {e}"))?;
         if file_type.is_symlink() {
-            continue;
+            return Err(format!(
+                "拒絕處理目錄中的符號連結項目 ({src_path:?})；更新中止以確保系統安全"
+            ));
         }
         if file_type.is_dir() {
             if let Ok(meta) = dst_path.symlink_metadata() {
@@ -1881,6 +1883,10 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
         } else if file_type.is_file() {
             safe_replace_file(&src_path, &dst_path)
                 .map_err(|e| format!("複製檔案失敗 {src_path:?} -> {dst_path:?}: {e}"))?;
+        } else {
+            return Err(format!(
+                "目錄包含不支援的檔案類型 ({src_path:?})；更新中止以確保安全"
+            ));
         }
     }
     Ok(())
@@ -3111,8 +3117,14 @@ fn restart_dashboard_instance(spec: &StoppedProcessSpec, install_dir: &Path) -> 
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
 
-    cmd.spawn()
+    let mut child = cmd
+        .spawn()
         .map_err(|e| format!("啟動背景看板進程失敗: {e}"))?;
+
+    std::thread::sleep(Duration::from_millis(50));
+    if let Ok(Some(status)) = child.try_wait() {
+        return Err(format!("背景看板進程啟動後立即異常退出: {status}"));
+    }
 
     Ok(())
 }
@@ -3510,9 +3522,6 @@ pub(crate) fn apply_installation_with_rollback(
         // 寫入更新就緒標記，供 Windows 服務守護進程確認新執行檔已完全寫入就緒
         safe_write_file(&install_dir.join(".update_ready"), b"ready")?;
 
-        // 寫入提交標記，證明新版資產已全數寫入成功，救援流程不可回滾
-        safe_write_file(&backup_dir.join(".committed"), b"committed")?;
-
         Ok(())
     })();
 
@@ -3587,27 +3596,7 @@ pub(crate) fn apply_installation_with_rollback(
         return Err(err);
     }
 
-    if backup_dir.exists() {
-        if let Err(e) = fs::remove_dir_all(backup_dir) {
-            log_update("WARN", "CLEANUP", &format!("清理備份目錄失敗: {e}"));
-            let fallback_backup =
-                install_dir.join(format!(".backup-old-{}", Utc::now().timestamp()));
-            if let Err(re) = fs::rename(backup_dir, &fallback_backup) {
-                log_update("WARN", "CLEANUP", &format!("備份目錄換名失敗: {re}"));
-                eprintln!(
-                    "⚠️ 更新已安裝完成，但備份目錄無法清理或換名 ({backup_dir:?}): {re}；請稍後手動移除。"
-                );
-            } else {
-                log_update(
-                    "INFO",
-                    "CLEANUP",
-                    &format!("備份目錄已安全移至 {fallback_backup:?}"),
-                );
-            }
-        }
-    }
-
-    // 1. Unix 上在檔案提交完成後，通知先前記錄之監管服務進程退出以讓 supervisor 自動載入新版執行檔
+    // 1. Unix 上在檔案寫入完成後，通知先前記錄之監管服務進程退出以讓 supervisor 自動載入新版執行檔
     #[cfg(unix)]
     {
         for &pid in &process_plan.supervised_unix_pids {
@@ -3625,7 +3614,7 @@ pub(crate) fn apply_installation_with_rollback(
         }
     }
 
-    // 2. 逐一處理先前停止之進程，獨立處理監管與非監管進程
+    // 2. 逐一處理先前停止之進程，獨立處理監管與非監管進程（保留備份直至重啟確認成功）
     let mut restart_errors: Vec<String> = Vec::new();
     for spec in &process_plan.stopped_specs {
         if spec.is_supervised {
@@ -3675,11 +3664,80 @@ pub(crate) fn apply_installation_with_rollback(
         }
     }
 
+    // 3. 若重啟失敗，此時備份依然完整留存，執行安全自動回滾恢復原版本並重新啟動原服務
     if !restart_errors.is_empty() {
         let combined = restart_errors.join("; ");
-        return Err(format!(
-            "更新安裝成功，但重啟看板進程時發生錯誤: {combined}"
-        ));
+        eprintln!("❌ 重啟新版看板服務失敗: {combined}，正在自動回滾至先前版本...");
+        log_update(
+            "ERROR",
+            "RESTART",
+            &format!("重啟新版服務失敗: {combined}，開始回滾"),
+        );
+        if let Err(rollback_err) = restore_from_backup(backup_dir, install_dir) {
+            let _ = fs::write(backup_dir.join(".rollback_failed"), &rollback_err);
+            eprintln!(
+                "❌ 自動回滾失敗: {rollback_err}；請保留備份目錄 {:?} 進行手動還原",
+                backup_dir
+            );
+            log_update("ERROR", "ROLLBACK", &format!("回滾失敗: {rollback_err}"));
+            return Err(format!(
+                "重啟失敗 ({combined}) 且回滾失敗 ({rollback_err})；備份已保留於 {backup_dir:?}"
+            ));
+        } else {
+            println!("✅ 已成功回滾至先前版本。正在恢復原服務...");
+            log_update("INFO", "ROLLBACK", "回滾成功，正在恢復原服務");
+            let _ = fs::remove_dir_all(backup_dir);
+
+            // 重新啟動先前版本的進程
+            for spec in &process_plan.stopped_specs {
+                if spec.is_supervised {
+                    #[cfg(windows)]
+                    {
+                        log_update(
+                            "INFO",
+                            "ROLLBACK",
+                            &format!("回滾完成，保留標記由 Windows 服務管理器自動重啟監管進程 (原 PID: {})", spec.pid),
+                        );
+                    }
+                } else {
+                    let _ = restart_dashboard_instance(spec, install_dir);
+                }
+            }
+
+            #[cfg(windows)]
+            {
+                let has_supervised = process_plan.stopped_specs.iter().any(|s| s.is_supervised);
+                if !has_supervised {
+                    let _ = fs::remove_file(install_dir.join(".service_restart_pending"));
+                }
+            }
+
+            return Err(format!(
+                "更新檔案替換成功，但重啟新版服務失敗 ({combined})；已自動回滾至先前版本並恢復原服務。"
+            ));
+        }
+    }
+
+    // 4. 重啟確認成功後，才標記提交並清理備份目錄
+    let _ = safe_write_file(&backup_dir.join(".committed"), b"committed");
+    if backup_dir.exists() {
+        if let Err(e) = fs::remove_dir_all(backup_dir) {
+            log_update("WARN", "CLEANUP", &format!("清理備份目錄失敗: {e}"));
+            let fallback_backup =
+                install_dir.join(format!(".backup-old-{}", Utc::now().timestamp()));
+            if let Err(re) = fs::rename(backup_dir, &fallback_backup) {
+                log_update("WARN", "CLEANUP", &format!("備份目錄換名失敗: {re}"));
+                eprintln!(
+                    "⚠️ 更新已安裝完成，但備份目錄無法清理或換名 ({backup_dir:?}): {re}；請稍後手動移除。"
+                );
+            } else {
+                log_update(
+                    "INFO",
+                    "CLEANUP",
+                    &format!("備份目錄已安全移至 {fallback_backup:?}"),
+                );
+            }
+        }
     }
 
     Ok(())
@@ -4809,6 +4867,38 @@ update_check_interval: 5 # check every 5 days
         let err = res.unwrap_err();
         assert!(err.contains("符號連結項目"));
         assert!(!install_dir.join("secret.txt").exists());
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_dir_recursive_rejects_nested_symlink() {
+        let temp = std::env::temp_dir().join(format!(
+            "test-copy-dir-symlink-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let src_dir = temp.join("src");
+        let dst_dir = temp.join("dst");
+        let outside_dir = temp.join("outside");
+
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::create_dir_all(&outside_dir).unwrap();
+
+        let outside_secret = outside_dir.join("secret.txt");
+        fs::write(&outside_secret, "sensitive data").unwrap();
+
+        let symlink_entry = src_dir.join("link_to_secret.txt");
+        std::os::unix::fs::symlink(&outside_secret, &symlink_entry).unwrap();
+
+        let res = copy_dir_recursive(&src_dir, &dst_dir);
+        assert!(
+            res.is_err(),
+            "copy_dir_recursive 應拒絕複製內含符號連結之項目"
+        );
+        let err = res.unwrap_err();
+        assert!(err.contains("符號連結項目"));
+        assert!(!dst_dir.join("link_to_secret.txt").exists());
 
         let _ = fs::remove_dir_all(&temp);
     }

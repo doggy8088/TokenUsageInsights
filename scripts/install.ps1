@@ -560,15 +560,20 @@ exit /b %APP_EXIT_CODE%
                 } catch {}
             }
 
-            $taskStillExists = $false
+            $survivingTask = $null
             try {
-                $taskStillExists = [bool](Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)
-                if (-not $taskStillExists -and $legacyTaskName -and ($legacyTaskName -ne $TaskName)) {
-                    $taskStillExists = [bool](Get-ScheduledTask -TaskName $legacyTaskName -ErrorAction SilentlyContinue)
+                if ([bool](Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)) {
+                    $survivingTask = $TaskName
+                } elseif ($legacyTaskName -and ($legacyTaskName -ne $TaskName) -and [bool](Get-ScheduledTask -TaskName $legacyTaskName -ErrorAction SilentlyContinue)) {
+                    $survivingTask = $legacyTaskName
                 }
             } catch {}
 
-            if ($taskStillExists) {
+            if ($survivingTask) {
+                # Stop-ExistingServiceInstance 已先停止既有服務；在拋出例外中止 fallback 前嘗試重啟留存之排程工作，避免服務離線
+                try {
+                    Start-ScheduledTask -TaskName $survivingTask -ErrorAction SilentlyContinue
+                } catch {}
                 throw "Could not register scheduled task and failed to unregister existing task. Aborting fallback to prevent duplicate execution."
             }
 
@@ -603,6 +608,10 @@ exit /b %APP_EXIT_CODE%
                 if ($legacyStillExists) {
                     try {
                         Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+                    } catch {}
+                    # Stop-ExistingServiceInstance 已先停止 legacy task；回滾新 task 註冊後，恢復啟動 legacy task 以免服務離線
+                    try {
+                        Start-ScheduledTask -TaskName $legacyTaskName -ErrorAction SilentlyContinue
                     } catch {}
                     throw "Scheduled task '$TaskName' registered, but failed to unregister legacy task '$legacyTaskName'. Aborting to prevent duplicate execution."
                 }

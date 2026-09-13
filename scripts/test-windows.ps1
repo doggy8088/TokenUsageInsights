@@ -807,6 +807,21 @@ Wait-ForExecutableReady -InstallDir '$readyTestDir' -ExePath '$readyExePath'
     $whileBodyText = $mainServiceLoop.Body.Extent.Text
     Assert-True ($whileBodyText -match '(?s)Wait-ForExecutableReady.*Start-Process') "run-service.ps1 main while loop must gate launch with Wait-ForExecutableReady before Start-Process."
 
+    # 7. Verify install.ps1 restarts surviving task before throwing on unregister failure
+    $installPs1Path = Join-Path $PSScriptRoot "install.ps1"
+    $installPs1Content = Get-Content -Raw -LiteralPath $installPs1Path
+    $installAst = [System.Management.Automation.Language.Parser]::ParseInput($installPs1Content, [ref]$null, [ref]$null)
+    $allThrowStatements = $installAst.FindAll({ $args[0] -is [System.Management.Automation.Language.ThrowStatementAst] }, $true)
+    $failedExistingTaskThrow = $allThrowStatements | Where-Object { $_.Extent.Text -match "failed to unregister existing task" }
+    Assert-True ($null -ne $failedExistingTaskThrow) "install.ps1 should contain failed existing task throw statement."
+    $surroundingBlock = $failedExistingTaskThrow.Parent
+    Assert-True ($surroundingBlock.Extent.Text -match '(?s)Start-ScheduledTask.*throw') "install.ps1 should restart surviving task before throwing on existing task unregister failure."
+
+    $failedLegacyTaskThrow = $allThrowStatements | Where-Object { $_.Extent.Text -match "failed to unregister legacy task" }
+    Assert-True ($null -ne $failedLegacyTaskThrow) "install.ps1 should contain failed legacy task throw statement."
+    $surroundingLegacyBlock = $failedLegacyTaskThrow.Parent
+    Assert-True ($surroundingLegacyBlock.Extent.Text -match '(?s)Start-ScheduledTask.*throw') "install.ps1 should restart legacy task before throwing on legacy task unregister failure."
+
     Write-Host "Windows collector smoke tests passed."
 } finally {
     $env:ANTIGRAVITY_DIR = $PreviousAntigravityDir
