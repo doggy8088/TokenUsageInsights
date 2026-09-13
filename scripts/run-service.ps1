@@ -15,6 +15,21 @@ $ErrorActionPreference = "Stop"
 $AppName = "token-usage-insights"
 $InstallDir = [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($InstallDir))
 
+# 載入持久化之服務環境變數 (.service.env)，還原自訂 INSIGHTS_DIR、各 Agent 目錄與 CORS 等設定
+$serviceEnvFile = Join-Path $InstallDir ".service.env"
+if (Test-Path -LiteralPath $serviceEnvFile) {
+    try {
+        Get-Content -LiteralPath $serviceEnvFile | ForEach-Object {
+            $line = $_.Trim()
+            if ($line -and (-not $line.StartsWith("#")) -and ($line -match '^([^=]+)=(.*)$')) {
+                $envKey = $matches[1].Trim()
+                $envVal = $matches[2]
+                [Environment]::SetEnvironmentVariable($envKey, $envVal, "Process")
+            }
+        }
+    } catch {}
+}
+
 $env:PORT = "$Port"
 $env:HOST = "$HostAddress"
 $env:TOKEN_USAGE_INSIGHTS_SERVICE = "1"

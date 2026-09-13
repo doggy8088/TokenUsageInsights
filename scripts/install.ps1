@@ -568,6 +568,45 @@ exit /b %APP_EXIT_CODE%
             throw "Missing background service runner script: $RunnerScript"
         }
 
+        # 持久化服務執行期環境變數至 .service.env，確保開機或排程啟動時能正確載入自訂目錄與設定
+        $serviceEnvFile = Join-Path $InstallDir ".service.env"
+        $runtimeEnvVars = @(
+            "INSIGHTS_DIR",
+            "ANTIGRAVITY_DIR",
+            "COPILOT_DIR",
+            "CODEX_DIR",
+            "CLAUDE_DIR",
+            "CURSOR_DIR",
+            "GROK_DIR",
+            "PI_DIR",
+            "OMP_DIR",
+            "CORS_ALLOW_ORIGIN"
+        )
+        $persistedEnvs = @{}
+        if (Test-Path -LiteralPath $serviceEnvFile) {
+            try {
+                Get-Content -LiteralPath $serviceEnvFile | ForEach-Object {
+                    $line = $_.Trim()
+                    if ($line -and (-not $line.StartsWith("#")) -and ($line -match '^([^=]+)=(.*)$')) {
+                        $persistedEnvs[$matches[1].Trim()] = $matches[2]
+                    }
+                }
+            } catch {}
+        }
+        foreach ($var in $runtimeEnvVars) {
+            $envVal = [Environment]::GetEnvironmentVariable($var, "Process")
+            if ($null -ne $envVal -and $envVal -ne "") {
+                $persistedEnvs[$var] = $envVal
+            }
+        }
+        if ($persistedEnvs.Count -gt 0) {
+            $envLines = @()
+            foreach ($k in ($persistedEnvs.Keys | Sort-Object)) {
+                $envLines += "$k=$($persistedEnvs[$k])"
+            }
+            Set-Content -LiteralPath $serviceEnvFile -Value $envLines -Encoding UTF8
+        }
+
         $runnerArgs = Format-RunnerArgumentString `
             -RunnerScript $RunnerScript `
             -InstallDir $InstallDir `

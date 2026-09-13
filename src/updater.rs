@@ -2082,6 +2082,7 @@ const MANAGED_ITEMS: &[&str] = &[
     "README.md",
     "LICENSE",
     ".install_marker",
+    ".service.env",
 ];
 
 fn backup_installation(install_dir: &Path, backup_dir: &Path) -> Result<(), String> {
@@ -3510,14 +3511,16 @@ fn build_windows_deferred_restart_script(
     }
     ps_script.push_str(");\n");
 
+    // 先從繼承的環境中清除所有相關環境變數，防止移交進程受到更新器自身的環境變數污染
+    for &key in RELEVANT_ENV_VARS {
+        ps_script.push_str(&format!(
+            "Remove-Item -LiteralPath 'env:{}' -ErrorAction SilentlyContinue;\n",
+            key
+        ));
+    }
+    // 再套用先前進程保留之完整環境變數
     for (k, v) in &spec.envs {
-        if !RELEVANT_ENV_VARS.contains(&k.as_str())
-            || k == "INSIGHTS_DIR"
-            || k == "PORT"
-            || k == "HOST"
-        {
-            ps_script.push_str(&format!("$env:{} = '{}';\n", k, v.replace('\'', "''")));
-        }
+        ps_script.push_str(&format!("$env:{} = '{}';\n", k, v.replace('\'', "''")));
     }
 
     ps_script.push_str(r#"
@@ -4435,9 +4438,9 @@ pub(crate) fn apply_installation_with_rollback(
     let is_async_restart = {
         #[cfg(windows)]
         {
-            is_current_exe
+            is_windows_service_runner()
                 || process_plan.stopped_specs.iter().any(|s| s.is_supervised)
-                || is_windows_service_runner()
+                || (is_current_exe && process_plan.stopped_specs.iter().any(|s| !s.is_supervised))
         }
         #[cfg(not(windows))]
         {
@@ -6675,6 +6678,14 @@ update_check_interval: 5 # check every 5 days
         // 驗證版本相符時才以原參數啟動
         assert!(script.contains("移交守護進程已確認新版執行檔版本"));
         assert!(script.contains("Start-Process -FilePath $exePath"));
+
+        // 驗證清除相關環境變數並套用原始環境變數
+        assert!(
+            script.contains("Remove-Item -LiteralPath 'env:PORT' -ErrorAction SilentlyContinue;")
+        );
+        assert!(script.contains("$env:PORT = '3003';"));
+        assert!(script.contains("$env:HOST = '127.0.0.1';"));
+        assert!(script.contains("$env:INSIGHTS_DIR = 'C:\\data';"));
     }
 
     #[tokio::test]

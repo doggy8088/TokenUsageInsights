@@ -113,6 +113,18 @@ if [[ "$install_service" == true ]]; then
       port_systemd="$(systemd_escape_value "$port")"
 
       # 若未於環境變數明確指定更新設定，自動繼承既有 systemd 服務單元之設定
+      runtime_vars=(
+        INSIGHTS_DIR
+        ANTIGRAVITY_DIR
+        COPILOT_DIR
+        CODEX_DIR
+        CLAUDE_DIR
+        CURSOR_DIR
+        GROK_DIR
+        PI_DIR
+        OMP_DIR
+        CORS_ALLOW_ORIGIN
+      )
       if [[ -f "$service_file" ]]; then
         if [[ -z "${TOKEN_USAGE_INSIGHTS_AUTO_UPDATE+x}" ]]; then
           existing_auto_update="$(sed -n -E 's/^[[:space:]]*Environment="?TOKEN_USAGE_INSIGHTS_AUTO_UPDATE=([^"]*)"?$/\1/p' "$service_file" | tail -n 1)"
@@ -126,6 +138,14 @@ if [[ "$install_service" == true ]]; then
             TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS="$existing_interval"
           fi
         fi
+        for var in "${runtime_vars[@]}"; do
+          if [[ -z "${!var+x}" ]]; then
+            existing_val="$(sed -n -E "s/^[[:space:]]*Environment=\"?${var}=([^\"]*)\"?\$/\\1/p" "$service_file" | tail -n 1)"
+            if [[ -n "$existing_val" ]]; then
+              printf -v "$var" '%s' "$existing_val"
+            fi
+          fi
+        done
       fi
 
       extra_env_systemd=""
@@ -135,6 +155,12 @@ if [[ "$install_service" == true ]]; then
       if [[ -n "${TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS:-}" ]]; then
         extra_env_systemd+="$(printf '\nEnvironment="TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS=%s"' "$(systemd_escape_value "$TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS")")"
       fi
+      for var in "${runtime_vars[@]}"; do
+        val="${!var:-}"
+        if [[ -n "$val" ]]; then
+          extra_env_systemd+="$(printf '\nEnvironment="%s=%s"' "$var" "$(systemd_escape_value "$val")")"
+        fi
+      done
 
       cat > "$service_file" <<SERVICE
 [Unit]
@@ -203,6 +229,13 @@ SERVICE
             TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS="$existing_interval"
           fi
         fi
+        for var in "${runtime_vars[@]}"; do
+          if [[ -z "${!var+x}" ]]; then
+            if existing_val="$(plutil -extract "EnvironmentVariables.${var}" raw -o - "$launch_agent_file" 2>/dev/null)" && [[ -n "$existing_val" ]]; then
+              printf -v "$var" '%s' "$existing_val"
+            fi
+          fi
+        done
       fi
 
       extra_env_plist=""
@@ -214,6 +247,13 @@ SERVICE
         interval_plist="$(plist_escape "$TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS")"
         extra_env_plist+="$(printf '\n    <key>TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS</key>\n    <string>%s</string>' "$interval_plist")"
       fi
+      for var in "${runtime_vars[@]}"; do
+        val="${!var:-}"
+        if [[ -n "$val" ]]; then
+          val_plist="$(plist_escape "$val")"
+          extra_env_plist+="$(printf '\n    <key>%s</key>\n    <string>%s</string>' "$var" "$val_plist")"
+        fi
+      done
 
       cat > "$launch_agent_file" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
