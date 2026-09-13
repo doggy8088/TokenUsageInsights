@@ -95,6 +95,7 @@ function Invoke-InstallServiceTest {
         [bool]$ServiceInstall = $true,
         [bool]$SeedStartupShortcut = $true,
         [string]$SeedTaskActionArguments = $null,
+        [string]$SeedLegacyTaskActionArguments = $null,
         [string]$SeedShortcutActionArguments = $null,
         [string]$AutoUpdate = $null,
         [string]$UpdateIntervalHours = $null,
@@ -163,7 +164,11 @@ function Invoke-InstallServiceTest {
     } else {
         "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$installDir\scripts\run-service.ps1`" -InstallDir `"$installDir`" -HostAddress `"$HostAddress`" -Port $Port"
     }
-    $legacyTaskActionArguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -f:`"$otherInstallDir\scripts\run-service.ps1`" -InstallDir `"$otherInstallDir`" -HostAddress `"127.0.0.1`" -Port 3003"
+    $legacyTaskActionArguments = if ($SeedLegacyTaskActionArguments) {
+        $SeedLegacyTaskActionArguments
+    } else {
+        "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -f:`"$otherInstallDir\scripts\run-service.ps1`" -InstallDir `"$otherInstallDir`" -HostAddress `"127.0.0.1`" -Port 3003"
+    }
     $appExecutablePath = "$installDir\token-usage-insights.exe"
     $otherAppExecutablePath = "$otherInstallDir\token-usage-insights.exe"
 
@@ -641,6 +646,13 @@ try {
 
     $installExplicitResetResult = Invoke-InstallServiceTest -HostAddress "127.0.0.1" -Port 3003 -ServiceInstall:$true -SeedTaskActionArguments $seededTaskArgs -HasCurrentAndLegacyTask -AutoUpdate ""
     Assert-True ($installExplicitResetResult.LastRegisteredTaskArguments -match '-AutoUpdate ""') "install.ps1 should persist explicit empty string AutoUpdate to clear inherited environment."
+
+    # 5.5 Dual-task legacy fallback persistence test
+    $plainCurrentTaskArgs = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$installDir\scripts\run-service.ps1`" -InstallDir `"$installDir`" -HostAddress `"127.0.0.1`" -Port 3003"
+    $legacyTaskWithUpdateArgs = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$otherInstallDir\scripts\run-service.ps1`" -InstallDir `"$otherInstallDir`" -HostAddress `"127.0.0.1`" -Port 3003 -AutoUpdate `"daily`" -UpdateIntervalHours `"12`""
+    $installLegacyFallbackResult = Invoke-InstallServiceTest -HostAddress "127.0.0.1" -Port 3003 -ServiceInstall:$true -SeedTaskActionArguments $plainCurrentTaskArgs -SeedLegacyTaskActionArguments $legacyTaskWithUpdateArgs -HasCurrentAndLegacyTask
+    Assert-True ($installLegacyFallbackResult.LastRegisteredTaskArguments -match '-AutoUpdate "daily"') "install.ps1 should fall back to AutoUpdate from legacy task when current task lacks update arguments."
+    Assert-True ($installLegacyFallbackResult.LastRegisteredTaskArguments -match '-UpdateIntervalHours "12"') "install.ps1 should fall back to UpdateIntervalHours from legacy task when current task lacks update arguments."
 
     # 6. Legacy task removal failure verification
     $threwLegacyCleanup = $false

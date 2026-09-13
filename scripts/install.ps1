@@ -423,6 +423,7 @@ if ($PSCmdlet.ShouldProcess($InstallDir, "Install Token Usage Insights")) {
     $detectedTaskName = $null
     $taskNamesToStop = @($TaskName)
     $existingTaskArguments = $null
+    $legacyTaskArguments = $null
     try {
         $foundTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
         if ($foundTask) {
@@ -444,10 +445,13 @@ if ($PSCmdlet.ShouldProcess($InstallDir, "Install Token Usage Insights")) {
                 if (-not $detectedTaskName) {
                     $detectedTaskName = "TokenUsageInsights"
                 }
-                if (-not $existingTaskArguments -and $legacyTask.Actions) {
+                if ($legacyTask.Actions) {
                     $firstLegacyAction = $legacyTask.Actions | Select-Object -First 1
                     if ($firstLegacyAction) {
-                        $existingTaskArguments = $firstLegacyAction.Arguments
+                        $legacyTaskArguments = $firstLegacyAction.Arguments
+                        if (-not $existingTaskArguments) {
+                            $existingTaskArguments = $firstLegacyAction.Arguments
+                        }
                     }
                 }
             }
@@ -485,7 +489,7 @@ if ($PSCmdlet.ShouldProcess($InstallDir, "Install Token Usage Insights")) {
         $persistedUpdateInterval = $UpdateIntervalHours
     }
 
-    $candidateServiceArguments = @($existingTaskArguments, $existingShortcutArguments) | Where-Object { $_ }
+    $candidateServiceArguments = @($existingTaskArguments, $legacyTaskArguments, $existingShortcutArguments) | Where-Object { $_ }
     if ($null -eq $persistedAutoUpdate) {
         foreach ($candArgs in $candidateServiceArguments) {
             $existingAutoUpdate = Get-RunnerArgumentValue -Arguments $candArgs -ParameterName "AutoUpdate"

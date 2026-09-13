@@ -228,11 +228,39 @@ fn get_process_exe_path(_pid: u32) -> Option<PathBuf> {
 }
 
 fn matches_install_dir(exe_path: &Path, install_dir: &Path) -> bool {
-    if let (Ok(can_exe), Ok(can_dir)) = (fs::canonicalize(exe_path), fs::canonicalize(install_dir))
+    let is_direct_child = if let (Ok(can_exe), Ok(can_dir)) =
+        (fs::canonicalize(exe_path), fs::canonicalize(install_dir))
     {
-        can_exe.starts_with(&can_dir)
+        can_exe.parent() == Some(can_dir.as_path())
+    } else if let Some(parent) = exe_path.parent() {
+        if parent == install_dir {
+            true
+        } else {
+            let mut parent_comps = parent.components();
+            let mut dir_comps = install_dir.components();
+            loop {
+                match (parent_comps.next(), dir_comps.next()) {
+                    (None, None) => break true,
+                    (Some(a), Some(b)) if a == b => continue,
+                    _ => break false,
+                }
+            }
+        }
     } else {
-        exe_path.starts_with(install_dir)
+        false
+    };
+
+    if !is_direct_child {
+        return false;
+    }
+
+    if let Some(file_name) = exe_path.file_name().and_then(|n| n.to_str()) {
+        let clean = file_name.replace('_', "-");
+        clean == APP_NAME
+            || clean == format!("{APP_NAME}.exe")
+            || clean.starts_with(&format!("{APP_NAME}-"))
+    } else {
+        false
     }
 }
 
@@ -5319,6 +5347,14 @@ update_check_interval: 5 # check every 5 days
             &path,
             Path::new("/nonexistent/directory")
         ));
+
+        // 拒絕安裝目錄更深層子目錄下的可執行檔
+        let sub_tool = parent.join("tools").join("token-usage-insights-helper");
+        assert!(!matches_install_dir(&sub_tool, parent));
+
+        // 拒絕檔名不符看板程式之可執行檔
+        let other_tool = parent.join("other-tool");
+        assert!(!matches_install_dir(&other_tool, parent));
     }
 
     #[test]
