@@ -196,7 +196,8 @@ function Wait-ForExecutableReady {
                 $exeStream = [System.IO.File]::Open($ExePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
                 $exeStream.Dispose()
                 $tempReplacements = @(Get-ChildItem -LiteralPath $InstallDir -Filter "*.__temp__.exe" -ErrorAction SilentlyContinue)
-                if ($tempReplacements.Count -eq 0) {
+                $relocatedReplacements = @(Get-ChildItem -LiteralPath $InstallDir -Filter "*.__relocated__.exe" -ErrorAction SilentlyContinue)
+                if ($tempReplacements.Count -eq 0 -and $relocatedReplacements.Count -eq 0) {
                     $exeReady = $true
                     break
                 }
@@ -209,6 +210,19 @@ function Wait-ForExecutableReady {
     if (-not $exeReady) {
         Write-Error -Message "等待執行檔就緒逾時（15 秒），執行檔仍未就緒或臨時替換檔殘留。保留就緒與重啟標記以利後續復原，保持停止狀態退出。"
         exit 1
+    }
+
+    # 2.5 驗證執行檔版本是否與 VERSION 檔案一致（若存在 VERSION 檔案），防止載入未完成置換之舊版二進位檔
+    $versionFile = Join-Path $InstallDir "VERSION"
+    if (Test-Path -LiteralPath $versionFile) {
+        $expectedVer = (Get-Content -LiteralPath $versionFile -Raw).Trim().TrimStart('v').TrimStart('V')
+        if ($expectedVer) {
+            $verOutput = & $ExePath --version 2>&1
+            if ($verOutput -notmatch [regex]::Escape($expectedVer)) {
+                Write-Error -Message "執行檔版本 ($verOutput) 與 VERSION 檔案 ($expectedVer) 不符，中止啟動以確保安全。"
+                exit 1
+            }
+        }
     }
 
     # 3. 清理更新協商與就緒標記檔

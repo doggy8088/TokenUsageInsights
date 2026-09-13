@@ -12,6 +12,7 @@ const HELP_TEXT: &str = r#"Token 戰情室：看板、使用量匯入 / 匯出�
   不帶參數時啟動看板；HOST 預設 0.0.0.0，PORT 預設 3003。
   INSIGHTS_DIR 可指定資料庫目錄。
   --help, -h         顯示此說明
+  --version, -V      顯示版本資訊
   --no-auto-update   啟動看板時略過自動更新檢查
 
 用途:
@@ -200,6 +201,10 @@ pub(crate) async fn run(args: &[String]) -> Option<i32> {
         "export-all" => run_export_all(&filtered_args[2..]),
         "import" => run_import(&filtered_args[2..]),
         "update" | "--update" | "-u" => run_update_cli(&filtered_args[2..]).await,
+        "-V" | "--version" | "version" => {
+            println!("token-usage-insights {}", env!("CARGO_PKG_VERSION"));
+            0
+        }
         "-h" | "--help" | "help" => {
             print_help();
             0
@@ -1007,5 +1012,17 @@ mod tests {
             "nonexistent-cmd".to_string(),
         ];
         assert_eq!(super::run(&with_invalid).await, Some(2));
+    }
+
+    #[tokio::test]
+    async fn cli_run_version_flag_returns_zero() {
+        let version_long = vec!["token-usage-insights".to_string(), "--version".to_string()];
+        assert_eq!(super::run(&version_long).await, Some(0));
+
+        let version_short = vec!["token-usage-insights".to_string(), "-V".to_string()];
+        assert_eq!(super::run(&version_short).await, Some(0));
+
+        let version_cmd = vec!["token-usage-insights".to_string(), "version".to_string()];
+        assert_eq!(super::run(&version_cmd).await, Some(0));
     }
 }

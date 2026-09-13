@@ -1495,23 +1495,92 @@ impl UpdateLock {
     fn try_acquire(install_dir: &Path) -> Result<Self, String> {
         let lock_path = Self::lock_path(install_dir);
         if let Ok(meta) = fs::symlink_metadata(&lock_path) {
-            if meta.file_type().is_symlink() || !meta.is_file() {
-                return Err(format!(
-                    "拒絕在符號連結或非正規檔案上建立更新鎖 ({lock_path:?})；更新中止以確保安全"
-                ));
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x00000400;
+                if meta.file_type().is_symlink()
+                    || (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+                    || !meta.is_file()
+                {
+                    return Err(format!(
+                        "拒絕在符號連結、重剖析點或非正規檔案上建立更新鎖 ({lock_path:?})；更新中止以確保安全"
+                    ));
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                if meta.file_type().is_symlink() || !meta.is_file() {
+                    return Err(format!(
+                        "拒絕在符號連結或非正規檔案上建立更新鎖 ({lock_path:?})；更新中止以確保安全"
+                    ));
+                }
             }
         }
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
+
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x00200000;
+            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+
+        let file = options
             .open(&lock_path)
             .map_err(|e| format!("無法建立或開啟更新鎖定檔 ({lock_path:?}): {e}"))?;
 
-        if let Ok(meta) = file.metadata() {
-            if !meta.is_file() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let handle_meta = file
+                .metadata()
+                .map_err(|e| format!("無法讀取開啟之更新鎖定檔元資料 ({lock_path:?}): {e}"))?;
+            if !handle_meta.is_file() {
                 return Err(format!("開啟的更新鎖定檔非正規檔案 ({lock_path:?})"));
+            }
+            let sym_meta = fs::symlink_metadata(&lock_path)
+                .map_err(|e| format!("無法重新確認更新鎖定檔路徑元資料 ({lock_path:?}): {e}"))?;
+            if sym_meta.file_type().is_symlink()
+                || sym_meta.dev() != handle_meta.dev()
+                || sym_meta.ino() != handle_meta.ino()
+            {
+                return Err(format!(
+                    "偵測到更新鎖定檔路徑在開啟後被置換或為符號連結 ({lock_path:?})；更新中止以確保安全"
+                ));
+            }
+        }
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x00000400;
+            let handle_meta = file
+                .metadata()
+                .map_err(|e| format!("無法讀取開啟之更新鎖定檔元資料 ({lock_path:?}): {e}"))?;
+            if !handle_meta.is_file()
+                || (handle_meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+            {
+                return Err(format!(
+                    "開啟的更新鎖定檔為符號連結、重剖析點或非正規檔案 ({lock_path:?})"
+                ));
+            }
+            let sym_meta = fs::symlink_metadata(&lock_path)
+                .map_err(|e| format!("無法重新確認更新鎖定檔路徑元資料 ({lock_path:?}): {e}"))?;
+            if sym_meta.file_type().is_symlink()
+                || (sym_meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+            {
+                return Err(format!(
+                    "偵測到更新鎖定檔路徑在開啟後被置換或為符號連結 ({lock_path:?})；更新中止以確保安全"
+                ));
             }
         }
 
@@ -1537,8 +1606,22 @@ impl UpdateLock {
         let lock_path = Self::lock_path(install_dir);
         match fs::symlink_metadata(&lock_path) {
             Ok(meta) => {
-                if meta.file_type().is_symlink() || !meta.is_file() {
-                    return true;
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::MetadataExt;
+                    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x00000400;
+                    if meta.file_type().is_symlink()
+                        || (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+                        || !meta.is_file()
+                    {
+                        return true;
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    if meta.file_type().is_symlink() || !meta.is_file() {
+                        return true;
+                    }
                 }
             }
             Err(_) => {
@@ -1548,14 +1631,66 @@ impl UpdateLock {
                 return true;
             }
         }
-        let file = match fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&lock_path)
+
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true);
+
+        #[cfg(unix)]
         {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x00200000;
+            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+
+        let file = match options.open(&lock_path) {
             Ok(f) => f,
             Err(_) => return true,
         };
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if let Ok(handle_meta) = file.metadata() {
+                if !handle_meta.is_file() {
+                    return true;
+                }
+                if let Ok(sym_meta) = fs::symlink_metadata(&lock_path) {
+                    if sym_meta.file_type().is_symlink()
+                        || sym_meta.dev() != handle_meta.dev()
+                        || sym_meta.ino() != handle_meta.ino()
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x00000400;
+            if let Ok(handle_meta) = file.metadata() {
+                if !handle_meta.is_file()
+                    || (handle_meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+                {
+                    return true;
+                }
+            }
+            if let Ok(sym_meta) = fs::symlink_metadata(&lock_path) {
+                if sym_meta.file_type().is_symlink()
+                    || (sym_meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+                {
+                    return true;
+                }
+            }
+        }
+
         match try_lock_file_exclusive(&file) {
             Ok(true) => {
                 let _ = unlock_file(&file);
@@ -3262,10 +3397,210 @@ fn configure_windows_runner_command(
         .stderr(std::process::Stdio::null());
 }
 
+#[allow(dead_code)] // 於 Windows 移交重啟流程使用，並於跨平台單元測試驗證腳本產生與命令列跳脫
+fn build_windows_deferred_restart_script(
+    updater_pid: u32,
+    install_dir: &Path,
+    exe_path: &Path,
+    expected_version: &str,
+    spec: &StoppedProcessSpec,
+) -> Result<String, String> {
+    let fallback_args = vec![APP_NAME.to_string()];
+    let args = match &spec.args {
+        Some(a) => a,
+        None if spec.is_server => &fallback_args,
+        None => {
+            return Err("無法可靠取得先前進程之命令列參數，略過自動重啟以防組態重設".to_string());
+        }
+    };
+
+    let child_args = if args.len() > 1 { &args[1..] } else { &[] };
+    if child_args.iter().any(|arg| is_cli_subcommand(arg)) {
+        return Err("先前進程包含非看板 CLI 子命令，略過自動重啟".to_string());
+    }
+
+    let cwd = match &spec.cwd {
+        Some(c) => c.as_path(),
+        None => install_dir,
+    };
+
+    let expected_clean = expected_version.trim().trim_start_matches(['v', 'V']);
+
+    let mut ps_script = String::new();
+    ps_script.push_str(&format!("$updaterPid = {updater_pid};\n"));
+    ps_script.push_str(&format!(
+        "$installDir = '{}';\n",
+        install_dir.to_string_lossy().replace('\'', "''")
+    ));
+    ps_script.push_str(&format!(
+        "$exePath = '{}';\n",
+        exe_path.to_string_lossy().replace('\'', "''")
+    ));
+    ps_script.push_str(&format!(
+        "$expectedVersion = '{}';\n",
+        expected_clean.replace('\'', "''")
+    ));
+    ps_script.push_str(&format!(
+        "$cwd = '{}';\n",
+        cwd.to_string_lossy().replace('\'', "''")
+    ));
+
+    ps_script.push_str("$argList = @(");
+    for (idx, arg) in child_args.iter().enumerate() {
+        if idx > 0 {
+            ps_script.push_str(", ");
+        }
+        ps_script.push_str(&format!("'{}'", arg.replace('\'', "''")));
+    }
+    ps_script.push_str(");\n");
+
+    for (k, v) in &spec.envs {
+        if !RELEVANT_ENV_VARS.contains(&k.as_str())
+            || k == "INSIGHTS_DIR"
+            || k == "PORT"
+            || k == "HOST"
+        {
+            ps_script.push_str(&format!("$env:{} = '{}';\n", k, v.replace('\'', "''")));
+        }
+    }
+
+    ps_script.push_str(r#"
+# 1. 等待更新程序退出
+while (Get-Process -Id $updaterPid -ErrorAction SilentlyContinue) {
+    Start-Sleep -Milliseconds 100
+}
+
+# 2. 等待更新鎖 (.update.lock) 釋放
+$lockFile = Join-Path $installDir '.update.lock'
+$waitCount = 0
+while ($waitCount -lt 300) {
+    $isLocked = $false
+    if (Test-Path -LiteralPath $lockFile) {
+        try {
+            $stream = [System.IO.File]::Open($lockFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::ReadWrite)
+            try {
+                $stream.Lock(0, 1)
+                $stream.Unlock(0, 1)
+            } catch {
+                $isLocked = $true
+            } finally {
+                $stream.Dispose()
+            }
+        } catch {
+            $isLocked = $true
+        }
+    }
+    if (-not $isLocked) { break }
+    Start-Sleep -Milliseconds 100
+    $waitCount++
+}
+
+# 3. 等待 self_replace 臨時置換檔完全清理且執行檔可獨占讀取
+$readyCount = 0
+$exeReady = $false
+while ($readyCount -lt 150) {
+    if (Test-Path -LiteralPath $exePath) {
+        try {
+            $exeStream = [System.IO.File]::Open($exePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+            $exeStream.Dispose()
+            $tempFiles = @(Get-ChildItem -LiteralPath $installDir -Filter '*.__temp__.exe' -ErrorAction SilentlyContinue)
+            $relocatedFiles = @(Get-ChildItem -LiteralPath $installDir -Filter '*.__relocated__.exe' -ErrorAction SilentlyContinue)
+            if ($tempFiles.Count -eq 0 -and $relocatedFiles.Count -eq 0) {
+                $exeReady = $true
+                break
+            }
+        } catch {}
+    }
+    Start-Sleep -Milliseconds 100
+    $readyCount++
+}
+
+# 4. 驗證執行檔版本是否已為新版
+$versionMatched = $false
+$vCheckCount = 0
+while ($vCheckCount -lt 50) {
+    try {
+        $out = & $exePath --version 2>&1
+        if ($out -match [regex]::Escape($expectedVersion)) {
+            $versionMatched = $true
+            break
+        }
+    } catch {}
+    Start-Sleep -Milliseconds 100
+    $vCheckCount++
+}
+
+# 5. 依版本驗證結果決定啟動或拒絕載入舊版
+$logDir = Join-Path $installDir 'logs'
+if (!(Test-Path -LiteralPath $logDir)) {
+    New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+}
+$logFile = Join-Path $installDir 'update.log'
+$logTime = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+
+if ($versionMatched) {
+    Add-Content -LiteralPath $logFile -Value "[$logTime] [INFO] [RESTART] 移交守護進程已確認新版執行檔版本 ($expectedVersion)，正在重新啟動看板服務..."
+    if ($argList.Count -gt 0) {
+        Start-Process -FilePath $exePath -ArgumentList $argList -WorkingDirectory $cwd -WindowStyle Hidden
+    } else {
+        Start-Process -FilePath $exePath -WorkingDirectory $cwd -WindowStyle Hidden
+    }
+} else {
+    Add-Content -LiteralPath $logFile -Value "[$logTime] [ERROR] [RESTART] 移交守護進程驗證新版執行檔版本失敗 (預期 $expectedVersion)，中止啟動以防載入舊版。"
+}
+"#);
+
+    Ok(ps_script)
+}
+
+#[cfg(windows)]
+fn schedule_windows_deferred_restart(
+    spec: &StoppedProcessSpec,
+    install_dir: &Path,
+    expected_version: &str,
+) -> Result<(), String> {
+    let my_pid = std::process::id();
+    let exec_name = format!("{APP_NAME}.exe");
+    let exe = if spec.exe_path.exists() {
+        spec.exe_path.clone()
+    } else {
+        install_dir.join(&exec_name)
+    };
+
+    let ps_script =
+        build_windows_deferred_restart_script(my_pid, install_dir, &exe, expected_version, spec)?;
+
+    let mut cmd = std::process::Command::new("powershell.exe");
+    cmd.args([
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-WindowStyle",
+        "Hidden",
+        "-Command",
+        &ps_script,
+    ]);
+
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    cmd.spawn()
+        .map_err(|e| format!("啟動 Windows 移交重啟進程失敗: {e}"))?;
+
+    Ok(())
+}
+
 #[cfg(windows)]
 fn restart_windows_supervised_service(
     spec: &StoppedProcessSpec,
     install_dir: &Path,
+    is_current_exe: bool,
+    expected_version: &str,
 ) -> Result<Option<u32>, String> {
     log_update(
         "INFO",
@@ -3371,9 +3706,24 @@ fn restart_windows_supervised_service(
         }
     }
 
-    // 2c. 若以上皆未成功，回退直接以 restart_dashboard_instance 啟動看板進程
+    // 2c. 若以上皆未成功，回退直接以 restart_dashboard_instance 或移交守護啟動看板進程
     if !started {
+        if is_current_exe {
+            schedule_windows_deferred_restart(spec, install_dir, expected_version)?;
+            return Ok(None);
+        }
         return restart_dashboard_instance(spec, install_dir).map(Some);
+    }
+
+    // 若為當前執行檔更新，run-service.ps1 會等待更新鎖釋放後才啟動新版，此處直接回傳 runner_pid 不提前超時回退
+    if is_current_exe {
+        log_update(
+            "INFO",
+            "RESTART",
+            "已成功啟動服務移交 (ScheduledTask / run-service.ps1)，將於更新程序退出並釋放更新鎖後自動載入新版",
+        );
+        println!("🔄 已成功移交服務管理器，將於更新程序退出後自動載入新版看板服務。");
+        return Ok(runner_pid);
     }
 
     // 3. 等待確認新進程是否成功啟動 (最多等待 5 秒)
@@ -3426,14 +3776,22 @@ pub(crate) fn apply_installation_with_rollback(
     println!("🚀 正在安裝新版檔案至 {:?} ...", install_dir);
     log_update("INFO", "INSTALL", &format!("開始替換至 {install_dir:?}"));
 
-    let install_result = (|| -> Result<(), String> {
-        let exec_name = if cfg!(windows) {
-            format!("{APP_NAME}.exe")
-        } else {
-            APP_NAME.to_string()
-        };
+    let exec_name = if cfg!(windows) {
+        format!("{APP_NAME}.exe")
+    } else {
+        APP_NAME.to_string()
+    };
 
-        let target_exe = install_dir.join(&exec_name);
+    let target_exe = install_dir.join(&exec_name);
+    let current_exe = std::env::current_exe().ok();
+    let is_current_exe = current_exe
+        .as_ref()
+        .and_then(|c| fs::canonicalize(c).ok())
+        .zip(fs::canonicalize(&target_exe).ok())
+        .map(|(a, b)| a == b)
+        .unwrap_or(false);
+
+    let install_result = (|| -> Result<(), String> {
         let src_exe = release_root.join(&exec_name);
 
         if !src_exe.exists() {
@@ -3441,14 +3799,6 @@ pub(crate) fn apply_installation_with_rollback(
         }
 
         // 跨平台安全替換執行檔（Windows 使用 self_replace 或安全重命名）
-        let current_exe = std::env::current_exe().ok();
-        let is_current_exe = current_exe
-            .as_ref()
-            .and_then(|c| fs::canonicalize(c).ok())
-            .zip(fs::canonicalize(&target_exe).ok())
-            .map(|(a, b)| a == b)
-            .unwrap_or(false);
-
         if is_current_exe {
             self_replace::self_replace(&src_exe)
                 .map_err(|e| format!("執行中的程序替換失敗: {e}"))?;
@@ -3574,6 +3924,18 @@ pub(crate) fn apply_installation_with_rollback(
                         );
                     }
                 } else {
+                    #[cfg(windows)]
+                    if is_current_exe {
+                        let original_version =
+                            fs::read_to_string(install_dir.join("VERSION")).unwrap_or_default();
+                        let _ =
+                            schedule_windows_deferred_restart(spec, install_dir, &original_version);
+                        println!(
+                            "🔄 回滾完成，已排定於更新程序退出後重新啟動 PID {} 對應之原版背景看板服務。",
+                            spec.pid
+                        );
+                        continue;
+                    }
                     match restart_dashboard_instance(spec, install_dir) {
                         Ok(_) => {
                             println!(
@@ -3615,6 +3977,19 @@ pub(crate) fn apply_installation_with_rollback(
         return Err(err);
     }
 
+    let expected_version = fs::read_to_string(install_dir.join("VERSION")).unwrap_or_default();
+    let expected_version = expected_version
+        .trim()
+        .trim_start_matches(['v', 'V'])
+        .to_string();
+    let expected_version = if expected_version.is_empty() {
+        env!("CARGO_PKG_VERSION").to_string()
+    } else {
+        expected_version
+    };
+    let _ = &expected_version;
+    let _ = is_current_exe;
+
     // 1. Unix 上在檔案寫入完成後，通知先前記錄之監管服務進程退出以讓 supervisor 自動載入新版執行檔
     #[cfg(unix)]
     {
@@ -3640,7 +4015,12 @@ pub(crate) fn apply_installation_with_rollback(
         if spec.is_supervised {
             #[cfg(windows)]
             {
-                match restart_windows_supervised_service(spec, install_dir) {
+                match restart_windows_supervised_service(
+                    spec,
+                    install_dir,
+                    is_current_exe,
+                    &expected_version,
+                ) {
                     Ok(maybe_pid) => {
                         if let Some(pid) = maybe_pid {
                             spawned_pids.push(pid);
@@ -3658,6 +4038,36 @@ pub(crate) fn apply_installation_with_rollback(
                 }
             }
         } else {
+            #[cfg(windows)]
+            if is_current_exe {
+                match schedule_windows_deferred_restart(spec, install_dir, &expected_version) {
+                    Ok(_) => {
+                        println!(
+                            "🔄 已排定於更新程序退出後由移交守護進程自動啟動 PID {} 對應之新版背景看板服務。",
+                            spec.pid
+                        );
+                        log_update(
+                            "INFO",
+                            "RESTART",
+                            &format!(
+                                "更新成功，已排定於更新程序退出並釋放執行檔後由移交守護進程啟動新版看板 (原 PID: {}, 目標版本: {expected_version})",
+                                spec.pid
+                            ),
+                        );
+                    }
+                    Err(err) => {
+                        let msg = format!(
+                            "排定 Windows 移交重啟進程 (原 PID: {}) 失敗: {err}",
+                            spec.pid
+                        );
+                        eprintln!("⚠️ 更新完成，但無法排定移交重啟 (原 PID: {}): {err}；請於更新後手動啟動看板服務。", spec.pid);
+                        log_update("ERROR", "RESTART", &msg);
+                        restart_errors.push(msg);
+                    }
+                }
+                continue;
+            }
+
             match restart_dashboard_instance(spec, install_dir) {
                 Ok(child_pid) => {
                     spawned_pids.push(child_pid);
@@ -3764,6 +4174,14 @@ pub(crate) fn apply_installation_with_rollback(
                         );
                     }
                 } else {
+                    #[cfg(windows)]
+                    if is_current_exe {
+                        let original_version =
+                            fs::read_to_string(install_dir.join("VERSION")).unwrap_or_default();
+                        let _ =
+                            schedule_windows_deferred_restart(spec, install_dir, &original_version);
+                        continue;
+                    }
                     let _ = restart_dashboard_instance(spec, install_dir);
                 }
             }
@@ -5927,5 +6345,62 @@ update_check_interval: 5 # check every 5 days
         assert!(validate_download_url("http://localhost:3000/archive.zip").is_ok());
         assert!(validate_download_url("not a url").is_err());
         assert!(validate_download_url("ftp://example.com/file.zip").is_err());
+    }
+
+    #[test]
+    fn build_windows_deferred_restart_script_generates_correct_powershell() {
+        let spec = StoppedProcessSpec {
+            pid: 12345,
+            is_supervised: false,
+            supervisor_pid: None,
+            is_server: true,
+            exe_path: PathBuf::from("C:\\test\\bin\\token-usage-insights.exe"),
+            args: Some(vec![
+                "token-usage-insights.exe".to_string(),
+                "--no-auto-update".to_string(),
+            ]),
+            envs: vec![
+                ("PORT".to_string(), "3003".to_string()),
+                ("HOST".to_string(), "127.0.0.1".to_string()),
+                ("INSIGHTS_DIR".to_string(), "C:\\data".to_string()),
+            ],
+            cwd: Some(PathBuf::from("C:\\test")),
+        };
+
+        let script = build_windows_deferred_restart_script(
+            9999,
+            Path::new("C:\\test"),
+            Path::new("C:\\test\\bin\\token-usage-insights.exe"),
+            "v0.9.6",
+            &spec,
+        )
+        .expect("產生移交重啟腳本應成功");
+
+        // 驗證腳本包含更新程序 PID 等待
+        assert!(script.contains("$updaterPid = 9999;"));
+        assert!(
+            script.contains("while (Get-Process -Id $updaterPid -ErrorAction SilentlyContinue)")
+        );
+
+        // 驗證腳本包含更新鎖釋放等待
+        assert!(script.contains("Join-Path $installDir '.update.lock'"));
+        assert!(script.contains("$stream.Lock(0, 1)"));
+
+        // 驗證腳本包含 self_replace 暫存置換檔清理等待
+        assert!(script.contains("*.__temp__.exe"));
+        assert!(script.contains("*.__relocated__.exe"));
+
+        // 驗證腳本包含 --version 執行與版本驗證
+        assert!(script.contains("& $exePath --version"));
+        assert!(script.contains("$expectedVersion = '0.9.6';"));
+        assert!(script.contains("out -match [regex]::Escape($expectedVersion)"));
+
+        // 驗證版本不符時拒絕啟動並記錄錯誤
+        assert!(script.contains("移交守護進程驗證新版執行檔版本失敗"));
+        assert!(script.contains("中止啟動以防載入舊版"));
+
+        // 驗證版本相符時才以原參數啟動
+        assert!(script.contains("移交守護進程已確認新版執行檔版本"));
+        assert!(script.contains("Start-Process -FilePath $exePath"));
     }
 }
