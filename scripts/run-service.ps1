@@ -148,6 +148,58 @@ function Rotate-ServiceLog {
     }
 }
 
+function Exit-WithError {
+    param(
+        [string]$Message
+    )
+
+    Write-Error -Message $Message -ErrorAction Continue
+    exit 1
+}
+
+function Test-IsUpdateLockHeld {
+    param(
+        [string]$LockFile
+    )
+
+    if (-not (Test-Path -LiteralPath $LockFile)) {
+        return $false
+    }
+
+    try {
+        $stream = [System.IO.File]::Open($LockFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::ReadWrite)
+        try {
+            $stream.Lock(0, 1)
+            $stream.Unlock(0, 1)
+            return $false
+        } catch {
+            return $true
+        } finally {
+            $stream.Dispose()
+        }
+    } catch {
+        return $true
+    }
+}
+
+function Wait-ForUpdateLockRelease {
+    param(
+        [string]$LockFile,
+        [int]$MaxWaitDeciseconds = 900
+    )
+
+    $waitCount = 0
+    while ($waitCount -lt $MaxWaitDeciseconds) {
+        if (-not (Test-IsUpdateLockHeld -LockFile $LockFile)) {
+            return $true
+        }
+        Start-Sleep -Milliseconds 100
+        $waitCount++
+    }
+
+    return (-not (Test-IsUpdateLockHeld -LockFile $LockFile))
+}
+
 function Wait-ForExecutableReady {
     param(
         [string]$InstallDir,
@@ -156,35 +208,8 @@ function Wait-ForExecutableReady {
 
     # 1. 等待更新鎖 (.update.lock) 釋放（確保 updater 程序及任何更新鎖定已完全釋放）
     $lockFile = Join-Path $InstallDir ".update.lock"
-    $waitCount = 0
-    while ($waitCount -lt 900) {
-        $isLocked = $false
-        if (Test-Path -LiteralPath $lockFile) {
-            try {
-                $stream = [System.IO.File]::Open($lockFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::ReadWrite)
-                try {
-                    $stream.Lock(0, 1)
-                    $stream.Unlock(0, 1)
-                } catch {
-                    $isLocked = $true
-                } finally {
-                    $stream.Dispose()
-                }
-            } catch {
-                $isLocked = $true
-            }
-        }
-
-        if (-not $isLocked) {
-            break
-        }
-        Start-Sleep -Milliseconds 100
-        $waitCount++
-    }
-
-    if ($isLocked) {
-        Write-Error -Message "等待更新程序釋放更新鎖逾時（90 秒），保持停止狀態退出。"
-        exit 1
+    if (-not (Wait-ForUpdateLockRelease -LockFile $lockFile -MaxWaitDeciseconds 900)) {
+        Exit-WithError -Message "等待更新程序釋放更新鎖逾時（90 秒），保持停止狀態退出。"
     }
 
     # 2. 等待 self_replace 或替換 helper 完成：確保執行檔存在且可獨占讀取（無寫入鎖定），且無臨時置換殘留檔
@@ -208,8 +233,7 @@ function Wait-ForExecutableReady {
     }
 
     if (-not $exeReady) {
-        Write-Error -Message "等待執行檔就緒逾時（15 秒），執行檔仍未就緒或臨時替換檔殘留。保留就緒與重啟標記以利後續復原，保持停止狀態退出。"
-        exit 1
+        Exit-WithError -Message "等待執行檔就緒逾時（15 秒），執行檔仍未就緒或臨時替換檔殘留。保留就緒與重啟標記以利後續復原，保持停止狀態退出。"
     }
 
     # 2.5 驗證執行檔版本是否與 VERSION 檔案一致（若存在 VERSION 檔案），防止載入未完成置換之舊版二進位檔
@@ -231,8 +255,7 @@ function Wait-ForExecutableReady {
                 $exited = $proc.WaitForExit(5000)
                 if (-not $exited) {
                     try { $proc.Kill() } catch {}
-                    Write-Error -Message "執行檔版本檢查逾時（5 秒），二進位檔可能異常；中止啟動以確保安全。"
-                    exit 1
+                    Exit-WithError -Message "執行檔版本檢查逾時（5 秒），二進位檔可能異常；中止啟動以確保安全。"
                 }
                 $stdout = $proc.StandardOutput.ReadToEnd()
                 $stderr = $proc.StandardError.ReadToEnd()
@@ -240,12 +263,10 @@ function Wait-ForExecutableReady {
                 $tokens = $verOutput -split '\s+'
                 $actualVer = if ($tokens.Count -gt 0) { $tokens[-1].TrimStart('v').TrimStart('V') } else { '' }
                 if ($actualVer -ne $expectedVer) {
-                    Write-Error -Message "執行檔版本 ($verOutput) 與 VERSION 檔案 ($expectedVer) 不符，中止啟動以確保安全。"
-                    exit 1
+                    Exit-WithError -Message "執行檔版本 ($verOutput) 與 VERSION 檔案 ($expectedVer) 不符，中止啟動以確保安全。"
                 }
             } else {
-                Write-Error -Message "無法啟動執行檔進行版本檢查，中止啟動以確保安全。"
-                exit 1
+                Exit-WithError -Message "無法啟動執行檔進行版本檢查，中止啟動以確保安全。"
             }
         }
     }
@@ -265,54 +286,11 @@ function Wait-ForUpdateCompletion {
 
     $lockFile = Join-Path $InstallDir ".update.lock"
     $hasPendingMarker = Test-Path -LiteralPath $RestartPendingFile
-    $isLocked = $false
-
-    if (Test-Path -LiteralPath $lockFile) {
-        try {
-            $stream = [System.IO.File]::Open($lockFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::ReadWrite)
-            try {
-                $stream.Lock(0, 1)
-                $stream.Unlock(0, 1)
-            } catch {
-                $isLocked = $true
-            } finally {
-                $stream.Dispose()
-            }
-        } catch {
-            $isLocked = $true
-        }
-    }
+    $isLocked = Test-IsUpdateLockHeld -LockFile $lockFile
 
     if ($hasPendingMarker -or $isLocked) {
-        $waitCount = 0
-        while ($waitCount -lt 900) {
-            $isLocked = $false
-            if (Test-Path -LiteralPath $lockFile) {
-                try {
-                    $stream = [System.IO.File]::Open($lockFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::ReadWrite)
-                    try {
-                        $stream.Lock(0, 1)
-                        $stream.Unlock(0, 1)
-                    } catch {
-                        $isLocked = $true
-                    } finally {
-                        $stream.Dispose()
-                    }
-                } catch {
-                    $isLocked = $true
-                }
-            }
-
-            if (-not $isLocked) {
-                break
-            }
-            Start-Sleep -Milliseconds 100
-            $waitCount++
-        }
-
-        if ($isLocked) {
-            Write-Error "等待更新程序完成逾時（90 秒），更新鎖仍未釋放。為防止損毀安裝目錄，保持停止狀態退出。"
-            exit 1
+        if (-not (Wait-ForUpdateLockRelease -LockFile $lockFile -MaxWaitDeciseconds 900)) {
+            Exit-WithError -Message "等待更新程序完成逾時（90 秒），更新鎖仍未釋放。為防止損毀安裝目錄，保持停止狀態退出。"
         }
 
         Wait-ForExecutableReady -InstallDir $InstallDir -ExePath (Join-Path $InstallDir "$AppName.exe")

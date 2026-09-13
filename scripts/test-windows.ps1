@@ -766,7 +766,16 @@ if ($env:TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS -ne "24") { throw "TOKEN_USA
     Assert-Equal $false ('powershell -File "' + $mockInstallDir + '-old\run-service.ps1"' -match $boundaryPattern) "Boundary regex should not match install dir prefix collision."
     Assert-Equal $false ('powershell -File "' + $mockInstallDir + '2\run-service.ps1"' -match $boundaryPattern) "Boundary regex should not match install dir number suffix."
 
-    # 5. Wait-ForExecutableReady behavior verification
+    # 5. Wait-ForExecutableReady 與輔助函式 behavior verification
+    $fnDefExitWithError = $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq "Exit-WithError" }, $true)
+    Assert-True ($null -ne $fnDefExitWithError -and $fnDefExitWithError.Count -eq 1) "run-service.ps1 should define Exit-WithError."
+
+    $fnDefLockHeld = $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq "Test-IsUpdateLockHeld" }, $true)
+    Assert-True ($null -ne $fnDefLockHeld -and $fnDefLockHeld.Count -eq 1) "run-service.ps1 should define Test-IsUpdateLockHeld."
+
+    $fnDefLockRelease = $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq "Wait-ForUpdateLockRelease" }, $true)
+    Assert-True ($null -ne $fnDefLockRelease -and $fnDefLockRelease.Count -eq 1) "run-service.ps1 should define Wait-ForUpdateLockRelease."
+
     $fnDefReady = $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq "Wait-ForExecutableReady" }, $true)
     Assert-True ($null -ne $fnDefReady -and $fnDefReady.Count -eq 1) "run-service.ps1 should define Wait-ForExecutableReady."
 
@@ -782,7 +791,9 @@ if ($env:TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS -ne "24") { throw "TOKEN_USA
     Set-Content -LiteralPath $readyExePath -Value "binary"
     Set-Content -LiteralPath $tempExePath -Value "temp"
 
-    $funcCode = $fnDefReady[0].Extent.Text.Replace("900", "2").Replace("150", "2")
+    $helperFunctions = @("Exit-WithError", "Test-IsUpdateLockHeld", "Wait-ForUpdateLockRelease", "Wait-ForExecutableReady")
+    $fnDefs = $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and ($args[0].Name -in $helperFunctions) }, $true)
+    $funcCode = (($fnDefs | ForEach-Object { $_.Extent.Text }) -join "`n`n").Replace("900", "2").Replace("150", "2")
     $testScript = @"
 `$ErrorActionPreference = 'SilentlyContinue'
 $funcCode

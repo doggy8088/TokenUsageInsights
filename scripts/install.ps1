@@ -564,13 +564,13 @@ exit /b %APP_EXIT_CODE%
             throw "Missing background service runner script: $RunnerScript"
         }
 
-        $runnerArgs = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$RunnerScript`" -InstallDir `"$InstallDir`" -HostAddress `"$HostAddress`" -Port $Port"
-        if ($null -ne $persistedAutoUpdate) {
-            $runnerArgs += " -AutoUpdate `"$persistedAutoUpdate`""
-        }
-        if ($null -ne $persistedUpdateInterval) {
-            $runnerArgs += " -UpdateIntervalHours `"$persistedUpdateInterval`""
-        }
+        $runnerArgs = Format-RunnerArgumentString `
+            -RunnerScript $RunnerScript `
+            -InstallDir $InstallDir `
+            -HostAddress $HostAddress `
+            -Port $Port `
+            -AutoUpdate $persistedAutoUpdate `
+            -UpdateIntervalHours $persistedUpdateInterval
 
         $taskRegistered = $false
         try {

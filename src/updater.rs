@@ -4533,8 +4533,26 @@ pub(crate) fn restart_current_process(exe_path: &Path, args: &[String]) -> ! {
     }
 }
 
+fn is_auto_update_cli_flag_present(args: &[String]) -> bool {
+    for (idx, arg) in args.iter().enumerate() {
+        if idx == 0 && !arg.starts_with('-') {
+            continue;
+        }
+        if arg == "--" {
+            break;
+        }
+        if arg == "--no-auto-update" {
+            return true;
+        }
+        if !arg.starts_with('-') || is_cli_subcommand(arg) {
+            break;
+        }
+    }
+    false
+}
+
 fn is_auto_update_disabled(args: &[String]) -> bool {
-    if args.iter().any(|arg| arg == "--no-auto-update") {
+    if is_auto_update_cli_flag_present(args) {
         return true;
     }
     if let Ok(val) = std::env::var("TOKEN_USAGE_INSIGHTS_AUTO_UPDATE") {
@@ -5584,6 +5602,28 @@ update_check_interval: 5 # check every 5 days
         assert!(is_auto_update_disabled(&[
             "app".to_string(),
             "--no-auto-update".to_string()
+        ]));
+    }
+
+    #[test]
+    fn auto_update_cli_flag_present_parsing() {
+        assert!(is_auto_update_cli_flag_present(&[
+            "--no-auto-update".to_string()
+        ]));
+        assert!(is_auto_update_cli_flag_present(&[
+            "app".to_string(),
+            "--no-auto-update".to_string(),
+        ]));
+        assert!(!is_auto_update_cli_flag_present(&[
+            "app".to_string(),
+            "--".to_string(),
+            "--no-auto-update".to_string(),
+        ]));
+        assert!(!is_auto_update_cli_flag_present(&[
+            "app".to_string(),
+            "export".to_string(),
+            "--out".to_string(),
+            "--no-auto-update".to_string(),
         ]));
     }
 

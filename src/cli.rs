@@ -177,30 +177,36 @@ struct UsageDayImportPayload {
 
 // None means start the dashboard; commands finish before server initialization.
 pub(crate) async fn run(args: &[String]) -> Option<i32> {
-    // 過濾全域旗標 --no-auto-update（該旗標已由 is_auto_update_disabled 識別），
-    // 允許 --no-auto-update 與其他子命令自由組合（如 --no-auto-update --help、--no-auto-update update --check）
-    let filtered_args: Vec<String> = if args.len() > 1 {
-        let mut v = Vec::with_capacity(args.len());
-        v.push(args[0].clone());
-        for arg in &args[1..] {
-            if arg != "--no-auto-update" {
-                v.push(arg.clone());
-            }
-        }
-        v
-    } else {
-        args.to_vec()
-    };
-
-    if filtered_args.len() < 2 {
+    if args.is_empty() {
         return None;
     }
 
-    Some(match filtered_args[1].as_str() {
-        "export" => run_export(&filtered_args[2..]),
-        "export-all" => run_export_all(&filtered_args[2..]),
-        "import" => run_import(&filtered_args[2..]),
-        "update" | "--update" | "-u" => run_update_cli(&filtered_args[2..]).await,
+    // 解析並消耗位於子命令前的全域旗標（如 --no-auto-update），或直到遇到 `--` end-of-options。
+    // 任何在子命令或 `--` 之後出現的 token 均原樣保留交由對應子命令解析，避免誤傷合法參數值。
+    let mut idx = 1;
+    while idx < args.len() {
+        let arg = &args[idx];
+        if arg == "--" {
+            idx += 1;
+            break;
+        }
+        if arg == "--no-auto-update" {
+            idx += 1;
+            continue;
+        }
+        break;
+    }
+
+    let subcmd_args = &args[idx..];
+    if subcmd_args.is_empty() {
+        return None;
+    }
+
+    Some(match subcmd_args[0].as_str() {
+        "export" => run_export(&subcmd_args[1..]),
+        "export-all" => run_export_all(&subcmd_args[1..]),
+        "import" => run_import(&subcmd_args[1..]),
+        "update" | "--update" | "-u" => run_update_cli(&subcmd_args[1..]).await,
         "-V" | "--version" | "version" => {
             println!("token-usage-insights {}", env!("CARGO_PKG_VERSION"));
             0
@@ -210,7 +216,7 @@ pub(crate) async fn run(args: &[String]) -> Option<i32> {
             0
         }
         _ => {
-            eprintln!("未知指令：{}", filtered_args[1]);
+            eprintln!("未知指令：{}", subcmd_args[0]);
             print_help();
             2
         }
@@ -1028,5 +1034,41 @@ mod tests {
 
         let version_cmd = vec!["token-usage-insights".to_string(), "version".to_string()];
         assert_eq!(super::run(&version_cmd).await, Some(0));
+    }
+
+    #[tokio::test]
+    async fn cli_run_handles_end_of_options_and_subcommand_arguments() {
+        // 在 -- 之後的 --no-auto-update 應被視為子命令而非全域旗標
+        let after_delimiter = vec![
+            "token-usage-insights".to_string(),
+            "--".to_string(),
+            "--no-auto-update".to_string(),
+        ];
+        assert_eq!(super::run(&after_delimiter).await, Some(2));
+
+        // 單獨 -- 應啟動看板（回傳 None）
+        let delimiter_only = vec!["token-usage-insights".to_string(), "--".to_string()];
+        assert_eq!(super::run(&delimiter_only).await, None);
+
+        // 空參數應啟動看板
+        assert_eq!(super::run(&[]).await, None);
+
+        // 全域旗標在子命令前被消耗，子命令與參數保持完整傳遞
+        let update_with_flag = vec![
+            "token-usage-insights".to_string(),
+            "--no-auto-update".to_string(),
+            "update".to_string(),
+            "--help".to_string(),
+        ];
+        assert_eq!(super::run(&update_with_flag).await, Some(0));
+
+        // 未知子命令在全域旗標之後正確被辨識
+        let invalid_after_flag = vec![
+            "token-usage-insights".to_string(),
+            "--no-auto-update".to_string(),
+            "unknown-cmd".to_string(),
+            "--no-auto-update".to_string(),
+        ];
+        assert_eq!(super::run(&invalid_after_flag).await, Some(2));
     }
 }
