@@ -331,30 +331,12 @@ pub(crate) fn load_session_details(
         ));
     }
 
-    let session_cwd = db::get_session_cwd(
-        &conn,
-        &lookup.assistant_type,
-        &session_id,
-        Some(&lookup.source_kind),
-        lookup.source_dir_key.as_deref(),
-    )
-    .unwrap_or(None);
-    let session_model = db::get_session_model(
-        &conn,
-        &lookup.assistant_type,
-        &session_id,
-        Some(&lookup.source_kind),
-        lookup.source_dir_key.as_deref(),
-    )
-    .unwrap_or(None);
-    let db_entries = db::get_session_turns_token_stats(
-        &conn,
-        &lookup.assistant_type,
-        &session_id,
-        Some(&lookup.source_kind),
-        lookup.source_dir_key.as_deref(),
-    )
-    .unwrap_or_default();
+    let session_data = lookup
+        .load_data(&conn, &session_id)
+        .map_err(|error| SessionDetailsError::new(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    let session_cwd = session_data.cwd;
+    let session_model = session_data.model;
+    let db_entries = session_data.turn_stats;
 
     let agent_filter = (lookup.assistant_type == "copilot"
         && matches!(lookup.source_kind.as_str(), "copilot-app" | "copilot-cli"))

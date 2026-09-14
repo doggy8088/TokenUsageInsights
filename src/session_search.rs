@@ -229,6 +229,7 @@ mod tests {
                 usage_identity: None,
             },
             assistant_type: "copilot".to_string(),
+            date: "2026-07-16".to_string(),
         }
     }
 

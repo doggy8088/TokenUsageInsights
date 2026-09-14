@@ -526,6 +526,7 @@ mod tests {
                 usage_identity: None,
             },
             assistant_type: assistant_type.to_string(),
+            date: "2026-07-10".to_string(),
         }
     }
 

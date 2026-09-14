@@ -18,23 +18,7 @@ struct CodexTokenUsage {
 }
 
 pub(super) fn find_codex_session_files(dir: &Path) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                files.extend(find_codex_session_files(&path));
-            } else if path.is_file()
-                && path
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
-            {
-                files.push(path);
-            }
-        }
-    }
-    files
+    find_jsonl_files(dir)
 }
 
 fn codex_content_to_text(content: &serde_json::Value) -> String {

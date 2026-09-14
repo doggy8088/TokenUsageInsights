@@ -16,6 +16,26 @@ use codex::{find_codex_session_files, parse_codex_session_file};
 pub(crate) use cursor::parse_cursor_timestamp;
 use cursor::sync_cursor_usage_logs;
 
+fn find_jsonl_files(dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                files.extend(find_jsonl_files(&path));
+            } else if path.is_file()
+                && path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
+            {
+                files.push(path);
+            }
+        }
+    }
+    files
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TokenStats {
     pub input: u64,
@@ -99,6 +119,7 @@ pub struct UsageDayExportRecord {
 pub struct UsageDayRecordWithAssistant {
     pub record: UsageDayExportRecord,
     pub assistant_type: String,
+    pub date: String,
 }
 
 #[derive(Serialize, Debug)]
@@ -4724,20 +4745,22 @@ pub fn get_available_dates(
     Ok(dates)
 }
 
-pub fn get_usage_entries_by_date(
+fn query_usage_entries(
     conn: &rusqlite::Connection,
-    date: &str,
+    date_filter: &str,
     assistant: &str,
+    exact_date: bool,
 ) -> Result<Vec<UsageDayRecordWithAssistant>, String> {
     let mut query = "SELECT
             timestamp, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
             tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_cache_write_5m, tokens_cache_write_1h, tokens_reasoning, tokens_total,
             delta_input, delta_output, delta_cache_read, delta_cache_write, delta_cache_write_5m, delta_cache_write_1h, delta_reasoning, delta_total,
             duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, assistant_type, reasoning_effort, import_source_id, source_kind, source_dir_key, reported_cost_usd
-            , usage_identity
-         FROM usage_entries WHERE date = ?".to_string();
+            , usage_identity, date
+         FROM usage_entries WHERE date ".to_string();
+    query.push_str(if exact_date { "= ?" } else { "LIKE ?" });
     let mut params_vec = Vec::new();
-    params_vec.push(rusqlite::types::Value::Text(date.to_string()));
+    params_vec.push(rusqlite::types::Value::Text(date_filter.to_string()));
 
     if assistant != "all" {
         let assistants: Vec<&str> = assistant.split(',').collect();
@@ -4924,10 +4947,11 @@ pub fn get_usage_entries_by_date(
             record.usage_identity = None;
         }
 
+        let entry_date = row.get::<_, String>(37).map_err(|e| e.to_string())?;
         if record.import_source_id.is_none() {
             record.import_source_id = Some(build_usage_entry_import_source_id(
                 assistant,
-                date,
+                &entry_date,
                 &record.entry,
                 record.usage_identity.as_deref(),
             ));
@@ -4936,9 +4960,18 @@ pub fn get_usage_entries_by_date(
         entries.push(UsageDayRecordWithAssistant {
             record,
             assistant_type: ast_type,
+            date: entry_date,
         });
     }
     Ok(entries)
+}
+
+pub fn get_usage_entries_by_date(
+    conn: &rusqlite::Connection,
+    date: &str,
+    assistant: &str,
+) -> Result<Vec<UsageDayRecordWithAssistant>, String> {
+    query_usage_entries(conn, date, assistant, true)
 }
 
 fn entry_date_from_timestamp(timestamp: &str) -> Option<&str> {
@@ -5316,6 +5349,50 @@ pub struct SessionLookup {
     pub source_dir_key: Option<String>,
     pub parent_session_id: Option<String>,
     pub agent_nickname: Option<String>,
+}
+
+/// Database-backed details scoped to the same concrete session source as a
+/// [`SessionLookup`]. Keeping the three related lookups behind one method
+/// prevents callers from accidentally mixing assistant, source, or directory
+/// identity between queries.
+pub struct SessionData {
+    pub cwd: Option<String>,
+    pub model: Option<String>,
+    pub turn_stats: HashMap<u32, (TokenStats, String)>,
+}
+
+impl SessionLookup {
+    pub fn load_data(
+        &self,
+        conn: &rusqlite::Connection,
+        session_id: &str,
+    ) -> Result<SessionData, String> {
+        let source_kind = Some(self.source_kind.as_str());
+        let source_dir_key = self.source_dir_key.as_deref();
+        Ok(SessionData {
+            cwd: get_session_cwd(
+                conn,
+                &self.assistant_type,
+                session_id,
+                source_kind,
+                source_dir_key,
+            )?,
+            model: get_session_model(
+                conn,
+                &self.assistant_type,
+                session_id,
+                source_kind,
+                source_dir_key,
+            )?,
+            turn_stats: get_session_turns_token_stats(
+                conn,
+                &self.assistant_type,
+                session_id,
+                source_kind,
+                source_dir_key,
+            )?,
+        })
+    }
 }
 
 /// Resolves the single `source_kind` used by the legacy `source_kind = None`
@@ -5821,193 +5898,16 @@ pub fn get_usage_entries_by_month(
     year_month: &str,
     assistant: &str,
 ) -> Result<Vec<DatedUsageEntry>, String> {
-    let query_month = format!("{}-%", year_month);
-    let mut query = "SELECT
-            timestamp, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
-            tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_cache_write_5m, tokens_cache_write_1h, tokens_reasoning, tokens_total,
-            delta_input, delta_output, delta_cache_read, delta_cache_write, delta_cache_write_5m, delta_cache_write_1h, delta_reasoning, delta_total,
-            duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, assistant_type, reasoning_effort,
-            date, source_kind, source_dir_key, reported_cost_usd
-         FROM usage_entries WHERE date LIKE ?".to_string();
-    let mut params_vec = Vec::new();
-    params_vec.push(rusqlite::types::Value::Text(query_month));
-
-    if assistant != "all" {
-        let assistants: Vec<&str> = assistant.split(',').collect();
-        let mut placeholders = Vec::new();
-        for a in assistants {
-            placeholders.push("?");
-            params_vec.push(rusqlite::types::Value::Text(a.to_string()));
-        }
-        query.push_str(&format!(
-            " AND assistant_type IN ({})",
-            placeholders.join(",")
-        ));
-    }
-    query.push_str(" ORDER BY timestamp ASC");
-
-    let mut stmt = conn.prepare(&query).map_err(|e| e.to_string())?;
-    let mut rows = stmt
-        .query(rusqlite::params_from_iter(params_vec))
-        .map_err(|e| e.to_string())?;
-
-    let mut entries = Vec::new();
-    while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-        let ast_type = row.get::<_, String>(30).map_err(|e| e.to_string())?;
-        let tokens_input: Option<u64> = row
-            .get::<_, Option<i64>>(9)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let tokens_output: Option<u64> = row
-            .get::<_, Option<i64>>(10)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let tokens_cache_read: Option<u64> = row
-            .get::<_, Option<i64>>(11)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let tokens_cache_write: Option<u64> = row
-            .get::<_, Option<i64>>(12)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let tokens_cache_write_5m: Option<u64> = row
-            .get::<_, Option<i64>>(13)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let tokens_cache_write_1h: Option<u64> = row
-            .get::<_, Option<i64>>(14)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let tokens_reasoning: Option<u64> = row
-            .get::<_, Option<i64>>(15)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let tokens_total: Option<u64> = row
-            .get::<_, Option<i64>>(16)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-
-        let tokens = if let (Some(input), Some(output), Some(total)) =
-            (tokens_input, tokens_output, tokens_total)
-        {
-            Some(TokenStats {
-                input,
-                output,
-                cache_read: tokens_cache_read,
-                cache_write: tokens_cache_write,
-                cache_write_5m: tokens_cache_write_5m,
-                cache_write_1h: tokens_cache_write_1h,
-                reasoning: tokens_reasoning,
-                total,
-            })
-        } else {
-            None
-        };
-
-        let delta_input: Option<u64> = row
-            .get::<_, Option<i64>>(17)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let delta_output: Option<u64> = row
-            .get::<_, Option<i64>>(18)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let delta_cache_read: Option<u64> = row
-            .get::<_, Option<i64>>(19)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let delta_cache_write: Option<u64> = row
-            .get::<_, Option<i64>>(20)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let delta_cache_write_5m: Option<u64> = row
-            .get::<_, Option<i64>>(21)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let delta_cache_write_1h: Option<u64> = row
-            .get::<_, Option<i64>>(22)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let delta_reasoning: Option<u64> = row
-            .get::<_, Option<i64>>(23)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let delta_total: Option<u64> = row
-            .get::<_, Option<i64>>(24)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-
-        let delta_tokens = if let (Some(input), Some(output), Some(total)) =
-            (delta_input, delta_output, delta_total)
-        {
-            Some(TokenStats {
-                input,
-                output,
-                cache_read: delta_cache_read,
-                cache_write: delta_cache_write,
-                cache_write_5m: delta_cache_write_5m,
-                cache_write_1h: delta_cache_write_1h,
-                reasoning: delta_reasoning,
-                total,
-            })
-        } else {
-            None
-        };
-
-        let duration_ms: Option<f64> = row
-            .get::<_, Option<i64>>(25)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as f64);
-        let premium_requests: Option<f64> = row
-            .get::<_, Option<i64>>(26)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as f64);
-
-        let reported_cost_usd: Option<f64> =
-            row.get::<_, Option<f64>>(35).map_err(|e| e.to_string())?;
-        let cost =
-            if duration_ms.is_some() || premium_requests.is_some() || reported_cost_usd.is_some() {
-                Some(CostStats {
-                    total_api_duration_ms: duration_ms,
-                    total_duration_ms: None,
-                    total_premium_requests: premium_requests,
-                    reported_cost_usd,
-                })
-            } else {
-                None
-            };
-
-        let entry_date = row.get::<_, String>(32).map_err(|e| e.to_string())?;
-
-        entries.push(DatedUsageEntry {
-            entry: UsageEntry {
-                timestamp: row.get(0).map_err(|e| e.to_string())?,
-                session_id: row.get(1).map_err(|e| e.to_string())?,
-                session_name: row.get(2).ok(),
-                transcript_path: row.get(3).ok(),
-                cwd: row.get(4).ok(),
-                version: row.get(5).ok(),
-                turn_no: row.get::<_, i64>(6).map_err(|e| e.to_string())? as u32,
-                model: row.get(7).ok(),
-                model_id: row.get(8).ok(),
-                tokens,
-                delta_tokens,
-                context: None,
-                cost,
-                source_kind: row.get(33).ok(),
-                source_dir_key: row.get(34).ok(),
-                parent_session_id: row.get(27).ok(),
-                agent_nickname: row.get(28).ok(),
-                agent_role: row.get(29).ok(),
-                reasoning_effort: row.get(31).ok(),
-            },
-            assistant_type: ast_type,
-            date: entry_date,
-        });
-    }
-    Ok(entries)
+    let rows = query_usage_entries(conn, &format!("{year_month}-%"), assistant, false)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| DatedUsageEntry {
+            entry: row.record.entry,
+            assistant_type: row.assistant_type,
+            date: row.date,
+        })
+        .collect())
 }
-
 pub fn get_available_years(
     conn: &rusqlite::Connection,
     assistant: &str,
@@ -6053,193 +5953,16 @@ pub fn get_usage_entries_by_year(
     year: &str,
     assistant: &str,
 ) -> Result<Vec<DatedUsageEntry>, String> {
-    let query_year = format!("{}-%", year);
-    let mut query = "SELECT
-            timestamp, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
-            tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_cache_write_5m, tokens_cache_write_1h, tokens_reasoning, tokens_total,
-            delta_input, delta_output, delta_cache_read, delta_cache_write, delta_cache_write_5m, delta_cache_write_1h, delta_reasoning, delta_total,
-            duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, assistant_type, reasoning_effort,
-            date, source_kind, source_dir_key, reported_cost_usd
-         FROM usage_entries WHERE date LIKE ?".to_string();
-    let mut params_vec = Vec::new();
-    params_vec.push(rusqlite::types::Value::Text(query_year));
-
-    if assistant != "all" {
-        let assistants: Vec<&str> = assistant.split(',').collect();
-        let mut placeholders = Vec::new();
-        for a in assistants {
-            placeholders.push("?");
-            params_vec.push(rusqlite::types::Value::Text(a.to_string()));
-        }
-        query.push_str(&format!(
-            " AND assistant_type IN ({})",
-            placeholders.join(",")
-        ));
-    }
-    query.push_str(" ORDER BY timestamp ASC");
-
-    let mut stmt = conn.prepare(&query).map_err(|e| e.to_string())?;
-    let mut rows = stmt
-        .query(rusqlite::params_from_iter(params_vec))
-        .map_err(|e| e.to_string())?;
-
-    let mut entries = Vec::new();
-    while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-        let ast_type = row.get::<_, String>(30).map_err(|e| e.to_string())?;
-        let tokens_input: Option<u64> = row
-            .get::<_, Option<i64>>(9)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let tokens_output: Option<u64> = row
-            .get::<_, Option<i64>>(10)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let tokens_cache_read: Option<u64> = row
-            .get::<_, Option<i64>>(11)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let tokens_cache_write: Option<u64> = row
-            .get::<_, Option<i64>>(12)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let tokens_cache_write_5m: Option<u64> = row
-            .get::<_, Option<i64>>(13)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let tokens_cache_write_1h: Option<u64> = row
-            .get::<_, Option<i64>>(14)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let tokens_reasoning: Option<u64> = row
-            .get::<_, Option<i64>>(15)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let tokens_total: Option<u64> = row
-            .get::<_, Option<i64>>(16)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-
-        let tokens = if let (Some(input), Some(output), Some(total)) =
-            (tokens_input, tokens_output, tokens_total)
-        {
-            Some(TokenStats {
-                input,
-                output,
-                cache_read: tokens_cache_read,
-                cache_write: tokens_cache_write,
-                cache_write_5m: tokens_cache_write_5m,
-                cache_write_1h: tokens_cache_write_1h,
-                reasoning: tokens_reasoning,
-                total,
-            })
-        } else {
-            None
-        };
-
-        let delta_input: Option<u64> = row
-            .get::<_, Option<i64>>(17)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let delta_output: Option<u64> = row
-            .get::<_, Option<i64>>(18)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let delta_cache_read: Option<u64> = row
-            .get::<_, Option<i64>>(19)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let delta_cache_write: Option<u64> = row
-            .get::<_, Option<i64>>(20)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let delta_cache_write_5m: Option<u64> = row
-            .get::<_, Option<i64>>(21)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let delta_cache_write_1h: Option<u64> = row
-            .get::<_, Option<i64>>(22)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let delta_reasoning: Option<u64> = row
-            .get::<_, Option<i64>>(23)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let delta_total: Option<u64> = row
-            .get::<_, Option<i64>>(24)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-
-        let delta_tokens = if let (Some(input), Some(output), Some(total)) =
-            (delta_input, delta_output, delta_total)
-        {
-            Some(TokenStats {
-                input,
-                output,
-                cache_read: delta_cache_read,
-                cache_write: delta_cache_write,
-                cache_write_5m: delta_cache_write_5m,
-                cache_write_1h: delta_cache_write_1h,
-                reasoning: delta_reasoning,
-                total,
-            })
-        } else {
-            None
-        };
-
-        let duration_ms: Option<f64> = row
-            .get::<_, Option<i64>>(25)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as f64);
-        let premium_requests: Option<f64> = row
-            .get::<_, Option<i64>>(26)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as f64);
-
-        let reported_cost_usd: Option<f64> =
-            row.get::<_, Option<f64>>(35).map_err(|e| e.to_string())?;
-        let cost =
-            if duration_ms.is_some() || premium_requests.is_some() || reported_cost_usd.is_some() {
-                Some(CostStats {
-                    total_api_duration_ms: duration_ms,
-                    total_duration_ms: None,
-                    total_premium_requests: premium_requests,
-                    reported_cost_usd,
-                })
-            } else {
-                None
-            };
-
-        let entry_date = row.get::<_, String>(32).map_err(|e| e.to_string())?;
-
-        entries.push(DatedUsageEntry {
-            entry: UsageEntry {
-                timestamp: row.get(0).map_err(|e| e.to_string())?,
-                session_id: row.get(1).map_err(|e| e.to_string())?,
-                session_name: row.get(2).ok(),
-                transcript_path: row.get(3).ok(),
-                cwd: row.get(4).ok(),
-                version: row.get(5).ok(),
-                turn_no: row.get::<_, i64>(6).map_err(|e| e.to_string())? as u32,
-                model: row.get(7).ok(),
-                model_id: row.get(8).ok(),
-                tokens,
-                delta_tokens,
-                context: None,
-                cost,
-                source_kind: row.get(33).ok(),
-                source_dir_key: row.get(34).ok(),
-                parent_session_id: row.get(27).ok(),
-                agent_nickname: row.get(28).ok(),
-                agent_role: row.get(29).ok(),
-                reasoning_effort: row.get(31).ok(),
-            },
-            assistant_type: ast_type,
-            date: entry_date,
-        });
-    }
-    Ok(entries)
+    let rows = query_usage_entries(conn, &format!("{year}-%"), assistant, false)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| DatedUsageEntry {
+            entry: row.record.entry,
+            assistant_type: row.assistant_type,
+            date: row.date,
+        })
+        .collect())
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6310,6 +6033,26 @@ mod tests {
             unique
         ));
         path
+    }
+
+    #[test]
+    fn recursive_jsonl_finder_includes_nested_case_insensitive_extensions_only() {
+        let root = temp_jsonl_path("recursive-jsonl-finder");
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        let root_jsonl = root.join("root.jsonl");
+        let nested_jsonl = nested.join("nested.JSONL");
+        fs::write(&root_jsonl, "{}\n").unwrap();
+        fs::write(&nested_jsonl, "{}\n").unwrap();
+        fs::write(nested.join("ignored.json"), "{}").unwrap();
+
+        let mut files = find_jsonl_files(&root);
+        files.sort();
+        let mut expected = vec![root_jsonl, nested_jsonl];
+        expected.sort();
+        assert_eq!(files, expected);
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     fn create_copilot_app_registry_from_events(app_dir: &Path) {
@@ -7230,6 +6973,9 @@ mod tests {
             &month_entries[0].entry,
             &year_entries[0].entry,
         ];
+        assert_eq!(day_entries[0].date, "2026-07-10");
+        assert_eq!(month_entries[0].date, "2026-07-10");
+        assert_eq!(year_entries[0].date, "2026-07-10");
 
         for entry in entries {
             let tokens = entry.tokens.as_ref().unwrap();
@@ -7299,13 +7045,10 @@ mod tests {
             Some("/tmp/vscode/session.json")
         );
 
-        let cwd = get_session_cwd(&conn, "copilot", "shared", Some("vscode-chat"), None).unwrap();
-        assert_eq!(cwd.as_deref(), Some("/tmp/vscode"));
-
-        let turns =
-            get_session_turns_token_stats(&conn, "copilot", "shared", Some("vscode-chat"), None)
-                .unwrap();
-        let (tokens, model) = turns.get(&1).unwrap();
+        let session_data = lookup.load_data(&conn, "shared").unwrap();
+        assert_eq!(session_data.cwd.as_deref(), Some("/tmp/vscode"));
+        assert_eq!(session_data.model.as_deref(), Some("gpt-4.1"));
+        let (tokens, model) = session_data.turn_stats.get(&1).unwrap();
         assert_eq!(tokens.input, 20);
         assert_eq!(tokens.output, 1);
         assert_eq!(tokens.total, 21);

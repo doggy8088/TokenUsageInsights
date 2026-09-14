@@ -17,73 +17,77 @@ pub(crate) fn is_safe_session_id(session_id: &str) -> bool {
         .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.')
 }
 
-fn resolve_claude_transcript_path(
-    claude_dir: &StdPath,
-    session_id: &str,
-    transcript_path_db: &str,
-) -> Result<PathBuf, String> {
-    let mut path = PathBuf::from(transcript_path_db);
-    if path.is_relative() {
-        path = claude_dir.join(path);
-    }
-
-    if !path.exists() {
-        return Err("找不到該會話的本地日誌檔案。".to_string());
-    }
-
-    let claude_root = claude_dir
-        .canonicalize()
-        .map_err(|_| "無法存取 Claude Code 根目錄。".to_string())?;
-    let canonical_path = path
-        .canonicalize()
-        .map_err(|_| "無法解析會話日誌路徑。".to_string())?;
-
-    if !canonical_path.starts_with(claude_root) {
-        return Err("會話日誌路徑不在預期目錄內。".to_string());
-    }
-
-    let file_name = canonical_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("");
-    if !file_name.contains(session_id) {
-        return Err("會話日誌路徑與 session id 不一致。".to_string());
-    }
-
-    Ok(canonical_path)
+enum TranscriptValidation<'a> {
+    Any,
+    FileNameContains(&'a str),
+    Jsonl,
+    ExactSessionFile {
+        file_name: &'a str,
+        session_id: &'a str,
+    },
 }
 
-fn resolve_codex_transcript_path(
-    codex_dir: &StdPath,
-    transcript_path_db: &str,
-) -> Result<PathBuf, String> {
-    let mut path = PathBuf::from(transcript_path_db);
-    if path.is_relative() {
-        path = codex_dir.join(path);
-    }
-
-    if !path.exists() {
-        return Err("找不到該 Codex 會話的本地日誌檔案。".to_string());
-    }
-
-    let codex_root = codex_dir
-        .canonicalize()
-        .map_err(|_| "無法存取 Codex 根目錄。".to_string())?;
-    let canonical_path = path
-        .canonicalize()
-        .map_err(|_| "無法解析 Codex 會話日誌路徑。".to_string())?;
-
-    if !canonical_path.starts_with(codex_root) {
-        return Err("Codex 會話日誌路徑不在預期目錄內。".to_string());
-    }
-
-    Ok(canonical_path)
+struct TranscriptPathPolicy<'a> {
+    assistant_label: &'a str,
+    validation: TranscriptValidation<'a>,
 }
 
-fn resolve_pi_family_transcript_path(
+impl TranscriptPathPolicy<'_> {
+    fn validate(&self, path: &StdPath) -> Result<(), String> {
+        let format_error = || format!("{} session 日誌格式不受支援。", self.assistant_label);
+        let identity_error = || {
+            format!(
+                "{} session 日誌路徑與 session id 不一致。",
+                self.assistant_label
+            )
+        };
+
+        match &self.validation {
+            TranscriptValidation::Any => Ok(()),
+            TranscriptValidation::FileNameContains(session_id) => {
+                let matches_session = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains(session_id));
+                if matches_session {
+                    Ok(())
+                } else {
+                    Err(identity_error())
+                }
+            }
+            TranscriptValidation::Jsonl => {
+                if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+                    Ok(())
+                } else {
+                    Err(format_error())
+                }
+            }
+            TranscriptValidation::ExactSessionFile {
+                file_name,
+                session_id,
+            } => {
+                if path.file_name().and_then(|name| name.to_str()) != Some(file_name) {
+                    return Err(format_error());
+                }
+                let matches_session = path
+                    .parent()
+                    .and_then(|parent| parent.file_name())
+                    .and_then(|name| name.to_str())
+                    == Some(session_id);
+                if matches_session {
+                    Ok(())
+                } else {
+                    Err(identity_error())
+                }
+            }
+        }
+    }
+}
+
+fn resolve_transcript_path(
     base_dir: &StdPath,
-    assistant_label: &str,
     transcript_path_db: &str,
+    policy: TranscriptPathPolicy<'_>,
 ) -> Result<PathBuf, String> {
     let mut path = PathBuf::from(transcript_path_db);
     if path.is_relative() {
@@ -92,27 +96,71 @@ fn resolve_pi_family_transcript_path(
 
     if !path.exists() {
         return Err(format!(
-            "找不到該 {assistant_label} session 的本地日誌檔案。"
+            "找不到該 {} session 的本地日誌檔案。",
+            policy.assistant_label
         ));
     }
 
     let base_root = base_dir
         .canonicalize()
-        .map_err(|_| format!("無法存取 {assistant_label} 根目錄。"))?;
+        .map_err(|_| format!("無法存取 {} 根目錄。", policy.assistant_label))?;
     let canonical_path = path
         .canonicalize()
-        .map_err(|_| format!("無法解析 {assistant_label} session 日誌路徑。"))?;
+        .map_err(|_| format!("無法解析 {} session 日誌路徑。", policy.assistant_label))?;
 
     if !canonical_path.starts_with(&base_root) {
         return Err(format!(
-            "{assistant_label} session 日誌路徑不在預期目錄內。"
+            "{} session 日誌路徑不在預期目錄內。",
+            policy.assistant_label
         ));
     }
-    if canonical_path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
-        return Err(format!("{assistant_label} session 日誌格式不受支援。"));
-    }
 
+    policy.validate(&canonical_path)?;
     Ok(canonical_path)
+}
+
+fn resolve_claude_transcript_path(
+    claude_dir: &StdPath,
+    session_id: &str,
+    transcript_path_db: &str,
+) -> Result<PathBuf, String> {
+    resolve_transcript_path(
+        claude_dir,
+        transcript_path_db,
+        TranscriptPathPolicy {
+            assistant_label: "Claude Code",
+            validation: TranscriptValidation::FileNameContains(session_id),
+        },
+    )
+}
+
+fn resolve_codex_transcript_path(
+    codex_dir: &StdPath,
+    transcript_path_db: &str,
+) -> Result<PathBuf, String> {
+    resolve_transcript_path(
+        codex_dir,
+        transcript_path_db,
+        TranscriptPathPolicy {
+            assistant_label: "Codex",
+            validation: TranscriptValidation::Any,
+        },
+    )
+}
+
+fn resolve_pi_family_transcript_path(
+    base_dir: &StdPath,
+    assistant_label: &str,
+    transcript_path_db: &str,
+) -> Result<PathBuf, String> {
+    resolve_transcript_path(
+        base_dir,
+        transcript_path_db,
+        TranscriptPathPolicy {
+            assistant_label,
+            validation: TranscriptValidation::Jsonl,
+        },
+    )
 }
 
 fn resolve_cursor_transcript_path(
@@ -120,35 +168,14 @@ fn resolve_cursor_transcript_path(
     session_id: &str,
     transcript_path_db: &str,
 ) -> Result<PathBuf, String> {
-    let mut path = PathBuf::from(transcript_path_db);
-    if path.is_relative() {
-        path = cursor_dir.join(path);
-    }
-
-    if !path.exists() {
-        return Err("找不到該 Cursor 會話的本地日誌檔案。".to_string());
-    }
-
-    let cursor_root = cursor_dir
-        .canonicalize()
-        .map_err(|_| "無法存取 Cursor 根目錄。".to_string())?;
-    let canonical_path = path
-        .canonicalize()
-        .map_err(|_| "無法解析 Cursor 會話日誌路徑。".to_string())?;
-
-    if !canonical_path.starts_with(cursor_root) {
-        return Err("Cursor 會話日誌路徑不在預期目錄內。".to_string());
-    }
-
-    let file_name = canonical_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("");
-    if !file_name.contains(session_id) {
-        return Err("會話日誌路徑與 session id 不一致。".to_string());
-    }
-
-    Ok(canonical_path)
+    resolve_transcript_path(
+        cursor_dir,
+        transcript_path_db,
+        TranscriptPathPolicy {
+            assistant_label: "Cursor",
+            validation: TranscriptValidation::FileNameContains(session_id),
+        },
+    )
 }
 
 fn resolve_grok_transcript_path(
@@ -156,40 +183,18 @@ fn resolve_grok_transcript_path(
     session_id: &str,
     transcript_path_db: &str,
 ) -> Result<PathBuf, String> {
-    let mut path = PathBuf::from(transcript_path_db);
-    if path.is_relative() {
-        path = grok_dir.join(path);
-    }
-
-    if !path.exists() {
-        return Err("找不到該 Grok Build session 的本地日誌檔案。".to_string());
-    }
-
-    let grok_root = grok_dir
-        .canonicalize()
-        .map_err(|_| "無法存取 Grok Build 根目錄。".to_string())?;
-    let canonical_path = path
-        .canonicalize()
-        .map_err(|_| "無法解析 Grok Build session 日誌路徑。".to_string())?;
-
-    if !canonical_path.starts_with(&grok_root) {
-        return Err("Grok Build session 日誌路徑不在預期目錄內。".to_string());
-    }
-    if canonical_path.file_name().and_then(|name| name.to_str()) != Some("updates.jsonl") {
-        return Err("Grok Build session 日誌格式不受支援。".to_string());
-    }
-    if canonical_path
-        .parent()
-        .and_then(|parent| parent.file_name())
-        .and_then(|name| name.to_str())
-        != Some(session_id)
-    {
-        return Err("Grok Build session 日誌路徑與 session id 不一致。".to_string());
-    }
-
-    Ok(canonical_path)
+    resolve_transcript_path(
+        grok_dir,
+        transcript_path_db,
+        TranscriptPathPolicy {
+            assistant_label: "Grok Build",
+            validation: TranscriptValidation::ExactSessionFile {
+                file_name: "updates.jsonl",
+                session_id,
+            },
+        },
+    )
 }
-
 fn resolve_vscode_transcript_path(transcript_path_db: &str) -> Result<PathBuf, String> {
     let path = PathBuf::from(transcript_path_db);
     if !path.exists() {
@@ -621,6 +626,50 @@ mod tests {
             "token-insights-test-{prefix}-{}-{unique}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn transcript_resolvers_share_containment_and_enforce_source_shape() {
+        let root = copilot_app_fixture_dir("transcript-resolvers");
+        fs::create_dir_all(&root).unwrap();
+        let claude_path = root.join("claude-session.jsonl");
+        let text_path = root.join("session.txt");
+        let grok_session_dir = root.join("grok-session");
+        let grok_path = grok_session_dir.join("updates.jsonl");
+        fs::create_dir_all(&grok_session_dir).unwrap();
+        fs::write(&claude_path, "{}\n").unwrap();
+        fs::write(&text_path, "{}\n").unwrap();
+        fs::write(&grok_path, "{}\n").unwrap();
+
+        assert_eq!(
+            resolve_claude_transcript_path(&root, "claude-session", &claude_path.to_string_lossy())
+                .unwrap(),
+            claude_path.canonicalize().unwrap()
+        );
+        assert!(resolve_claude_transcript_path(
+            &root,
+            "another-session",
+            &claude_path.to_string_lossy()
+        )
+        .is_err());
+        assert!(resolve_pi_family_transcript_path(
+            &root,
+            "Pi Coding Agent",
+            &text_path.to_string_lossy()
+        )
+        .is_err());
+        assert_eq!(
+            resolve_grok_transcript_path(&root, "grok-session", &grok_path.to_string_lossy())
+                .unwrap(),
+            grok_path.canonicalize().unwrap()
+        );
+
+        let outside_path = root.with_extension("outside.jsonl");
+        fs::write(&outside_path, "{}\n").unwrap();
+        assert!(resolve_codex_transcript_path(&root, &outside_path.to_string_lossy()).is_err());
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_file(&outside_path);
     }
 
     fn write_copilot_app_events(app_dir: &StdPath, session_id: &str, lines: &[&str]) {
