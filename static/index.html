@@ -20,7 +20,7 @@
     document.documentElement.setAttribute('data-theme', savedTheme);
   </script>
   <!-- CSS Stylesheet -->
-  <link rel="stylesheet" href="/static/styles.css?v=31">
+  <link rel="stylesheet" href="/static/styles.css?v=32">
   <!-- Chart.js for beautiful charts -->
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <!-- Marked.js for rendering markdown response -->
@@ -36,6 +36,7 @@
   <div class="app-container">
     <!-- Sidebar: Date selector & Overview Cards -->
     <aside class="app-sidebar">
+      <div class="sidebar-scroll-area">
       <div class="brand">
         <div class="logo"><img id="brand-logo-img" src="/static/favicon-v2.png" /></div>
         <div class="title-group">
@@ -322,6 +323,8 @@
           <span class="value" id="mini-requests">-</span>
         </div>
       </div>
+      </div>
+      <footer class="sidebar-version" aria-label="應用程式版本">v1.0.0 (2026/9/14)</footer>
     </aside>
 
     <!-- Main Content Area -->
