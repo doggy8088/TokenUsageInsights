@@ -443,6 +443,13 @@ pub(crate) struct SessionFileErrorExt {
     pub reason: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct SessionFileResolutionContext<'a> {
+    pub copilot_app_source_dir: Option<&'a StdPath>,
+    pub parent_session_id: Option<&'a str>,
+    pub agent_nickname: Option<&'a str>,
+}
+
 impl SessionFileErrorExt {
     fn new(status: StatusCode, error: impl Into<String>) -> Self {
         Self {
@@ -470,9 +477,7 @@ pub(crate) fn resolve_session_file_path(
     session_id: &str,
     transcript_path_db: Option<&str>,
     source_kind: &str,
-    copilot_app_source_dir: Option<&StdPath>,
-    copilot_app_parent_session_id: Option<&str>,
-    copilot_app_agent_nickname: Option<&str>,
+    context: SessionFileResolutionContext<'_>,
 ) -> Result<PathBuf, SessionFileErrorExt> {
     match assistant {
         "antigravity" => Ok(db::get_antigravity_dir()
@@ -490,7 +495,7 @@ pub(crate) fn resolve_session_file_path(
                 .map_err(|error| SessionFileErrorExt::new(StatusCode::BAD_REQUEST, error))
         }
         "copilot" if source_kind == "copilot-app" => {
-            let source_dir = copilot_app_source_dir.ok_or_else(|| {
+            let source_dir = context.copilot_app_source_dir.ok_or_else(|| {
                 SessionFileErrorExt::with_reason(
                     StatusCode::NOT_FOUND,
                     "找不到 Copilot App session 對應的已登錄來源目錄。",
@@ -499,16 +504,16 @@ pub(crate) fn resolve_session_file_path(
             })?;
             resolve_copilot_app_events_path(
                 source_dir,
-                copilot_app_parent_session_id.unwrap_or(session_id),
-                copilot_app_agent_nickname,
+                context.parent_session_id.unwrap_or(session_id),
+                context.agent_nickname,
             )
         }
-        "copilot" if source_kind == "copilot-cli" && copilot_app_parent_session_id.is_some() => {
+        "copilot" if source_kind == "copilot-cli" && context.parent_session_id.is_some() => {
             // CLI subagent synthetic session: locate the shared events.jsonl
             // under the parent session's directory, not the synthetic id's.
             resolve_copilot_cli_subagent_events_path(
                 &db::get_copilot_dir(),
-                copilot_app_parent_session_id.unwrap(),
+                context.parent_session_id.unwrap(),
             )
         }
         "copilot" => {
@@ -696,9 +701,10 @@ mod tests {
             session_id,
             None,
             "copilot-app",
-            Some(&source_b),
-            None,
-            None,
+            SessionFileResolutionContext {
+                copilot_app_source_dir: Some(&source_b),
+                ..SessionFileResolutionContext::default()
+            },
         )
         .unwrap();
 

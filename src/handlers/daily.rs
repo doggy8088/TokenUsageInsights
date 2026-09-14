@@ -10,8 +10,12 @@ use std::{collections::HashMap, path::PathBuf};
 use super::*;
 use crate::db;
 use crate::pricing::{load_prepared_pricing_rules, PreparedPricingRules};
+use crate::reporting::group_sessions;
 use crate::session_details::{load_session_details, parse_session_timeline_file};
-use crate::session_files::{is_safe_session_id, resolve_session_file_path};
+use crate::session_files::{
+    is_safe_session_id, resolve_session_file_path, SessionFileResolutionContext,
+};
+use crate::session_identity::SessionIdentity;
 use crate::timeline::TimelineItem;
 
 #[cfg(test)]
@@ -36,63 +40,30 @@ fn aggregate_usage_details(
     pricing_rules: &PreparedPricingRules,
 ) -> (DaySummary, Vec<SessionSummary>, Vec<RawUsageEntry>) {
     let mut summary = DaySummary::default();
-    // Preserve the complete session identity across combined-assistant reports,
-    // source kinds, and distinct Copilot App directories.
-    type SessionKey = (String, String, String, Option<String>);
-    let mut sessions_map: HashMap<SessionKey, Vec<UsageEntry>> = HashMap::new();
-    let mut entries = Vec::new();
-
-    for (record, ast_type) in entries_with_type {
-        let e = &record.entry;
-        entries.push(RawUsageEntry {
-            assistant_type: ast_type.clone(),
-            entry: e.clone(),
-        });
-        let source_kind = e
-            .source_kind
-            .clone()
-            .unwrap_or_else(|| "legacy".to_string());
-        let key = (
-            ast_type.clone(),
-            source_kind,
-            e.session_id.clone(),
-            e.source_dir_key.clone(),
-        );
-        sessions_map.entry(key).or_default().push(e.clone());
-    }
+    let sessions_map = group_sessions(
+        entries_with_type
+            .iter()
+            .map(|(record, assistant_type)| (&record.entry, assistant_type.as_str())),
+    );
+    let entries = entries_with_type
+        .iter()
+        .map(|(record, assistant_type)| RawUsageEntry {
+            assistant_type: assistant_type.clone(),
+            entry: record.entry.clone(),
+        })
+        .collect::<Vec<_>>();
 
     summary.total_sessions = sessions_map.len();
-    let mut session_last_entries: HashMap<SessionKey, UsageEntry> = HashMap::new();
-    for raw_entry in &entries {
-        let e = &raw_entry.entry;
-        let source_kind = e
-            .source_kind
-            .clone()
-            .unwrap_or_else(|| "legacy".to_string());
-        let key = (
-            raw_entry.assistant_type.clone(),
-            source_kind,
-            e.session_id.clone(),
-            e.source_dir_key.clone(),
-        );
-        let last_e = session_last_entries.entry(key).or_insert_with(|| e.clone());
-        if e.turn_no > last_e.turn_no {
-            *last_e = e.clone();
-        }
-    }
 
     let mut sessions_summary = Vec::new();
-    for ((ast_type, source_kind, session_id, source_dir_key), s_entries) in &sessions_map {
-        let key = (
-            ast_type.clone(),
-            source_kind.clone(),
-            session_id.clone(),
-            source_dir_key.clone(),
-        );
-        let last_entry = session_last_entries
-            .get(&key)
-            .cloned()
-            .unwrap_or_else(|| s_entries[0].clone());
+    for (identity, group) in &sessions_map {
+        let s_entries = &group.entries;
+        let mut last_entry = &s_entries[0];
+        for entry in &s_entries[1..] {
+            if entry.turn_no > last_entry.turn_no {
+                last_entry = entry;
+            }
+        }
         let session_usage = summarize_session_usage(pricing_rules, s_entries);
 
         let session_duration = last_entry
@@ -112,14 +83,15 @@ fn aggregate_usage_details(
         add_usage_to_day_summary(&mut summary, &session_usage.usage);
 
         sessions_summary.push(SessionSummary {
-            session_id: session_id.clone(),
+            session_id: identity.session_id.clone(),
             session_name: last_entry
                 .session_name
+                .clone()
                 .unwrap_or_else(|| "Start Coding Session".to_string()),
-            assistant_type: ast_type.clone(),
-            source_kind: source_kind.clone(),
-            source_dir_key: source_dir_key.clone(),
-            cwd: last_entry.cwd.unwrap_or_default(),
+            assistant_type: identity.assistant_type.clone(),
+            source_kind: identity.source_kind.clone(),
+            source_dir_key: identity.source_dir_key.clone(),
+            cwd: last_entry.cwd.clone().unwrap_or_default(),
             model: session_usage.display_model,
             total_tokens: session_usage.usage.total_tokens,
             total_input_tokens: session_usage.usage.input_tokens,
@@ -189,29 +161,21 @@ struct SearchableSession {
     model: Option<String>,
 }
 
-type SearchSessionKey = (String, String, Option<String>, String);
-
 fn group_searchable_sessions(
     entries: Vec<(db::UsageDayExportRecord, String)>,
-) -> HashMap<SearchSessionKey, SearchableSession> {
+) -> HashMap<SessionIdentity, SearchableSession> {
     let mut sessions = HashMap::new();
     for (record, assistant_type) in entries {
         let entry = record.entry;
-        let source_kind = entry
-            .source_kind
-            .clone()
-            .unwrap_or_else(|| "legacy".to_string());
-        let key = (
-            assistant_type.clone(),
-            source_kind.clone(),
-            entry.source_dir_key.clone(),
-            entry.session_id.clone(),
-        );
+        let key = SessionIdentity::from_entry(&assistant_type, &entry);
         let session = sessions.entry(key).or_insert_with(|| SearchableSession {
             session_id: entry.session_id.clone(),
             assistant_type,
             transcript_path: entry.transcript_path.clone(),
-            source_kind,
+            source_kind: entry
+                .source_kind
+                .clone()
+                .unwrap_or_else(|| "legacy".to_string()),
             source_dir_key: entry.source_dir_key.clone(),
             parent_session_id: entry.parent_session_id.clone(),
             agent_nickname: entry.agent_nickname.clone(),
@@ -562,9 +526,11 @@ pub async fn search_sessions_by_user_prompt(
                     &session.session_id,
                     session.transcript_path.as_deref(),
                     &session.source_kind,
-                    copilot_app_source_dir.as_deref(),
-                    session.parent_session_id.as_deref(),
-                    session.agent_nickname.as_deref(),
+                    SessionFileResolutionContext {
+                        copilot_app_source_dir: copilot_app_source_dir.as_deref(),
+                        parent_session_id: session.parent_session_id.as_deref(),
+                        agent_nickname: session.agent_nickname.as_deref(),
+                    },
                 ) {
                     Ok(path) if path.exists() => path,
                     _ => {
@@ -879,12 +845,12 @@ mod tests {
 
         assert_eq!(sessions.len(), 2);
         for source_dir_key in ["aa", "bb"] {
-            assert!(sessions.contains_key(&(
-                "copilot".to_string(),
-                "copilot-app".to_string(),
-                Some(source_dir_key.to_string()),
-                "shared-search-session".to_string(),
-            )));
+            assert!(sessions.contains_key(&SessionIdentity {
+                assistant_type: "copilot".to_string(),
+                source_kind: "copilot-app".to_string(),
+                source_dir_key: Some(source_dir_key.to_string()),
+                session_id: "shared-search-session".to_string(),
+            }));
         }
     }
 

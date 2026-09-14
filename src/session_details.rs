@@ -4,7 +4,7 @@ use std::{collections::HashMap, fs::File, io::BufReader, path::Path};
 
 use crate::{
     db::{self, TokenStats},
-    session_files::{resolve_session_file_path, SessionFileErrorExt},
+    session_files::{resolve_session_file_path, SessionFileErrorExt, SessionFileResolutionContext},
     timeline::{
         parse_antigravity_timeline, parse_claude_timeline, parse_codex_timeline,
         parse_copilot_timeline_filtered, parse_cursor_timeline, parse_grok_timeline,
@@ -301,9 +301,11 @@ pub(crate) fn load_session_details(
         &session_id,
         transcript_path_db.as_deref(),
         &source_kind,
-        copilot_app_source_dir.as_deref(),
-        parent_session_id.as_deref(),
-        agent_nickname.as_deref(),
+        SessionFileResolutionContext {
+            copilot_app_source_dir: copilot_app_source_dir.as_deref(),
+            parent_session_id: parent_session_id.as_deref(),
+            agent_nickname: agent_nickname.as_deref(),
+        },
     )?;
     if !filepath.exists() {
         let session_dir_exists = if resolved_assistant == "copilot" {

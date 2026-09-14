@@ -7,7 +7,7 @@
     "token-usage-insights": "npm/cli.cjs"
   },
   "scripts": {
-    "test": "node --test tests/npm-package.test.cjs tests/session-utils.test.mjs",
+    "test": "node --test tests/npm-package.test.cjs tests/chart-utils.test.mjs tests/session-utils.test.mjs",
     "check:package": "npm test && npm pack --dry-run --ignore-scripts && node npm/prepublish-check.cjs",
     "prepublishOnly": "npm run check:package"
   },

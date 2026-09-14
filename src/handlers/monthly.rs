@@ -9,7 +9,8 @@ use std::collections::HashMap;
 use super::*;
 use crate::db;
 use crate::pricing::{load_prepared_pricing_rules, PreparedPricingRules};
-use crate::reporting::{build_period_report, cursor_session_mode, group_sessions, SessionIdentity};
+use crate::reporting::{build_period_report, cursor_session_mode, group_sessions};
+use crate::session_identity::SessionIdentity;
 
 #[derive(serde::Deserialize)]
 pub struct ModelSessionsQuery {

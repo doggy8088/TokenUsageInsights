@@ -1,5 +1,27 @@
 use super::*;
 
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct ClaudeUsage {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    cache_creation_input_tokens: u64,
+    #[serde(default)]
+    cache_read_input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+    #[serde(default)]
+    cache_creation: ClaudeCacheCreation,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct ClaudeCacheCreation {
+    #[serde(default)]
+    ephemeral_5m_input_tokens: u64,
+    #[serde(default)]
+    ephemeral_1h_input_tokens: u64,
+}
+
 pub(super) fn find_claude_session_files(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     if let Ok(entries) = fs::read_dir(dir) {

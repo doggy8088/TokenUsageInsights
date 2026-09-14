@@ -25,6 +25,7 @@ mod pricing;
 mod reporting;
 mod session_details;
 mod session_files;
+mod session_identity;
 mod timeline;
 mod updater;
 mod vscode;

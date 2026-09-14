@@ -1,5 +1,22 @@
 use super::*;
 
+// Shared by the Codex CLI and Desktop transcript formats.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct CodexTokenUsage {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    cached_input_tokens: u64,
+    #[serde(default)]
+    cache_write_input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+    #[serde(default)]
+    reasoning_output_tokens: u64,
+    #[serde(default)]
+    total_tokens: u64,
+}
+
 pub(super) fn find_codex_session_files(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     if let Ok(entries) = fs::read_dir(dir) {

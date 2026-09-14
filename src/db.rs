@@ -121,46 +121,6 @@ pub struct UsageImportRollbackSummary {
     pub removed_records: usize,
 }
 
-// Claude Code helper structs
-#[derive(Debug, Clone, Default, Deserialize)]
-struct ClaudeUsage {
-    #[serde(default)]
-    input_tokens: u64,
-    #[serde(default)]
-    cache_creation_input_tokens: u64,
-    #[serde(default)]
-    cache_read_input_tokens: u64,
-    #[serde(default)]
-    output_tokens: u64,
-    #[serde(default)]
-    cache_creation: ClaudeCacheCreation,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-struct ClaudeCacheCreation {
-    #[serde(default)]
-    ephemeral_5m_input_tokens: u64,
-    #[serde(default)]
-    ephemeral_1h_input_tokens: u64,
-}
-
-// Codex helper structs shared by the CLI and Desktop session formats.
-#[derive(Debug, Clone, Default, Deserialize)]
-struct CodexTokenUsage {
-    #[serde(default)]
-    input_tokens: u64,
-    #[serde(default)]
-    cached_input_tokens: u64,
-    #[serde(default)]
-    cache_write_input_tokens: u64,
-    #[serde(default)]
-    output_tokens: u64,
-    #[serde(default)]
-    reasoning_output_tokens: u64,
-    #[serde(default)]
-    total_tokens: u64,
-}
-
 const CODEX_PARSER_MIGRATION_KEY: &str = "migration:codex_session_identity_v7";
 const CODEX_SOURCE_KIND_MIGRATION_KEY: &str = "migration:codex_source_kind_v1";
 const CODEX_CLI_SOURCE_KIND: &str = "codex-cli";

@@ -7,7 +7,7 @@ import {
   calculateMovingAverageViewportTrend,
   getChartDataPointX,
   parseUsageTimestamp,
-} from './chart-utils.js?v=7';
+} from './chart-utils.js?v=8';
 import {
   compareSessionRows,
   filterEntriesBySessionIdentity,
