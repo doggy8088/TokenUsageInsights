@@ -1,10 +1,12 @@
 use crate::{
-    db::{TokenStats, UsageEntry},
-    pricing::PreparedPricingRules,
+    db::UsageEntry,
+    reporting::{
+        summarize_session_usage, AgentBreakdown, DaySummary, MonthlyModelSummary,
+        MonthlyProjectSummary, UsageAggregation,
+    },
 };
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
-use std::sync::{LazyLock, Mutex};
+use std::collections::HashMap;
 
 pub mod daily;
 pub mod misc;
@@ -36,179 +38,6 @@ pub fn is_supported_assistant(assistant: &str) -> bool {
         normalize_assistant_name(assistant).as_str(),
         "antigravity" | "copilot" | "codex" | "claude" | "cursor" | "grok" | "pi" | "omp" | "muse"
     )
-}
-
-#[derive(Debug, Clone, Default)]
-pub(crate) struct UsageAggregation {
-    pub total_tokens: u64,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cache_read_tokens: u64,
-    pub cache_write_tokens: u64,
-    pub cache_write_5m_tokens: u64,
-    pub cache_write_1h_tokens: u64,
-    pub reasoning_tokens: u64,
-    pub cost_usd: f64,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct ModelUsageAggregation {
-    pub model: String,
-    pub usage: UsageAggregation,
-}
-
-#[derive(Debug, Clone, Default)]
-pub(crate) struct SessionUsageAggregation {
-    pub usage: UsageAggregation,
-    pub models: Vec<ModelUsageAggregation>,
-    pub display_model: String,
-}
-
-fn has_usage(tokens: &TokenStats) -> bool {
-    tokens.total > 0
-        || tokens.input > 0
-        || tokens.output > 0
-        || tokens.cache_read.unwrap_or(0) > 0
-        || tokens.cache_write.unwrap_or(0) > 0
-        || tokens.reasoning.unwrap_or(0) > 0
-}
-
-fn add_tokens(aggregation: &mut UsageAggregation, tokens: &TokenStats) {
-    aggregation.total_tokens += tokens.total;
-    aggregation.input_tokens += tokens.input;
-    aggregation.output_tokens += tokens.output;
-    aggregation.cache_read_tokens += tokens.cache_read.unwrap_or(0);
-    aggregation.cache_write_tokens += tokens.cache_write.unwrap_or(0);
-    let (cache_write_5m, cache_write_1h) = cache_write_breakdown(tokens);
-    aggregation.cache_write_5m_tokens += cache_write_5m;
-    aggregation.cache_write_1h_tokens += cache_write_1h;
-    aggregation.reasoning_tokens += tokens.reasoning.unwrap_or(0);
-}
-
-fn cache_write_breakdown(tokens: &TokenStats) -> (u64, u64) {
-    (
-        tokens.cache_write_5m.unwrap_or(0),
-        tokens.cache_write_1h.unwrap_or(0),
-    )
-}
-
-fn entry_model(entry: &UsageEntry) -> Option<&str> {
-    entry
-        .model
-        .as_deref()
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-}
-
-static WARNED_PRICING_MODELS: LazyLock<Mutex<HashSet<String>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
-
-fn log_pricing_failure(model: &str, session_id: &str, turn_no: u32, error: &str) {
-    let mut warned = match WARNED_PRICING_MODELS.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    if warned.insert(model.to_string()) {
-        eprintln!(
-            "計算成本失敗: session_id={} turn_no={} model={}: {}（此模型後續不再重複提示）",
-            session_id, turn_no, model, error
-        );
-    }
-}
-
-fn record_usage(
-    result: &mut SessionUsageAggregation,
-    pricing_rules: &PreparedPricingRules,
-    entry: &UsageEntry,
-    tokens: &TokenStats,
-) {
-    let model = entry_model(entry);
-    let model_label = model.unwrap_or("Unknown Model");
-    let (cache_write_5m, cache_write_1h) = cache_write_breakdown(tokens);
-    let cost_usd =
-        if let Some(reported_cost) = entry.cost.as_ref().and_then(|cost| cost.reported_cost_usd) {
-            reported_cost
-        } else {
-            match pricing_rules.calculate_usage_cost(
-                model,
-                tokens.input,
-                tokens.output,
-                tokens.cache_read.unwrap_or(0),
-                cache_write_5m,
-                cache_write_1h,
-            ) {
-                Ok(cost) => cost,
-                Err(error) => {
-                    log_pricing_failure(model_label, &entry.session_id, entry.turn_no, &error);
-                    0.0
-                }
-            }
-        };
-
-    add_tokens(&mut result.usage, tokens);
-    result.usage.cost_usd += cost_usd;
-
-    let model_usage = if let Some(existing) = result
-        .models
-        .iter_mut()
-        .find(|item| item.model == model_label)
-    {
-        existing
-    } else {
-        result.models.push(ModelUsageAggregation {
-            model: model_label.to_string(),
-            usage: UsageAggregation::default(),
-        });
-        result.models.last_mut().unwrap()
-    };
-    add_tokens(&mut model_usage.usage, tokens);
-    model_usage.usage.cost_usd += cost_usd;
-}
-
-pub(crate) fn summarize_session_usage(
-    pricing_rules: &PreparedPricingRules,
-    entries: &[UsageEntry],
-) -> SessionUsageAggregation {
-    let has_delta_usage = entries
-        .iter()
-        .filter_map(|entry| entry.delta_tokens.as_ref())
-        .any(has_usage);
-    let mut result = SessionUsageAggregation::default();
-    let mut display_entry: Option<&UsageEntry> = None;
-
-    if has_delta_usage {
-        for entry in entries {
-            let Some(tokens) = entry
-                .delta_tokens
-                .as_ref()
-                .filter(|tokens| has_usage(tokens))
-            else {
-                continue;
-            };
-            record_usage(&mut result, pricing_rules, entry, tokens);
-            if display_entry.is_none_or(|current| entry.turn_no >= current.turn_no) {
-                display_entry = Some(entry);
-            }
-        }
-    } else if let Some(entry) = entries
-        .iter()
-        .filter(|entry| entry.tokens.as_ref().is_some_and(has_usage))
-        .max_by_key(|entry| entry.turn_no)
-    {
-        record_usage(
-            &mut result,
-            pricing_rules,
-            entry,
-            entry.tokens.as_ref().unwrap(),
-        );
-        display_entry = Some(entry);
-    }
-
-    result.display_model = display_entry
-        .and_then(entry_model)
-        .unwrap_or("Unknown Model")
-        .to_string();
-    result
 }
 
 #[derive(Serialize)]
@@ -246,20 +75,6 @@ pub struct AssistantSetupStatus {
     pub script_path: String,
     pub source_script_path: String,
     pub settings_path: String,
-}
-
-#[derive(Serialize, Default, Clone)]
-pub struct DaySummary {
-    pub total_sessions: usize,
-    pub total_tokens: u64,
-    pub total_input_tokens: u64,
-    pub total_output_tokens: u64,
-    pub total_cache_read_tokens: u64,
-    pub total_cache_write_tokens: u64,
-    pub total_reasoning_tokens: u64,
-    pub total_duration_ms: u64,
-    pub total_requests: u64,
-    pub total_cost_usd: f64,
 }
 
 #[derive(Serialize, Clone)]
@@ -309,26 +124,6 @@ pub struct MonthlyDailyBreakdown {
     pub cost_usd: f64,
 }
 
-#[derive(Serialize)]
-pub struct MonthlyProjectSummary {
-    pub cwd: String,
-    pub sessions_count: usize,
-    pub total_tokens: u64,
-    pub cost_usd: f64,
-}
-
-#[derive(Serialize)]
-pub struct MonthlyModelSummary {
-    pub model: String,
-    pub mode: Option<String>,
-    pub sessions_count: usize,
-    pub total_tokens: u64,
-    pub total_input_tokens: u64,
-    pub total_output_tokens: u64,
-    pub total_cache_read_tokens: u64,
-    pub cost_usd: f64,
-}
-
 #[derive(Serialize, Clone)]
 pub struct ModelSessionDetail {
     pub session_id: String,
@@ -372,17 +167,6 @@ pub struct ModelSessionsResponse {
     pub sessions: Vec<ModelSessionDetail>,
 }
 
-#[derive(Serialize, Default, Clone)]
-pub struct AgentBreakdown {
-    pub total_tokens: u64,
-    pub total_input_tokens: u64,
-    pub total_output_tokens: u64,
-    pub total_cache_read_tokens: u64,
-    pub total_reasoning_tokens: u64,
-    pub total_cost_usd: f64,
-    pub total_sessions: usize,
-}
-
 #[derive(Serialize)]
 pub struct MonthlyDetailsResponse {
     pub year_month: String,
@@ -423,7 +207,7 @@ pub struct YearListResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db;
+    use crate::db::{self, TokenStats};
     use crate::pricing::PreparedPricingRules;
     use crate::pricing::PricingRule;
     use std::env;
@@ -726,10 +510,7 @@ mod tests {
         assert_eq!(result.models[0].model, "copilot/auto");
         assert_eq!(result.models[0].usage.cost_usd, 0.0);
 
-        // Verify the model was recorded in WARNED_PRICING_MODELS so subsequent logs are suppressed
-        assert!(WARNED_PRICING_MODELS
-            .lock()
-            .unwrap()
-            .contains("copilot/auto"));
+        // Verify the model was recorded so subsequent pricing warnings are suppressed.
+        assert!(crate::reporting::was_pricing_model_warned("copilot/auto"));
     }
 }

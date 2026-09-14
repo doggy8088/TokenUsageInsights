@@ -1,13 +1,240 @@
-use std::collections::HashMap;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{LazyLock, Mutex},
+};
+
+use serde::Serialize;
 
 use crate::{
-    db::UsageEntry,
-    handlers::{
-        summarize_session_usage, AgentBreakdown, DaySummary, MonthlyModelSummary,
-        MonthlyProjectSummary, UsageAggregation,
-    },
+    db::{TokenStats, UsageEntry},
     pricing::PreparedPricingRules,
 };
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct UsageAggregation {
+    pub total_tokens: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub cache_write_5m_tokens: u64,
+    pub cache_write_1h_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub cost_usd: f64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ModelUsageAggregation {
+    pub model: String,
+    pub usage: UsageAggregation,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SessionUsageAggregation {
+    pub usage: UsageAggregation,
+    pub models: Vec<ModelUsageAggregation>,
+    pub display_model: String,
+}
+
+#[derive(Serialize, Default, Clone)]
+pub struct DaySummary {
+    pub total_sessions: usize,
+    pub total_tokens: u64,
+    pub total_input_tokens: u64,
+    pub total_output_tokens: u64,
+    pub total_cache_read_tokens: u64,
+    pub total_cache_write_tokens: u64,
+    pub total_reasoning_tokens: u64,
+    pub total_duration_ms: u64,
+    pub total_requests: u64,
+    pub total_cost_usd: f64,
+}
+
+#[derive(Serialize)]
+pub struct MonthlyProjectSummary {
+    pub cwd: String,
+    pub sessions_count: usize,
+    pub total_tokens: u64,
+    pub cost_usd: f64,
+}
+
+#[derive(Serialize)]
+pub struct MonthlyModelSummary {
+    pub model: String,
+    pub mode: Option<String>,
+    pub sessions_count: usize,
+    pub total_tokens: u64,
+    pub total_input_tokens: u64,
+    pub total_output_tokens: u64,
+    pub total_cache_read_tokens: u64,
+    pub cost_usd: f64,
+}
+
+#[derive(Serialize, Default, Clone)]
+pub struct AgentBreakdown {
+    pub total_tokens: u64,
+    pub total_input_tokens: u64,
+    pub total_output_tokens: u64,
+    pub total_cache_read_tokens: u64,
+    pub total_reasoning_tokens: u64,
+    pub total_cost_usd: f64,
+    pub total_sessions: usize,
+}
+
+fn has_usage(tokens: &TokenStats) -> bool {
+    tokens.total > 0
+        || tokens.input > 0
+        || tokens.output > 0
+        || tokens.cache_read.unwrap_or(0) > 0
+        || tokens.cache_write.unwrap_or(0) > 0
+        || tokens.reasoning.unwrap_or(0) > 0
+}
+
+fn add_tokens(aggregation: &mut UsageAggregation, tokens: &TokenStats) {
+    aggregation.total_tokens += tokens.total;
+    aggregation.input_tokens += tokens.input;
+    aggregation.output_tokens += tokens.output;
+    aggregation.cache_read_tokens += tokens.cache_read.unwrap_or(0);
+    aggregation.cache_write_tokens += tokens.cache_write.unwrap_or(0);
+    let (cache_write_5m, cache_write_1h) = cache_write_breakdown(tokens);
+    aggregation.cache_write_5m_tokens += cache_write_5m;
+    aggregation.cache_write_1h_tokens += cache_write_1h;
+    aggregation.reasoning_tokens += tokens.reasoning.unwrap_or(0);
+}
+
+fn cache_write_breakdown(tokens: &TokenStats) -> (u64, u64) {
+    (
+        tokens.cache_write_5m.unwrap_or(0),
+        tokens.cache_write_1h.unwrap_or(0),
+    )
+}
+
+fn entry_model(entry: &UsageEntry) -> Option<&str> {
+    entry
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+}
+
+static WARNED_PRICING_MODELS: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+fn log_pricing_failure(model: &str, session_id: &str, turn_no: u32, error: &str) {
+    let mut warned = match WARNED_PRICING_MODELS.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if warned.insert(model.to_string()) {
+        eprintln!(
+            "計算成本失敗: session_id={} turn_no={} model={}: {}（此模型後續不再重複提示）",
+            session_id, turn_no, model, error
+        );
+    }
+}
+
+fn record_usage(
+    result: &mut SessionUsageAggregation,
+    pricing_rules: &PreparedPricingRules,
+    entry: &UsageEntry,
+    tokens: &TokenStats,
+) {
+    let model = entry_model(entry);
+    let model_label = model.unwrap_or("Unknown Model");
+    let (cache_write_5m, cache_write_1h) = cache_write_breakdown(tokens);
+    let cost_usd =
+        if let Some(reported_cost) = entry.cost.as_ref().and_then(|cost| cost.reported_cost_usd) {
+            reported_cost
+        } else {
+            match pricing_rules.calculate_usage_cost(
+                model,
+                tokens.input,
+                tokens.output,
+                tokens.cache_read.unwrap_or(0),
+                cache_write_5m,
+                cache_write_1h,
+            ) {
+                Ok(cost) => cost,
+                Err(error) => {
+                    log_pricing_failure(model_label, &entry.session_id, entry.turn_no, &error);
+                    0.0
+                }
+            }
+        };
+
+    add_tokens(&mut result.usage, tokens);
+    result.usage.cost_usd += cost_usd;
+
+    let model_usage = if let Some(existing) = result
+        .models
+        .iter_mut()
+        .find(|item| item.model == model_label)
+    {
+        existing
+    } else {
+        result.models.push(ModelUsageAggregation {
+            model: model_label.to_string(),
+            usage: UsageAggregation::default(),
+        });
+        result.models.last_mut().unwrap()
+    };
+    add_tokens(&mut model_usage.usage, tokens);
+    model_usage.usage.cost_usd += cost_usd;
+}
+
+pub(crate) fn summarize_session_usage(
+    pricing_rules: &PreparedPricingRules,
+    entries: &[UsageEntry],
+) -> SessionUsageAggregation {
+    let has_delta_usage = entries
+        .iter()
+        .filter_map(|entry| entry.delta_tokens.as_ref())
+        .any(has_usage);
+    let mut result = SessionUsageAggregation::default();
+    let mut display_entry: Option<&UsageEntry> = None;
+
+    if has_delta_usage {
+        for entry in entries {
+            let Some(tokens) = entry
+                .delta_tokens
+                .as_ref()
+                .filter(|tokens| has_usage(tokens))
+            else {
+                continue;
+            };
+            record_usage(&mut result, pricing_rules, entry, tokens);
+            if display_entry.is_none_or(|current| entry.turn_no >= current.turn_no) {
+                display_entry = Some(entry);
+            }
+        }
+    } else if let Some(entry) = entries
+        .iter()
+        .filter(|entry| entry.tokens.as_ref().is_some_and(has_usage))
+        .max_by_key(|entry| entry.turn_no)
+    {
+        record_usage(
+            &mut result,
+            pricing_rules,
+            entry,
+            entry.tokens.as_ref().unwrap(),
+        );
+        display_entry = Some(entry);
+    }
+
+    result.display_model = display_entry
+        .and_then(entry_model)
+        .unwrap_or("Unknown Model")
+        .to_string();
+    result
+}
+
+#[cfg(test)]
+pub(crate) fn was_pricing_model_warned(model: &str) -> bool {
+    WARNED_PRICING_MODELS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains(model)
+}
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct SessionIdentity {
@@ -80,7 +307,15 @@ pub(crate) fn summarize_models_by_mode(
     sessions: &SessionMap,
     pricing_rules: &PreparedPricingRules,
 ) -> Vec<MonthlyModelSummary> {
-    type ModelStats = (usize, u64, u64, u64, u64, f64);
+    #[derive(Default)]
+    struct ModelStats {
+        sessions_count: usize,
+        total_tokens: u64,
+        total_input_tokens: u64,
+        total_output_tokens: u64,
+        total_cache_read_tokens: u64,
+        cost_usd: f64,
+    }
 
     let mut stats: HashMap<(String, Option<String>), ModelStats> = HashMap::new();
     for (identity, group) in sessions {
@@ -88,42 +323,28 @@ pub(crate) fn summarize_models_by_mode(
         let mode =
             cursor_session_mode(&identity.assistant_type, &group.entries).map(str::to_string);
         for model_usage in session_usage.models {
-            let model_stat = stats
-                .entry((model_usage.model, mode.clone()))
-                .or_insert((0, 0, 0, 0, 0, 0.0));
-            model_stat.0 += 1;
-            model_stat.1 += model_usage.usage.total_tokens;
-            model_stat.2 += model_usage.usage.input_tokens;
-            model_stat.3 += model_usage.usage.output_tokens;
-            model_stat.4 += model_usage.usage.cache_read_tokens;
-            model_stat.5 += model_usage.usage.cost_usd;
+            let model_stat = stats.entry((model_usage.model, mode.clone())).or_default();
+            model_stat.sessions_count += 1;
+            model_stat.total_tokens += model_usage.usage.total_tokens;
+            model_stat.total_input_tokens += model_usage.usage.input_tokens;
+            model_stat.total_output_tokens += model_usage.usage.output_tokens;
+            model_stat.total_cache_read_tokens += model_usage.usage.cache_read_tokens;
+            model_stat.cost_usd += model_usage.usage.cost_usd;
         }
     }
 
     let mut summaries = stats
         .into_iter()
-        .map(
-            |(
-                (model, mode),
-                (
-                    sessions_count,
-                    total_tokens,
-                    total_input_tokens,
-                    total_output_tokens,
-                    total_cache_read_tokens,
-                    cost_usd,
-                ),
-            )| MonthlyModelSummary {
-                model,
-                mode,
-                sessions_count,
-                total_tokens,
-                total_input_tokens,
-                total_output_tokens,
-                total_cache_read_tokens,
-                cost_usd,
-            },
-        )
+        .map(|((model, mode), stats)| MonthlyModelSummary {
+            model,
+            mode,
+            sessions_count: stats.sessions_count,
+            total_tokens: stats.total_tokens,
+            total_input_tokens: stats.total_input_tokens,
+            total_output_tokens: stats.total_output_tokens,
+            total_cache_read_tokens: stats.total_cache_read_tokens,
+            cost_usd: stats.cost_usd,
+        })
         .collect::<Vec<_>>();
     summaries.sort_by_key(|item| std::cmp::Reverse(item.total_tokens));
     summaries
