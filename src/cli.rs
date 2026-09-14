@@ -29,12 +29,12 @@ const HELP_TEXT: &str = r#"Token 戰情室：看板、使用量匯入 / 匯出�
   token-usage-insights update
   token-usage-insights update --check
   token-usage-insights update --force
-  token-usage-insights update --target-version v0.9.9
+  token-usage-insights update --target-version v1.0.0
 
 參數:
   -c, --check                 僅檢查是否有新版本，不進行下載與安裝
   -f, --force                 強制重新下載並覆蓋現有安裝（即使已是最新版本）
-  -v, --target-version <TAG>  指定安裝特定版本標籤（例如 v0.9.9）
+  -v, --target-version <TAG>  指定安裝特定版本標籤（例如 v1.0.0）
 
 共用參數:
   --agent <name>      助理名稱: antigravity / copilot / codex / claude / cursor / grok / pi / omp / muse
@@ -554,7 +554,7 @@ fn print_update_help() {
 參數:
   -c, --check                 僅檢查是否有新版本，不進行下載與安裝
   -f, --force                 強制重新下載並覆蓋現有安裝（即使已是最新版本）
-  -v, --target-version <TAG>  指定安裝特定版本標籤（例如 v0.9.9）
+  -v, --target-version <TAG>  指定安裝特定版本標籤（例如 v1.0.0）
   -h, --help                  顯示此說明
 "#
     );

@@ -755,14 +755,14 @@ token-usage-insights update --check
 # 最新バージョンへの自動更新（--force、--target-version にも対応）
 token-usage-insights update
 token-usage-insights update --force
-token-usage-insights update --target-version v0.9.9
+token-usage-insights update --target-version v1.0.0
 ```
 
 環境変数でバージョンとインストール先を指定できます（すべて任意）：
 
 | 変数 | 対応プラットフォーム | 説明 |
 | --- | --- | --- |
-| `TOKEN_USAGE_INSIGHTS_VERSION` | Linux / macOS / Windows | `v0.9.9` のようなインストール対象の Release tag。デフォルトは `latest` |
+| `TOKEN_USAGE_INSIGHTS_VERSION` | Linux / macOS / Windows | `v1.0.0` のようなインストール対象の Release tag。デフォルトは `latest` |
 | `TOKEN_USAGE_INSIGHTS_INSTALL_DIR` | Linux / macOS | `install.sh` に渡すインストールディレクトリ |
 | `TOKEN_USAGE_INSIGHTS_BIN_DIR` | Linux / macOS | `install.sh` に渡す実行ファイルリンクディレクトリ |
 

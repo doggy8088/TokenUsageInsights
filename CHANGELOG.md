@@ -4,6 +4,34 @@
 
 ## [未發行]
 
+## [1.0.0] - 2026-09-14
+
+### 新增與改善
+
+- 看板側邊欄底部新增固定且水平置中的版本與日期標示；版本由後端 `GET /api/version` 讀取 Cargo 套件版本，終端機啟動橫幅亦使用相同來源，後續版本升級不需再修改前端字串。
+- 建立完整 Session 身分模型，以助理類型、來源類型、來源目錄與 Session ID 隔離每日、每月、年度報表、模型明細、USER prompt 搜尋、工作目錄篩選、時間軸與 K 線成本，讓不同來源的同名 Session 可正確並存。
+
+### 變更
+
+- 將報表彙整、Session 身分、檔案解析、詳情重建與搜尋邏輯拆分為專責模組，統一日期查詢解碼、JSONL 掃描、路徑安全驗證、最新記錄決勝與 delta 用量彙總規則；HTTP handler 維持輸入驗證與回應轉換責任。
+- 使用量匯出會保留 `source_dir_key` 與選用的 `usage_identity`；匯入會以完整來源身分建立穩定識別碼，既有未包含新欄位的匯出檔仍可匯入。
+
+### 修正
+
+- 修正不同助理、來源類型或 Copilot App 目錄共用 Session ID 時，資料可能在報表、清單、搜尋、抽屜、圖表或匯入流程被合併、覆寫或靜默略過的問題；Copilot App 時間軸現在只會解析資料列所屬且由本機同步登錄的來源目錄。
+- 修正累計型用量的 Session 跨越月份或年份時，各期間桶重複加總累計值而放大 Token 與費用的問題；delta 型來源維持逐筆加總。
+- 限制無資料狀態卡片的 Agent 圖示尺寸，避免 Antigravity 與 GitHub Copilot 點陣圖依原始尺寸覆蓋主要內容。
+
+### 資料影響
+
+- SQLite 啟動時會自動建立 `usage_source_directories` 資料表，以助理、來源類型與來源目錄鍵保存本機已驗證路徑，供 Copilot App 詳情與搜尋精確定位；不刪除或重寫既有使用量資料。
+- 匯出 JSON 新增選用的 `usage_identity` 欄位並保留既有 `source_dir_key`；舊版匯出檔與既有匯入批次維持相容。
+
+### 相容性
+
+- 新增 `GET /api/version` 並在每日原始用量項目加入助理身分，皆為附加資訊；既有 HTTP 路由、CLI 參數、環境變數、資料來源目錄與 Release 資產格式維持相容。
+- 本次沒有破壞性變更；資料庫新增表由啟動流程自動建立，不需人工遷移。
+
 ## [0.9.9] - 2026-09-14
 
 ### 新增與改善
@@ -640,7 +668,8 @@
 - 修正行動版側邊欄遮擋、黑畫面、標題擠壓、圖表導覽索引與年度版面問題。
 - 修正並補齊多個 Gemini、Claude、GPT 與 GPT-OSS 模型的定價規則。
 
-[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.9.9...HEAD
+[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.9.9...v1.0.0
 [0.9.9]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.9.8...v0.9.9
 [0.9.8]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.9.5...v0.9.8
 [0.9.5]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.9.4...v0.9.5
