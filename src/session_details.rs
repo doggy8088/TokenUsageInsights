@@ -4,7 +4,7 @@ use std::{collections::HashMap, fs::File, io::BufReader, path::Path};
 
 use crate::{
     db::{self, TokenStats},
-    handlers::daily::{resolve_session_file_path, SessionFileErrorExt},
+    session_files::{resolve_session_file_path, SessionFileErrorExt},
     timeline::{
         parse_antigravity_timeline, parse_claude_timeline, parse_codex_timeline,
         parse_copilot_timeline_filtered, parse_cursor_timeline, parse_grok_timeline,

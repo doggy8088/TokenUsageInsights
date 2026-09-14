@@ -43,9 +43,9 @@ Codex 原始碼把 ephemeral 的語意定義為不 materialize 到磁碟。官�
 
 目前同步器只遞迴掃描 `CODEX_DIR/sessions` 下的 JSONL：
 
-- [`find_codex_session_files`](../../src/db.rs)
+- [`find_codex_session_files`](../../src/db/codex.rs)
 - [`sync_codex_usage_logs`](../../src/db.rs)
-- [`parse_codex_session_file`](../../src/db.rs)
+- [`parse_codex_session_file`](../../src/db/codex.rs)
 
 parser 已能處理持久化 subagent，並讀取 `event_msg` 的 `token_count.info.total_token_usage`。這類 subagent 有自己的 rollout JSONL，所以與 `/side` 的問題不同。
 

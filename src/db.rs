@@ -5011,7 +5011,43 @@ pub fn import_usage_day_entries(
         } else if assistant == "claude" {
             normalize_legacy_claude_usage_entry(&mut entry);
         }
-        let source_id = normalized_id.unwrap_or(generated_source_id);
+        let source_id = match normalized_id {
+            Some(source_id) => {
+                let conflicts_with_existing_identity: i64 = tx
+                    .query_row(
+                        "SELECT EXISTS (
+                            SELECT 1
+                            FROM usage_entries
+                            WHERE assistant_type = ?1
+                              AND import_source_id = ?2
+                              AND NOT (
+                                  source_kind = ?3
+                                  AND source_dir_key IS ?4
+                                  AND session_id = ?5
+                                  AND turn_no = ?6
+                                  AND usage_identity = ?7
+                              )
+                        )",
+                        params![
+                            assistant,
+                            source_id,
+                            source_kind,
+                            entry.source_dir_key.as_deref(),
+                            entry.session_id,
+                            entry.turn_no as i64,
+                            usage_identity,
+                        ],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| format!("檢查匯入資料來源識別衝突失敗: {error}"))?;
+                if conflicts_with_existing_identity != 0 {
+                    format!("{source_id}:{generated_source_id}")
+                } else {
+                    source_id
+                }
+            }
+            None => generated_source_id,
+        };
 
         let imported = tx
             .execute(
@@ -6654,16 +6690,16 @@ mod tests {
         first.entry.agent_nickname = None;
         first.entry.model = Some("gpt-5".to_string());
         first.entry.model_id = Some("gpt-5".to_string());
-        first.import_source_id = None;
+        first.import_source_id = Some("shared-external-id".to_string());
 
         let mut second = first.clone();
         second.entry.model = Some("claude-sonnet-4".to_string());
         second.entry.model_id = Some("claude-sonnet-4".to_string());
-        second.import_source_id = None;
+        second.import_source_id = Some("shared-external-id".to_string());
 
         let mut third = first.clone();
         third.entry.source_dir_key = Some("bb".to_string());
-        third.import_source_id = None;
+        third.import_source_id = Some("shared-external-id".to_string());
 
         let summary = import_usage_day_entries(
             &mut conn,
@@ -6702,12 +6738,23 @@ mod tests {
             &mut round_trip,
             "copilot",
             "2026-07-10",
-            exported,
+            exported.clone(),
             UsageImportMetadata::default(),
         )
         .unwrap();
         assert_eq!(round_trip_summary.imported, 3);
         assert_eq!(round_trip_summary.skipped_duplicates, 0);
+
+        let repeated_summary = import_usage_day_entries(
+            &mut round_trip,
+            "copilot",
+            "2026-07-10",
+            exported,
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        assert_eq!(repeated_summary.imported, 0);
+        assert_eq!(repeated_summary.skipped_duplicates, 3);
     }
 
     #[test]

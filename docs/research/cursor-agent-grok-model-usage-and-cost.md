@@ -397,7 +397,7 @@ request_id
 
 相關現況：
 
-- [`parse_cursor_session_file`](../../src/db.rs)
+- [`parse_cursor_session_file`](../../src/db/cursor.rs)
 - [`parse_cursor_timeline`](../../src/timeline.rs)
 
 ### `~/Library/Application Support/Cursor/User/globalStorage/state.vscdb`
@@ -471,7 +471,7 @@ ai_deleted_files.model
 
 ## TokenUsageInsights 現況的直接影響
 
-目前 Cursor importer 在 [`parse_cursor_session_file`](../../src/db.rs) 中：
+目前 Cursor importer 在 [`parse_cursor_session_file`](../../src/db/cursor.rs) 中：
 
 ```rust
 let input_tokens = (current_prompt.len() / 4).max(10) as u64;

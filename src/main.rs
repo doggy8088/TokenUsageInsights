@@ -24,6 +24,7 @@ mod pi;
 mod pricing;
 mod reporting;
 mod session_details;
+mod session_files;
 mod timeline;
 mod updater;
 mod vscode;
