@@ -21,3 +21,10 @@ export function compareSessionRows(a, b, sortColumn, sortDirection) {
 
   return sortDirection === 'asc' ? comparison : -comparison;
 }
+
+export function matchesSessionIdentity(session, identity) {
+  return (session?.session_id || '') === (identity?.session_id || '')
+    && (session?.assistant_type || '') === (identity?.assistant_type || '')
+    && (session?.source_kind || '') === (identity?.source_kind || '')
+    && (session?.source_dir_key || '') === (identity?.source_dir_key || '');
+}

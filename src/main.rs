@@ -22,6 +22,8 @@ mod omp;
 mod paths;
 mod pi;
 mod pricing;
+mod reporting;
+mod session_details;
 mod timeline;
 mod updater;
 mod vscode;

@@ -11,7 +11,7 @@ pub struct PricingRule {
     pub output_price: f64,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct PricingEntry {
     pub model_name: String,
     pub deployment_type: String,
@@ -22,8 +22,49 @@ pub struct PricingEntry {
     pub batch_api_price: String,
 }
 
-pub fn load_pricing_rules() -> Vec<PricingRule> {
-    let mut rules = Vec::new();
+fn fallback_pricing_entries() -> Vec<PricingEntry> {
+    vec![
+        PricingEntry {
+            model_name: "Gemini 3.5 Flash".to_string(),
+            deployment_type: "Google AI".to_string(),
+            unit: "1M Tokens".to_string(),
+            input_price: 1.50,
+            cache_input_price: 0.375,
+            output_price: 9.00,
+            batch_api_price: "0.75/0.1875/4.50".to_string(),
+        },
+        PricingEntry {
+            model_name: "Gemini 1.5 Flash".to_string(),
+            deployment_type: "Google AI".to_string(),
+            unit: "1M Tokens".to_string(),
+            input_price: 0.075,
+            cache_input_price: 0.01875,
+            output_price: 0.30,
+            batch_api_price: "0.0375/0.009375/0.15".to_string(),
+        },
+        PricingEntry {
+            model_name: "Gemini 1.5 Pro".to_string(),
+            deployment_type: "Google AI".to_string(),
+            unit: "1M Tokens".to_string(),
+            input_price: 1.25,
+            cache_input_price: 0.3125,
+            output_price: 5.00,
+            batch_api_price: "0.625/0.15625/2.50".to_string(),
+        },
+        PricingEntry {
+            model_name: "Gemini 2.0 Flash".to_string(),
+            deployment_type: "Google AI".to_string(),
+            unit: "1M Tokens".to_string(),
+            input_price: 0.10,
+            cache_input_price: 0.025,
+            output_price: 0.40,
+            batch_api_price: "0.05/0.0125/0.20".to_string(),
+        },
+    ]
+}
+
+pub fn load_pricing_entries() -> Vec<PricingEntry> {
+    let mut entries = Vec::new();
     let file_path =
         crate::paths::find_resource("pricing.csv").unwrap_or_else(|| PathBuf::from("pricing.csv"));
     if let Ok(file) = File::open(&file_path) {
@@ -36,45 +77,37 @@ pub fn load_pricing_rules() -> Vec<PricingRule> {
                     let input_price = parts[3].trim().parse::<f64>().unwrap_or(0.0);
                     let cache_input_price = parts[4].trim().parse::<f64>().unwrap_or(0.0);
                     let output_price = parts[5].trim().parse::<f64>().unwrap_or(0.0);
-                    rules.push(PricingRule {
+                    entries.push(PricingEntry {
                         model_name: parts[0].trim().to_string(),
+                        deployment_type: parts[1].trim().to_string(),
+                        unit: parts[2].trim().to_string(),
                         input_price,
                         cache_input_price,
                         output_price,
+                        batch_api_price: parts
+                            .get(6)
+                            .map_or_else(|| "N/A".to_string(), |value| value.trim().to_string()),
                     });
                 }
             }
         }
     }
-    if rules.is_empty() {
-        rules = vec![
-            PricingRule {
-                model_name: "Gemini 3.5 Flash".to_string(),
-                input_price: 1.50,
-                cache_input_price: 0.375,
-                output_price: 9.00,
-            },
-            PricingRule {
-                model_name: "Gemini 1.5 Flash".to_string(),
-                input_price: 0.075,
-                cache_input_price: 0.01875,
-                output_price: 0.30,
-            },
-            PricingRule {
-                model_name: "Gemini 1.5 Pro".to_string(),
-                input_price: 1.25,
-                cache_input_price: 0.3125,
-                output_price: 5.00,
-            },
-            PricingRule {
-                model_name: "Gemini 2.0 Flash".to_string(),
-                input_price: 0.10,
-                cache_input_price: 0.025,
-                output_price: 0.40,
-            },
-        ];
+    if entries.is_empty() {
+        return fallback_pricing_entries();
     }
-    rules
+    entries
+}
+
+pub fn load_pricing_rules() -> Vec<PricingRule> {
+    load_pricing_entries()
+        .into_iter()
+        .map(|entry| PricingRule {
+            model_name: entry.model_name,
+            input_price: entry.input_price,
+            cache_input_price: entry.cache_input_price,
+            output_price: entry.output_price,
+        })
+        .collect()
 }
 
 /// 載入價格規則並完成一次性的標籤解析，供大量聚合的 API 重複使用。

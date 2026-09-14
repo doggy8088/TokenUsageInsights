@@ -1,12 +1,13 @@
 {
   "name": "token-usage-insights",
   "version": "0.9.9",
+  "type": "module",
   "description": "Local-first AI coding agent token usage dashboard and CLI",
   "bin": {
     "token-usage-insights": "npm/cli.cjs"
   },
   "scripts": {
-    "test": "node --test tests/npm-package.test.cjs",
+    "test": "node --test tests/npm-package.test.cjs tests/session-utils.test.mjs",
     "check:package": "npm test && npm pack --dry-run --ignore-scripts && node npm/prepublish-check.cjs",
     "prepublishOnly": "npm run check:package"
   },

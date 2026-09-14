@@ -177,7 +177,7 @@ mkdir -p ~/.gemini/antigravity-cli && cp ~/.local/share/token-usage-insights/she
 }
 ```
 
-請將 `/ABSOLUTE/HOME` 替換成 `echo $HOME` 顯示的實際家目錄路徑，例如 `/Users/will` 或 `/home/will`。
+請將 `/ABSOLUTE/HOME` 替換成 `echo $HOME` 顯示的實際家目錄路徑，例如 `/Users/your-name` 或 `/home/your-name`。
 
 ### 3. 驗證
 

@@ -177,7 +177,7 @@ mkdir -p ~/.gemini/antigravity-cli && cp ~/.local/share/token-usage-insights/she
 }
 ```
 
-请将 `/ABSOLUTE/HOME` 替换为 `echo $HOME` 显示的实际主目录路径，例如 `/Users/will` 或 `/home/will`。
+请将 `/ABSOLUTE/HOME` 替换为 `echo $HOME` 显示的实际主目录路径，例如 `/Users/your-name` 或 `/home/your-name`。
 
 ### 3. 验证
 

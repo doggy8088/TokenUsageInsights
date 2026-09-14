@@ -8,7 +8,7 @@ import {
   getChartDataPointX,
   parseUsageTimestamp,
 } from './chart-utils.js?v=7';
-import { compareSessionRows } from './session-utils.js?v=1';
+import { compareSessionRows, matchesSessionIdentity } from './session-utils.js?v=2';
 
 // Globals
 let tokenChartInstance = null;
@@ -5554,7 +5554,7 @@ function renderModelSessionDrilldown(sessions) {
                   const cwd = session.cwd || t('unknown_cwd');
                   const time = formatLocalTime(session.timestamp, true) || '—';
                   return `
-                    <button type="button" class="model-session-link" data-session-id="${escapeHtml(session.session_id)}" data-assistant-type="${escapeHtml(session.assistant_type || '')}" data-source-kind="${escapeHtml(session.source_kind || '')}" aria-label="${escapeHtml(`${t('open_session')}: ${name}`)}">
+                    <button type="button" class="model-session-link" data-session-id="${escapeHtml(session.session_id)}" data-assistant-type="${escapeHtml(session.assistant_type || '')}" data-source-kind="${escapeHtml(session.source_kind || '')}" data-source-dir-key="${escapeHtml(session.source_dir_key || '')}" aria-label="${escapeHtml(`${t('open_session')}: ${name}`)}">
                       <span class="model-session-primary">
                         <span class="model-session-name-row">
                           <span class="model-session-name">${escapeHtml(name)}</span>
@@ -5683,12 +5683,12 @@ function appendModelSummaryRows(tbody, models, period) {
 
       const sessionButton = event.target.closest('.model-session-link');
       if (!sessionButton || !Array.isArray(detailsRow.modelSessions)) return;
-      const session = detailsRow.modelSessions.find(
-        item =>
-          item.session_id === sessionButton.dataset.sessionId
-          && (item.assistant_type || '') === sessionButton.dataset.assistantType
-          && (item.source_kind || '') === sessionButton.dataset.sourceKind
-      );
+      const session = detailsRow.modelSessions.find(item => matchesSessionIdentity(item, {
+        session_id: sessionButton.dataset.sessionId,
+        assistant_type: sessionButton.dataset.assistantType,
+        source_kind: sessionButton.dataset.sourceKind,
+        source_dir_key: sessionButton.dataset.sourceDirKey,
+      }));
       if (session) {
         openSessionTimeline({
           ...session,

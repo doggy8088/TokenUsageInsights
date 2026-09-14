@@ -177,7 +177,7 @@ mkdir -p ~/.gemini/antigravity-cli && cp ~/.local/share/token-usage-insights/she
 }
 ```
 
-`/ABSOLUTE/HOME` を `echo $HOME` で表示される実際のホームディレクトリ（例：`/Users/will` または `/home/will`）に置き換えてください。
+`/ABSOLUTE/HOME` を `echo $HOME` で表示される実際のホームディレクトリ（例：`/Users/your-name` または `/home/your-name`）に置き換えてください。
 
 ### 3. 検証
 

@@ -1,15 +1,10 @@
 use axum::{extract::Path, http::StatusCode, response::IntoResponse, Json};
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
-use std::{
-    fs::File,
-    io::{BufRead, BufReader},
-    path::PathBuf,
-};
 
 use super::*;
 use crate::db::{self, UsageDayExportRecord};
-use crate::pricing::PricingEntry;
+use crate::pricing::load_pricing_entries;
 
 #[derive(Serialize)]
 struct UsageDayExportResponse {
@@ -45,78 +40,14 @@ pub async fn get_pricing(Path(assistant): Path<String>) -> impl IntoResponse {
             .into_response();
     }
 
-    let mut entries = Vec::new();
-    let file_path =
-        crate::paths::find_resource("pricing.csv").unwrap_or_else(|| PathBuf::from("pricing.csv"));
-    if let Ok(file) = File::open(&file_path) {
-        let reader = BufReader::new(file);
-        let mut lines = reader.lines();
-        if let Some(Ok(_header)) = lines.next() {
-            for line in lines.map_while(Result::ok) {
-                let parts: Vec<&str> = line.split(',').collect();
-                if parts.len() >= 6 {
-                    let input_price = parts[3].trim().parse::<f64>().unwrap_or(0.0);
-                    let cache_input_price = parts[4].trim().parse::<f64>().unwrap_or(0.0);
-                    let output_price = parts[5].trim().parse::<f64>().unwrap_or(0.0);
-                    let batch_api_price = if parts.len() >= 7 {
-                        parts[6].trim().to_string()
-                    } else {
-                        "N/A".to_string()
-                    };
-                    entries.push(PricingEntry {
-                        model_name: parts[0].trim().to_string(),
-                        deployment_type: parts[1].trim().to_string(),
-                        unit: parts[2].trim().to_string(),
-                        input_price,
-                        cache_input_price,
-                        output_price,
-                        batch_api_price,
-                    });
-                }
-            }
-        }
+    match tokio::task::spawn_blocking(load_pricing_entries).await {
+        Ok(entries) => Json(entries).into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "執行緒執行失敗" })),
+        )
+            .into_response(),
     }
-    if entries.is_empty() {
-        entries = vec![
-            PricingEntry {
-                model_name: "Gemini 3.5 Flash".to_string(),
-                deployment_type: "Google AI".to_string(),
-                unit: "1M Tokens".to_string(),
-                input_price: 1.50,
-                cache_input_price: 0.375,
-                output_price: 9.00,
-                batch_api_price: "0.75/0.1875/4.50".to_string(),
-            },
-            PricingEntry {
-                model_name: "Gemini 1.5 Flash".to_string(),
-                deployment_type: "Google AI".to_string(),
-                unit: "1M Tokens".to_string(),
-                input_price: 0.075,
-                cache_input_price: 0.01875,
-                output_price: 0.30,
-                batch_api_price: "0.0375/0.009375/0.15".to_string(),
-            },
-            PricingEntry {
-                model_name: "Gemini 1.5 Pro".to_string(),
-                deployment_type: "Google AI".to_string(),
-                unit: "1M Tokens".to_string(),
-                input_price: 1.25,
-                cache_input_price: 0.3125,
-                output_price: 5.00,
-                batch_api_price: "0.625/0.15625/2.50".to_string(),
-            },
-            PricingEntry {
-                model_name: "Gemini 2.0 Flash".to_string(),
-                deployment_type: "Google AI".to_string(),
-                unit: "1M Tokens".to_string(),
-                input_price: 0.10,
-                cache_input_price: 0.025,
-                output_price: 0.40,
-                batch_api_price: "0.05/0.0125/0.20".to_string(),
-            },
-        ];
-    }
-    Json(entries).into_response()
 }
 
 /// API 8: 手動觸發日誌增量同步

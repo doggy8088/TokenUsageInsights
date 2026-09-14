@@ -7,20 +7,21 @@ use axum::{
 use serde::Deserialize;
 use std::{
     collections::HashMap,
-    fs::File,
-    io::BufReader,
     path::{Path as StdPath, PathBuf},
 };
 
 use super::*;
-use crate::db::{self, TokenStats};
+use crate::db;
 use crate::pricing::{load_prepared_pricing_rules, PreparedPricingRules};
-use crate::timeline::{
-    parse_antigravity_timeline, parse_claude_timeline, parse_codex_timeline,
-    parse_copilot_timeline_filtered, parse_cursor_timeline, parse_grok_timeline,
-    parse_muse_timeline, parse_omp_timeline, parse_pi_timeline, parse_vscode_timeline,
-    TimelineItem,
-};
+use crate::session_details::{load_session_details, parse_session_timeline_file};
+use crate::timeline::TimelineItem;
+
+#[cfg(test)]
+use crate::db::TokenStats;
+#[cfg(test)]
+use crate::timeline::parse_grok_timeline;
+#[cfg(test)]
+use std::{fs::File, io::BufReader};
 
 fn add_usage_to_day_summary(summary: &mut DaySummary, usage: &UsageAggregation) {
     summary.total_tokens += usage.total_tokens;
@@ -562,17 +563,15 @@ fn resolve_copilot_cli_subagent_events_path(
     Ok(canonical_path)
 }
 
-type SessionFileError = (StatusCode, String);
-
 /// Extended error carrying a machine-readable `reason` code for the frontend.
 /// `reason` is `None` for generic errors (the frontend falls back to a generic
 /// "load failed" message) and `Some("no_events_yet" | "file_missing" |
 /// "content_unavailable")` for Copilot App session drawer cases.
 #[derive(Debug)]
-struct SessionFileErrorExt {
-    status: StatusCode,
-    error: String,
-    reason: Option<String>,
+pub(crate) struct SessionFileErrorExt {
+    pub status: StatusCode,
+    pub error: String,
+    pub reason: Option<String>,
 }
 
 impl SessionFileErrorExt {
@@ -597,7 +596,7 @@ impl SessionFileErrorExt {
     }
 }
 
-fn resolve_session_file_path(
+pub(crate) fn resolve_session_file_path(
     assistant: &str,
     session_id: &str,
     transcript_path_db: Option<&str>,
@@ -719,83 +718,6 @@ fn resolve_session_file_path(
             "不支援的助理類型",
         )),
     }
-}
-
-/// Aggregated per-session DB data fetched before parsing the timeline file:
-/// per-turn token stats, the session cwd, and the canonical session model.
-/// The model is the child session's own model for subagent synthetic rows,
-/// used to seed the Copilot timeline parser so the subagent drawer shows the
-/// child model instead of the shared parent `session.start.selectedModel`.
-#[derive(Default)]
-struct SessionDbData {
-    db_entries: HashMap<u32, (TokenStats, String)>,
-    session_cwd: Option<String>,
-    session_model: Option<String>,
-}
-
-fn parse_session_timeline_file(
-    assistant: &str,
-    source_kind: &str,
-    filepath: &StdPath,
-    db_entries: &HashMap<u32, (TokenStats, String)>,
-    copilot_app_agent_filter: Option<&str>,
-    copilot_session_model: Option<&str>,
-) -> Result<(Vec<TimelineItem>, HashMap<String, serde_json::Value>), SessionFileError> {
-    let mut timeline = Vec::new();
-    let mut metadata = HashMap::new();
-
-    if source_kind == crate::vscode::SOURCE_KIND {
-        let session = crate::vscode::read_session_file(filepath)
-            .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
-        parse_vscode_timeline(&session, db_entries, &mut timeline, &mut metadata);
-        return Ok((timeline, metadata));
-    }
-
-    let file = File::open(filepath).map_err(|error| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("開啟日誌檔案失敗: {error}"),
-        )
-    })?;
-    let reader = BufReader::new(file);
-    match assistant {
-        "antigravity" => {
-            parse_antigravity_timeline(reader, db_entries, &mut timeline, &mut metadata)
-        }
-        // Copilot App sessions share one events.jsonl across the main agent and
-        // every subagent; the agent filter keeps each drawer's timeline scoped
-        // to the right agent. Copilot CLI calls never carry an agentId, so
-        // passing `None` here preserves the original CLI behavior. The
-        // DB-sourced session model seeds the parser so a subagent drawer starts
-        // from its own child model instead of the shared parent
-        // `session.start.selectedModel`.
-        "copilot" if source_kind == "copilot-app" => parse_copilot_timeline_filtered(
-            reader,
-            db_entries,
-            &mut timeline,
-            &mut metadata,
-            copilot_app_agent_filter,
-            copilot_session_model,
-        ),
-        "copilot" => parse_copilot_timeline_filtered(
-            reader,
-            db_entries,
-            &mut timeline,
-            &mut metadata,
-            copilot_app_agent_filter,
-            copilot_session_model,
-        ),
-        "codex" => parse_codex_timeline(reader, db_entries, &mut timeline, &mut metadata),
-        "claude" => parse_claude_timeline(reader, db_entries, &mut timeline, &mut metadata),
-        "cursor" => parse_cursor_timeline(reader, db_entries, &mut timeline, &mut metadata),
-        "grok" => parse_grok_timeline(reader, db_entries, &mut timeline, &mut metadata),
-        "pi" => parse_pi_timeline(reader, db_entries, &mut timeline, &mut metadata),
-        "omp" => parse_omp_timeline(reader, db_entries, &mut timeline, &mut metadata),
-        "muse" => parse_muse_timeline(reader, db_entries, &mut timeline, &mut metadata),
-        _ => return Err((StatusCode::BAD_REQUEST, "不支援的助理類型".to_string())),
-    }
-
-    Ok((timeline, metadata))
 }
 
 fn timeline_matches_user_prompt(timeline: &[TimelineItem], normalized_query: &str) -> bool {
@@ -1224,50 +1146,9 @@ pub async fn search_sessions_by_user_prompt(
 }
 
 /// API 4: 獲取特定會話的詳細對話歷史還原時間軸
-fn get_git_info(cwd_str: &str) -> (Option<String>, Option<String>) {
-    let path = std::path::Path::new(cwd_str);
-    if !path.exists() {
-        return (None, None);
-    }
-
-    let branch = std::process::Command::new("git")
-        .args(["symbolic-ref", "--short", "HEAD"])
-        .current_dir(path)
-        .output()
-        .ok()
-        .and_then(|output| {
-            if output.status.success() {
-                Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-            } else {
-                None
-            }
-        });
-
-    let repo = std::process::Command::new("git")
-        .args(["config", "--get", "remote.origin.url"])
-        .current_dir(path)
-        .output()
-        .ok()
-        .and_then(|output| {
-            if output.status.success() {
-                Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-            } else {
-                None
-            }
-        });
-
-    (branch, repo)
-}
-
-/// Query parameters for the session detail API.
-/// `source_kind` and `source_dir_key` allow the client to disambiguate
-/// sessions that share the same `session_id` across different sources
-/// (e.g. Copilot CLI vs. Copilot App, or two different Copilot App
-/// directories). Both are optional for backward compatibility; when omitted
-/// the query falls back to non-App rows only.
-/// Validates a `source_dir_key` value. The key is a hex-encoded canonical
-/// path produced by the Copilot App collector; it must only contain
-/// hex characters so it cannot be used for path injection.
+///
+/// Session 查詢、日誌解析與 Git 子程序都由 `session_details` 服務在
+/// blocking thread 執行；HTTP handler 僅負責輸入驗證與回應轉換。
 fn is_safe_source_dir_key(key: &str) -> bool {
     !key.is_empty() && key.len() <= 512 && key.chars().all(|c| c.is_ascii_hexdigit())
 }
@@ -1284,7 +1165,6 @@ pub async fn get_session_details(
         )
             .into_response();
     }
-
     if !is_safe_session_id(&session_id) {
         return (
             StatusCode::BAD_REQUEST,
@@ -1293,396 +1173,44 @@ pub async fn get_session_details(
             .into_response();
     }
 
-    let requested_source_kind = query
+    let source_kind = query
         .source_kind
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
-    if requested_source_kind
-        .as_ref()
-        .is_some_and(|value| value.len() > 64)
-    {
+    if source_kind.as_ref().is_some_and(|value| value.len() > 64) {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": "source_kind 格式不正確。" })),
         )
             .into_response();
     }
-
-    // Validate source_dir_key if provided — must be hex-only to prevent
-    // path injection.
-    if let Some(ref sdk) = query.source_dir_key {
-        if !is_safe_source_dir_key(sdk) {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": "非法的 source_dir_key 格式。" })),
-            )
-                .into_response();
-        }
-    }
-
-    let session_info: Result<db::SessionIdentity, String> = tokio::task::spawn_blocking({
-        let sid = session_id.clone();
-        let assistant_name = assistant.clone();
-        let sk = requested_source_kind;
-        let sdk = query.source_dir_key.clone();
-        move || {
-            let conn = db::get_db_conn()?;
-            db::get_session_assistant_and_transcript(
-                &conn,
-                &assistant_name,
-                &sid,
-                sk.as_deref(),
-                sdk.as_deref(),
-            )
-        }
-    })
-    .await
-    .unwrap_or_else(|_| Err("執行緒執行失敗".to_string()));
-
-    let (
-        resolved_assistant,
-        transcript_path_db,
-        source_kind,
-        source_dir_key,
-        copilot_app_parent_session_id,
-        copilot_app_agent_nickname,
-    ) = match session_info {
-        Ok(info) => info,
-        Err(e) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "error": e })),
-            )
-                .into_response();
-        }
-    };
-
-    if resolved_assistant != assistant {
+    if query
+        .source_dir_key
+        .as_deref()
+        .is_some_and(|key| !is_safe_source_dir_key(key))
+    {
         return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "找不到該會話資料或助理類型不符" })),
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "非法的 source_dir_key 格式。" })),
         )
             .into_response();
     }
 
-    // 2. 準備讀取檔案的完整路徑
-    let filepath = match resolve_session_file_path(
-        &resolved_assistant,
-        &session_id,
-        transcript_path_db.as_deref(),
-        &source_kind,
-        copilot_app_parent_session_id.as_deref(),
-        copilot_app_agent_nickname.as_deref(),
-    ) {
-        Ok(path) => path,
-        Err(err) => {
-            let mut payload = serde_json::json!({ "error": err.error });
-            if let Some(reason) = err.reason {
-                payload["reason"] = serde_json::Value::String(reason);
-            }
-            return (err.status, Json(payload)).into_response();
-        }
-    };
-
-    if !filepath.exists() {
-        // 判斷是否為「尚未開始交談」（session 目錄存在但 events.jsonl 尚未產生）
-        // For Copilot subagent synthetic sessions (App or CLI), the events file
-        // lives under the parent session's directory, so check that directory.
-        let is_session_dir_present = match resolved_assistant.as_str() {
-            "copilot" => {
-                // Copilot App and Copilot CLI subagent synthetic sessions store
-                // their events.jsonl under the parent session's session-state
-                // directory. App sessions live under `paths::copilot_app_dir()`
-                // (honors COPILOT_APP_DIR), while CLI sessions live under
-                // `db::get_copilot_dir()` (honors COPILOT_DIR). Using the wrong
-                // base would misclassify missing App sessions when the two env
-                // vars point to different directories.
-                let cop_dir = if source_kind == "copilot-app" {
-                    crate::paths::copilot_app_dir()
-                } else {
-                    db::get_copilot_dir()
-                };
-                let dir_id = if source_kind == "copilot-app" || source_kind == "copilot-cli" {
-                    copilot_app_parent_session_id
-                        .as_deref()
-                        .unwrap_or(&session_id)
-                } else {
-                    &session_id
-                };
-                cop_dir.join("session-state").join(dir_id).exists()
-            }
-            _ => false,
-        };
-        let reason = if is_session_dir_present {
-            "no_events_yet"
-        } else {
-            "file_missing"
-        };
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "找不到該會話的本地日誌檔。", "reason": reason })),
-        )
-            .into_response();
-    }
-
-    // 3. 預先載入 SQLite 中的回合 (turn_no) 增量 token 數據
-    let sid_clone = session_id.clone();
-    let assistant_clone = resolved_assistant.clone();
-    let source_kind_clone = source_kind.clone();
-    let sdk_clone = source_dir_key.clone();
-    let session_db_data: SessionDbData = tokio::task::spawn_blocking(move || {
-        if let Ok(conn) = db::get_db_conn() {
-            let session_cwd = db::get_session_cwd(
-                &conn,
-                &assistant_clone,
-                &sid_clone,
-                Some(&source_kind_clone),
-                sdk_clone.as_deref(),
-            )
-            .unwrap_or(None);
-            let session_model = db::get_session_model(
-                &conn,
-                &assistant_clone,
-                &sid_clone,
-                Some(&source_kind_clone),
-                sdk_clone.as_deref(),
-            )
-            .unwrap_or(None);
-            let map = db::get_session_turns_token_stats(
-                &conn,
-                &assistant_clone,
-                &sid_clone,
-                Some(&source_kind_clone),
-                sdk_clone.as_deref(),
-            )
-            .unwrap_or_default();
-            SessionDbData {
-                db_entries: map,
-                session_cwd,
-                session_model,
-            }
-        } else {
-            SessionDbData::default()
-        }
+    match tokio::task::spawn_blocking(move || {
+        load_session_details(assistant, session_id, source_kind, query.source_dir_key)
     })
     .await
-    .unwrap_or_default();
-    let SessionDbData {
-        db_entries,
-        session_cwd,
-        session_model,
-    } = session_db_data;
-
-    // Agent filter: Copilot App and Copilot CLI synthetic subagent rows both
-    // share the parent session's events.jsonl and rely on a top-level
-    // `agentId` field to keep subagent events out of the main agent view and
-    // vice versa. The filter value is the database-sourced `agent_nickname`
-    // (the real agent_id), never a string-split synthetic id.
-    let copilot_agent_filter: Option<&str> = if resolved_assistant == "copilot"
-        && matches!(source_kind.as_str(), "copilot-app" | "copilot-cli")
     {
-        copilot_app_agent_nickname.as_deref()
-    } else {
-        None
-    };
-    let (timeline, mut metadata) = match parse_session_timeline_file(
-        &resolved_assistant,
-        &source_kind,
-        &filepath,
-        &db_entries,
-        copilot_agent_filter,
-        session_model.as_deref(),
-    ) {
-        Ok(result) => result,
-        Err((status, error)) => {
-            return (status, Json(serde_json::json!({ "error": error }))).into_response();
-        }
-    };
-
-    // Copilot App / CLI subagent requests may resolve the shared events.jsonl
-    // but find no agent-specific events carrying the requested agentId (e.g.
-    // the subagent row was imported from a usage snapshot before its lifecycle
-    // events were written, or the agent id drifted between DB and file).
-    // Shared context (session start, user prompt) is intentionally kept for
-    // readability, so the drawer is "unavailable" only when there are no
-    // agent-specific items at all. Surface a recognizable reason instead of a
-    // context-only drawer so the frontend can explain it.
-    if matches!(source_kind.as_str(), "copilot-app" | "copilot-cli")
-        && copilot_agent_filter.is_some()
-    {
-        let has_agent_specific = timeline.iter().any(|item| match item {
-            TimelineItem::AgentReply { .. } => true,
-            TimelineItem::ToolStep { .. } => true,
-            TimelineItem::SystemStatus { status_type, .. } => {
-                matches!(
-                    status_type.as_str(),
-                    "subagent_started" | "subagent_completed" | "subagent_failed"
-                )
-            }
-            _ => false,
-        });
-        if !has_agent_specific {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({
-                    "error": "Copilot subagent 的 events.jsonl 中找不到對應 agentId 的事件，可能該 subagent 尚未寫入事件或檔案已被置換。",
-                    "reason": "content_unavailable",
-                })),
-            )
-                .into_response();
-        }
+        Ok(Ok(payload)) => Json(payload).into_response(),
+        Ok(Err(error)) => (error.status, Json(error.payload)).into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "執行緒執行失敗" })),
+        )
+            .into_response(),
     }
-
-    // 補充或覆寫 Git 與 CWD 相關資訊（若 metadata 未包含但資料庫中有紀錄）
-    if let Some(ref cwd) = session_cwd {
-        if !metadata.contains_key("cwd") {
-            metadata.insert("cwd".to_string(), serde_json::Value::String(cwd.clone()));
-        }
-
-        let (branch, repo) = get_git_info(cwd);
-        if !metadata.contains_key("git_branch") {
-            if let Some(b) = branch {
-                metadata.insert("git_branch".to_string(), serde_json::Value::String(b));
-            }
-        }
-        if !metadata.contains_key("repository") {
-            if let Some(r) = repo {
-                metadata.insert("repository".to_string(), serde_json::Value::String(r));
-            }
-        }
-    }
-
-    // 計算該會話的加總 Token 資料，供 metadata 使用
-    let mut total_tokens = 0;
-    let mut total_cache_read_tokens = 0;
-    let mut total_input_tokens = 0;
-    let mut total_output_tokens = 0;
-    let mut total_reasoning_tokens = 0;
-
-    for (stats, _) in db_entries.values() {
-        total_tokens += stats.total;
-        total_cache_read_tokens += stats.cache_read.unwrap_or(0);
-        total_input_tokens += stats.input;
-        total_output_tokens += stats.output;
-        total_reasoning_tokens += stats.reasoning.unwrap_or(0);
-    }
-
-    metadata.insert(
-        "total_tokens".to_string(),
-        serde_json::Value::Number(serde_json::Number::from(total_tokens)),
-    );
-    metadata.insert(
-        "total_cache_read_tokens".to_string(),
-        serde_json::Value::Number(serde_json::Number::from(total_cache_read_tokens)),
-    );
-    metadata.insert(
-        "total_input_tokens".to_string(),
-        serde_json::Value::Number(serde_json::Number::from(total_input_tokens)),
-    );
-    metadata.insert(
-        "total_output_tokens".to_string(),
-        serde_json::Value::Number(serde_json::Number::from(total_output_tokens)),
-    );
-    metadata.insert(
-        "total_reasoning_tokens".to_string(),
-        serde_json::Value::Number(serde_json::Number::from(total_reasoning_tokens)),
-    );
-
-    #[derive(Serialize)]
-    struct LegacyEventWrapper {
-        event_type: String,
-        event_data: serde_json::Value,
-    }
-
-    let legacy_timeline: Vec<LegacyEventWrapper> = timeline.into_iter().map(|item| {
-        match item {
-            TimelineItem::UserPrompt { timestamp, prompt, context, turn_no } => {
-                let mut attachments = Vec::new();
-                if let Some(ctx) = context {
-                    if let Some(atts) = ctx.get("attachments").and_then(|a| a.as_array()) {
-                        attachments = atts.clone();
-                    }
-                }
-                LegacyEventWrapper {
-                    event_type: "UserPrompt".to_string(),
-                    event_data: serde_json::json!({
-                        "timestamp": timestamp,
-                        "prompt": prompt,
-                        "transformed_prompt": None::<String>,
-                        "attachments": attachments,
-                        "turn_no": turn_no,
-                    }),
-                }
-            }
-            TimelineItem::AgentReply { timestamp, reply, reasoning, turn_no, model, tokens, duration_ms: _, reasoning_effort } => {
-                let reply_content = if let Some(r) = reasoning {
-                    format!("<details><summary>🧠 LLM Reasoning Process</summary>\n{}\n</details>\n\n{}", r, reply)
-                } else {
-                    reply
-                };
-                LegacyEventWrapper {
-                    event_type: "AssistantReply".to_string(),
-                    event_data: serde_json::json!({
-                        "timestamp": timestamp,
-                        "reply": reply_content,
-                        "model": model,
-                        "reasoning_effort": reasoning_effort,
-                        "input_tokens": tokens.as_ref().map(|t| t.input),
-                        "output_tokens": tokens.as_ref().map(|t| t.output),
-                        "cache_read_tokens": tokens.as_ref().and_then(|t| t.cache_read),
-                        "cache_write_tokens": tokens.as_ref().and_then(|t| t.cache_write),
-                        "reasoning_tokens": tokens.as_ref().and_then(|t| t.reasoning),
-                        "total_tokens": tokens.as_ref().map(|t| t.total),
-                        "tool_requests": Vec::<serde_json::Value>::new(),
-                        "turn_no": turn_no,
-                    }),
-                }
-            }
-            TimelineItem::ToolStep { timestamp, tool_name, arguments, env: _, exit_code, stdout, stderr, tool_call_id: _, status } => {
-                let content_str = if !stderr.is_empty() {
-                    format!("Stdout:\n{}\n\nStderr:\n{}", stdout, stderr)
-                } else {
-                    stdout
-                };
-                LegacyEventWrapper {
-                    event_type: "ToolStep".to_string(),
-                    event_data: serde_json::json!({
-                        "timestamp": timestamp,
-                        "tool_name": tool_name,
-                        "arguments": arguments,
-                        "result": if status == "success" || status == "failed" {
-                            Some(serde_json::json!({
-                                "content": content_str,
-                                "exitCode": exit_code,
-                            }))
-                        } else {
-                            None
-                        },
-                        "turn_no": 1,
-                    }),
-                }
-            }
-            TimelineItem::SystemStatus { timestamp, status_type, message } => {
-                LegacyEventWrapper {
-                    event_type: "SystemStatus".to_string(),
-                    event_data: serde_json::json!({
-                        "timestamp": timestamp,
-                        "status_type": status_type,
-                        "message": message,
-                    }),
-                }
-            }
-        }
-    }).collect();
-
-    Json(serde_json::json!({
-        "session_id": session_id,
-        "metadata": metadata,
-        "timeline": legacy_timeline,
-    }))
-    .into_response()
 }
 
 #[cfg(test)]
@@ -1723,6 +1251,7 @@ mod tests {
             UsageDayExportRecord {
                 entry,
                 import_source_id: None,
+                usage_identity: None,
             },
             assistant_type.to_string(),
         )

@@ -177,7 +177,7 @@ If the file does not exist, you can create it with the following content. If it 
 }
 ```
 
-Replace `/ABSOLUTE/HOME` with the actual home-directory path shown by `echo $HOME`, such as `/Users/will` or `/home/will`.
+Replace `/ABSOLUTE/HOME` with the actual home-directory path shown by `echo $HOME`, such as `/Users/your-name` or `/home/your-name`.
 
 ### 3. Verify
 

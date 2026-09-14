@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { compareSessionRows } from '../static/session-utils.js';
+import { compareSessionRows, matchesSessionIdentity } from '../static/session-utils.js';
 
 const mixedTimestampSessions = [
   {
@@ -51,5 +51,20 @@ test('session sorting preserves numeric and string column behavior', () => {
       .sort((a, b) => compareSessionRows(a, b, 'session_id', 'asc'))
       .map(session => session.session_id),
     ['a', 'b'],
+  );
+});
+
+test('session identity includes the source directory key', () => {
+  const session = {
+    session_id: 'shared',
+    assistant_type: 'copilot',
+    source_kind: 'copilot-app',
+    source_dir_key: 'aa',
+  };
+
+  assert.equal(matchesSessionIdentity(session, { ...session }), true);
+  assert.equal(
+    matchesSessionIdentity(session, { ...session, source_dir_key: 'bb' }),
+    false,
   );
 });
