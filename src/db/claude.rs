@@ -212,3 +212,65 @@ pub(super) fn parse_claude_session_file(filepath: &Path) -> Result<Vec<UsageEntr
 
     Ok(results)
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_jsonl_path(prefix: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{}-{unique}.jsonl", std::process::id()))
+    }
+
+    #[test]
+    fn parse_claude_session_file_deduplicates_request_usage() {
+        let path = temp_jsonl_path("claude-parser");
+
+        let content = r#"{"type":"user","sessionId":"session-1","cwd":"/tmp/project","version":"2.1.201","timestamp":"2026-07-04T19:28:48.190Z","uuid":"u1","message":{"role":"user","content":"Build the report"}}
+{"type":"user","sessionId":"session-1","cwd":"/tmp/project","version":"2.1.201","timestamp":"2026-07-04T19:28:49.190Z","uuid":"u2","message":{"role":"user","content":"Use monthly grouping"}}
+{"type":"assistant","sessionId":"session-1","cwd":"/tmp/project","version":"2.1.201","timestamp":"2026-07-04T19:28:51.753Z","uuid":"a1","requestId":"req_1","message":{"id":"msg_1","role":"assistant","model":"claude-haiku-4-5-20251001","content":[{"type":"thinking","thinking":"working"}],"usage":{"input_tokens":10,"cache_creation_input_tokens":3,"cache_read_input_tokens":7,"output_tokens":5,"cache_creation":{"ephemeral_5m_input_tokens":1,"ephemeral_1h_input_tokens":2}}}}
+{"type":"assistant","sessionId":"session-1","cwd":"/tmp/project","version":"2.1.201","timestamp":"2026-07-04T19:28:51.948Z","uuid":"a2","requestId":"req_1","message":{"id":"msg_1","role":"assistant","model":"claude-haiku-4-5-20251001","content":[{"type":"text","text":"Done"}],"usage":{"input_tokens":10,"cache_creation_input_tokens":3,"cache_read_input_tokens":7,"output_tokens":5,"cache_creation":{"ephemeral_5m_input_tokens":1,"ephemeral_1h_input_tokens":2}}}}
+"#;
+
+        fs::write(&path, content).unwrap();
+        let entries = parse_claude_session_file(&path).unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry.session_id, "session-1");
+        assert_eq!(entry.session_name.as_deref(), Some("Use monthly grouping"));
+        assert_eq!(entry.cwd.as_deref(), Some("/tmp/project"));
+        assert_eq!(entry.version.as_deref(), Some("2.1.201"));
+        assert_eq!(entry.model.as_deref(), Some("claude-haiku-4-5-20251001"));
+
+        let tokens = entry.tokens.as_ref().unwrap();
+        assert_eq!(tokens.input, 10);
+        assert_eq!(tokens.cache_write, Some(3));
+        assert_eq!(tokens.cache_write_5m, Some(1));
+        assert_eq!(tokens.cache_write_1h, Some(2));
+        assert_eq!(tokens.cache_read, Some(7));
+        assert_eq!(tokens.output, 5);
+        assert_eq!(tokens.total, 25);
+    }
+
+    #[test]
+    fn parse_claude_session_file_defaults_unclassified_cache_writes_to_5m() {
+        let path = temp_jsonl_path("claude-cache-default");
+        let content = r#"{"type":"assistant","sessionId":"session-cache-default","timestamp":"2026-07-04T19:28:51.753Z","uuid":"a1","requestId":"req_1","message":{"id":"msg_1","role":"assistant","model":"claude-haiku-4-5-20251001","content":[{"type":"text","text":"Done"}],"usage":{"input_tokens":10,"cache_creation_input_tokens":3,"cache_read_input_tokens":7,"output_tokens":5}}}
+"#;
+
+        fs::write(&path, content).unwrap();
+        let entries = parse_claude_session_file(&path).unwrap();
+        let _ = fs::remove_file(&path);
+
+        let tokens = entries[0].tokens.as_ref().unwrap();
+        assert_eq!(tokens.input, 10);
+        assert_eq!(tokens.cache_write, Some(3));
+        assert_eq!(tokens.cache_write_5m, Some(3));
+        assert_eq!(tokens.cache_write_1h, Some(0));
+        assert_eq!(tokens.total, 25);
+    }
+}

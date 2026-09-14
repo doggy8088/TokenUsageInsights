@@ -23,8 +23,27 @@ export function compareSessionRows(a, b, sortColumn, sortDirection) {
 }
 
 export function matchesSessionIdentity(session, identity) {
-  return (session?.session_id || '') === (identity?.session_id || '')
-    && (session?.assistant_type || '') === (identity?.assistant_type || '')
-    && (session?.source_kind || '') === (identity?.source_kind || '')
-    && (session?.source_dir_key || '') === (identity?.source_dir_key || '');
+  return sessionIdentityKey(session) === sessionIdentityKey(identity);
+}
+
+export function sessionIdentityKey(session) {
+  return JSON.stringify([
+    session?.assistant_type || '',
+    session?.source_kind || '',
+    session?.source_dir_key || '',
+    session?.session_id || '',
+  ]);
+}
+
+export function parentSessionIdentityKey(session) {
+  if (!session?.parent_session_id) return null;
+  return sessionIdentityKey({
+    ...session,
+    session_id: session.parent_session_id,
+  });
+}
+
+export function filterEntriesBySessionIdentity(entries, sessions) {
+  const sessionKeys = new Set((sessions || []).map(sessionIdentityKey));
+  return (entries || []).filter(entry => sessionKeys.has(sessionIdentityKey(entry)));
 }

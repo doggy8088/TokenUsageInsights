@@ -387,3 +387,185 @@ pub(super) fn parse_codex_session_file(filepath: &Path) -> Result<Vec<UsageEntry
 
     Ok(results)
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_jsonl_path(prefix: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{}-{unique}.jsonl", std::process::id()))
+    }
+
+    #[test]
+    fn parse_codex_session_file_derives_delta_from_cumulative_usage() {
+        let path = temp_jsonl_path("codex-parser");
+
+        let content = r#"{"timestamp":"2026-07-07T10:58:17.474Z","type":"session_meta","payload":{"session_id":"session-1","cwd":"/tmp/project","cli_version":"0.142.5","model":"gpt-5.5"}}
+{"timestamp":"2026-07-07T10:58:26.197Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110},"last_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110},"model_context_window":258400}}}
+{"timestamp":"2026-07-07T10:59:26.197Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110},"last_token_usage":{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":19347},"model_context_window":258400}}}
+{"timestamp":"2026-07-07T11:00:26.197Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":130,"cached_input_tokens":30,"output_tokens":15,"reasoning_output_tokens":7,"total_tokens":145},"last_token_usage":{"input_tokens":30,"cached_input_tokens":10,"output_tokens":5,"reasoning_output_tokens":3,"total_tokens":35},"model_context_window":258400}}}
+"#;
+
+        fs::write(&path, content).unwrap();
+        let entries = parse_codex_session_file(&path).unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(entries.len(), 3);
+
+        let first = entries[0].delta_tokens.as_ref().unwrap();
+        assert_eq!(first.input, 80);
+        assert_eq!(first.cache_read, Some(20));
+        assert_eq!(first.output, 10);
+        assert_eq!(first.reasoning, Some(4));
+        assert_eq!(first.total, 110);
+
+        let anomalous = entries[1].delta_tokens.as_ref().unwrap();
+        assert_eq!(anomalous.input, 0);
+        assert_eq!(anomalous.cache_read, Some(0));
+        assert_eq!(anomalous.output, 0);
+        assert_eq!(anomalous.reasoning, Some(0));
+        assert_eq!(anomalous.total, 0);
+
+        let third = entries[2].delta_tokens.as_ref().unwrap();
+        assert_eq!(third.input, 20);
+        assert_eq!(third.cache_read, Some(10));
+        assert_eq!(third.output, 5);
+        assert_eq!(third.reasoning, Some(3));
+        assert_eq!(third.total, 35);
+
+        let total = entries
+            .iter()
+            .map(|entry| entry.delta_tokens.as_ref().unwrap().total)
+            .sum::<u64>();
+        assert_eq!(total, 145);
+    }
+
+    #[test]
+    fn parse_codex_session_file_sums_completed_task_durations() {
+        let path = temp_jsonl_path("codex-task-duration");
+
+        let content = r#"{"timestamp":"2026-07-07T10:58:17.474Z","type":"session_meta","payload":{"session_id":"session-duration","model":"gpt-5.5"}}
+{"timestamp":"2026-07-07T10:58:18.000Z","type":"event_msg","payload":{"type":"task_started"}}
+{"timestamp":"2026-07-07T10:58:19.000Z","type":"event_msg","payload":{"type":"task_complete","duration_ms":1200}}
+{"timestamp":"2026-07-07T10:58:20.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110},"model_context_window":258400}}}
+{"timestamp":"2026-07-07T10:58:21.000Z","type":"event_msg","payload":{"type":"task_started"}}
+{"timestamp":"2026-07-07T10:58:22.000Z","type":"event_msg","payload":{"type":"task_complete","duration_ms":2300}}
+{"timestamp":"2026-07-07T10:58:23.000Z","type":"event_msg","payload":{"type":"task_started","duration_ms":9000}}
+{"timestamp":"2026-07-07T10:58:24.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":130,"cached_input_tokens":30,"output_tokens":15,"reasoning_output_tokens":7,"total_tokens":145},"model_context_window":258400}}}
+"#;
+
+        fs::write(&path, content).unwrap();
+        let entries = parse_codex_session_file(&path).unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|entry| {
+            entry
+                .cost
+                .as_ref()
+                .and_then(|cost| cost.total_api_duration_ms)
+                == Some(3500.0)
+        }));
+    }
+
+    #[test]
+    fn parse_codex_session_file_uses_last_initial_consecutive_user_prompt_as_name() {
+        let path = temp_jsonl_path("codex-session-name");
+        let content = r#"{"timestamp":"2026-07-16T00:00:00Z","type":"session_meta","payload":{"session_id":"session-name","model":"gpt-5.5"}}
+{"timestamp":"2026-07-16T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"第一條提示"}}
+{"timestamp":"2026-07-16T00:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"第二條提示"}}
+{"timestamp":"2026-07-16T00:00:03Z","type":"event_msg","payload":{"type":"agent_message","message":"收到"}}
+{"timestamp":"2026-07-16T00:00:04Z","type":"event_msg","payload":{"type":"user_message","message":"後續提示"}}
+{"timestamp":"2026-07-16T00:00:05Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110},"model_context_window":258400}}}
+"#;
+
+        fs::write(&path, content).unwrap();
+        let entries = parse_codex_session_file(&path).unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].session_name.as_deref(), Some("第二條提示"));
+    }
+
+    #[test]
+    fn parse_codex_session_file_ignores_repeats_and_handles_resets() {
+        let path = temp_jsonl_path("codex-parser");
+
+        let content = r#"{"timestamp":"2026-06-17T13:50:00.000Z","type":"session_meta","payload":{"session_id":"session-2","cwd":"/tmp/project","cli_version":"0.142.5","model":"gpt-5.5"}}
+{"timestamp":"2026-06-17T13:50:51.243Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":200,"output_tokens":100,"reasoning_output_tokens":40,"total_tokens":1100},"last_token_usage":{"input_tokens":1000,"cached_input_tokens":200,"output_tokens":100,"reasoning_output_tokens":40,"total_tokens":1100},"model_context_window":121600}}}
+{"timestamp":"2026-06-17T13:50:54.339Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":200,"output_tokens":100,"reasoning_output_tokens":40,"total_tokens":1100},"last_token_usage":{"input_tokens":1000,"cached_input_tokens":200,"output_tokens":100,"reasoning_output_tokens":40,"total_tokens":1100},"model_context_window":121600}}}
+{"timestamp":"2026-06-17T13:53:01.169Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":121600},"last_token_usage":{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":0},"model_context_window":121600}}}
+{"timestamp":"2026-06-17T14:43:08.185Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":200,"cached_input_tokens":50,"output_tokens":20,"reasoning_output_tokens":8,"total_tokens":121820},"last_token_usage":{"input_tokens":200,"cached_input_tokens":50,"output_tokens":20,"reasoning_output_tokens":8,"total_tokens":220},"model_context_window":258400}}}
+"#;
+
+        fs::write(&path, content).unwrap();
+        let entries = parse_codex_session_file(&path).unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[0].delta_tokens.as_ref().unwrap().total, 1100);
+        assert_eq!(entries[1].delta_tokens.as_ref().unwrap().total, 0);
+        assert_eq!(entries[2].delta_tokens.as_ref().unwrap().total, 0);
+
+        let after_reset = entries[3].delta_tokens.as_ref().unwrap();
+        assert_eq!(after_reset.input, 150);
+        assert_eq!(after_reset.cache_read, Some(50));
+        assert_eq!(after_reset.output, 20);
+        assert_eq!(after_reset.reasoning, Some(8));
+        assert_eq!(after_reset.total, 220);
+    }
+
+    #[test]
+    fn parse_codex_session_file_keeps_subagent_identity_separate_from_parent() {
+        let path = temp_jsonl_path("codex-subagent");
+        let content = r#"{"timestamp":"2026-07-10T03:45:00.000Z","type":"session_meta","payload":{"session_id":"parent-session","id":"child-session","forked_from_id":"parent-session","parent_thread_id":"parent-session","cwd":"/tmp/project","cli_version":"0.142.5","model":"gpt-5.5","agent_nickname":"reviewer","agent_role":"review","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-session","depth":1,"agent_nickname":"reviewer","agent_role":"review"}}}}}
+{"timestamp":"2026-07-10T03:45:00.500Z","type":"session_meta","payload":{"session_id":"parent-session","id":"parent-session","cwd":"/tmp/project","cli_version":"0.142.5","model":"gpt-5.5","source":"cli"}}
+{"timestamp":"2026-07-10T03:45:01.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110},"last_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110},"model_context_window":258400}}}
+"#;
+
+        fs::write(&path, content).unwrap();
+        let entries = parse_codex_session_file(&path).unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].session_id, "child-session");
+        assert_eq!(
+            entries[0].parent_session_id.as_deref(),
+            Some("parent-session")
+        );
+        assert_ne!(entries[0].session_id, "parent-session");
+    }
+
+    #[test]
+    fn parse_codex_desktop_session_preserves_source_and_cache_write_tokens() {
+        let path = temp_jsonl_path("codex-desktop");
+        let content = r#"{"timestamp":"2026-07-26T10:00:00Z","type":"session_meta","payload":{"id":"desktop-session","session_id":"desktop-session","originator":"Codex Desktop","source":"vscode","cwd":"/tmp/project","cli_version":"0.145.0-alpha.30"}}
+{"timestamp":"2026-07-26T10:00:00.500Z","type":"session_meta","payload":{"id":"desktop-session","session_id":"desktop-session","source":"cli","cwd":"/tmp/project","cli_version":"0.145.0-alpha.30"}}
+{"timestamp":"2026-07-26T10:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"cache_write_input_tokens":5,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110},"model_context_window":258400}}}
+{"timestamp":"2026-07-26T10:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":150,"cached_input_tokens":30,"cache_write_input_tokens":8,"output_tokens":15,"reasoning_output_tokens":7,"total_tokens":165},"model_context_window":258400}}}
+"#;
+
+        fs::write(&path, content).unwrap();
+        let entries = parse_codex_session_file(&path).unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(entries.len(), 2);
+        assert!(entries
+            .iter()
+            .all(|entry| entry.source_kind.as_deref() == Some(CODEX_DESKTOP_SOURCE_KIND)));
+
+        let first = entries[0].delta_tokens.as_ref().unwrap();
+        assert_eq!(first.cache_write, Some(5));
+
+        let second = entries[1].delta_tokens.as_ref().unwrap();
+        assert_eq!(second.input, 40);
+        assert_eq!(second.cache_read, Some(10));
+        assert_eq!(second.cache_write, Some(3));
+        assert_eq!(second.output, 5);
+        assert_eq!(second.reasoning, Some(3));
+        assert_eq!(second.total, 55);
+    }
+}

@@ -1,7 +1,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { compareSessionRows, matchesSessionIdentity } from '../static/session-utils.js';
+import {
+  compareSessionRows,
+  filterEntriesBySessionIdentity,
+  matchesSessionIdentity,
+  parentSessionIdentityKey,
+  sessionIdentityKey,
+} from '../static/session-utils.js';
 
 const mixedTimestampSessions = [
   {
@@ -67,4 +73,47 @@ test('session identity includes the source directory key', () => {
     matchesSessionIdentity(session, { ...session, source_dir_key: 'bb' }),
     false,
   );
+  assert.notEqual(
+    sessionIdentityKey(session),
+    sessionIdentityKey({ ...session, source_kind: 'copilot-cli', source_dir_key: null }),
+  );
+});
+
+test('parent session identity remains scoped to the child source', () => {
+  const child = {
+    session_id: 'parent__agent',
+    parent_session_id: 'parent',
+    assistant_type: 'copilot',
+    source_kind: 'copilot-app',
+    source_dir_key: 'aa',
+  };
+
+  assert.equal(
+    parentSessionIdentityKey(child),
+    sessionIdentityKey({ ...child, session_id: 'parent' }),
+  );
+  assert.notEqual(
+    parentSessionIdentityKey(child),
+    sessionIdentityKey({
+      ...child,
+      session_id: 'parent',
+      source_dir_key: 'bb',
+    }),
+  );
+});
+
+test('raw usage filtering preserves the full session source identity', () => {
+  const sessions = [{
+    assistant_type: 'copilot',
+    source_kind: 'copilot-app',
+    source_dir_key: 'aa',
+    session_id: 'shared-session',
+  }];
+  const entries = [
+    { ...sessions[0], total_tokens: 100 },
+    { ...sessions[0], source_dir_key: 'bb', total_tokens: 300 },
+    { ...sessions[0], assistant_type: 'codex', total_tokens: 500 },
+  ];
+
+  assert.deepEqual(filterEntriesBySessionIdentity(entries, sessions), [entries[0]]);
 });

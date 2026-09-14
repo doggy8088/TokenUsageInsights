@@ -8,7 +8,13 @@ import {
   getChartDataPointX,
   parseUsageTimestamp,
 } from './chart-utils.js?v=7';
-import { compareSessionRows, matchesSessionIdentity } from './session-utils.js?v=2';
+import {
+  compareSessionRows,
+  filterEntriesBySessionIdentity,
+  matchesSessionIdentity,
+  parentSessionIdentityKey,
+  sessionIdentityKey,
+} from './session-utils.js?v=3';
 
 // Globals
 let tokenChartInstance = null;
@@ -2553,7 +2559,13 @@ function renderDashboard(data) {
   }
   const nextSearchFingerprint = JSON.stringify(
     allSessions
-      .map(session => [session.assistant_type, session.session_id, session.max_turn_no])
+      .map(session => [
+        session.assistant_type,
+        session.source_kind,
+        session.source_dir_key,
+        session.session_id,
+        session.max_turn_no,
+      ])
       .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)))
   );
   const shouldRefreshSearch = currentSessionSearchQuery
@@ -3755,10 +3767,10 @@ function buildDailyViewData(data) {
   if (!currentSessionCwdFilter) return data;
 
   const sessions = getCwdFilteredSessions(Array.isArray(data.sessions) ? data.sessions : []);
-  const sessionIds = new Set(sessions.map(session => String(session.session_id || '')));
-  const rawEntries = (Array.isArray(data.raw_entries) ? data.raw_entries : []).filter(entry => (
-    sessionIds.has(String(entry.session_id || ''))
-  ));
+  const rawEntries = filterEntriesBySessionIdentity(
+    Array.isArray(data.raw_entries) ? data.raw_entries : [],
+    sessions
+  );
 
   return {
     ...data,
@@ -3853,8 +3865,8 @@ function updateSessionCwdFilterOptions(sessions) {
     : t('session_cwd_filter_aria_label');
 }
 
-function sessionSearchMatchKey(assistantType, sessionId) {
-  return JSON.stringify([assistantType || '', sessionId || '']);
+function sessionSearchMatchKey(session) {
+  return sessionIdentityKey(session);
 }
 
 function getSearchFilteredSessions() {
@@ -3869,7 +3881,7 @@ function getSearchFilteredSessions() {
   }
 
   return cwdFilteredSessions.filter(session => currentSessionSearchMatches.has(
-    sessionSearchMatchKey(session.assistant_type, session.session_id)
+    sessionSearchMatchKey(session)
   ));
 }
 
@@ -3933,10 +3945,7 @@ async function executeSessionPromptSearch(query, searchContext) {
     }
 
     currentSessionSearchMatches = new Set(
-      (result.matches || []).map(match => sessionSearchMatchKey(
-        match.assistant_type,
-        match.session_id
-      ))
+      (result.matches || []).map(match => sessionSearchMatchKey(match))
     );
     currentSessionSearchUnavailable = Number(result.unavailable_sessions) || 0;
     currentSessionSearchState = 'complete';
@@ -3966,13 +3975,14 @@ async function executeSessionPromptSearch(query, searchContext) {
 function sortAndGetFlatSessions(sessions, sortCol, sortDir) {
   const map = new Map();
   sessions.forEach(s => {
-    map.set(s.session_id, { ...s, children: [] });
+    map.set(sessionIdentityKey(s), { ...s, children: [] });
   });
 
   const nodes = [...map.values()];
   const roots = [];
   nodes.forEach(item => {
-    const parent = item.parent_session_id ? map.get(item.parent_session_id) : null;
+    const parentKey = parentSessionIdentityKey(item);
+    const parent = parentKey ? map.get(parentKey) : null;
     if (parent && parent !== item) {
       parent.children.push(item);
     } else {
@@ -3990,8 +4000,9 @@ function sortAndGetFlatSessions(sessions, sortCol, sortDir) {
   const flat = [];
   const visited = new Set();
   const traverse = (node, depth, parentName) => {
-    if (visited.has(node.session_id)) return;
-    visited.add(node.session_id);
+    const nodeKey = sessionIdentityKey(node);
+    if (visited.has(nodeKey)) return;
+    visited.add(nodeKey);
     flat.push({
       ...node,
       depth,
@@ -4004,7 +4015,7 @@ function sortAndGetFlatSessions(sessions, sortCol, sortDir) {
   };
   roots.forEach(r => traverse(r, 0, null));
   nodes.forEach(node => {
-    if (!visited.has(node.session_id)) {
+    if (!visited.has(sessionIdentityKey(node))) {
       traverse(node, 0, null);
     }
   });
@@ -4139,41 +4150,44 @@ function renderSessionTable(sessions) {
   }
 
   // 建立快速查詢 Map 以供 Hover 高亮與樹狀結構查詢
-  const sessionsMap = Object.create(null);
+  const sessionsMap = new Map();
   sessions.forEach(s => {
-    sessionsMap[s.session_id] = s;
+    sessionsMap.set(sessionIdentityKey(s), s);
   });
 
-  function getRootParentId(session) {
+  function getRootParentKey(session) {
     let curr = session;
     const path = [];
     const positions = new Map();
 
     while (curr) {
-      const id = curr.session_id;
-      if (positions.has(id)) {
+      const key = sessionIdentityKey(curr);
+      if (positions.has(key)) {
         return path
-          .slice(positions.get(id))
-          .map(node => String(node.session_id))
+          .slice(positions.get(key))
+          .map(node => sessionIdentityKey(node))
           .sort((a, b) => a.localeCompare(b))[0];
       }
 
-      positions.set(id, path.length);
+      positions.set(key, path.length);
       path.push(curr);
 
-      if (!curr.parent_session_id || !sessionsMap[curr.parent_session_id]) {
-        return id;
+      const parentKey = parentSessionIdentityKey(curr);
+      if (!parentKey || !sessionsMap.has(parentKey)) {
+        return key;
       }
-      curr = sessionsMap[curr.parent_session_id];
+      curr = sessionsMap.get(parentKey);
     }
 
-    return session.session_id;
+    return sessionIdentityKey(session);
   }
 
   sessions.forEach(s => {
     const tr = document.createElement('tr');
     tr.setAttribute('data-session-id', s.session_id);
     tr.setAttribute('data-parent-id', s.parent_session_id || '');
+    tr.setAttribute('data-session-key', sessionIdentityKey(s));
+    tr.setAttribute('data-parent-key', parentSessionIdentityKey(s) || '');
 
     if (s.isSubagent) {
       tr.classList.add('subagent-row');
@@ -4261,13 +4275,13 @@ function renderSessionTable(sessions) {
 
     // 群組 Hover 高亮
     tr.addEventListener('mouseenter', () => {
-      const rootId = getRootParentId(s);
+      const rootKey = getRootParentKey(s);
       tbody.querySelectorAll('tr').forEach(row => {
-        const sid = row.getAttribute('data-session-id');
-        const pid = row.getAttribute('data-parent-id');
-        const rowSession = sessionsMap[sid];
+        const sid = row.getAttribute('data-session-key');
+        const pid = row.getAttribute('data-parent-key');
+        const rowSession = sessionsMap.get(sid);
         
-        if (sid === rootId || pid === rootId || (rowSession && getRootParentId(rowSession) === rootId)) {
+        if (sid === rootKey || pid === rootKey || (rowSession && getRootParentKey(rowSession) === rootKey)) {
           row.classList.add('family-highlight');
         }
       });

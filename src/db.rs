@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
@@ -15,13 +15,6 @@ use claude::{find_claude_session_files, parse_claude_session_file};
 use codex::{find_codex_session_files, parse_codex_session_file};
 pub(crate) use cursor::parse_cursor_timestamp;
 use cursor::sync_cursor_usage_logs;
-
-#[cfg(test)]
-use cursor::{
-    cursor_date_from_timestamp, cursor_response_signature, open_cursor_state_db,
-    parse_cursor_agent_kv_model_signature, parse_cursor_session_file,
-    parse_cursor_session_metadata, run_cursor_cache_tokens_unknown_migration,
-};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TokenStats {
@@ -674,6 +667,18 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
         [],
     )
     .map_err(|e| format!("建立 usage_entries 表失敗: {}", e))?;
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS usage_source_directories (
+            assistant_type TEXT NOT NULL,
+            source_kind TEXT NOT NULL,
+            source_dir_key TEXT NOT NULL,
+            dir_path BLOB NOT NULL,
+            PRIMARY KEY (assistant_type, source_kind, source_dir_key)
+        )",
+        [],
+    )
+    .map_err(|e| format!("建立 usage_source_directories 表失敗: {e}"))?;
 
     // Ensure reasoning_effort column is present in case database already exists
     let _ = conn.execute(
@@ -1818,6 +1823,96 @@ fn portable_relative_path(root: &Path, path: &Path) -> String {
         .join("/")
 }
 
+fn register_usage_source_directory(
+    conn: &Connection,
+    assistant: &str,
+    source_kind: &str,
+    source_dir_key: &str,
+    directory: &Path,
+) -> Result<(), String> {
+    let encoded_directory = encode_registered_path(directory);
+    conn.execute(
+        "INSERT INTO usage_source_directories (
+            assistant_type, source_kind, source_dir_key, dir_path
+         ) VALUES (?, ?, ?, ?)
+         ON CONFLICT(assistant_type, source_kind, source_dir_key)
+         DO UPDATE SET dir_path = excluded.dir_path",
+        params![assistant, source_kind, source_dir_key, encoded_directory,],
+    )
+    .map_err(|error| format!("記錄使用量來源目錄失敗: {error}"))?;
+    Ok(())
+}
+
+pub(crate) fn get_usage_source_directory(
+    conn: &Connection,
+    assistant: &str,
+    source_kind: &str,
+    source_dir_key: &str,
+) -> Result<Option<PathBuf>, String> {
+    let encoded = conn
+        .query_row(
+            "SELECT dir_path
+         FROM usage_source_directories
+         WHERE assistant_type = ? AND source_kind = ? AND source_dir_key = ?",
+            params![assistant, source_kind, source_dir_key],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()
+        .map_err(|error| format!("查詢使用量來源目錄失敗: {error}"))?;
+    encoded
+        .map(|bytes| {
+            decode_registered_path(bytes)
+                .ok_or_else(|| "已登錄的使用量來源目錄格式無效".to_string())
+        })
+        .transpose()
+}
+
+#[cfg(unix)]
+fn encode_registered_path(path: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(unix)]
+fn decode_registered_path(bytes: Vec<u8>) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    Some(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+}
+
+#[cfg(windows)]
+fn encode_registered_path(path: &Path) -> Vec<u8> {
+    use std::os::windows::ffi::OsStrExt;
+    path.as_os_str()
+        .encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect()
+}
+
+#[cfg(windows)]
+fn decode_registered_path(bytes: Vec<u8>) -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    let chunks = bytes.chunks_exact(2);
+    if !chunks.remainder().is_empty() {
+        return None;
+    }
+    let path = std::ffi::OsString::from_wide(
+        &chunks
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect::<Vec<_>>(),
+    );
+    Some(PathBuf::from(path))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn encode_registered_path(path: &Path) -> Vec<u8> {
+    path.to_string_lossy().into_owned().into_bytes()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn decode_registered_path(bytes: Vec<u8>) -> Option<PathBuf> {
+    String::from_utf8(bytes).ok().map(PathBuf::from)
+}
+
 /// Sync token usage from the Copilot App (Tauri desktop application).
 ///
 /// The Copilot App writes per-API-call usage into `~/.copilot/session-store.db`
@@ -1849,6 +1944,13 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
     // collisions from Unicode replacement chars and from `\\` vs `/` normalization.
     let canonical_app_dir = app_dir.canonicalize().unwrap_or_else(|_| app_dir.clone());
     let source_key = encode_hex(canonical_app_dir.as_os_str().as_encoded_bytes());
+    register_usage_source_directory(
+        conn,
+        "copilot",
+        COPILOT_APP_SOURCE_KIND,
+        &source_key,
+        &canonical_app_dir,
+    )?;
     let cursor_key_prefix = format!("{}{}::", COPILOT_APP_CURSOR_PREFIX, source_key);
 
     // `data.db.sessions` is the authoritative registry for Copilot App
@@ -6641,6 +6743,67 @@ mod tests {
     }
 
     #[test]
+    fn usage_source_directory_registry_is_scoped_by_source_key() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let source_a = PathBuf::from("registered/copilot-a");
+        let source_b = PathBuf::from("registered/copilot-b");
+
+        register_usage_source_directory(&conn, "copilot", "copilot-app", "aa", &source_a).unwrap();
+        register_usage_source_directory(&conn, "copilot", "copilot-app", "bb", &source_b).unwrap();
+
+        assert_eq!(
+            get_usage_source_directory(&conn, "copilot", "copilot-app", "aa").unwrap(),
+            Some(source_a)
+        );
+        assert_eq!(
+            get_usage_source_directory(&conn, "copilot", "copilot-app", "bb").unwrap(),
+            Some(source_b)
+        );
+        assert_eq!(
+            get_usage_source_directory(&conn, "copilot", "copilot-app", "cc").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn session_lookup_returns_parent_and_agent_for_subagent_row() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let parent = "74b6d236-d311-4675-9855-fee91bc508e5";
+        let agent = "call_v4b32z66";
+        let synthetic = format!("{parent}__{agent}");
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, model,
+                tokens_input, tokens_output, tokens_total,
+                delta_input, delta_output, delta_total,
+                parent_session_id, agent_nickname
+             ) VALUES (
+                'copilot', 'copilot-app', 'abcdef00', '2026-07-20T10:00:00Z', '2026-07-20',
+                ?, 1, 'K2.7', 100, 10, 110, 100, 10, 110, ?, ?
+             )",
+            params![synthetic, parent, agent],
+        )
+        .unwrap();
+
+        let (_, _, source_kind, source_dir_key, parent_id, nickname) =
+            get_session_assistant_and_transcript(
+                &conn,
+                "copilot",
+                &synthetic,
+                Some("copilot-app"),
+                Some("abcdef00"),
+            )
+            .unwrap();
+        assert_eq!(source_kind, "copilot-app");
+        assert_eq!(source_dir_key.as_deref(), Some("abcdef00"));
+        assert_eq!(parent_id.as_deref(), Some(parent));
+        assert_eq!(nickname.as_deref(), Some(agent));
+    }
+
+    #[test]
     fn import_usage_day_entries_writes_and_deduplicates_records() {
         let mut conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
@@ -7540,176 +7703,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_codex_session_file_derives_delta_from_cumulative_usage() {
-        let path = temp_jsonl_path("codex-parser");
-
-        let content = r#"{"timestamp":"2026-07-07T10:58:17.474Z","type":"session_meta","payload":{"session_id":"session-1","cwd":"/tmp/project","cli_version":"0.142.5","model":"gpt-5.5"}}
-{"timestamp":"2026-07-07T10:58:26.197Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110},"last_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110},"model_context_window":258400}}}
-{"timestamp":"2026-07-07T10:59:26.197Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110},"last_token_usage":{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":19347},"model_context_window":258400}}}
-{"timestamp":"2026-07-07T11:00:26.197Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":130,"cached_input_tokens":30,"output_tokens":15,"reasoning_output_tokens":7,"total_tokens":145},"last_token_usage":{"input_tokens":30,"cached_input_tokens":10,"output_tokens":5,"reasoning_output_tokens":3,"total_tokens":35},"model_context_window":258400}}}
-"#;
-
-        fs::write(&path, content).unwrap();
-        let entries = parse_codex_session_file(&path).unwrap();
-        let _ = fs::remove_file(&path);
-
-        assert_eq!(entries.len(), 3);
-
-        let first = entries[0].delta_tokens.as_ref().unwrap();
-        assert_eq!(first.input, 80);
-        assert_eq!(first.cache_read, Some(20));
-        assert_eq!(first.output, 10);
-        assert_eq!(first.reasoning, Some(4));
-        assert_eq!(first.total, 110);
-
-        let anomalous = entries[1].delta_tokens.as_ref().unwrap();
-        assert_eq!(anomalous.input, 0);
-        assert_eq!(anomalous.cache_read, Some(0));
-        assert_eq!(anomalous.output, 0);
-        assert_eq!(anomalous.reasoning, Some(0));
-        assert_eq!(anomalous.total, 0);
-
-        let third = entries[2].delta_tokens.as_ref().unwrap();
-        assert_eq!(third.input, 20);
-        assert_eq!(third.cache_read, Some(10));
-        assert_eq!(third.output, 5);
-        assert_eq!(third.reasoning, Some(3));
-        assert_eq!(third.total, 35);
-
-        let total = entries
-            .iter()
-            .map(|entry| entry.delta_tokens.as_ref().unwrap().total)
-            .sum::<u64>();
-        assert_eq!(total, 145);
-    }
-
-    #[test]
-    fn parse_codex_session_file_sums_completed_task_durations() {
-        let path = temp_jsonl_path("codex-task-duration");
-
-        let content = r#"{"timestamp":"2026-07-07T10:58:17.474Z","type":"session_meta","payload":{"session_id":"session-duration","model":"gpt-5.5"}}
-{"timestamp":"2026-07-07T10:58:18.000Z","type":"event_msg","payload":{"type":"task_started"}}
-{"timestamp":"2026-07-07T10:58:19.000Z","type":"event_msg","payload":{"type":"task_complete","duration_ms":1200}}
-{"timestamp":"2026-07-07T10:58:20.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110},"model_context_window":258400}}}
-{"timestamp":"2026-07-07T10:58:21.000Z","type":"event_msg","payload":{"type":"task_started"}}
-{"timestamp":"2026-07-07T10:58:22.000Z","type":"event_msg","payload":{"type":"task_complete","duration_ms":2300}}
-{"timestamp":"2026-07-07T10:58:23.000Z","type":"event_msg","payload":{"type":"task_started","duration_ms":9000}}
-{"timestamp":"2026-07-07T10:58:24.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":130,"cached_input_tokens":30,"output_tokens":15,"reasoning_output_tokens":7,"total_tokens":145},"model_context_window":258400}}}
-"#;
-
-        fs::write(&path, content).unwrap();
-        let entries = parse_codex_session_file(&path).unwrap();
-        let _ = fs::remove_file(&path);
-
-        assert_eq!(entries.len(), 2);
-        assert!(entries.iter().all(|entry| {
-            entry
-                .cost
-                .as_ref()
-                .and_then(|cost| cost.total_api_duration_ms)
-                == Some(3500.0)
-        }));
-    }
-
-    #[test]
-    fn parse_codex_session_file_uses_last_initial_consecutive_user_prompt_as_name() {
-        let path = temp_jsonl_path("codex-session-name");
-        let content = r#"{"timestamp":"2026-07-16T00:00:00Z","type":"session_meta","payload":{"session_id":"session-name","model":"gpt-5.5"}}
-{"timestamp":"2026-07-16T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"第一條提示"}}
-{"timestamp":"2026-07-16T00:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"第二條提示"}}
-{"timestamp":"2026-07-16T00:00:03Z","type":"event_msg","payload":{"type":"agent_message","message":"收到"}}
-{"timestamp":"2026-07-16T00:00:04Z","type":"event_msg","payload":{"type":"user_message","message":"後續提示"}}
-{"timestamp":"2026-07-16T00:00:05Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110},"model_context_window":258400}}}
-"#;
-
-        fs::write(&path, content).unwrap();
-        let entries = parse_codex_session_file(&path).unwrap();
-        let _ = fs::remove_file(&path);
-
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].session_name.as_deref(), Some("第二條提示"));
-    }
-
-    #[test]
-    fn parse_codex_session_file_ignores_repeats_and_handles_resets() {
-        let path = temp_jsonl_path("codex-parser");
-
-        let content = r#"{"timestamp":"2026-06-17T13:50:00.000Z","type":"session_meta","payload":{"session_id":"session-2","cwd":"/tmp/project","cli_version":"0.142.5","model":"gpt-5.5"}}
-{"timestamp":"2026-06-17T13:50:51.243Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":200,"output_tokens":100,"reasoning_output_tokens":40,"total_tokens":1100},"last_token_usage":{"input_tokens":1000,"cached_input_tokens":200,"output_tokens":100,"reasoning_output_tokens":40,"total_tokens":1100},"model_context_window":121600}}}
-{"timestamp":"2026-06-17T13:50:54.339Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":200,"output_tokens":100,"reasoning_output_tokens":40,"total_tokens":1100},"last_token_usage":{"input_tokens":1000,"cached_input_tokens":200,"output_tokens":100,"reasoning_output_tokens":40,"total_tokens":1100},"model_context_window":121600}}}
-{"timestamp":"2026-06-17T13:53:01.169Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":121600},"last_token_usage":{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":0},"model_context_window":121600}}}
-{"timestamp":"2026-06-17T14:43:08.185Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":200,"cached_input_tokens":50,"output_tokens":20,"reasoning_output_tokens":8,"total_tokens":121820},"last_token_usage":{"input_tokens":200,"cached_input_tokens":50,"output_tokens":20,"reasoning_output_tokens":8,"total_tokens":220},"model_context_window":258400}}}
-"#;
-
-        fs::write(&path, content).unwrap();
-        let entries = parse_codex_session_file(&path).unwrap();
-        let _ = fs::remove_file(&path);
-
-        assert_eq!(entries.len(), 4);
-        assert_eq!(entries[0].delta_tokens.as_ref().unwrap().total, 1100);
-        assert_eq!(entries[1].delta_tokens.as_ref().unwrap().total, 0);
-        assert_eq!(entries[2].delta_tokens.as_ref().unwrap().total, 0);
-
-        let after_reset = entries[3].delta_tokens.as_ref().unwrap();
-        assert_eq!(after_reset.input, 150);
-        assert_eq!(after_reset.cache_read, Some(50));
-        assert_eq!(after_reset.output, 20);
-        assert_eq!(after_reset.reasoning, Some(8));
-        assert_eq!(after_reset.total, 220);
-    }
-
-    #[test]
-    fn parse_codex_session_file_keeps_subagent_identity_separate_from_parent() {
-        let path = temp_jsonl_path("codex-subagent");
-        let content = r#"{"timestamp":"2026-07-10T03:45:00.000Z","type":"session_meta","payload":{"session_id":"parent-session","id":"child-session","forked_from_id":"parent-session","parent_thread_id":"parent-session","cwd":"/tmp/project","cli_version":"0.142.5","model":"gpt-5.5","agent_nickname":"reviewer","agent_role":"review","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-session","depth":1,"agent_nickname":"reviewer","agent_role":"review"}}}}}
-{"timestamp":"2026-07-10T03:45:00.500Z","type":"session_meta","payload":{"session_id":"parent-session","id":"parent-session","cwd":"/tmp/project","cli_version":"0.142.5","model":"gpt-5.5","source":"cli"}}
-{"timestamp":"2026-07-10T03:45:01.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110},"last_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110},"model_context_window":258400}}}
-"#;
-
-        fs::write(&path, content).unwrap();
-        let entries = parse_codex_session_file(&path).unwrap();
-        let _ = fs::remove_file(&path);
-
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].session_id, "child-session");
-        assert_eq!(
-            entries[0].parent_session_id.as_deref(),
-            Some("parent-session")
-        );
-        assert_ne!(entries[0].session_id, "parent-session");
-    }
-
-    #[test]
-    fn parse_codex_desktop_session_preserves_source_and_cache_write_tokens() {
-        let path = temp_jsonl_path("codex-desktop");
-        let content = r#"{"timestamp":"2026-07-26T10:00:00Z","type":"session_meta","payload":{"id":"desktop-session","session_id":"desktop-session","originator":"Codex Desktop","source":"vscode","cwd":"/tmp/project","cli_version":"0.145.0-alpha.30"}}
-{"timestamp":"2026-07-26T10:00:00.500Z","type":"session_meta","payload":{"id":"desktop-session","session_id":"desktop-session","source":"cli","cwd":"/tmp/project","cli_version":"0.145.0-alpha.30"}}
-{"timestamp":"2026-07-26T10:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"cache_write_input_tokens":5,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110},"model_context_window":258400}}}
-{"timestamp":"2026-07-26T10:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":150,"cached_input_tokens":30,"cache_write_input_tokens":8,"output_tokens":15,"reasoning_output_tokens":7,"total_tokens":165},"model_context_window":258400}}}
-"#;
-
-        fs::write(&path, content).unwrap();
-        let entries = parse_codex_session_file(&path).unwrap();
-        let _ = fs::remove_file(&path);
-
-        assert_eq!(entries.len(), 2);
-        assert!(entries
-            .iter()
-            .all(|entry| entry.source_kind.as_deref() == Some(CODEX_DESKTOP_SOURCE_KIND)));
-
-        let first = entries[0].delta_tokens.as_ref().unwrap();
-        assert_eq!(first.cache_write, Some(5));
-
-        let second = entries[1].delta_tokens.as_ref().unwrap();
-        assert_eq!(second.input, 40);
-        assert_eq!(second.cache_read, Some(10));
-        assert_eq!(second.cache_write, Some(3));
-        assert_eq!(second.output, 5);
-        assert_eq!(second.reasoning, Some(3));
-        assert_eq!(second.total, 55);
-    }
-
-    #[test]
     fn sync_codex_usage_logs_tracks_archived_and_unarchived_desktop_sessions() {
         let _guard = ENV_LOCK.lock().unwrap();
         let old_codex_dir = std::env::var("CODEX_DIR").ok();
@@ -8073,56 +8066,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_claude_session_file_deduplicates_request_usage() {
-        let path = temp_jsonl_path("claude-parser");
-
-        let content = r#"{"type":"user","sessionId":"session-1","cwd":"/tmp/project","version":"2.1.201","timestamp":"2026-07-04T19:28:48.190Z","uuid":"u1","message":{"role":"user","content":"Build the report"}}
-{"type":"user","sessionId":"session-1","cwd":"/tmp/project","version":"2.1.201","timestamp":"2026-07-04T19:28:49.190Z","uuid":"u2","message":{"role":"user","content":"Use monthly grouping"}}
-{"type":"assistant","sessionId":"session-1","cwd":"/tmp/project","version":"2.1.201","timestamp":"2026-07-04T19:28:51.753Z","uuid":"a1","requestId":"req_1","message":{"id":"msg_1","role":"assistant","model":"claude-haiku-4-5-20251001","content":[{"type":"thinking","thinking":"working"}],"usage":{"input_tokens":10,"cache_creation_input_tokens":3,"cache_read_input_tokens":7,"output_tokens":5,"cache_creation":{"ephemeral_5m_input_tokens":1,"ephemeral_1h_input_tokens":2}}}}
-{"type":"assistant","sessionId":"session-1","cwd":"/tmp/project","version":"2.1.201","timestamp":"2026-07-04T19:28:51.948Z","uuid":"a2","requestId":"req_1","message":{"id":"msg_1","role":"assistant","model":"claude-haiku-4-5-20251001","content":[{"type":"text","text":"Done"}],"usage":{"input_tokens":10,"cache_creation_input_tokens":3,"cache_read_input_tokens":7,"output_tokens":5,"cache_creation":{"ephemeral_5m_input_tokens":1,"ephemeral_1h_input_tokens":2}}}}
-"#;
-
-        fs::write(&path, content).unwrap();
-        let entries = parse_claude_session_file(&path).unwrap();
-        let _ = fs::remove_file(&path);
-
-        assert_eq!(entries.len(), 1);
-        let entry = &entries[0];
-        assert_eq!(entry.session_id, "session-1");
-        assert_eq!(entry.session_name.as_deref(), Some("Use monthly grouping"));
-        assert_eq!(entry.cwd.as_deref(), Some("/tmp/project"));
-        assert_eq!(entry.version.as_deref(), Some("2.1.201"));
-        assert_eq!(entry.model.as_deref(), Some("claude-haiku-4-5-20251001"));
-
-        let tokens = entry.tokens.as_ref().unwrap();
-        assert_eq!(tokens.input, 10);
-        assert_eq!(tokens.cache_write, Some(3));
-        assert_eq!(tokens.cache_write_5m, Some(1));
-        assert_eq!(tokens.cache_write_1h, Some(2));
-        assert_eq!(tokens.cache_read, Some(7));
-        assert_eq!(tokens.output, 5);
-        assert_eq!(tokens.total, 25);
-    }
-
-    #[test]
-    fn parse_claude_session_file_defaults_unclassified_cache_writes_to_5m() {
-        let path = temp_jsonl_path("claude-cache-default");
-        let content = r#"{"type":"assistant","sessionId":"session-cache-default","timestamp":"2026-07-04T19:28:51.753Z","uuid":"a1","requestId":"req_1","message":{"id":"msg_1","role":"assistant","model":"claude-haiku-4-5-20251001","content":[{"type":"text","text":"Done"}],"usage":{"input_tokens":10,"cache_creation_input_tokens":3,"cache_read_input_tokens":7,"output_tokens":5}}}
-"#;
-
-        fs::write(&path, content).unwrap();
-        let entries = parse_claude_session_file(&path).unwrap();
-        let _ = fs::remove_file(&path);
-
-        let tokens = entries[0].tokens.as_ref().unwrap();
-        assert_eq!(tokens.input, 10);
-        assert_eq!(tokens.cache_write, Some(3));
-        assert_eq!(tokens.cache_write_5m, Some(3));
-        assert_eq!(tokens.cache_write_1h, Some(0));
-        assert_eq!(tokens.total, 25);
-    }
-
-    #[test]
     fn sync_claude_usage_logs_writes_cache_write_ttls() {
         let _guard = ENV_LOCK.lock().unwrap();
         let old_claude_dir = std::env::var("CLAUDE_DIR").ok();
@@ -8167,321 +8110,6 @@ mod tests {
             std::env::remove_var("CLAUDE_DIR");
         }
         fs::remove_dir_all(claude_dir).unwrap();
-    }
-
-    #[test]
-    fn parse_cursor_session_file_uses_last_initial_consecutive_user_prompt_as_name() {
-        let path = temp_jsonl_path("cursor-session-name");
-        let content = r#"{"role":"user","message":{"content":"第一條提示"}}
-{"role":"user","message":{"content":"第二條提示"}}
-{"role":"assistant","message":{"content":"收到"}}
-{"role":"user","message":{"content":"後續提示"}}
-{"role":"assistant","message":{"content":"完成"}}
-"#;
-
-        fs::write(&path, content).unwrap();
-        let entries =
-            parse_cursor_session_file(&path, &HashMap::new(), &HashSet::new(), &HashMap::new())
-                .unwrap();
-        let _ = fs::remove_file(&path);
-
-        assert_eq!(entries.len(), 2);
-        assert!(entries
-            .iter()
-            .all(|entry| entry.entry.session_name.as_deref() == Some("第二條提示")));
-    }
-
-    #[test]
-    fn cursor_response_signature_matches_plain_text_agent_kv_content() {
-        let transcript_content = serde_json::json!([
-            {
-                "type": "text",
-                "text": "Plain answer"
-            }
-        ]);
-        let agent_kv_content = serde_json::json!([
-            {
-                "type": "text",
-                "data": "Plain answer",
-                "providerOptions": {
-                    "cursor": {
-                        "modelName": "composer-2.5"
-                    }
-                }
-            }
-        ]);
-
-        assert_eq!(
-            cursor_response_signature(&transcript_content),
-            cursor_response_signature(&agent_kv_content)
-        );
-    }
-
-    #[test]
-    fn cursor_response_signature_matches_agent_kv_tool_calls() {
-        let transcript_content = serde_json::json!([
-            {
-                "type": "text",
-                "text": "Running"
-            },
-            {
-                "type": "tool_use",
-                "name": "Shell",
-                "input": {
-                    "command": "echo hi",
-                    "block_until_ms": 120_000
-                }
-            }
-        ]);
-        let agent_kv_event = serde_json::json!({
-            "role": "assistant",
-            "content": [
-                {
-                    "type": "text",
-                    "data": "Running",
-                    "providerOptions": {
-                        "cursor": {
-                            "modelName": "composer-2.5"
-                        }
-                    }
-                },
-                {
-                    "type": "tool-call",
-                    "toolName": "Shell",
-                    "args": {
-                        "block_until_ms": 120_000,
-                        "command": "echo hi"
-                    }
-                }
-            ]
-        });
-        let raw = serde_json::to_vec(&agent_kv_event).unwrap();
-        let (signature, model) = parse_cursor_agent_kv_model_signature(&raw).unwrap();
-
-        assert_eq!(
-            Some(signature),
-            cursor_response_signature(&transcript_content)
-        );
-        assert_eq!(model, "composer-2.5");
-    }
-
-    #[test]
-    fn cursor_parser_does_not_reuse_a_previous_reply_model() {
-        let path = temp_jsonl_path("cursor-model-reset");
-        let content = r#"{"role":"user","message":{"content":"Prompt"}}
-{"role":"assistant","message":{"content":[{"type":"text","text":"Known reply"}]}}
-{"role":"assistant","message":{"content":[{"type":"image","data":"omitted"}]}}
-"#;
-        fs::write(&path, content).unwrap();
-        let signature = cursor_response_signature(
-            &serde_json::json!([{"type": "text", "text": "Known reply"}]),
-        )
-        .unwrap();
-        let model_mappings = HashMap::from([(signature, "composer-2.5".to_string())]);
-
-        let entries =
-            parse_cursor_session_file(&path, &model_mappings, &HashSet::new(), &HashMap::new())
-                .unwrap();
-        let _ = fs::remove_file(&path);
-
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].entry.model.as_deref(), Some("composer-2.5"));
-        assert!(entries[0].model_signature.is_some());
-        assert_eq!(entries[1].entry.model.as_deref(), Some("Unknown Model"));
-        assert!(entries[1].model_signature.is_none());
-    }
-
-    #[test]
-    fn cursor_session_metadata_treats_non_agent_modes_as_ide() {
-        let (_, false_overrides_agent_mode) = parse_cursor_session_metadata(
-            "composerData:false-overrides-agent",
-            br#"{
-                "composerId": "false-overrides-agent",
-                "unifiedMode": "agent",
-                "isAgentic": false
-            }"#,
-        )
-        .unwrap();
-        let (_, non_agent_mode_overrides_true) = parse_cursor_session_metadata(
-            "composerData:chat-overrides-true",
-            br#"{
-                "composerId": "chat-overrides-true",
-                "unifiedMode": "chat",
-                "isAgentic": true
-            }"#,
-        )
-        .unwrap();
-        let (_, agent_mode) = parse_cursor_session_metadata(
-            "composerData:agent",
-            br#"{
-                "composerId": "agent",
-                "unifiedMode": "agent",
-                "isAgentic": true
-            }"#,
-        )
-        .unwrap();
-
-        assert_eq!(false_overrides_agent_mode.mode.as_deref(), Some("ide"));
-        assert_eq!(non_agent_mode_overrides_true.mode.as_deref(), Some("ide"));
-        assert_eq!(agent_mode.mode.as_deref(), Some("agent"));
-    }
-
-    #[test]
-    fn cursor_session_metadata_uses_only_concrete_model_configs() {
-        let (_, concrete_model) = parse_cursor_session_metadata(
-            "composerData:concrete-model",
-            br#"{
-                "composerId": "concrete-model",
-                "unifiedMode": "agent",
-                "modelConfig": { "modelName": "composer-2.5" }
-            }"#,
-        )
-        .unwrap();
-        let (_, default_model) = parse_cursor_session_metadata(
-            "composerData:default-model",
-            br#"{
-                "composerId": "default-model",
-                "unifiedMode": "agent",
-                "modelConfig": { "modelName": "default" }
-            }"#,
-        )
-        .unwrap();
-
-        assert_eq!(concrete_model.model.as_deref(), Some("composer-2.5"));
-        assert!(default_model.model.is_none());
-    }
-
-    #[test]
-    fn cursor_state_db_reader_observes_uncheckpointed_wal() {
-        let state_db_path = temp_jsonl_path("cursor-state-wal").with_extension("vscdb");
-        let writer = Connection::open(&state_db_path).unwrap();
-        let journal_mode: String = writer
-            .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
-        writer
-            .execute_batch(
-                "PRAGMA wal_autocheckpoint = 0;
-                 CREATE TABLE cursorDiskKV (
-                    key TEXT PRIMARY KEY,
-                    value BLOB
-                 );
-                 INSERT INTO cursorDiskKV (key, value)
-                 VALUES ('agentKv:blob:test', X'7B7D');",
-            )
-            .unwrap();
-
-        let wal_path = PathBuf::from(format!("{}-wal", state_db_path.to_string_lossy()));
-        assert!(wal_path.exists(), "fixture must keep committed data in WAL");
-
-        let reader = open_cursor_state_db(&state_db_path).unwrap();
-        let row_count: i64 = reader
-            .query_row("SELECT COUNT(*) FROM cursorDiskKV", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(row_count, 1, "read-only connection must observe WAL data");
-
-        drop(reader);
-        drop(writer);
-        let _ = fs::remove_file(&state_db_path);
-        let _ = fs::remove_file(wal_path);
-        let _ = fs::remove_file(format!("{}-shm", state_db_path.to_string_lossy()));
-    }
-
-    #[test]
-    fn cursor_cache_token_migration_marks_legacy_values_unknown() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        init_db(&conn).unwrap();
-        conn.execute(
-            "INSERT INTO usage_entries (
-                assistant_type, timestamp, date, session_id, turn_no,
-                tokens_cache_read, tokens_cache_write,
-                tokens_cache_write_5m, tokens_cache_write_1h,
-                delta_cache_read, delta_cache_write,
-                delta_cache_write_5m, delta_cache_write_1h
-             ) VALUES (
-                'cursor', '2026-07-24T00:00:00Z', '2026-07-24',
-                'cursor-cache-session', 1, 0, 0, 0, 0, 0, 0, 0, 0
-             )",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO usage_entries (
-                assistant_type, timestamp, date, session_id, turn_no,
-                tokens_cache_read, tokens_cache_write,
-                tokens_cache_write_5m, tokens_cache_write_1h,
-                delta_cache_read, delta_cache_write,
-                delta_cache_write_5m, delta_cache_write_1h
-             ) VALUES (
-                'cursor', '2026-07-24T00:01:00Z', '2026-07-24',
-                'cursor-cache-measured', 1, 10, 20, 30, 40, 1, 2, 3, 4
-             )",
-            [],
-        )
-        .unwrap();
-
-        run_cursor_cache_tokens_unknown_migration(&mut conn).unwrap();
-        run_cursor_cache_tokens_unknown_migration(&mut conn).unwrap();
-
-        let values: [Option<u64>; 8] = conn
-            .query_row(
-                "SELECT
-                    tokens_cache_read, tokens_cache_write,
-                    tokens_cache_write_5m, tokens_cache_write_1h,
-                    delta_cache_read, delta_cache_write,
-                    delta_cache_write_5m, delta_cache_write_1h
-                 FROM usage_entries
-                 WHERE session_id = 'cursor-cache-session'",
-                [],
-                |row| {
-                    Ok([
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                        row.get(7)?,
-                    ])
-                },
-            )
-            .unwrap();
-        let migration_count: u64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sync_state WHERE filename = ?",
-                params![CURSOR_CACHE_TOKENS_UNKNOWN_MIGRATION_KEY],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let measured_values: [u64; 8] = conn
-            .query_row(
-                "SELECT
-                    tokens_cache_read, tokens_cache_write,
-                    tokens_cache_write_5m, tokens_cache_write_1h,
-                    delta_cache_read, delta_cache_write,
-                    delta_cache_write_5m, delta_cache_write_1h
-                 FROM usage_entries
-                 WHERE session_id = 'cursor-cache-measured'",
-                [],
-                |row| {
-                    Ok([
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                        row.get(7)?,
-                    ])
-                },
-            )
-            .unwrap();
-
-        assert_eq!(values, [None; 8]);
-        assert_eq!(measured_values, [10, 20, 30, 40, 1, 2, 3, 4]);
-        assert_eq!(migration_count, 1);
     }
 
     #[test]
@@ -8786,15 +8414,6 @@ mod tests {
                 0
             )
         );
-    }
-
-    #[test]
-    fn test_parse_cursor_timestamp() {
-        let ts = "Wednesday, Jul 8, 2026, 2:24 AM (UTC+8)";
-        let parsed = parse_cursor_timestamp(ts);
-        assert_eq!(parsed, "2026-07-08T02:24:00+08:00");
-        assert_eq!(cursor_date_from_timestamp(&parsed), Some("2026-07-08"));
-        assert_eq!(cursor_date_from_timestamp("unknown"), None);
     }
 
     #[test]

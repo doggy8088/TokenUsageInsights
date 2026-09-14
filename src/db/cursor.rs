@@ -1147,3 +1147,339 @@ pub(super) fn sync_cursor_usage_logs(
 
     Ok(())
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_jsonl_path(prefix: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{}-{unique}.jsonl", std::process::id()))
+    }
+
+    #[test]
+    fn parse_cursor_session_file_uses_last_initial_consecutive_user_prompt_as_name() {
+        let path = temp_jsonl_path("cursor-session-name");
+        let content = r#"{"role":"user","message":{"content":"第一條提示"}}
+{"role":"user","message":{"content":"第二條提示"}}
+{"role":"assistant","message":{"content":"收到"}}
+{"role":"user","message":{"content":"後續提示"}}
+{"role":"assistant","message":{"content":"完成"}}
+"#;
+
+        fs::write(&path, content).unwrap();
+        let entries =
+            parse_cursor_session_file(&path, &HashMap::new(), &HashSet::new(), &HashMap::new())
+                .unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(entries.len(), 2);
+        assert!(entries
+            .iter()
+            .all(|entry| entry.entry.session_name.as_deref() == Some("第二條提示")));
+    }
+
+    #[test]
+    fn cursor_response_signature_matches_plain_text_agent_kv_content() {
+        let transcript_content = serde_json::json!([
+            {
+                "type": "text",
+                "text": "Plain answer"
+            }
+        ]);
+        let agent_kv_content = serde_json::json!([
+            {
+                "type": "text",
+                "data": "Plain answer",
+                "providerOptions": {
+                    "cursor": {
+                        "modelName": "composer-2.5"
+                    }
+                }
+            }
+        ]);
+
+        assert_eq!(
+            cursor_response_signature(&transcript_content),
+            cursor_response_signature(&agent_kv_content)
+        );
+    }
+
+    #[test]
+    fn cursor_response_signature_matches_agent_kv_tool_calls() {
+        let transcript_content = serde_json::json!([
+            {
+                "type": "text",
+                "text": "Running"
+            },
+            {
+                "type": "tool_use",
+                "name": "Shell",
+                "input": {
+                    "command": "echo hi",
+                    "block_until_ms": 120_000
+                }
+            }
+        ]);
+        let agent_kv_event = serde_json::json!({
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "text",
+                    "data": "Running",
+                    "providerOptions": {
+                        "cursor": {
+                            "modelName": "composer-2.5"
+                        }
+                    }
+                },
+                {
+                    "type": "tool-call",
+                    "toolName": "Shell",
+                    "args": {
+                        "block_until_ms": 120_000,
+                        "command": "echo hi"
+                    }
+                }
+            ]
+        });
+        let raw = serde_json::to_vec(&agent_kv_event).unwrap();
+        let (signature, model) = parse_cursor_agent_kv_model_signature(&raw).unwrap();
+
+        assert_eq!(
+            Some(signature),
+            cursor_response_signature(&transcript_content)
+        );
+        assert_eq!(model, "composer-2.5");
+    }
+
+    #[test]
+    fn cursor_parser_does_not_reuse_a_previous_reply_model() {
+        let path = temp_jsonl_path("cursor-model-reset");
+        let content = r#"{"role":"user","message":{"content":"Prompt"}}
+{"role":"assistant","message":{"content":[{"type":"text","text":"Known reply"}]}}
+{"role":"assistant","message":{"content":[{"type":"image","data":"omitted"}]}}
+"#;
+        fs::write(&path, content).unwrap();
+        let signature = cursor_response_signature(
+            &serde_json::json!([{"type": "text", "text": "Known reply"}]),
+        )
+        .unwrap();
+        let model_mappings = HashMap::from([(signature, "composer-2.5".to_string())]);
+
+        let entries =
+            parse_cursor_session_file(&path, &model_mappings, &HashSet::new(), &HashMap::new())
+                .unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].entry.model.as_deref(), Some("composer-2.5"));
+        assert!(entries[0].model_signature.is_some());
+        assert_eq!(entries[1].entry.model.as_deref(), Some("Unknown Model"));
+        assert!(entries[1].model_signature.is_none());
+    }
+
+    #[test]
+    fn cursor_session_metadata_treats_non_agent_modes_as_ide() {
+        let (_, false_overrides_agent_mode) = parse_cursor_session_metadata(
+            "composerData:false-overrides-agent",
+            br#"{
+                "composerId": "false-overrides-agent",
+                "unifiedMode": "agent",
+                "isAgentic": false
+            }"#,
+        )
+        .unwrap();
+        let (_, non_agent_mode_overrides_true) = parse_cursor_session_metadata(
+            "composerData:chat-overrides-true",
+            br#"{
+                "composerId": "chat-overrides-true",
+                "unifiedMode": "chat",
+                "isAgentic": true
+            }"#,
+        )
+        .unwrap();
+        let (_, agent_mode) = parse_cursor_session_metadata(
+            "composerData:agent",
+            br#"{
+                "composerId": "agent",
+                "unifiedMode": "agent",
+                "isAgentic": true
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(false_overrides_agent_mode.mode.as_deref(), Some("ide"));
+        assert_eq!(non_agent_mode_overrides_true.mode.as_deref(), Some("ide"));
+        assert_eq!(agent_mode.mode.as_deref(), Some("agent"));
+    }
+
+    #[test]
+    fn cursor_session_metadata_uses_only_concrete_model_configs() {
+        let (_, concrete_model) = parse_cursor_session_metadata(
+            "composerData:concrete-model",
+            br#"{
+                "composerId": "concrete-model",
+                "unifiedMode": "agent",
+                "modelConfig": { "modelName": "composer-2.5" }
+            }"#,
+        )
+        .unwrap();
+        let (_, default_model) = parse_cursor_session_metadata(
+            "composerData:default-model",
+            br#"{
+                "composerId": "default-model",
+                "unifiedMode": "agent",
+                "modelConfig": { "modelName": "default" }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(concrete_model.model.as_deref(), Some("composer-2.5"));
+        assert!(default_model.model.is_none());
+    }
+
+    #[test]
+    fn cursor_state_db_reader_observes_uncheckpointed_wal() {
+        let state_db_path = temp_jsonl_path("cursor-state-wal").with_extension("vscdb");
+        let writer = Connection::open(&state_db_path).unwrap();
+        let journal_mode: String = writer
+            .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+        writer
+            .execute_batch(
+                "PRAGMA wal_autocheckpoint = 0;
+                 CREATE TABLE cursorDiskKV (
+                    key TEXT PRIMARY KEY,
+                    value BLOB
+                 );
+                 INSERT INTO cursorDiskKV (key, value)
+                 VALUES ('agentKv:blob:test', X'7B7D');",
+            )
+            .unwrap();
+
+        let wal_path = PathBuf::from(format!("{}-wal", state_db_path.to_string_lossy()));
+        assert!(wal_path.exists(), "fixture must keep committed data in WAL");
+
+        let reader = open_cursor_state_db(&state_db_path).unwrap();
+        let row_count: i64 = reader
+            .query_row("SELECT COUNT(*) FROM cursorDiskKV", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(row_count, 1, "read-only connection must observe WAL data");
+
+        drop(reader);
+        drop(writer);
+        let _ = fs::remove_file(&state_db_path);
+        let _ = fs::remove_file(wal_path);
+        let _ = fs::remove_file(format!("{}-shm", state_db_path.to_string_lossy()));
+    }
+
+    #[test]
+    fn cursor_cache_token_migration_marks_legacy_values_unknown() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, turn_no,
+                tokens_cache_read, tokens_cache_write,
+                tokens_cache_write_5m, tokens_cache_write_1h,
+                delta_cache_read, delta_cache_write,
+                delta_cache_write_5m, delta_cache_write_1h
+             ) VALUES (
+                'cursor', '2026-07-24T00:00:00Z', '2026-07-24',
+                'cursor-cache-session', 1, 0, 0, 0, 0, 0, 0, 0, 0
+             )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, turn_no,
+                tokens_cache_read, tokens_cache_write,
+                tokens_cache_write_5m, tokens_cache_write_1h,
+                delta_cache_read, delta_cache_write,
+                delta_cache_write_5m, delta_cache_write_1h
+             ) VALUES (
+                'cursor', '2026-07-24T00:01:00Z', '2026-07-24',
+                'cursor-cache-measured', 1, 10, 20, 30, 40, 1, 2, 3, 4
+             )",
+            [],
+        )
+        .unwrap();
+
+        run_cursor_cache_tokens_unknown_migration(&mut conn).unwrap();
+        run_cursor_cache_tokens_unknown_migration(&mut conn).unwrap();
+
+        let values: [Option<u64>; 8] = conn
+            .query_row(
+                "SELECT
+                    tokens_cache_read, tokens_cache_write,
+                    tokens_cache_write_5m, tokens_cache_write_1h,
+                    delta_cache_read, delta_cache_write,
+                    delta_cache_write_5m, delta_cache_write_1h
+                 FROM usage_entries
+                 WHERE session_id = 'cursor-cache-session'",
+                [],
+                |row| {
+                    Ok([
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ])
+                },
+            )
+            .unwrap();
+        let migration_count: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state WHERE filename = ?",
+                params![CURSOR_CACHE_TOKENS_UNKNOWN_MIGRATION_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let measured_values: [u64; 8] = conn
+            .query_row(
+                "SELECT
+                    tokens_cache_read, tokens_cache_write,
+                    tokens_cache_write_5m, tokens_cache_write_1h,
+                    delta_cache_read, delta_cache_write,
+                    delta_cache_write_5m, delta_cache_write_1h
+                 FROM usage_entries
+                 WHERE session_id = 'cursor-cache-measured'",
+                [],
+                |row| {
+                    Ok([
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ])
+                },
+            )
+            .unwrap();
+
+        assert_eq!(values, [None; 8]);
+        assert_eq!(measured_values, [10, 20, 30, 40, 1, 2, 3, 4]);
+        assert_eq!(migration_count, 1);
+    }
+
+    #[test]
+    fn test_parse_cursor_timestamp() {
+        let ts = "Wednesday, Jul 8, 2026, 2:24 AM (UTC+8)";
+        let parsed = parse_cursor_timestamp(ts);
+        assert_eq!(parsed, "2026-07-08T02:24:00+08:00");
+        assert_eq!(cursor_date_from_timestamp(&parsed), Some("2026-07-08"));
+        assert_eq!(cursor_date_from_timestamp("unknown"), None);
+    }
+}

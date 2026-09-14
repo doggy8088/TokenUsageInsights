@@ -470,6 +470,7 @@ pub(crate) fn resolve_session_file_path(
     session_id: &str,
     transcript_path_db: Option<&str>,
     source_kind: &str,
+    copilot_app_source_dir: Option<&StdPath>,
     copilot_app_parent_session_id: Option<&str>,
     copilot_app_agent_nickname: Option<&str>,
 ) -> Result<PathBuf, SessionFileErrorExt> {
@@ -488,11 +489,20 @@ pub(crate) fn resolve_session_file_path(
             resolve_vscode_transcript_path(path)
                 .map_err(|error| SessionFileErrorExt::new(StatusCode::BAD_REQUEST, error))
         }
-        "copilot" if source_kind == "copilot-app" => resolve_copilot_app_events_path(
-            &crate::paths::copilot_app_dir(),
-            copilot_app_parent_session_id.unwrap_or(session_id),
-            copilot_app_agent_nickname,
-        ),
+        "copilot" if source_kind == "copilot-app" => {
+            let source_dir = copilot_app_source_dir.ok_or_else(|| {
+                SessionFileErrorExt::with_reason(
+                    StatusCode::NOT_FOUND,
+                    "找不到 Copilot App session 對應的已登錄來源目錄。",
+                    "file_missing",
+                )
+            })?;
+            resolve_copilot_app_events_path(
+                source_dir,
+                copilot_app_parent_session_id.unwrap_or(session_id),
+                copilot_app_agent_nickname,
+            )
+        }
         "copilot" if source_kind == "copilot-cli" && copilot_app_parent_session_id.is_some() => {
             // CLI subagent synthetic session: locate the shared events.jsonl
             // under the parent session's directory, not the synthetic id's.
@@ -586,5 +596,116 @@ pub(crate) fn resolve_session_file_path(
             StatusCode::BAD_REQUEST,
             "不支援的助理類型",
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{fs, time::SystemTime};
+
+    fn copilot_app_fixture_dir(prefix: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "token-insights-test-{prefix}-{}-{unique}",
+            std::process::id()
+        ))
+    }
+
+    fn write_copilot_app_events(app_dir: &StdPath, session_id: &str, lines: &[&str]) {
+        let session_dir = app_dir.join("session-state").join(session_id);
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(session_dir.join("events.jsonl"), lines.join("\n")).unwrap();
+    }
+
+    #[test]
+    fn copilot_app_main_session_resolves_events_jsonl_under_session_state() {
+        let app_dir = copilot_app_fixture_dir("app-main-resolve");
+        let session_id = "74b6d236-d311-4675-9855-fee91bc508e5";
+        write_copilot_app_events(&app_dir, session_id, &["{}"]);
+
+        let resolved = resolve_copilot_app_events_path(&app_dir, session_id, None).unwrap();
+        assert!(resolved.ends_with("events.jsonl"));
+        assert!(resolved.parent().unwrap().ends_with(session_id));
+
+        let _ = fs::remove_dir_all(&app_dir);
+    }
+
+    #[test]
+    fn copilot_app_subagent_uses_parent_session_id_for_path() {
+        let app_dir = copilot_app_fixture_dir("app-sub-resolve");
+        let parent = "74b6d236-d311-4675-9855-fee91bc508e5";
+        let agent = "call_v4b32z66";
+        write_copilot_app_events(&app_dir, parent, &["{}"]);
+
+        let resolved = resolve_copilot_app_events_path(&app_dir, parent, Some(agent)).unwrap();
+        assert!(resolved.parent().unwrap().ends_with(parent));
+        assert!(!resolved.to_string_lossy().contains(&format!("__{agent}")));
+
+        let _ = fs::remove_dir_all(&app_dir);
+    }
+
+    #[test]
+    fn copilot_app_missing_session_dir_returns_file_missing_reason() {
+        let app_dir = copilot_app_fixture_dir("app-missing-dir");
+        let session_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+
+        let error = resolve_copilot_app_events_path(&app_dir, session_id, None).unwrap_err();
+        assert_eq!(error.status, StatusCode::NOT_FOUND);
+        assert_eq!(error.reason.as_deref(), Some("file_missing"));
+
+        let _ = fs::remove_dir_all(&app_dir);
+    }
+
+    #[test]
+    fn copilot_app_session_dir_without_events_returns_no_events_yet_reason() {
+        let app_dir = copilot_app_fixture_dir("app-no-events-yet");
+        let session_id = "55555555-6666-7777-8888-999999999999";
+        fs::create_dir_all(app_dir.join("session-state").join(session_id)).unwrap();
+
+        let error = resolve_copilot_app_events_path(&app_dir, session_id, None).unwrap_err();
+        assert_eq!(error.status, StatusCode::NOT_FOUND);
+        assert_eq!(error.reason.as_deref(), Some("no_events_yet"));
+
+        let _ = fs::remove_dir_all(&app_dir);
+    }
+
+    #[test]
+    fn copilot_app_rejects_unsafe_session_id_before_path_lookup() {
+        let app_dir = copilot_app_fixture_dir("app-unsafe-id");
+        let error = resolve_copilot_app_events_path(&app_dir, "..", None).unwrap_err();
+        assert_eq!(error.status, StatusCode::NOT_FOUND);
+        assert_eq!(error.reason.as_deref(), Some("file_missing"));
+
+        let _ = fs::remove_dir_all(&app_dir);
+    }
+
+    #[test]
+    fn copilot_app_resolution_uses_the_registered_source_directory() {
+        let source_a = copilot_app_fixture_dir("app-source-a");
+        let source_b = copilot_app_fixture_dir("app-source-b");
+        let session_id = "shared-session-id";
+        write_copilot_app_events(&source_a, session_id, &[r#"{"source":"a"}"#]);
+        write_copilot_app_events(&source_b, session_id, &[r#"{"source":"b"}"#]);
+
+        let resolved = resolve_session_file_path(
+            "copilot",
+            session_id,
+            None,
+            "copilot-app",
+            Some(&source_b),
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(resolved.starts_with(source_b.canonicalize().unwrap()));
+        assert!(!resolved.starts_with(source_a.canonicalize().unwrap()));
+
+        let _ = fs::remove_dir_all(&source_a);
+        let _ = fs::remove_dir_all(&source_b);
     }
 }
