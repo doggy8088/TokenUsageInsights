@@ -26,6 +26,7 @@ mod reporting;
 mod session_details;
 mod session_files;
 mod session_identity;
+mod session_search;
 mod timeline;
 mod updater;
 mod vscode;

@@ -6,7 +6,7 @@ use std::{
 use serde::Serialize;
 
 use crate::{
-    db::{TokenStats, UsageEntry},
+    db::{DatedUsageEntry, TokenStats, UsageEntry},
     pricing::PreparedPricingRules,
     session_identity::SessionIdentity,
 };
@@ -22,6 +22,44 @@ pub(crate) struct UsageAggregation {
     pub cache_write_1h_tokens: u64,
     pub reasoning_tokens: u64,
     pub cost_usd: f64,
+}
+
+impl UsageAggregation {
+    fn add(&mut self, other: &Self) {
+        self.total_tokens += other.total_tokens;
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.cache_read_tokens += other.cache_read_tokens;
+        self.cache_write_tokens += other.cache_write_tokens;
+        self.cache_write_5m_tokens += other.cache_write_5m_tokens;
+        self.cache_write_1h_tokens += other.cache_write_1h_tokens;
+        self.reasoning_tokens += other.reasoning_tokens;
+        self.cost_usd += other.cost_usd;
+    }
+
+    fn saturating_difference(&self, previous: &Self) -> Self {
+        Self {
+            total_tokens: self.total_tokens.saturating_sub(previous.total_tokens),
+            input_tokens: self.input_tokens.saturating_sub(previous.input_tokens),
+            output_tokens: self.output_tokens.saturating_sub(previous.output_tokens),
+            cache_read_tokens: self
+                .cache_read_tokens
+                .saturating_sub(previous.cache_read_tokens),
+            cache_write_tokens: self
+                .cache_write_tokens
+                .saturating_sub(previous.cache_write_tokens),
+            cache_write_5m_tokens: self
+                .cache_write_5m_tokens
+                .saturating_sub(previous.cache_write_5m_tokens),
+            cache_write_1h_tokens: self
+                .cache_write_1h_tokens
+                .saturating_sub(previous.cache_write_1h_tokens),
+            reasoning_tokens: self
+                .reasoning_tokens
+                .saturating_sub(previous.reasoning_tokens),
+            cost_usd: (self.cost_usd - previous.cost_usd).max(0.0),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -49,6 +87,18 @@ pub struct DaySummary {
     pub total_duration_ms: u64,
     pub total_requests: u64,
     pub total_cost_usd: f64,
+}
+
+impl DaySummary {
+    pub(crate) fn add_usage(&mut self, usage: &UsageAggregation) {
+        self.total_tokens += usage.total_tokens;
+        self.total_input_tokens += usage.input_tokens;
+        self.total_output_tokens += usage.output_tokens;
+        self.total_cache_read_tokens += usage.cache_read_tokens;
+        self.total_cache_write_tokens += usage.cache_write_tokens;
+        self.total_reasoning_tokens += usage.reasoning_tokens;
+        self.total_cost_usd += usage.cost_usd;
+    }
 }
 
 #[derive(Serialize)]
@@ -229,6 +279,24 @@ pub(crate) fn summarize_session_usage(
     result
 }
 
+fn summarize_delta_usage(
+    pricing_rules: &PreparedPricingRules,
+    entries: &[UsageEntry],
+) -> UsageAggregation {
+    let mut result = SessionUsageAggregation::default();
+    for entry in entries {
+        let Some(tokens) = entry
+            .delta_tokens
+            .as_ref()
+            .filter(|tokens| has_usage(tokens))
+        else {
+            continue;
+        };
+        record_usage(&mut result, pricing_rules, entry, tokens);
+    }
+    result.usage
+}
+
 #[derive(Debug)]
 pub(crate) struct SessionGroup {
     pub entries: Vec<UsageEntry>,
@@ -336,14 +404,17 @@ pub(crate) struct PeriodReport {
     pub agent_breakdown: HashMap<String, AgentBreakdown>,
 }
 
-fn add_usage(summary: &mut DaySummary, usage: &UsageAggregation) {
-    summary.total_tokens += usage.total_tokens;
-    summary.total_input_tokens += usage.input_tokens;
-    summary.total_output_tokens += usage.output_tokens;
-    summary.total_cache_read_tokens += usage.cache_read_tokens;
-    summary.total_cache_write_tokens += usage.cache_write_tokens;
-    summary.total_reasoning_tokens += usage.reasoning_tokens;
-    summary.total_cost_usd += usage.cost_usd;
+#[derive(Default)]
+struct PeriodBucketAggregation {
+    usage: UsageAggregation,
+    sessions_count: usize,
+}
+
+#[derive(Default)]
+struct ProjectUsageAggregation {
+    sessions_count: usize,
+    total_tokens: u64,
+    cost_usd: f64,
 }
 
 fn summarize_groups(
@@ -353,58 +424,98 @@ fn summarize_groups(
     let mut usage = UsageAggregation::default();
     for group in sessions.values() {
         let session = summarize_session_usage(pricing_rules, &group.entries);
-        usage.total_tokens += session.usage.total_tokens;
-        usage.input_tokens += session.usage.input_tokens;
-        usage.output_tokens += session.usage.output_tokens;
-        usage.cache_read_tokens += session.usage.cache_read_tokens;
-        usage.cache_write_tokens += session.usage.cache_write_tokens;
-        usage.reasoning_tokens += session.usage.reasoning_tokens;
-        usage.cost_usd += session.usage.cost_usd;
+        usage.add(&session.usage);
     }
     usage
 }
 
+fn build_period_breakdown(
+    entries: &[DatedUsageEntry],
+    bucket_label: &impl Fn(&str) -> String,
+    pricing_rules: &PreparedPricingRules,
+) -> Vec<PeriodBreakdown> {
+    let mut dated_sessions: HashMap<SessionIdentity, Vec<&DatedUsageEntry>> = HashMap::new();
+    for record in entries {
+        dated_sessions
+            .entry(SessionIdentity::from_entry(
+                &record.assistant_type,
+                &record.entry,
+            ))
+            .or_default()
+            .push(record);
+    }
+
+    let mut bucket_totals: HashMap<String, PeriodBucketAggregation> = HashMap::new();
+    for records in dated_sessions.values() {
+        // Delta-based collectors can be summed inside each bucket. Legacy
+        // cumulative collectors must instead contribute the increase from the
+        // preceding bucket; otherwise a session spanning two buckets would
+        // count both cumulative snapshots in the period total.
+        let has_delta_usage = records
+            .iter()
+            .filter_map(|record| record.entry.delta_tokens.as_ref())
+            .any(has_usage);
+        let mut session_buckets: HashMap<String, Vec<UsageEntry>> = HashMap::new();
+        for record in records {
+            session_buckets
+                .entry(bucket_label(&record.date))
+                .or_default()
+                .push(record.entry.clone());
+        }
+
+        let mut labels = session_buckets.keys().cloned().collect::<Vec<_>>();
+        labels.sort();
+        let mut previous_cumulative = UsageAggregation::default();
+        for label in labels {
+            let cumulative_or_delta = if has_delta_usage {
+                summarize_delta_usage(pricing_rules, &session_buckets[&label])
+            } else {
+                summarize_session_usage(pricing_rules, &session_buckets[&label]).usage
+            };
+            let bucket_usage = if has_delta_usage {
+                cumulative_or_delta
+            } else {
+                let increment = cumulative_or_delta.saturating_difference(&previous_cumulative);
+                previous_cumulative = cumulative_or_delta;
+                increment
+            };
+            let bucket = bucket_totals.entry(label).or_default();
+            bucket.usage.add(&bucket_usage);
+            bucket.sessions_count += 1;
+        }
+    }
+
+    let mut breakdown = bucket_totals
+        .into_iter()
+        .map(|(label, bucket)| PeriodBreakdown {
+            label,
+            usage: bucket.usage,
+            sessions_count: bucket.sessions_count,
+        })
+        .collect::<Vec<_>>();
+    breakdown.sort_by(|left, right| left.label.cmp(&right.label));
+    breakdown
+}
+
 pub(crate) fn build_period_report(
-    entries: &[(UsageEntry, String, String)],
+    entries: &[DatedUsageEntry],
     bucket_label: impl Fn(&str) -> String,
     pricing_rules: &PreparedPricingRules,
 ) -> PeriodReport {
     let sessions = group_sessions(
         entries
             .iter()
-            .map(|(entry, assistant_type, _)| (entry, assistant_type.as_str())),
+            .map(|record| (&record.entry, record.assistant_type.as_str())),
     );
-    let mut buckets: HashMap<String, Vec<(UsageEntry, String)>> = HashMap::new();
-    for (entry, assistant_type, entry_date) in entries {
-        buckets
-            .entry(bucket_label(entry_date))
-            .or_default()
-            .push((entry.clone(), assistant_type.clone()));
-    }
-
-    let mut labels = buckets.keys().cloned().collect::<Vec<_>>();
-    labels.sort();
     let mut summary = DaySummary {
         total_sessions: sessions.len(),
         ..Default::default()
     };
-    let mut breakdown = Vec::with_capacity(labels.len());
-    for label in labels {
-        let bucket_sessions = group_sessions(
-            buckets[&label]
-                .iter()
-                .map(|(entry, assistant_type)| (entry, assistant_type.as_str())),
-        );
-        let usage = summarize_groups(&bucket_sessions, pricing_rules);
-        add_usage(&mut summary, &usage);
-        breakdown.push(PeriodBreakdown {
-            label,
-            usage,
-            sessions_count: bucket_sessions.len(),
-        });
-    }
+    summary.add_usage(&summarize_groups(&sessions, pricing_rules));
 
-    let mut project_stats: HashMap<String, (usize, u64, f64)> = HashMap::new();
+    let breakdown = build_period_breakdown(entries, &bucket_label, pricing_rules);
+
+    let mut project_stats: HashMap<String, ProjectUsageAggregation> = HashMap::new();
     let mut agent_breakdown: HashMap<String, AgentBreakdown> = HashMap::new();
     for (identity, group) in &sessions {
         let Some(latest) = group.entries.iter().max_by(|left, right| {
@@ -419,10 +530,10 @@ pub(crate) fn build_period_report(
             .cwd
             .clone()
             .unwrap_or_else(|| "Unknown CWD".to_string());
-        let project = project_stats.entry(cwd).or_insert((0, 0, 0.0));
-        project.0 += 1;
-        project.1 += session.usage.total_tokens;
-        project.2 += session.usage.cost_usd;
+        let project = project_stats.entry(cwd).or_default();
+        project.sessions_count += 1;
+        project.total_tokens += session.usage.total_tokens;
+        project.cost_usd += session.usage.cost_usd;
 
         let agent = agent_breakdown
             .entry(identity.assistant_type.clone())
@@ -438,14 +549,12 @@ pub(crate) fn build_period_report(
 
     let mut projects = project_stats
         .into_iter()
-        .map(
-            |(cwd, (sessions_count, total_tokens, cost_usd))| MonthlyProjectSummary {
-                cwd,
-                sessions_count,
-                total_tokens,
-                cost_usd,
-            },
-        )
+        .map(|(cwd, stats)| MonthlyProjectSummary {
+            cwd,
+            sessions_count: stats.sessions_count,
+            total_tokens: stats.total_tokens,
+            cost_usd: stats.cost_usd,
+        })
         .collect::<Vec<_>>();
     projects.sort_by_key(|item| std::cmp::Reverse(item.total_tokens));
     let models = summarize_models_by_mode(&sessions, pricing_rules);
@@ -541,21 +650,21 @@ mod tests {
     #[test]
     fn period_report_keeps_same_id_source_directories_separate() {
         let entries = vec![
-            (
-                usage_entry("aa", "gpt-5", 100),
-                "copilot".to_string(),
-                "2026-07-10".to_string(),
-            ),
-            (
-                usage_entry("aa", "claude-sonnet-4", 200),
-                "copilot".to_string(),
-                "2026-07-10".to_string(),
-            ),
-            (
-                usage_entry("bb", "gpt-5", 300),
-                "copilot".to_string(),
-                "2026-07-10".to_string(),
-            ),
+            DatedUsageEntry {
+                entry: usage_entry("aa", "gpt-5", 100),
+                assistant_type: "copilot".to_string(),
+                date: "2026-07-10".to_string(),
+            },
+            DatedUsageEntry {
+                entry: usage_entry("aa", "claude-sonnet-4", 200),
+                assistant_type: "copilot".to_string(),
+                date: "2026-07-10".to_string(),
+            },
+            DatedUsageEntry {
+                entry: usage_entry("bb", "gpt-5", 300),
+                assistant_type: "copilot".to_string(),
+                date: "2026-07-10".to_string(),
+            },
         ];
 
         let report = build_period_report(
@@ -573,6 +682,53 @@ mod tests {
             .unwrap();
         assert_eq!(gpt_summary.sessions_count, 2);
         assert_eq!(gpt_summary.total_tokens, 400);
+    }
+
+    #[test]
+    fn period_report_counts_cross_bucket_cumulative_usage_once() {
+        let mut first = usage_entry("aa", "gpt-5", 100);
+        first.delta_tokens = None;
+        first.turn_no = 1;
+        let mut second = usage_entry("aa", "gpt-5", 200);
+        second.delta_tokens = None;
+        second.turn_no = 2;
+        second.timestamp = "2026-08-01T10:00:00Z".to_string();
+        let entries = vec![
+            DatedUsageEntry {
+                entry: first,
+                assistant_type: "copilot".to_string(),
+                date: "2026-07-31".to_string(),
+            },
+            DatedUsageEntry {
+                entry: second,
+                assistant_type: "copilot".to_string(),
+                date: "2026-08-01".to_string(),
+            },
+        ];
+
+        let report = build_period_report(
+            &entries,
+            |date| date[..7].to_string(),
+            &PreparedPricingRules::from_rules(vec![PricingRule {
+                model_name: "gpt-5".to_string(),
+                input_price: 0.0,
+                cache_input_price: 0.0,
+                output_price: 0.0,
+            }]),
+        );
+
+        assert_eq!(report.summary.total_tokens, 200);
+        assert_eq!(report.breakdown.len(), 2);
+        assert_eq!(report.breakdown[0].usage.total_tokens, 100);
+        assert_eq!(report.breakdown[1].usage.total_tokens, 100);
+        assert_eq!(
+            report
+                .breakdown
+                .iter()
+                .map(|bucket| bucket.usage.total_tokens)
+                .sum::<u64>(),
+            report.summary.total_tokens
+        );
     }
 
     #[test]

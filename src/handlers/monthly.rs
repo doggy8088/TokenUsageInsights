@@ -80,8 +80,13 @@ fn valid_model_session_date(value: &str) -> Option<String> {
         .map(|_| value.to_string())
 }
 
+struct FirstDatedEntry {
+    entry: UsageEntry,
+    date: String,
+}
+
 fn collect_model_session_details(
-    entries_with_type: &[(UsageEntry, String, String)],
+    entries_with_type: &[db::DatedUsageEntry],
     requested_model: &str,
     requested_mode: Option<ModelSessionMode>,
     pricing_rules: &PreparedPricingRules,
@@ -89,19 +94,26 @@ fn collect_model_session_details(
     let sessions_map = group_sessions(
         entries_with_type
             .iter()
-            .map(|(entry, assistant_type, _)| (entry, assistant_type.as_str())),
+            .map(|record| (&record.entry, record.assistant_type.as_str())),
     );
-    let mut session_first_entries: HashMap<SessionIdentity, (UsageEntry, String)> = HashMap::new();
+    let mut session_first_entries: HashMap<SessionIdentity, FirstDatedEntry> = HashMap::new();
 
-    for (entry, assistant_type, entry_date) in entries_with_type {
-        let identity = SessionIdentity::from_entry(assistant_type, entry);
+    for record in entries_with_type {
+        let identity = SessionIdentity::from_entry(&record.assistant_type, &record.entry);
         let first = session_first_entries
             .entry(identity)
-            .or_insert_with(|| (entry.clone(), entry_date.clone()));
-        if entry.turn_no < first.0.turn_no
-            || (entry.turn_no == first.0.turn_no && entry.timestamp < first.0.timestamp)
+            .or_insert_with(|| FirstDatedEntry {
+                entry: record.entry.clone(),
+                date: record.date.clone(),
+            });
+        if record.entry.turn_no < first.entry.turn_no
+            || (record.entry.turn_no == first.entry.turn_no
+                && record.entry.timestamp < first.entry.timestamp)
         {
-            *first = (entry.clone(), entry_date.clone());
+            *first = FirstDatedEntry {
+                entry: record.entry.clone(),
+                date: record.date.clone(),
+            };
         }
     }
 
@@ -120,7 +132,7 @@ fn collect_model_session_details(
         else {
             continue;
         };
-        let Some((first_entry, first_date)) = session_first_entries.get(&identity) else {
+        let Some(first) = session_first_entries.get(&identity) else {
             continue;
         };
         let last_entry = entries
@@ -130,7 +142,7 @@ fn collect_model_session_details(
                     .cmp(&right.turn_no)
                     .then_with(|| left.timestamp.cmp(&right.timestamp))
             })
-            .unwrap_or(first_entry);
+            .unwrap_or(&first.entry);
         let duration_ms = last_entry
             .cost
             .as_ref()
@@ -151,8 +163,8 @@ fn collect_model_session_details(
             assistant_type: identity.assistant_type,
             source_kind: identity.source_kind,
             source_dir_key: identity.source_dir_key,
-            date: valid_model_session_date(first_date),
-            timestamp: first_entry.timestamp.clone(),
+            date: valid_model_session_date(&first.date),
+            timestamp: first.entry.timestamp.clone(),
             cwd: last_entry.cwd.clone().unwrap_or_default(),
             model: requested_model.to_string(),
             total_tokens: model_usage.usage.total_tokens,
@@ -414,6 +426,14 @@ mod tests {
         }
     }
 
+    fn dated_entry(entry: UsageEntry, assistant_type: &str, date: &str) -> db::DatedUsageEntry {
+        db::DatedUsageEntry {
+            entry,
+            assistant_type: assistant_type.to_string(),
+            date: date.to_string(),
+        }
+    }
+
     #[test]
     fn model_session_period_accepts_only_valid_months_and_years() {
         assert!(matches!(
@@ -432,7 +452,7 @@ mod tests {
     #[test]
     fn model_session_details_are_model_specific_and_keep_invalid_dates_null() {
         let entries = vec![
-            (
+            dated_entry(
                 model_entry(
                     "mixed",
                     1,
@@ -442,10 +462,10 @@ mod tests {
                     100,
                     50,
                 ),
-                "cursor".to_string(),
-                "2026-07-10".to_string(),
+                "cursor",
+                "2026-07-10",
             ),
-            (
+            dated_entry(
                 model_entry(
                     "mixed",
                     2,
@@ -455,10 +475,10 @@ mod tests {
                     200,
                     100,
                 ),
-                "cursor".to_string(),
-                "2026-07-10".to_string(),
+                "cursor",
+                "2026-07-10",
             ),
-            (
+            dated_entry(
                 model_entry(
                     "invalid-date",
                     1,
@@ -468,8 +488,8 @@ mod tests {
                     20,
                     10,
                 ),
-                "cursor".to_string(),
-                "not-a-date".to_string(),
+                "cursor",
+                "not-a-date",
             ),
         ];
         let rules = [
@@ -566,7 +586,7 @@ mod tests {
     #[test]
     fn model_session_details_filter_cursor_mode() {
         let entries = vec![
-            (
+            dated_entry(
                 model_entry(
                     "agent",
                     1,
@@ -576,10 +596,10 @@ mod tests {
                     100,
                     50,
                 ),
-                "cursor".to_string(),
-                "2026-07-10".to_string(),
+                "cursor",
+                "2026-07-10",
             ),
-            (
+            dated_entry(
                 model_entry(
                     "ide",
                     1,
@@ -589,8 +609,8 @@ mod tests {
                     80,
                     20,
                 ),
-                "cursor".to_string(),
-                "2026-07-10".to_string(),
+                "cursor",
+                "2026-07-10",
             ),
         ];
 
@@ -608,7 +628,7 @@ mod tests {
     #[test]
     fn model_session_details_keep_same_id_sources_separate() {
         let entries = vec![
-            (
+            dated_entry(
                 model_entry(
                     "shared",
                     1,
@@ -618,10 +638,10 @@ mod tests {
                     100,
                     10,
                 ),
-                "copilot".to_string(),
-                "2026-07-10".to_string(),
+                "copilot",
+                "2026-07-10",
             ),
-            (
+            dated_entry(
                 model_entry(
                     "shared",
                     1,
@@ -631,8 +651,8 @@ mod tests {
                     200,
                     20,
                 ),
-                "copilot".to_string(),
-                "2026-07-10".to_string(),
+                "copilot",
+                "2026-07-10",
             ),
         ];
 
@@ -675,8 +695,8 @@ mod tests {
         );
         second.source_dir_key = Some("bb".to_string());
         let entries = vec![
-            (first, "copilot".to_string(), "2026-07-10".to_string()),
-            (second, "copilot".to_string(), "2026-07-10".to_string()),
+            dated_entry(first, "copilot", "2026-07-10"),
+            dated_entry(second, "copilot", "2026-07-10"),
         ];
 
         let details = collect_model_session_details(

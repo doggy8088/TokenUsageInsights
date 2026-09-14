@@ -247,7 +247,7 @@ pub(crate) fn load_session_details(
 ) -> Result<serde_json::Value, SessionDetailsError> {
     let conn = db::get_db_conn()
         .map_err(|error| SessionDetailsError::new(StatusCode::INTERNAL_SERVER_ERROR, error))?;
-    let info = db::get_session_assistant_and_transcript(
+    let lookup = db::get_session_assistant_and_transcript(
         &conn,
         &assistant,
         &session_id,
@@ -255,24 +255,15 @@ pub(crate) fn load_session_details(
         source_dir_key.as_deref(),
     )
     .map_err(|error| SessionDetailsError::new(StatusCode::NOT_FOUND, error))?;
-    let (
-        resolved_assistant,
-        transcript_path_db,
-        source_kind,
-        source_dir_key,
-        parent_session_id,
-        agent_nickname,
-    ) = info;
-
-    if resolved_assistant != assistant {
+    if lookup.assistant_type != assistant {
         return Err(SessionDetailsError::new(
             StatusCode::NOT_FOUND,
             "找不到該會話資料或助理類型不符",
         ));
     }
 
-    let copilot_app_source_dir = if source_kind == "copilot-app" {
-        let key = source_dir_key.as_deref().ok_or_else(|| {
+    let copilot_app_source_dir = if lookup.source_kind == "copilot-app" {
+        let key = lookup.source_dir_key.as_deref().ok_or_else(|| {
             SessionDetailsError::with_reason(
                 StatusCode::NOT_FOUND,
                 "Copilot App session 缺少來源目錄識別。",
@@ -280,7 +271,7 @@ pub(crate) fn load_session_details(
             )
         })?;
         Some(
-            db::get_usage_source_directory(&conn, &resolved_assistant, &source_kind, key)
+            db::get_usage_source_directory(&conn, &lookup.assistant_type, &lookup.source_kind, key)
                 .map_err(|error| {
                     SessionDetailsError::new(StatusCode::INTERNAL_SERVER_ERROR, error)
                 })?
@@ -297,30 +288,31 @@ pub(crate) fn load_session_details(
     };
 
     let filepath = resolve_session_file_path(
-        &resolved_assistant,
+        &lookup.assistant_type,
         &session_id,
-        transcript_path_db.as_deref(),
-        &source_kind,
+        lookup.transcript_path.as_deref(),
+        &lookup.source_kind,
         SessionFileResolutionContext {
             copilot_app_source_dir: copilot_app_source_dir.as_deref(),
-            parent_session_id: parent_session_id.as_deref(),
-            agent_nickname: agent_nickname.as_deref(),
+            parent_session_id: lookup.parent_session_id.as_deref(),
+            agent_nickname: lookup.agent_nickname.as_deref(),
         },
     )?;
     if !filepath.exists() {
-        let session_dir_exists = if resolved_assistant == "copilot" {
-            let base_dir = if source_kind == "copilot-app" {
+        let session_dir_exists = if lookup.assistant_type == "copilot" {
+            let base_dir = if lookup.source_kind == "copilot-app" {
                 copilot_app_source_dir
                     .clone()
                     .unwrap_or_else(crate::paths::copilot_app_dir)
             } else {
                 db::get_copilot_dir()
             };
-            let directory_id = if matches!(source_kind.as_str(), "copilot-app" | "copilot-cli") {
-                parent_session_id.as_deref().unwrap_or(&session_id)
-            } else {
-                &session_id
-            };
+            let directory_id =
+                if matches!(lookup.source_kind.as_str(), "copilot-app" | "copilot-cli") {
+                    lookup.parent_session_id.as_deref().unwrap_or(&session_id)
+                } else {
+                    &session_id
+                };
             base_dir.join("session-state").join(directory_id).exists()
         } else {
             false
@@ -338,36 +330,36 @@ pub(crate) fn load_session_details(
 
     let session_cwd = db::get_session_cwd(
         &conn,
-        &resolved_assistant,
+        &lookup.assistant_type,
         &session_id,
-        Some(&source_kind),
-        source_dir_key.as_deref(),
+        Some(&lookup.source_kind),
+        lookup.source_dir_key.as_deref(),
     )
     .unwrap_or(None);
     let session_model = db::get_session_model(
         &conn,
-        &resolved_assistant,
+        &lookup.assistant_type,
         &session_id,
-        Some(&source_kind),
-        source_dir_key.as_deref(),
+        Some(&lookup.source_kind),
+        lookup.source_dir_key.as_deref(),
     )
     .unwrap_or(None);
     let db_entries = db::get_session_turns_token_stats(
         &conn,
-        &resolved_assistant,
+        &lookup.assistant_type,
         &session_id,
-        Some(&source_kind),
-        source_dir_key.as_deref(),
+        Some(&lookup.source_kind),
+        lookup.source_dir_key.as_deref(),
     )
     .unwrap_or_default();
 
-    let agent_filter = (resolved_assistant == "copilot"
-        && matches!(source_kind.as_str(), "copilot-app" | "copilot-cli"))
-    .then_some(agent_nickname.as_deref())
+    let agent_filter = (lookup.assistant_type == "copilot"
+        && matches!(lookup.source_kind.as_str(), "copilot-app" | "copilot-cli"))
+    .then_some(lookup.agent_nickname.as_deref())
     .flatten();
     let (timeline, mut metadata) = parse_session_timeline_file(
-        &resolved_assistant,
-        &source_kind,
+        &lookup.assistant_type,
+        &lookup.source_kind,
         &filepath,
         &db_entries,
         agent_filter,

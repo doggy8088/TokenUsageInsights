@@ -76,6 +76,16 @@ pub struct UsageEntry {
     pub reasoning_effort: Option<String>,
 }
 
+/// A usage entry together with the assistant and calendar date selected by a
+/// period query. Keeping these values named prevents month/year reporting from
+/// depending on positional tuple conventions.
+#[derive(Debug, Clone)]
+pub struct DatedUsageEntry {
+    pub entry: UsageEntry,
+    pub assistant_type: String,
+    pub date: String,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct UsageDayExportRecord {
     #[serde(flatten)]
@@ -5287,17 +5297,16 @@ pub fn rollback_usage_import_batch(
     })
 }
 
-/// Session identity tuple returned by [`get_session_assistant_and_transcript`]:
-/// `(assistant_type, transcript_path, source_kind, source_dir_key,
-/// parent_session_id, agent_nickname)`.
-pub type SessionIdentity = (
-    String,
-    Option<String>,
-    String,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-);
+/// Database fields required to locate and parse one concrete session source.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SessionLookup {
+    pub assistant_type: String,
+    pub transcript_path: Option<String>,
+    pub source_kind: String,
+    pub source_dir_key: Option<String>,
+    pub parent_session_id: Option<String>,
+    pub agent_nickname: Option<String>,
+}
 
 /// Resolves the single `source_kind` used by the legacy `source_kind = None`
 /// fallback. All four session-lookup helpers
@@ -5378,8 +5387,7 @@ fn resolve_session_source_kind(
     }
 }
 
-/// Returns `(assistant_type, transcript_path, source_kind, source_dir_key,
-/// parent_session_id, agent_nickname)` for a given session id.
+/// Returns the fields required to locate and parse a given session id.
 ///
 /// `source_kind` and `source_dir_key` narrow the query so that sessions with the
 /// same `session_id` from different sources (e.g. Copilot CLI vs. Copilot App,
@@ -5412,7 +5420,7 @@ pub fn get_session_assistant_and_transcript(
     session_id: &str,
     source_kind: Option<&str>,
     source_dir_key: Option<&str>,
-) -> Result<SessionIdentity, String> {
+) -> Result<SessionLookup, String> {
     // Build a deterministic query:
     // - When source_kind is provided, filter by it exactly.
     // - When source_dir_key is Some, filter by source_dir_key = ?.
@@ -5488,14 +5496,14 @@ pub fn get_session_assistant_and_transcript(
             .ok()
             .flatten()
             .filter(|s| !s.is_empty());
-        Ok((
-            ast,
-            path,
+        Ok(SessionLookup {
+            assistant_type: ast,
+            transcript_path: path,
             source_kind,
             source_dir_key,
             parent_session_id,
             agent_nickname,
-        ))
+        })
     } else {
         Err("Session not found".to_string())
     }
@@ -5802,7 +5810,7 @@ pub fn get_usage_entries_by_month(
     conn: &rusqlite::Connection,
     year_month: &str,
     assistant: &str,
-) -> Result<Vec<(UsageEntry, String, String)>, String> {
+) -> Result<Vec<DatedUsageEntry>, String> {
     let query_month = format!("{}-%", year_month);
     let mut query = "SELECT
             timestamp, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
@@ -5961,8 +5969,8 @@ pub fn get_usage_entries_by_month(
 
         let entry_date = row.get::<_, String>(32).map_err(|e| e.to_string())?;
 
-        entries.push((
-            UsageEntry {
+        entries.push(DatedUsageEntry {
+            entry: UsageEntry {
                 timestamp: row.get(0).map_err(|e| e.to_string())?,
                 session_id: row.get(1).map_err(|e| e.to_string())?,
                 session_name: row.get(2).ok(),
@@ -5983,9 +5991,9 @@ pub fn get_usage_entries_by_month(
                 agent_role: row.get(29).ok(),
                 reasoning_effort: row.get(31).ok(),
             },
-            ast_type,
-            entry_date,
-        ));
+            assistant_type: ast_type,
+            date: entry_date,
+        });
     }
     Ok(entries)
 }
@@ -6034,7 +6042,7 @@ pub fn get_usage_entries_by_year(
     conn: &rusqlite::Connection,
     year: &str,
     assistant: &str,
-) -> Result<Vec<(UsageEntry, String, String)>, String> {
+) -> Result<Vec<DatedUsageEntry>, String> {
     let query_year = format!("{}-%", year);
     let mut query = "SELECT
             timestamp, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
@@ -6193,8 +6201,8 @@ pub fn get_usage_entries_by_year(
 
         let entry_date = row.get::<_, String>(32).map_err(|e| e.to_string())?;
 
-        entries.push((
-            UsageEntry {
+        entries.push(DatedUsageEntry {
+            entry: UsageEntry {
                 timestamp: row.get(0).map_err(|e| e.to_string())?,
                 session_id: row.get(1).map_err(|e| e.to_string())?,
                 session_name: row.get(2).ok(),
@@ -6215,9 +6223,9 @@ pub fn get_usage_entries_by_year(
                 agent_role: row.get(29).ok(),
                 reasoning_effort: row.get(31).ok(),
             },
-            ast_type,
-            entry_date,
-        ));
+            assistant_type: ast_type,
+            date: entry_date,
+        });
     }
     Ok(entries)
 }
@@ -6748,19 +6756,18 @@ mod tests {
         )
         .unwrap();
 
-        let (_, _, source_kind, source_dir_key, parent_id, nickname) =
-            get_session_assistant_and_transcript(
-                &conn,
-                "copilot",
-                &synthetic,
-                Some("copilot-app"),
-                Some("abcdef00"),
-            )
-            .unwrap();
-        assert_eq!(source_kind, "copilot-app");
-        assert_eq!(source_dir_key.as_deref(), Some("abcdef00"));
-        assert_eq!(parent_id.as_deref(), Some(parent));
-        assert_eq!(nickname.as_deref(), Some(agent));
+        let lookup = get_session_assistant_and_transcript(
+            &conn,
+            "copilot",
+            &synthetic,
+            Some("copilot-app"),
+            Some("abcdef00"),
+        )
+        .unwrap();
+        assert_eq!(lookup.source_kind, "copilot-app");
+        assert_eq!(lookup.source_dir_key.as_deref(), Some("abcdef00"));
+        assert_eq!(lookup.parent_session_id.as_deref(), Some(parent));
+        assert_eq!(lookup.agent_nickname.as_deref(), Some(agent));
     }
 
     #[test]
@@ -7210,8 +7217,8 @@ mod tests {
                 .unwrap();
         let entries = [
             &day_entries[0].0.entry,
-            &month_entries[0].0,
-            &year_entries[0].0,
+            &month_entries[0].entry,
+            &year_entries[0].entry,
         ];
 
         for entry in entries {
@@ -7268,7 +7275,7 @@ mod tests {
             .unwrap();
         }
 
-        let (_, transcript_path, source_kind, _, _, _) = get_session_assistant_and_transcript(
+        let lookup = get_session_assistant_and_transcript(
             &conn,
             "copilot",
             "shared",
@@ -7276,8 +7283,11 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(source_kind, "vscode-chat");
-        assert_eq!(transcript_path.as_deref(), Some("/tmp/vscode/session.json"));
+        assert_eq!(lookup.source_kind, "vscode-chat");
+        assert_eq!(
+            lookup.transcript_path.as_deref(),
+            Some("/tmp/vscode/session.json")
+        );
 
         let cwd = get_session_cwd(&conn, "copilot", "shared", Some("vscode-chat"), None).unwrap();
         assert_eq!(cwd.as_deref(), Some("/tmp/vscode"));
@@ -13766,7 +13776,7 @@ mod tests {
 
         // get_session_assistant_and_transcript must return the correct
         // source_dir_key when queried with explicit source_kind + source_dir_key.
-        let (_, _, sk_a, sdk_a, _, _) = get_session_assistant_and_transcript(
+        let lookup_a = get_session_assistant_and_transcript(
             &conn,
             "copilot",
             session_id,
@@ -13774,10 +13784,10 @@ mod tests {
             Some(dir_a),
         )
         .unwrap();
-        assert_eq!(sk_a, "copilot-app");
-        assert_eq!(sdk_a.as_deref(), Some(dir_a));
+        assert_eq!(lookup_a.source_kind, "copilot-app");
+        assert_eq!(lookup_a.source_dir_key.as_deref(), Some(dir_a));
 
-        let (_, _, sk_b, sdk_b, _, _) = get_session_assistant_and_transcript(
+        let lookup_b = get_session_assistant_and_transcript(
             &conn,
             "copilot",
             session_id,
@@ -13785,8 +13795,8 @@ mod tests {
             Some(dir_b),
         )
         .unwrap();
-        assert_eq!(sk_b, "copilot-app");
-        assert_eq!(sdk_b.as_deref(), Some(dir_b));
+        assert_eq!(lookup_b.source_kind, "copilot-app");
+        assert_eq!(lookup_b.source_dir_key.as_deref(), Some(dir_b));
 
         // get_session_cwd must return the correct CWD per source_dir_key.
         let cwd_a = get_session_cwd(
@@ -13898,7 +13908,7 @@ mod tests {
 
         // Query with source_kind=copilot-cli, source_dir_key=None must find
         // the CLI row only.
-        let (_, _, sk, _sdk, _, _) = get_session_assistant_and_transcript(
+        let cli_lookup = get_session_assistant_and_transcript(
             &conn,
             "copilot",
             session_id,
@@ -13906,11 +13916,11 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(sk, "copilot-cli");
+        assert_eq!(cli_lookup.source_kind, "copilot-cli");
 
         // Query with source_kind=copilot-app, source_dir_key=hex must find
         // the App row only.
-        let (_, _, sk_app, sdk_app, _, _) = get_session_assistant_and_transcript(
+        let app_lookup = get_session_assistant_and_transcript(
             &conn,
             "copilot",
             session_id,
@@ -13918,8 +13928,8 @@ mod tests {
             Some(dir_app),
         )
         .unwrap();
-        assert_eq!(sk_app, "copilot-app");
-        assert_eq!(sdk_app.as_deref(), Some(dir_app));
+        assert_eq!(app_lookup.source_kind, "copilot-app");
+        assert_eq!(app_lookup.source_dir_key.as_deref(), Some(dir_app));
 
         // CWD isolation: None -> CLI row; Some(dir) -> App row.
         let cwd_cli =
@@ -14022,7 +14032,7 @@ mod tests {
         )
         .unwrap();
 
-        let (_, _, cli_kind, cli_dir, _, _) = get_session_assistant_and_transcript(
+        let cli_lookup = get_session_assistant_and_transcript(
             &conn,
             "copilot",
             session_id,
@@ -14030,8 +14040,8 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(cli_kind, "copilot-cli");
-        assert_eq!(cli_dir, None);
+        assert_eq!(cli_lookup.source_kind, "copilot-cli");
+        assert_eq!(cli_lookup.source_dir_key, None);
 
         let cli_cwd =
             get_session_cwd(&conn, "copilot", session_id, Some("copilot-cli"), None).unwrap();
@@ -14114,9 +14124,9 @@ mod tests {
 
         // Legacy query (both source_kind and source_dir_key are None) must
         // return the CLI row because source_dir_key IS NULL is the filter.
-        let (_, _, sk, _sdk, _, _) =
+        let lookup =
             get_session_assistant_and_transcript(&conn, "copilot", session_id, None, None).unwrap();
-        assert_eq!(sk, "copilot-cli");
+        assert_eq!(lookup.source_kind, "copilot-cli");
 
         // CWD with None must be the CLI CWD.
         let cwd = get_session_cwd(&conn, "copilot", session_id, None, None).unwrap();
@@ -14187,7 +14197,7 @@ mod tests {
 
         // Identity must select the matching source_kind and report
         // source_dir_key as None for both.
-        let (_, _, sk_cli, sdk_cli, _, _) = get_session_assistant_and_transcript(
+        let cli_lookup = get_session_assistant_and_transcript(
             &conn,
             "copilot",
             session_id,
@@ -14195,10 +14205,10 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(sk_cli, "copilot-cli");
-        assert_eq!(sdk_cli, None);
+        assert_eq!(cli_lookup.source_kind, "copilot-cli");
+        assert_eq!(cli_lookup.source_dir_key, None);
 
-        let (_, _, sk_vscode, sdk_vscode, _, _) = get_session_assistant_and_transcript(
+        let vscode_lookup = get_session_assistant_and_transcript(
             &conn,
             "copilot",
             session_id,
@@ -14206,8 +14216,8 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(sk_vscode, "vscode-chat");
-        assert_eq!(sdk_vscode, None);
+        assert_eq!(vscode_lookup.source_kind, "vscode-chat");
+        assert_eq!(vscode_lookup.source_dir_key, None);
 
         // CWD isolation per source_kind.
         let cwd_cli =
@@ -14377,7 +14387,7 @@ mod tests {
         // they all observe the same source row.
         let pick_identity = || {
             get_session_assistant_and_transcript(&conn, "copilot", session_id, None, None)
-                .map(|(_, _, sk, sdk, _, _)| (sk, sdk))
+                .map(|lookup| (lookup.source_kind, lookup.source_dir_key))
         };
         let pick_cwd = || get_session_cwd(&conn, "copilot", session_id, None, None);
         let pick_model = || get_session_model(&conn, "copilot", session_id, None, None);
@@ -14468,10 +14478,10 @@ mod tests {
         .unwrap();
 
         // Legacy `None` lookup must see only the CLI row, never the App row.
-        let (_, _, sk, sdk, _, _) =
+        let lookup =
             get_session_assistant_and_transcript(&conn, "copilot", session_id, None, None).unwrap();
-        assert_eq!(sk, "copilot-cli");
-        assert_eq!(sdk, None);
+        assert_eq!(lookup.source_kind, "copilot-cli");
+        assert_eq!(lookup.source_dir_key, None);
 
         let cwd = get_session_cwd(&conn, "copilot", session_id, None, None).unwrap();
         assert_eq!(cwd.as_deref(), Some("/home/cli"));
@@ -14555,10 +14565,10 @@ mod tests {
         .unwrap();
 
         // Identity, CWD, model all must come from the CLI source.
-        let (_, _, sk, sdk, _, _) =
+        let lookup =
             get_session_assistant_and_transcript(&conn, "copilot", session_id, None, None).unwrap();
-        assert_eq!(sk, "copilot-cli");
-        assert_eq!(sdk, None);
+        assert_eq!(lookup.source_kind, "copilot-cli");
+        assert_eq!(lookup.source_dir_key, None);
 
         let cwd = get_session_cwd(&conn, "copilot", session_id, None, None).unwrap();
         assert_eq!(cwd.as_deref(), Some("/home/cli"));
@@ -14657,7 +14667,7 @@ mod tests {
         // Use the legacy `source_kind = None` fallback while scoping the
         // query to the App directory. The resolver must still prefer the
         // main row over the subagent row.
-        let (_, path, sk, sdk, parent, agent) = get_session_assistant_and_transcript(
+        let lookup = get_session_assistant_and_transcript(
             &conn,
             "copilot",
             session_id,
@@ -14665,19 +14675,19 @@ mod tests {
             Some("dead00"),
         )
         .unwrap();
-        assert_eq!(sk, "copilot-app");
-        assert_eq!(sdk.as_deref(), Some("dead00"));
+        assert_eq!(lookup.source_kind, "copilot-app");
+        assert_eq!(lookup.source_dir_key.as_deref(), Some("dead00"));
         assert_eq!(
-            parent, None,
+            lookup.parent_session_id, None,
             "main row must win: parent_session_id must be NULL"
         );
         assert_eq!(
-            agent, None,
+            lookup.agent_nickname, None,
             "main row must win: agent_nickname must be None"
         );
         // transcript_path can be NULL in this fixture; we only assert
         // that we got *some* row back (None is acceptable here).
-        let _ = path;
+        let _ = lookup.transcript_path;
 
         // CWD must come from the main row (`/home/main`), not the
         // subagent row (`/home/subagent`).
@@ -15002,7 +15012,7 @@ mod tests {
         let month_rows = get_usage_entries_by_month(&conn, "2024-03", "grok").unwrap();
         assert_eq!(
             month_rows[0]
-                .0
+                .entry
                 .cost
                 .as_ref()
                 .and_then(|cost| cost.reported_cost_usd),
@@ -15012,7 +15022,7 @@ mod tests {
         let year_rows = get_usage_entries_by_year(&conn, "2024", "grok").unwrap();
         assert_eq!(
             year_rows[0]
-                .0
+                .entry
                 .cost
                 .as_ref()
                 .and_then(|cost| cost.reported_cost_usd),

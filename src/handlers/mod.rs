@@ -2,7 +2,7 @@ use crate::{
     db::UsageEntry,
     reporting::{
         summarize_session_usage, AgentBreakdown, DaySummary, MonthlyModelSummary,
-        MonthlyProjectSummary, UsageAggregation,
+        MonthlyProjectSummary,
     },
 };
 use serde::Serialize;
