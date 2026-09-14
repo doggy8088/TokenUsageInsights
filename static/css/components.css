@@ -885,6 +885,15 @@ input:checked + .slider-round:before {
   animation: pulse-glow 3s infinite ease-in-out;
 }
 
+.welcome-setup-card .empty-agent-logo {
+  display: block;
+  inline-size: 2.5rem;
+  block-size: 2.5rem;
+  max-inline-size: 100%;
+  max-block-size: 100%;
+  object-fit: contain;
+}
+
 .welcome-setup-card h2 {
   font-family: var(--font-display);
   font-size: 28px;
