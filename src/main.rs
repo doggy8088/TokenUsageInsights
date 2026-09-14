@@ -35,6 +35,7 @@ use handlers::*;
 
 const MAX_IMPORT_PAYLOAD_BYTES: usize = 200_000_000;
 const DEFAULT_BIND_HOST: &str = "0.0.0.0";
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn import_usage_route() -> axum::routing::MethodRouter {
     post(import_usage_day).layer(DefaultBodyLimit::max(MAX_IMPORT_PAYLOAD_BYTES))
@@ -321,6 +322,7 @@ async fn main() {
 
     // 建立 Axum 路由，支援帶助理前綴的 API 及 fallback 相容 API
     let app = Router::new()
+        .route("/api/version", get(get_app_version))
         // 帶 :assistant 變數的路由
         .route("/api/:assistant/dates", get(get_available_dates))
         .route("/api/:assistant/setup-info", get(get_setup_info))

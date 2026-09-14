@@ -15,6 +15,17 @@ struct UsageDayExportResponse {
     records: Vec<UsageDayExportRecord>,
 }
 
+#[derive(Serialize)]
+pub struct AppVersionResponse {
+    pub version: &'static str,
+}
+
+pub async fn get_app_version() -> Json<AppVersionResponse> {
+    Json(AppVersionResponse {
+        version: crate::APP_VERSION,
+    })
+}
+
 #[derive(Deserialize)]
 pub struct UsageDayImportRequest {
     #[serde(default)]
@@ -405,7 +416,16 @@ pub async fn rollback_usage_import_batch(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_valid_period, validate_import_assistant};
+    use axum::Json;
+
+    use super::{get_app_version, is_valid_period, validate_import_assistant};
+
+    #[tokio::test]
+    async fn app_version_uses_cargo_package_version() {
+        let Json(response) = get_app_version().await;
+
+        assert_eq!(response.version, env!("CARGO_PKG_VERSION"));
+    }
 
     #[test]
     fn export_period_accepts_day_month_and_year() {

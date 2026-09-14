@@ -34,7 +34,10 @@ pub(crate) fn announce_dashboard(url: &str) {
 }
 
 fn startup_banner(url: &str, use_terminal_style: bool) -> String {
-    let message = format!("🚀 Token 戰情室 is running on: {url}");
+    let message = format!(
+        "🚀 Token 戰情室 v{} is running on: {url}",
+        crate::APP_VERSION
+    );
     if use_terminal_style {
         format!("\n\x1b[1;96m{STARTUP_SEPARATOR}\n{message}\n{STARTUP_SEPARATOR}\x1b[0m\n")
     } else {
@@ -146,7 +149,10 @@ mod tests {
 
         assert!(banner.contains("\x1b[1;96m"));
         assert!(banner.contains(STARTUP_SEPARATOR));
-        assert!(banner.contains("🚀 Token 戰情室 is running on: http://localhost:3003"));
+        assert!(banner.contains(&format!(
+            "🚀 Token 戰情室 v{} is running on: http://localhost:3003",
+            env!("CARGO_PKG_VERSION")
+        )));
         assert!(banner.ends_with("\x1b[0m\n"));
     }
 
@@ -154,7 +160,10 @@ mod tests {
     fn startup_banner_keeps_service_logs_plain() {
         assert_eq!(
             startup_banner("http://localhost:3003", false),
-            "🚀 Token 戰情室 is running on: http://localhost:3003"
+            format!(
+                "🚀 Token 戰情室 v{} is running on: http://localhost:3003",
+                env!("CARGO_PKG_VERSION")
+            )
         );
     }
 

@@ -115,11 +115,12 @@ test('empty-state assistant logos have bounded stylesheet dimensions', () => {
 
 test('keeps the release label visible at the bottom of the sidebar', () => {
   const indexHtml = readFileSync(join(__dirname, '..', 'static', 'index.html'), 'utf8');
+  const appSource = readFileSync(join(__dirname, '..', 'static', 'app.js'), 'utf8');
   const redesignCss = readFileSync(join(__dirname, '..', 'static', 'css', 'redesign.css'), 'utf8');
-  assert.match(
-    indexHtml,
-    /<footer class="sidebar-version" aria-label="應用程式版本">v1\.0\.0 \(2026\/9\/14\)<\/footer>/,
-  );
+  assert.match(indexHtml, /<span id="app-version">v—<\/span>/);
+  assert.doesNotMatch(indexHtml, /v1\.0\.0/);
+  assert.match(appSource, /fetch\('\/api\/version', \{ cache: 'no-store' \}\)/);
+  assert.match(appSource, /versionElement\.textContent = `v\$\{version\}`/);
 
   const scrollAreaRule = redesignCss.match(/\.sidebar-scroll-area\s*\{([^}]*)\}/s);
   assert.ok(scrollAreaRule, 'sidebar content needs an independent scroll area');

@@ -724,7 +724,30 @@ function updateLanguageUI() {
   updateCodexRateLimit();
 }
 
+async function loadAppVersion() {
+  const versionElement = document.getElementById('app-version');
+  if (!versionElement) return;
+
+  try {
+    const response = await fetch('/api/version', { cache: 'no-store' });
+    if (!response.ok) {
+      throw new Error(`版本 API 回傳 HTTP ${response.status}`);
+    }
+
+    const payload = await response.json();
+    const version = typeof payload.version === 'string' ? payload.version.trim() : '';
+    if (!version) {
+      throw new Error('版本 API 未提供有效版本');
+    }
+
+    versionElement.textContent = `v${version}`;
+  } catch (error) {
+    console.error('無法載入應用程式版本', error);
+  }
+}
+
 document.addEventListener('DOMContentLoaded', () => {
+  void loadAppVersion();
   initApp();
 });
 
