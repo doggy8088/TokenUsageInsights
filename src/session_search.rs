@@ -45,12 +45,12 @@ fn timeline_matches_user_prompt(timeline: &[TimelineItem], normalized_query: &st
 }
 
 fn build_searchable_sessions(
-    entries: &[(db::UsageDayExportRecord, String)],
+    entries: &[db::UsageDayRecordWithAssistant],
 ) -> Vec<SearchableSession> {
     group_sessions(
         entries
             .iter()
-            .map(|(record, assistant_type)| (&record.entry, assistant_type.as_str())),
+            .map(|row| (&row.record.entry, row.assistant_type.as_str())),
     )
     .into_iter()
     .map(|(identity, group)| {
@@ -191,7 +191,7 @@ mod tests {
         }
     }
 
-    fn usage_record(source_dir_key: &str) -> (db::UsageDayExportRecord, String) {
+    fn usage_record(source_dir_key: &str) -> db::UsageDayRecordWithAssistant {
         let tokens = TokenStats {
             input: 10,
             output: 5,
@@ -202,8 +202,8 @@ mod tests {
             reasoning: None,
             total: 15,
         };
-        (
-            db::UsageDayExportRecord {
+        db::UsageDayRecordWithAssistant {
+            record: db::UsageDayExportRecord {
                 entry: UsageEntry {
                     timestamp: "2026-07-16T00:00:00Z".to_string(),
                     session_id: "shared-search-session".to_string(),
@@ -228,8 +228,8 @@ mod tests {
                 import_source_id: None,
                 usage_identity: None,
             },
-            "copilot".to_string(),
-        )
+            assistant_type: "copilot".to_string(),
+        }
     }
 
     #[test]

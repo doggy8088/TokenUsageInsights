@@ -1,4 +1,4 @@
-import { parseUsageTimestamp } from './chart-utils.js?v=7';
+import { parseUsageTimestamp } from './time-utils.js?v=1';
 
 function getSessionSortValue(session, sortColumn) {
   const value = session?.[sortColumn];

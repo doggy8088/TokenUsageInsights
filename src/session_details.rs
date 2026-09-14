@@ -4,7 +4,10 @@ use std::{collections::HashMap, fs::File, io::BufReader, path::Path};
 
 use crate::{
     db::{self, TokenStats},
-    session_files::{resolve_session_file_path, SessionFileErrorExt, SessionFileResolutionContext},
+    session_files::{
+        resolve_session_file_path, SessionFileError, SessionFileReason,
+        SessionFileResolutionContext,
+    },
     timeline::{
         parse_antigravity_timeline, parse_claude_timeline, parse_codex_timeline,
         parse_copilot_timeline_filtered, parse_cursor_timeline, parse_grok_timeline,
@@ -32,20 +35,20 @@ impl SessionDetailsError {
     fn with_reason(
         status: StatusCode,
         error: impl Into<String>,
-        reason: impl Into<String>,
+        reason: SessionFileReason,
     ) -> Self {
         Self {
             status,
             payload: serde_json::json!({
                 "error": error.into(),
-                "reason": reason.into(),
+                "reason": reason.as_str(),
             }),
         }
     }
 }
 
-impl From<SessionFileErrorExt> for SessionDetailsError {
-    fn from(error: SessionFileErrorExt) -> Self {
+impl From<SessionFileError> for SessionDetailsError {
+    fn from(error: SessionFileError) -> Self {
         match error.reason {
             Some(reason) => Self::with_reason(error.status, error.error, reason),
             None => Self::new(error.status, error.error),
@@ -267,7 +270,7 @@ pub(crate) fn load_session_details(
             SessionDetailsError::with_reason(
                 StatusCode::NOT_FOUND,
                 "Copilot App session 缺少來源目錄識別。",
-                "file_missing",
+                SessionFileReason::FileMissing,
             )
         })?;
         Some(
@@ -279,7 +282,7 @@ pub(crate) fn load_session_details(
                     SessionDetailsError::with_reason(
                         StatusCode::NOT_FOUND,
                         "找不到 Copilot App session 對應的已登錄來源目錄。",
-                        "file_missing",
+                        SessionFileReason::FileMissing,
                     )
                 })?,
         )
@@ -321,9 +324,9 @@ pub(crate) fn load_session_details(
             StatusCode::NOT_FOUND,
             "找不到該會話的本地日誌檔。",
             if session_dir_exists {
-                "no_events_yet"
+                SessionFileReason::NoEventsYet
             } else {
-                "file_missing"
+                SessionFileReason::FileMissing
             },
         ));
     }
@@ -380,7 +383,7 @@ pub(crate) fn load_session_details(
         return Err(SessionDetailsError::with_reason(
             StatusCode::NOT_FOUND,
             "Copilot subagent 的 events.jsonl 中找不到對應 agentId 的事件，可能該 subagent 尚未寫入事件或檔案已被置換。",
-            "content_unavailable",
+            SessionFileReason::ContentUnavailable,
         ));
     }
 

@@ -95,6 +95,12 @@ pub struct UsageDayExportRecord {
     pub usage_identity: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct UsageDayRecordWithAssistant {
+    pub record: UsageDayExportRecord,
+    pub assistant_type: String,
+}
+
 #[derive(Serialize, Debug)]
 pub struct UsageDayImportSummary {
     pub date: String,
@@ -4722,7 +4728,7 @@ pub fn get_usage_entries_by_date(
     conn: &rusqlite::Connection,
     date: &str,
     assistant: &str,
-) -> Result<Vec<(UsageDayExportRecord, String)>, String> {
+) -> Result<Vec<UsageDayRecordWithAssistant>, String> {
     let mut query = "SELECT
             timestamp, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
             tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_cache_write_5m, tokens_cache_write_1h, tokens_reasoning, tokens_total,
@@ -4927,7 +4933,10 @@ pub fn get_usage_entries_by_date(
             ));
         }
 
-        entries.push((record, ast_type));
+        entries.push(UsageDayRecordWithAssistant {
+            record,
+            assistant_type: ast_type,
+        });
     }
     Ok(entries)
 }
@@ -4948,7 +4957,8 @@ pub fn export_usage_day_entries(
     let rows = get_usage_entries_by_date(conn, date, assistant)?;
     let mut records = Vec::with_capacity(rows.len());
 
-    for (mut record, _assistant_type) in rows {
+    for row in rows {
+        let mut record = row.record;
         if record.import_source_id.is_none() {
             record.import_source_id = Some(build_usage_entry_import_source_id(
                 assistant,
@@ -7216,7 +7226,7 @@ mod tests {
             get_session_turns_token_stats(&conn, "claude", "claude-cache-write-ttl", None, None)
                 .unwrap();
         let entries = [
-            &day_entries[0].0.entry,
+            &day_entries[0].record.entry,
             &month_entries[0].entry,
             &year_entries[0].entry,
         ];
@@ -11585,8 +11595,8 @@ mod tests {
 
         // Group by (session_id, source_dir_key) to simulate daily summary logic.
         let mut sessions: HashMap<(String, Option<String>), Vec<i64>> = HashMap::new();
-        for (record, _ast) in &entries {
-            let e = &record.entry;
+        for row in &entries {
+            let e = &row.record.entry;
             let key = (e.session_id.clone(), e.source_dir_key.clone());
             sessions
                 .entry(key)
@@ -11612,8 +11622,8 @@ mod tests {
 
         // Verify source_kind is "copilot-app" for all entries so the frontend
         // renders the App badge, not the CLI fallback.
-        for (record, _ast) in &entries {
-            let e = &record.entry;
+        for row in &entries {
+            let e = &row.record.entry;
             assert_eq!(
                 e.source_kind.as_deref(),
                 Some("copilot-app"),
@@ -15001,7 +15011,7 @@ mod tests {
         assert_eq!(date_rows.len(), 1);
         assert_eq!(
             date_rows[0]
-                .0
+                .record
                 .entry
                 .cost
                 .as_ref()

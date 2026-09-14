@@ -168,6 +168,16 @@ fn entry_model(entry: &UsageEntry) -> Option<&str> {
         .filter(|model| !model.is_empty())
 }
 
+pub(crate) fn latest_usage_entry<'a>(
+    entries: impl IntoIterator<Item = &'a UsageEntry>,
+) -> Option<&'a UsageEntry> {
+    entries.into_iter().max_by(|left, right| {
+        left.turn_no
+            .cmp(&right.turn_no)
+            .then_with(|| left.timestamp.cmp(&right.timestamp))
+    })
+}
+
 static WARNED_PRICING_MODELS: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
@@ -216,21 +226,22 @@ fn record_usage(
     add_tokens(&mut result.usage, tokens);
     result.usage.cost_usd += cost_usd;
 
-    let model_usage = if let Some(existing) = result
+    if let Some(model_usage) = result
         .models
         .iter_mut()
         .find(|item| item.model == model_label)
     {
-        existing
+        add_tokens(&mut model_usage.usage, tokens);
+        model_usage.usage.cost_usd += cost_usd;
     } else {
+        let mut usage = UsageAggregation::default();
+        add_tokens(&mut usage, tokens);
+        usage.cost_usd += cost_usd;
         result.models.push(ModelUsageAggregation {
             model: model_label.to_string(),
-            usage: UsageAggregation::default(),
+            usage,
         });
-        result.models.last_mut().unwrap()
-    };
-    add_tokens(&mut model_usage.usage, tokens);
-    model_usage.usage.cost_usd += cost_usd;
+    }
 }
 
 pub(crate) fn summarize_session_usage(
@@ -254,21 +265,20 @@ pub(crate) fn summarize_session_usage(
                 continue;
             };
             record_usage(&mut result, pricing_rules, entry, tokens);
-            if display_entry.is_none_or(|current| entry.turn_no >= current.turn_no) {
-                display_entry = Some(entry);
-            }
         }
-    } else if let Some(entry) = entries
-        .iter()
-        .filter(|entry| entry.tokens.as_ref().is_some_and(has_usage))
-        .max_by_key(|entry| entry.turn_no)
-    {
-        record_usage(
-            &mut result,
-            pricing_rules,
-            entry,
-            entry.tokens.as_ref().unwrap(),
+        display_entry = latest_usage_entry(
+            entries
+                .iter()
+                .filter(|entry| entry.delta_tokens.as_ref().is_some_and(has_usage)),
         );
+    } else if let Some((entry, tokens)) = latest_usage_entry(
+        entries
+            .iter()
+            .filter(|entry| entry.tokens.as_ref().is_some_and(has_usage)),
+    )
+    .and_then(|entry| entry.tokens.as_ref().map(|tokens| (entry, tokens)))
+    {
+        record_usage(&mut result, pricing_rules, entry, tokens);
         display_entry = Some(entry);
     }
 
@@ -328,18 +338,11 @@ pub(crate) fn cursor_session_mode(
         return None;
     }
 
-    entries
-        .iter()
-        .max_by(|left, right| {
-            left.turn_no
-                .cmp(&right.turn_no)
-                .then_with(|| left.timestamp.cmp(&right.timestamp))
-        })
-        .and_then(|entry| match entry.source_kind.as_deref() {
-            Some("cursor-agent") => Some("agent"),
-            Some("cursor-ide") => Some("ide"),
-            _ => None,
-        })
+    latest_usage_entry(entries).and_then(|entry| match entry.source_kind.as_deref() {
+        Some("cursor-agent") => Some("agent"),
+        Some("cursor-ide") => Some("ide"),
+        _ => None,
+    })
 }
 
 pub(crate) fn summarize_models_by_mode(
@@ -518,11 +521,7 @@ pub(crate) fn build_period_report(
     let mut project_stats: HashMap<String, ProjectUsageAggregation> = HashMap::new();
     let mut agent_breakdown: HashMap<String, AgentBreakdown> = HashMap::new();
     for (identity, group) in &sessions {
-        let Some(latest) = group.entries.iter().max_by(|left, right| {
-            left.turn_no
-                .cmp(&right.turn_no)
-                .then_with(|| left.timestamp.cmp(&right.timestamp))
-        }) else {
+        let Some(latest) = latest_usage_entry(&group.entries) else {
             continue;
         };
         let session = summarize_session_usage(pricing_rules, &group.entries);
@@ -645,6 +644,20 @@ mod tests {
             agent_role: None,
             reasoning_effort: None,
         }
+    }
+
+    #[test]
+    fn latest_usage_entry_breaks_equal_turns_by_timestamp() {
+        let mut earlier = usage_entry("aa", "earlier", 100);
+        earlier.turn_no = 7;
+        earlier.timestamp = "2026-07-10T10:00:00Z".to_string();
+        let mut later = usage_entry("aa", "later", 100);
+        later.turn_no = 7;
+        later.timestamp = "2026-07-10T10:01:00Z".to_string();
+
+        let latest = latest_usage_entry([&later, &earlier]);
+
+        assert_eq!(latest.and_then(entry_model), Some("later"));
     }
 
     #[test]

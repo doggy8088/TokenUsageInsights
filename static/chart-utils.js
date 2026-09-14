@@ -1,4 +1,5 @@
-import { sessionIdentityKey } from './session-utils.js?v=3';
+import { sessionIdentityKey } from './session-utils.js?v=4';
+import { parseUsageTimestamp } from './time-utils.js?v=1';
 
 export function normalizeEntryTokenParts(entry) {
   const tokens = entry?.delta_tokens || (entry?.turn_no === 1 ? entry.tokens : null);
@@ -17,19 +18,6 @@ export function normalizeEntryTokenParts(entry) {
   const input = Math.max(0, total - output - cache);
 
   return { input, output, cache, total };
-}
-
-export function parseUsageTimestamp(timestamp) {
-  const value = String(timestamp || '').trim();
-  if (!value) return null;
-
-  const hasExplicitTimezone = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(value);
-  const isSqlOrIsoTimestamp = /^\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}/.test(value);
-  const normalized = isSqlOrIsoTimestamp && !hasExplicitTimezone
-    ? `${value.replace(' ', 'T')}Z`
-    : value;
-  const parsed = new Date(normalized);
-  return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
 export function getUsageEntryUtcMinute(timestamp) {

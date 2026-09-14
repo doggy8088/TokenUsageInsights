@@ -9,7 +9,9 @@ use std::collections::HashMap;
 use super::*;
 use crate::db;
 use crate::pricing::{load_prepared_pricing_rules, PreparedPricingRules};
-use crate::reporting::{build_period_report, cursor_session_mode, group_sessions};
+use crate::reporting::{
+    build_period_report, cursor_session_mode, group_sessions, latest_usage_entry,
+};
 use crate::session_identity::SessionIdentity;
 
 #[derive(serde::Deserialize)]
@@ -135,14 +137,7 @@ fn collect_model_session_details(
         let Some(first) = session_first_entries.get(&identity) else {
             continue;
         };
-        let last_entry = entries
-            .iter()
-            .max_by(|left, right| {
-                left.turn_no
-                    .cmp(&right.turn_no)
-                    .then_with(|| left.timestamp.cmp(&right.timestamp))
-            })
-            .unwrap_or(&first.entry);
+        let last_entry = latest_usage_entry(&entries).unwrap_or(&first.entry);
         let duration_ms = last_entry
             .cost
             .as_ref()

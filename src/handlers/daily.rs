@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use super::*;
 use crate::db;
 use crate::pricing::{load_prepared_pricing_rules, PreparedPricingRules};
-use crate::reporting::group_sessions;
+use crate::reporting::{group_sessions, latest_usage_entry};
 use crate::session_details::load_session_details;
 use crate::session_files::is_safe_session_id;
 use crate::session_search;
@@ -23,20 +23,20 @@ use crate::timeline::{parse_grok_timeline, TimelineItem};
 use std::{fs::File, io::BufReader};
 
 fn aggregate_usage_details(
-    entries_with_type: &[(crate::db::UsageDayExportRecord, String)],
+    entries_with_type: &[crate::db::UsageDayRecordWithAssistant],
     pricing_rules: &PreparedPricingRules,
 ) -> (DaySummary, Vec<SessionSummary>, Vec<RawUsageEntry>) {
     let mut summary = DaySummary::default();
     let sessions_map = group_sessions(
         entries_with_type
             .iter()
-            .map(|(record, assistant_type)| (&record.entry, assistant_type.as_str())),
+            .map(|row| (&row.record.entry, row.assistant_type.as_str())),
     );
     let entries = entries_with_type
         .iter()
-        .map(|(record, assistant_type)| RawUsageEntry {
-            assistant_type: assistant_type.clone(),
-            entry: record.entry.clone(),
+        .map(|row| RawUsageEntry {
+            assistant_type: row.assistant_type.clone(),
+            entry: row.record.entry.clone(),
         })
         .collect::<Vec<_>>();
 
@@ -45,12 +45,9 @@ fn aggregate_usage_details(
     let mut sessions_summary = Vec::new();
     for (identity, group) in &sessions_map {
         let s_entries = &group.entries;
-        let mut last_entry = &s_entries[0];
-        for entry in &s_entries[1..] {
-            if entry.turn_no > last_entry.turn_no {
-                last_entry = entry;
-            }
-        }
+        let Some(last_entry) = latest_usage_entry(s_entries) else {
+            continue;
+        };
         let session_usage = summarize_session_usage(pricing_rules, s_entries);
 
         let session_duration = last_entry
@@ -329,7 +326,7 @@ pub async fn get_usage_details(
     let assistant_clone = assistant.clone();
     let date_clone = date.clone();
 
-    let entries_res: Result<Vec<(crate::db::UsageDayExportRecord, String)>, String> =
+    let entries_res: Result<Vec<crate::db::UsageDayRecordWithAssistant>, String> =
         tokio::task::spawn_blocking(move || {
             let conn = db::get_db_conn()?;
             db::get_usage_entries_by_date(&conn, &date_clone, &assistant_clone)
@@ -491,7 +488,7 @@ pub async fn get_session_details(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::UsageDayExportRecord;
+    use crate::db::{UsageDayExportRecord, UsageDayRecordWithAssistant};
     use crate::pricing::PricingRule;
     use rusqlite::Connection;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -521,15 +518,15 @@ mod tests {
         }
     }
 
-    fn usage_day_record(entry: UsageEntry, assistant_type: &str) -> (UsageDayExportRecord, String) {
-        (
-            UsageDayExportRecord {
+    fn usage_day_record(entry: UsageEntry, assistant_type: &str) -> UsageDayRecordWithAssistant {
+        UsageDayRecordWithAssistant {
+            record: UsageDayExportRecord {
                 entry,
                 import_source_id: None,
                 usage_identity: None,
             },
-            assistant_type.to_string(),
-        )
+            assistant_type: assistant_type.to_string(),
+        }
     }
 
     fn delta_usage_entry(

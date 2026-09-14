@@ -6,15 +6,15 @@ import {
   calculateMovingAverageTrend,
   calculateMovingAverageViewportTrend,
   getChartDataPointX,
-  parseUsageTimestamp,
-} from './chart-utils.js?v=8';
+} from './chart-utils.js?v=9';
 import {
   compareSessionRows,
   filterEntriesBySessionIdentity,
   matchesSessionIdentity,
   parentSessionIdentityKey,
   sessionIdentityKey,
-} from './session-utils.js?v=3';
+} from './session-utils.js?v=4';
+import { parseUsageTimestamp } from './time-utils.js?v=1';
 
 // Globals
 let tokenChartInstance = null;

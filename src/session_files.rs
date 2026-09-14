@@ -229,9 +229,8 @@ fn resolve_vscode_transcript_path(transcript_path_db: &str) -> Result<PathBuf, S
 /// the database `parent_session_id` column rather than splitting the synthetic
 /// id, so a tampered id cannot escape the session-state root.
 ///
-/// `agent_nickname` is only used to craft a precise `content_unavailable`
-/// reason when the file resolves but parsing the agent-specific slice yields no
-/// timeline items; it does not affect path resolution.
+/// `agent_nickname` only distinguishes the missing-directory message for a
+/// subagent request; it does not affect path construction or validation.
 ///
 /// Security: the canonicalized path must remain within the
 /// `<copilot_app_dir>/session-state` root. Any traversal attempt (synthetic id
@@ -240,98 +239,14 @@ pub(crate) fn resolve_copilot_app_events_path(
     copilot_app_dir: &StdPath,
     events_session_id: &str,
     agent_nickname: Option<&str>,
-) -> Result<PathBuf, SessionFileErrorExt> {
-    if !is_safe_session_id(events_session_id) {
-        return Err(SessionFileErrorExt::with_reason(
-            StatusCode::NOT_FOUND,
-            "Copilot App session id 格式不正確，無法定位 events.jsonl。",
-            "file_missing",
-        ));
-    }
-
-    let session_state_root = copilot_app_dir.join("session-state");
-    let session_dir = session_state_root.join(events_session_id);
-    let events_path = session_dir.join("events.jsonl");
-
-    // Canonicalize defensively. If the directory/file is missing we still want
-    // a precise reason, so handle missing paths before canonicalization (which
-    // would error on non-existent paths).
-    if !events_path.exists() {
-        let reason = if session_dir.exists() {
-            "no_events_yet"
-        } else {
-            "file_missing"
-        };
-        return Err(SessionFileErrorExt::with_reason(
-            StatusCode::NOT_FOUND,
-            if reason == "no_events_yet" {
-                "找不到 Copilot App session 的 events.jsonl（session 目錄存在但尚未產生事件檔）。"
-                    .to_string()
-            } else if agent_nickname.is_some() {
-                "找不到 Copilot App session 的 events.jsonl（subagent 對應的主 session 目錄不存在）。".to_string()
-            } else {
-                "找不到 Copilot App session 的 events.jsonl。".to_string()
-            },
-            reason,
-        ));
-    }
-
-    let root_canonical = match session_state_root.canonicalize() {
-        Ok(p) => p,
-        Err(_) => {
-            return Err(SessionFileErrorExt::with_reason(
-                StatusCode::NOT_FOUND,
-                "無法存取 Copilot App session-state 根目錄。",
-                "file_missing",
-            ));
-        }
-    };
-    let canonical_path = match events_path.canonicalize() {
-        Ok(p) => p,
-        Err(_) => {
-            return Err(SessionFileErrorExt::with_reason(
-                StatusCode::NOT_FOUND,
-                "無法解析 Copilot App events.jsonl 路徑。",
-                "file_missing",
-            ));
-        }
-    };
-
-    if !canonical_path.starts_with(&root_canonical) {
-        return Err(SessionFileErrorExt::with_reason(
-            StatusCode::NOT_FOUND,
-            "Copilot App events.jsonl 路徑不在允許的 session-state 目錄內。",
-            "file_missing",
-        ));
-    }
-
-    // The final path component must be events.jsonl and its parent directory
-    // name must equal the requested session id, preventing a symlinked file
-    // from impersonating another session.
-    let parent_name = canonical_path
-        .parent()
-        .and_then(|p| p.file_name())
-        .and_then(|n| n.to_str());
-    if parent_name != Some(events_session_id) {
-        return Err(SessionFileErrorExt::with_reason(
-            StatusCode::NOT_FOUND,
-            "Copilot App events.jsonl 路徑與 session id 不一致。",
-            "file_missing",
-        ));
-    }
-    let file_name = canonical_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
-    if file_name != "events.jsonl" {
-        return Err(SessionFileErrorExt::with_reason(
-            StatusCode::NOT_FOUND,
-            "Copilot App session 路徑未指向 events.jsonl。",
-            "file_missing",
-        ));
-    }
-
-    Ok(canonical_path)
+) -> Result<PathBuf, SessionFileError> {
+    resolve_copilot_events_path(
+        copilot_app_dir,
+        events_session_id,
+        CopilotEventsSource::App {
+            is_subagent: agent_nickname.is_some(),
+        },
+    )
 }
 
 /// Resolve the `events.jsonl` path for a Copilot CLI subagent drawer request.
@@ -347,100 +262,185 @@ pub(crate) fn resolve_copilot_app_events_path(
 pub(crate) fn resolve_copilot_cli_subagent_events_path(
     copilot_dir: &StdPath,
     parent_session_id: &str,
-) -> Result<PathBuf, SessionFileErrorExt> {
-    if !is_safe_session_id(parent_session_id) {
-        return Err(SessionFileErrorExt::with_reason(
+) -> Result<PathBuf, SessionFileError> {
+    resolve_copilot_events_path(
+        copilot_dir,
+        parent_session_id,
+        CopilotEventsSource::CliSubagent,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum CopilotEventsSource {
+    App { is_subagent: bool },
+    CliSubagent,
+}
+
+impl CopilotEventsSource {
+    fn invalid_id_message(self) -> &'static str {
+        match self {
+            Self::App { .. } => "Copilot App session id 格式不正確，無法定位 events.jsonl。",
+            Self::CliSubagent => {
+                "Copilot CLI subagent 的 parent session id 格式不正確，無法定位 events.jsonl。"
+            }
+        }
+    }
+
+    fn missing_message(self, session_dir_exists: bool) -> &'static str {
+        match (self, session_dir_exists) {
+            (Self::App { .. }, true) => {
+                "找不到 Copilot App session 的 events.jsonl（session 目錄存在但尚未產生事件檔）。"
+            }
+            (Self::App { is_subagent: true }, false) => {
+                "找不到 Copilot App session 的 events.jsonl（subagent 對應的主 session 目錄不存在）。"
+            }
+            (Self::App { .. }, false) => "找不到 Copilot App session 的 events.jsonl。",
+            (Self::CliSubagent, true) => {
+                "找不到 Copilot CLI subagent 對應的主 session events.jsonl（主 session 目錄存在但尚未產生事件檔）。"
+            }
+            (Self::CliSubagent, false) => {
+                "找不到 Copilot CLI subagent 對應的主 session events.jsonl（subagent 對應的主 session 目錄不存在）。"
+            }
+        }
+    }
+
+    fn root_error_message(self) -> &'static str {
+        match self {
+            Self::App { .. } => "無法存取 Copilot App session-state 根目錄。",
+            Self::CliSubagent => "無法存取 Copilot CLI session-state 根目錄。",
+        }
+    }
+
+    fn path_error_message(self) -> &'static str {
+        match self {
+            Self::App { .. } => "無法解析 Copilot App events.jsonl 路徑。",
+            Self::CliSubagent => "無法解析 Copilot CLI subagent events.jsonl 路徑。",
+        }
+    }
+
+    fn outside_root_message(self) -> &'static str {
+        match self {
+            Self::App { .. } => "Copilot App events.jsonl 路徑不在允許的 session-state 目錄內。",
+            Self::CliSubagent => {
+                "Copilot CLI subagent events.jsonl 路徑不在允許的 session-state 目錄內。"
+            }
+        }
+    }
+
+    fn parent_mismatch_message(self) -> &'static str {
+        match self {
+            Self::App { .. } => "Copilot App events.jsonl 路徑與 session id 不一致。",
+            Self::CliSubagent => {
+                "Copilot CLI subagent events.jsonl 路徑與 parent session id 不一致。"
+            }
+        }
+    }
+
+    fn filename_mismatch_message(self) -> &'static str {
+        match self {
+            Self::App { .. } => "Copilot App session 路徑未指向 events.jsonl。",
+            Self::CliSubagent => "Copilot CLI subagent 路徑未指向 events.jsonl。",
+        }
+    }
+}
+
+fn resolve_copilot_events_path(
+    copilot_dir: &StdPath,
+    session_id: &str,
+    source: CopilotEventsSource,
+) -> Result<PathBuf, SessionFileError> {
+    if !is_safe_session_id(session_id) {
+        return Err(SessionFileError::with_reason(
             StatusCode::NOT_FOUND,
-            "Copilot CLI subagent 的 parent session id 格式不正確，無法定位 events.jsonl。",
-            "file_missing",
+            source.invalid_id_message(),
+            SessionFileReason::FileMissing,
         ));
     }
 
     let session_state_root = copilot_dir.join("session-state");
-    let session_dir = session_state_root.join(parent_session_id);
+    let session_dir = session_state_root.join(session_id);
     let events_path = session_dir.join("events.jsonl");
-
     if !events_path.exists() {
-        let reason = if session_dir.exists() {
-            "no_events_yet"
-        } else {
-            "file_missing"
-        };
-        return Err(SessionFileErrorExt::with_reason(
+        let session_dir_exists = session_dir.exists();
+        return Err(SessionFileError::with_reason(
             StatusCode::NOT_FOUND,
-            if reason == "no_events_yet" {
-                "找不到 Copilot CLI subagent 對應的主 session events.jsonl（主 session 目錄存在但尚未產生事件檔）。".to_string()
+            source.missing_message(session_dir_exists),
+            if session_dir_exists {
+                SessionFileReason::NoEventsYet
             } else {
-                "找不到 Copilot CLI subagent 對應的主 session events.jsonl（subagent 對應的主 session 目錄不存在）。".to_string()
+                SessionFileReason::FileMissing
             },
-            reason,
         ));
     }
 
-    let root_canonical = match session_state_root.canonicalize() {
-        Ok(p) => p,
-        Err(_) => {
-            return Err(SessionFileErrorExt::with_reason(
-                StatusCode::NOT_FOUND,
-                "無法存取 Copilot CLI session-state 根目錄。",
-                "file_missing",
-            ));
-        }
-    };
-    let canonical_path = match events_path.canonicalize() {
-        Ok(p) => p,
-        Err(_) => {
-            return Err(SessionFileErrorExt::with_reason(
-                StatusCode::NOT_FOUND,
-                "無法解析 Copilot CLI subagent events.jsonl 路徑。",
-                "file_missing",
-            ));
-        }
-    };
+    let root_canonical = session_state_root.canonicalize().map_err(|_| {
+        SessionFileError::with_reason(
+            StatusCode::NOT_FOUND,
+            source.root_error_message(),
+            SessionFileReason::FileMissing,
+        )
+    })?;
+    let canonical_path = events_path.canonicalize().map_err(|_| {
+        SessionFileError::with_reason(
+            StatusCode::NOT_FOUND,
+            source.path_error_message(),
+            SessionFileReason::FileMissing,
+        )
+    })?;
 
     if !canonical_path.starts_with(&root_canonical) {
-        return Err(SessionFileErrorExt::with_reason(
+        return Err(SessionFileError::with_reason(
             StatusCode::NOT_FOUND,
-            "Copilot CLI subagent events.jsonl 路徑不在允許的 session-state 目錄內。",
-            "file_missing",
+            source.outside_root_message(),
+            SessionFileReason::FileMissing,
         ));
     }
-
     let parent_name = canonical_path
         .parent()
-        .and_then(|p| p.file_name())
-        .and_then(|n| n.to_str());
-    if parent_name != Some(parent_session_id) {
-        return Err(SessionFileErrorExt::with_reason(
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str());
+    if parent_name != Some(session_id) {
+        return Err(SessionFileError::with_reason(
             StatusCode::NOT_FOUND,
-            "Copilot CLI subagent events.jsonl 路徑與 parent session id 不一致。",
-            "file_missing",
+            source.parent_mismatch_message(),
+            SessionFileReason::FileMissing,
         ));
     }
-    let file_name = canonical_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
-    if file_name != "events.jsonl" {
-        return Err(SessionFileErrorExt::with_reason(
+    if canonical_path.file_name().and_then(|name| name.to_str()) != Some("events.jsonl") {
+        return Err(SessionFileError::with_reason(
             StatusCode::NOT_FOUND,
-            "Copilot CLI subagent 路徑未指向 events.jsonl。",
-            "file_missing",
+            source.filename_mismatch_message(),
+            SessionFileReason::FileMissing,
         ));
     }
 
     Ok(canonical_path)
 }
 
-/// Extended error carrying a machine-readable `reason` code for the frontend.
-/// `reason` is `None` for generic errors (the frontend falls back to a generic
-/// "load failed" message) and `Some("no_events_yet" | "file_missing" |
-/// "content_unavailable")` for Copilot App session drawer cases.
+/// Error locating a session transcript, optionally carrying a stable reason
+/// code used by the frontend to choose an empty-state message.
 #[derive(Debug)]
-pub(crate) struct SessionFileErrorExt {
+pub(crate) struct SessionFileError {
     pub status: StatusCode,
     pub error: String,
-    pub reason: Option<String>,
+    pub reason: Option<SessionFileReason>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SessionFileReason {
+    NoEventsYet,
+    FileMissing,
+    ContentUnavailable,
+}
+
+impl SessionFileReason {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::NoEventsYet => "no_events_yet",
+            Self::FileMissing => "file_missing",
+            Self::ContentUnavailable => "content_unavailable",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -450,7 +450,7 @@ pub(crate) struct SessionFileResolutionContext<'a> {
     pub agent_nickname: Option<&'a str>,
 }
 
-impl SessionFileErrorExt {
+impl SessionFileError {
     fn new(status: StatusCode, error: impl Into<String>) -> Self {
         Self {
             status,
@@ -462,12 +462,12 @@ impl SessionFileErrorExt {
     fn with_reason(
         status: StatusCode,
         error: impl Into<String>,
-        reason: impl Into<String>,
+        reason: SessionFileReason,
     ) -> Self {
         Self {
             status,
             error: error.into(),
-            reason: Some(reason.into()),
+            reason: Some(reason),
         }
     }
 }
@@ -478,7 +478,7 @@ pub(crate) fn resolve_session_file_path(
     transcript_path_db: Option<&str>,
     source_kind: &str,
     context: SessionFileResolutionContext<'_>,
-) -> Result<PathBuf, SessionFileErrorExt> {
+) -> Result<PathBuf, SessionFileError> {
     match assistant {
         "antigravity" => Ok(db::get_antigravity_dir()
             .join("brain")
@@ -486,20 +486,20 @@ pub(crate) fn resolve_session_file_path(
             .join(".system_generated/logs/transcript_full.jsonl")),
         "copilot" if source_kind == crate::vscode::SOURCE_KIND => {
             let path = transcript_path_db.ok_or_else(|| {
-                SessionFileErrorExt::new(
+                SessionFileError::new(
                     StatusCode::NOT_FOUND,
                     "找不到 VS Code Copilot 聊天檔案路徑。",
                 )
             })?;
             resolve_vscode_transcript_path(path)
-                .map_err(|error| SessionFileErrorExt::new(StatusCode::BAD_REQUEST, error))
+                .map_err(|error| SessionFileError::new(StatusCode::BAD_REQUEST, error))
         }
         "copilot" if source_kind == "copilot-app" => {
             let source_dir = context.copilot_app_source_dir.ok_or_else(|| {
-                SessionFileErrorExt::with_reason(
+                SessionFileError::with_reason(
                     StatusCode::NOT_FOUND,
                     "找不到 Copilot App session 對應的已登錄來源目錄。",
-                    "file_missing",
+                    SessionFileReason::FileMissing,
                 )
             })?;
             resolve_copilot_app_events_path(
@@ -511,10 +511,13 @@ pub(crate) fn resolve_session_file_path(
         "copilot" if source_kind == "copilot-cli" && context.parent_session_id.is_some() => {
             // CLI subagent synthetic session: locate the shared events.jsonl
             // under the parent session's directory, not the synthetic id's.
-            resolve_copilot_cli_subagent_events_path(
-                &db::get_copilot_dir(),
-                context.parent_session_id.unwrap(),
-            )
+            let Some(parent_session_id) = context.parent_session_id else {
+                return Err(SessionFileError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Copilot CLI subagent 缺少 parent session id。",
+                ));
+            };
+            resolve_copilot_cli_subagent_events_path(&db::get_copilot_dir(), parent_session_id)
         }
         "copilot" => {
             let copilot_dir = db::get_copilot_dir();
@@ -532,72 +535,72 @@ pub(crate) fn resolve_session_file_path(
         }
         "codex" => {
             let path = transcript_path_db.ok_or_else(|| {
-                SessionFileErrorExt::new(
+                SessionFileError::new(
                     StatusCode::NOT_FOUND,
                     "找不到 Codex 會話日誌檔案路徑。".to_string(),
                 )
             })?;
             resolve_codex_transcript_path(&db::get_codex_dir(), path)
-                .map_err(|error| SessionFileErrorExt::new(StatusCode::BAD_REQUEST, error))
+                .map_err(|error| SessionFileError::new(StatusCode::BAD_REQUEST, error))
         }
         "claude" => {
             let path = transcript_path_db.ok_or_else(|| {
-                SessionFileErrorExt::new(
+                SessionFileError::new(
                     StatusCode::NOT_FOUND,
                     "找不到 Claude Code 會話日誌檔案路徑。",
                 )
             })?;
             resolve_claude_transcript_path(&db::get_claude_dir(), session_id, path)
-                .map_err(|error| SessionFileErrorExt::new(StatusCode::BAD_REQUEST, error))
+                .map_err(|error| SessionFileError::new(StatusCode::BAD_REQUEST, error))
         }
         "cursor" => {
             let path = transcript_path_db.ok_or_else(|| {
-                SessionFileErrorExt::new(StatusCode::NOT_FOUND, "找不到 Cursor 會話日誌檔案路徑。")
+                SessionFileError::new(StatusCode::NOT_FOUND, "找不到 Cursor 會話日誌檔案路徑。")
             })?;
             resolve_cursor_transcript_path(&db::get_cursor_dir(), session_id, path)
-                .map_err(|error| SessionFileErrorExt::new(StatusCode::BAD_REQUEST, error))
+                .map_err(|error| SessionFileError::new(StatusCode::BAD_REQUEST, error))
         }
         "grok" => {
             let path = transcript_path_db.ok_or_else(|| {
-                SessionFileErrorExt::new(
+                SessionFileError::new(
                     StatusCode::NOT_FOUND,
                     "找不到 Grok Build session 日誌檔案路徑。".to_string(),
                 )
             })?;
             resolve_grok_transcript_path(&db::get_grok_dir(), session_id, path)
-                .map_err(|error| SessionFileErrorExt::new(StatusCode::BAD_REQUEST, error))
+                .map_err(|error| SessionFileError::new(StatusCode::BAD_REQUEST, error))
         }
         "pi" => {
             let path = transcript_path_db.ok_or_else(|| {
-                SessionFileErrorExt::new(
+                SessionFileError::new(
                     StatusCode::NOT_FOUND,
                     "找不到 Pi Coding Agent session 日誌檔案路徑。".to_string(),
                 )
             })?;
             resolve_pi_family_transcript_path(&db::get_pi_dir(), "Pi Coding Agent", path)
-                .map_err(|error| SessionFileErrorExt::new(StatusCode::BAD_REQUEST, error))
+                .map_err(|error| SessionFileError::new(StatusCode::BAD_REQUEST, error))
         }
         "omp" => {
             let path = transcript_path_db.ok_or_else(|| {
-                SessionFileErrorExt::new(
+                SessionFileError::new(
                     StatusCode::NOT_FOUND,
                     "找不到 OMP session 日誌檔案路徑。".to_string(),
                 )
             })?;
             resolve_pi_family_transcript_path(&db::get_omp_dir(), "OMP", path)
-                .map_err(|error| SessionFileErrorExt::new(StatusCode::BAD_REQUEST, error))
+                .map_err(|error| SessionFileError::new(StatusCode::BAD_REQUEST, error))
         }
         "muse" => {
             let path = transcript_path_db.ok_or_else(|| {
-                SessionFileErrorExt::new(
+                SessionFileError::new(
                     StatusCode::NOT_FOUND,
                     "找不到 Muse session 日誌檔案路徑。".to_string(),
                 )
             })?;
             resolve_pi_family_transcript_path(&db::get_muse_dir(), "Muse", path)
-                .map_err(|error| SessionFileErrorExt::new(StatusCode::BAD_REQUEST, error))
+                .map_err(|error| SessionFileError::new(StatusCode::BAD_REQUEST, error))
         }
-        _ => Err(SessionFileErrorExt::new(
+        _ => Err(SessionFileError::new(
             StatusCode::BAD_REQUEST,
             "不支援的助理類型",
         )),
@@ -660,7 +663,7 @@ mod tests {
 
         let error = resolve_copilot_app_events_path(&app_dir, session_id, None).unwrap_err();
         assert_eq!(error.status, StatusCode::NOT_FOUND);
-        assert_eq!(error.reason.as_deref(), Some("file_missing"));
+        assert_eq!(error.reason, Some(SessionFileReason::FileMissing));
 
         let _ = fs::remove_dir_all(&app_dir);
     }
@@ -673,7 +676,7 @@ mod tests {
 
         let error = resolve_copilot_app_events_path(&app_dir, session_id, None).unwrap_err();
         assert_eq!(error.status, StatusCode::NOT_FOUND);
-        assert_eq!(error.reason.as_deref(), Some("no_events_yet"));
+        assert_eq!(error.reason, Some(SessionFileReason::NoEventsYet));
 
         let _ = fs::remove_dir_all(&app_dir);
     }
@@ -683,7 +686,7 @@ mod tests {
         let app_dir = copilot_app_fixture_dir("app-unsafe-id");
         let error = resolve_copilot_app_events_path(&app_dir, "..", None).unwrap_err();
         assert_eq!(error.status, StatusCode::NOT_FOUND);
-        assert_eq!(error.reason.as_deref(), Some("file_missing"));
+        assert_eq!(error.reason, Some(SessionFileReason::FileMissing));
 
         let _ = fs::remove_dir_all(&app_dir);
     }
