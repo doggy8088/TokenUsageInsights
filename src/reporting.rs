@@ -248,24 +248,11 @@ pub(crate) fn summarize_session_usage(
     pricing_rules: &PreparedPricingRules,
     entries: &[UsageEntry],
 ) -> SessionUsageAggregation {
-    let has_delta_usage = entries
-        .iter()
-        .filter_map(|entry| entry.delta_tokens.as_ref())
-        .any(has_usage);
     let mut result = SessionUsageAggregation::default();
     let mut display_entry: Option<&UsageEntry> = None;
 
-    if has_delta_usage {
-        for entry in entries {
-            let Some(tokens) = entry
-                .delta_tokens
-                .as_ref()
-                .filter(|tokens| has_usage(tokens))
-            else {
-                continue;
-            };
-            record_usage(&mut result, pricing_rules, entry, tokens);
-        }
+    if let Some(delta_result) = summarize_delta_entries(pricing_rules, entries) {
+        result = delta_result;
         display_entry = latest_usage_entry(
             entries
                 .iter()
@@ -289,11 +276,12 @@ pub(crate) fn summarize_session_usage(
     result
 }
 
-fn summarize_delta_usage(
+fn summarize_delta_entries(
     pricing_rules: &PreparedPricingRules,
     entries: &[UsageEntry],
-) -> UsageAggregation {
+) -> Option<SessionUsageAggregation> {
     let mut result = SessionUsageAggregation::default();
+    let mut recorded_usage = false;
     for entry in entries {
         let Some(tokens) = entry
             .delta_tokens
@@ -303,8 +291,18 @@ fn summarize_delta_usage(
             continue;
         };
         record_usage(&mut result, pricing_rules, entry, tokens);
+        recorded_usage = true;
     }
-    result.usage
+    recorded_usage.then_some(result)
+}
+
+fn summarize_delta_usage(
+    pricing_rules: &PreparedPricingRules,
+    entries: &[UsageEntry],
+) -> UsageAggregation {
+    summarize_delta_entries(pricing_rules, entries)
+        .map(|result| result.usage)
+        .unwrap_or_default()
 }
 
 #[derive(Debug)]
