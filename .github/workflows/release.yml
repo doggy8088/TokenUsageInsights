@@ -367,6 +367,10 @@ jobs:
     env:
       TOKEN_USAGE_INSIGHTS_RELEASE_ASSET_RETRIES: "12"
       TOKEN_USAGE_INSIGHTS_RELEASE_ASSET_RETRY_DELAY_MS: "10000"
+      # npm Registry 完成發行後仍需時間同步，指數退避最多等待約 430 秒（10+20+40+60×6）。
+      NPM_VERIFY_MAX_ATTEMPTS: "10"
+      NPM_VERIFY_INITIAL_DELAY_SECONDS: "10"
+      NPM_VERIFY_MAX_DELAY_SECONDS: "60"
 
     steps:
       - name: Checkout release tag
@@ -404,21 +408,37 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
+          package="token-usage-insights@${version}"
+          max_attempts="$NPM_VERIFY_MAX_ATTEMPTS"
+          delay="$NPM_VERIFY_INITIAL_DELAY_SECONDS"
+          max_delay="$NPM_VERIFY_MAX_DELAY_SECONDS"
+          waited=0
           test_root="$(mktemp -d)"
           trap 'rm -rf "$test_root"' EXIT
           cd "$test_root"
-          for attempt in $(seq 1 12); do
-            if npm exec --yes --package="token-usage-insights@${version}" \
-              -- token-usage-insights --help > npx-output.txt 2>&1 \
-              && grep -Fq 'export-all' npx-output.txt; then
+          for attempt in $(seq 1 "$max_attempts"); do
+            # --prefer-online 可避免沿用本機快取的舊 packument，確保讀到剛發行的版本。
+            if npm view "$package" version --prefer-online > view-output.txt 2>&1; then
+              if npm exec --yes --prefer-online --package="$package" \
+                -- token-usage-insights --help > npx-output.txt 2>&1 \
+                && grep -Fq 'export-all' npx-output.txt; then
+                cat npx-output.txt
+                echo "npm Registry 已提供 v${version}（第 ${attempt} 次嘗試，累計等待 ${waited} 秒）。"
+                exit 0
+              fi
               cat npx-output.txt
-              exit 0
+            else
+              cat view-output.txt
             fi
-            cat npx-output.txt
-            if [[ "$attempt" -lt 12 ]]; then
-              echo "npm Registry 尚未提供 v${version}，10 秒後重試（${attempt}/12）。"
-              sleep 10
+            if [[ "$attempt" -lt "$max_attempts" ]]; then
+              echo "npm Registry 尚未提供 v${version}，${delay} 秒後重試（${attempt}/${max_attempts}，累計等待 ${waited} 秒）。"
+              sleep "$delay"
+              waited=$((waited + delay))
+              delay=$((delay * 2))
+              if ((delay > max_delay)); then
+                delay="$max_delay"
+              fi
             fi
           done
-          echo "無法透過 npm Registry 執行 token-usage-insights v${version}。" >&2
+          echo "無法透過 npm Registry 執行 token-usage-insights v${version}（累計等待 ${waited} 秒）。" >&2
           exit 1
