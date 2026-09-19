@@ -542,6 +542,33 @@ pub fn get_muse_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+pub fn get_mcode_dir() -> PathBuf {
+    if let Some(path) = crate::paths::env_path("MCODE_DIR") {
+        return path;
+    }
+    dirs::home_dir()
+        .map(|home| home.join(".minimax").join("v2"))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// MiniMax Code's runtime ledger. It lives beside the session directory but is
+/// resolved independently of `MCODE_DIR` (mirroring
+/// [`get_cursor_state_db_path`]) so a redirected session root does not silently
+/// repoint the ledger.
+pub fn get_mcode_state_db_path() -> PathBuf {
+    if let Some(path) = crate::paths::env_path("MCODE_STATE_DB") {
+        return path;
+    }
+    dirs::home_dir()
+        .map(|home| {
+            home.join(".minimax")
+                .join("v2")
+                .join("sqlite")
+                .join("runtime-state.sqlite")
+        })
+        .unwrap_or_else(|| PathBuf::from("runtime-state.sqlite"))
+}
+
 fn move_file_with_copy_fallback(source: &Path, destination: &Path) -> Result<(), String> {
     if let Err(rename_error) = fs::rename(source, destination) {
         let copied = fs::copy(source, destination).map_err(|copy_error| {
@@ -615,7 +642,7 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS usage_entries (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            assistant_type TEXT NOT NULL, -- 'antigravity', 'copilot', 'codex', 'claude', 'cursor', 'grok', 'pi', 'omp'
+            assistant_type TEXT NOT NULL, -- 'antigravity', 'copilot', 'codex', 'claude', 'cursor', 'grok', 'pi', 'omp', 'muse', 'mcode'
             timestamp TEXT NOT NULL,
             date TEXT NOT NULL,
             session_id TEXT NOT NULL,
@@ -4261,70 +4288,13 @@ fn sync_pi_family_usage_logs(
         let tx = conn
             .transaction()
             .map_err(|error| format!("{assistant_label} transaction BEGIN 失敗: {error}"))?;
-        tx.execute(
-            "DELETE FROM usage_entries
-             WHERE assistant_type = ?1 AND transcript_path = ?2",
-            params![assistant_type, transcript_path],
-        )
-        .map_err(|error| format!("清除舊 {assistant_label} session 資料失敗: {error}"))?;
-
-        for entry in &parsed_entries {
-            let tokens = entry.tokens.as_ref();
-            let delta = entry.delta_tokens.as_ref();
-            let cost = entry.cost.as_ref();
-            let source_kind = entry.source_kind.as_deref().unwrap_or(assistant_type);
-            let usage_identity = entry
-                .model_id
-                .as_deref()
-                .filter(|model| !model.trim().is_empty())
-                .map(|model| format!("model:{model}"))
-                .unwrap_or_default();
-            tx.execute(
-                "INSERT INTO usage_entries (
-                    assistant_type, source_kind, usage_identity, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
-                    tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_reasoning, tokens_total,
-                    delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total,
-                    duration_ms, premium_requests, reported_cost_usd, reasoning_effort
-                ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?
-                )",
-                params![
-                    assistant_type,
-                    source_kind,
-                    usage_identity,
-                    entry.timestamp,
-                    entry.timestamp.get(0..10).unwrap_or("unknown"),
-                    entry.session_id,
-                    entry.session_name.as_deref(),
-                    entry.transcript_path.as_deref(),
-                    entry.cwd.as_deref(),
-                    entry.version.as_deref(),
-                    entry.turn_no as i64,
-                    entry.model.as_deref(),
-                    entry.model_id.as_deref(),
-                    tokens.map(|value| value.input as i64),
-                    tokens.map(|value| value.output as i64),
-                    tokens.and_then(|value| value.cache_read.map(|v| v as i64)),
-                    tokens.and_then(|value| value.cache_write.map(|v| v as i64)),
-                    tokens.and_then(|value| value.reasoning.map(|v| v as i64)),
-                    tokens.map(|value| value.total as i64),
-                    delta.map(|value| value.input as i64),
-                    delta.map(|value| value.output as i64),
-                    delta.and_then(|value| value.cache_read.map(|v| v as i64)),
-                    delta.and_then(|value| value.cache_write.map(|v| v as i64)),
-                    delta.and_then(|value| value.reasoning.map(|v| v as i64)),
-                    delta.map(|value| value.total as i64),
-                    cost.and_then(|value| value.total_api_duration_ms.map(|v| v as i64)),
-                    cost.and_then(|value| value.total_premium_requests.map(|v| v as i64)),
-                    cost.and_then(|value| value.reported_cost_usd),
-                    entry.reasoning_effort.as_deref(),
-                ],
-            )
-            .map_err(|error| format!("寫入 {assistant_label} 資料庫失敗: {error}"))?;
-        }
+        delete_usage_entries_for_transcript(
+            &tx,
+            assistant_type,
+            &transcript_path,
+            assistant_label,
+        )?;
+        insert_usage_entries(&tx, assistant_type, assistant_label, &parsed_entries)?;
 
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -4338,6 +4308,92 @@ fn sync_pi_family_usage_logs(
         .map_err(|error| format!("更新 {assistant_label} sync state 失敗: {error}"))?;
         tx.commit()
             .map_err(|error| format!("提交 {assistant_label} transaction 失敗: {error}"))?;
+    }
+
+    Ok(())
+}
+
+/// Clears the previously imported rows of one transcript so a re-parse rebuilds
+/// the session idempotently instead of appending duplicates.
+fn delete_usage_entries_for_transcript(
+    tx: &rusqlite::Transaction<'_>,
+    assistant_type: &str,
+    transcript_path: &str,
+    assistant_label: &str,
+) -> Result<(), String> {
+    tx.execute(
+        "DELETE FROM usage_entries
+         WHERE assistant_type = ?1 AND transcript_path = ?2",
+        params![assistant_type, transcript_path],
+    )
+    .map_err(|error| format!("清除舊 {assistant_label} session 資料失敗: {error}"))?;
+    Ok(())
+}
+
+/// Inserts parsed per-turn rows. Shared by every transcript collector whose
+/// assistant messages already carry a complete, self-contained token snapshot.
+fn insert_usage_entries(
+    tx: &rusqlite::Transaction<'_>,
+    assistant_type: &str,
+    assistant_label: &str,
+    entries: &[UsageEntry],
+) -> Result<(), String> {
+    for entry in entries {
+        let tokens = entry.tokens.as_ref();
+        let delta = entry.delta_tokens.as_ref();
+        let cost = entry.cost.as_ref();
+        let source_kind = entry.source_kind.as_deref().unwrap_or(assistant_type);
+        let usage_identity = entry
+            .model_id
+            .as_deref()
+            .filter(|model| !model.trim().is_empty())
+            .map(|model| format!("model:{model}"))
+            .unwrap_or_default();
+        tx.execute(
+            "INSERT INTO usage_entries (
+                    assistant_type, source_kind, usage_identity, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
+                    tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_reasoning, tokens_total,
+                    delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total,
+                    duration_ms, premium_requests, reported_cost_usd, reasoning_effort
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?
+                )",
+            params![
+                assistant_type,
+                source_kind,
+                usage_identity,
+                entry.timestamp,
+                entry.timestamp.get(0..10).unwrap_or("unknown"),
+                entry.session_id,
+                entry.session_name.as_deref(),
+                entry.transcript_path.as_deref(),
+                entry.cwd.as_deref(),
+                entry.version.as_deref(),
+                entry.turn_no as i64,
+                entry.model.as_deref(),
+                entry.model_id.as_deref(),
+                tokens.map(|value| value.input as i64),
+                tokens.map(|value| value.output as i64),
+                tokens.and_then(|value| value.cache_read.map(|v| v as i64)),
+                tokens.and_then(|value| value.cache_write.map(|v| v as i64)),
+                tokens.and_then(|value| value.reasoning.map(|v| v as i64)),
+                tokens.map(|value| value.total as i64),
+                delta.map(|value| value.input as i64),
+                delta.map(|value| value.output as i64),
+                delta.and_then(|value| value.cache_read.map(|v| v as i64)),
+                delta.and_then(|value| value.cache_write.map(|v| v as i64)),
+                delta.and_then(|value| value.reasoning.map(|v| v as i64)),
+                delta.map(|value| value.total as i64),
+                cost.and_then(|value| value.total_api_duration_ms.map(|v| v as i64)),
+                cost.and_then(|value| value.total_premium_requests.map(|v| v as i64)),
+                cost.and_then(|value| value.reported_cost_usd),
+                entry.reasoning_effort.as_deref(),
+            ],
+        )
+        .map_err(|error| format!("寫入 {assistant_label} 資料庫失敗: {error}"))?;
     }
 
     Ok(())
@@ -4377,6 +4433,176 @@ pub(crate) fn sync_muse_usage_logs(conn: &mut Connection, muse_dir: &Path) -> Re
         muse_dir,
         crate::muse::parse_session_usage_file,
     )
+}
+
+/// Working directory and title of one MiniMax Code runtime session. Both are
+/// read from MiniMax Code's own runtime ledger instead of being guessed from
+/// prompt text.
+struct McodeRuntimeSessionMeta {
+    workspace_dir: Option<String>,
+    title: Option<String>,
+}
+
+/// Loads `session_id -> (workspace_dir, title)` from MiniMax Code's runtime
+/// SQLite ledger. A missing file or table is not an error: the sessions are
+/// still imported, just without the enrichment.
+fn load_mcode_runtime_session_meta(
+    state_db_path: &Path,
+) -> HashMap<String, McodeRuntimeSessionMeta> {
+    let mut meta = HashMap::new();
+    let Ok(conn) = Connection::open_with_flags(
+        state_db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        return meta;
+    };
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(2));
+
+    let table_exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='local_runtime_sessions'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if !table_exists {
+        return meta;
+    }
+
+    let Ok(mut statement) =
+        conn.prepare("SELECT session_id, workspace_dir, title FROM local_runtime_sessions")
+    else {
+        return meta;
+    };
+    let Ok(rows) = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+        ))
+    }) else {
+        return meta;
+    };
+    for (session_id, workspace_dir, title) in rows.flatten() {
+        meta.insert(
+            session_id,
+            McodeRuntimeSessionMeta {
+                workspace_dir,
+                title,
+            },
+        );
+    }
+    meta
+}
+
+/// Byte length of `path`, or `None` when its trailing JSONL record is still
+/// being written. MiniMax Code appends records, so a file not ending in a
+/// newline may grow; skipping it keeps the incremental fingerprint honest.
+fn complete_file_len(path: &Path) -> Option<u64> {
+    let mut file = File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    if len == 0 {
+        return Some(0);
+    }
+    file.seek(SeekFrom::End(-1)).ok()?;
+    let mut last_byte = [0u8; 1];
+    file.read_exact(&mut last_byte).ok()?;
+    (last_byte[0] == b'\n').then_some(len)
+}
+
+/// MiniMax Code stores one session per dated directory and splits its
+/// transcript across `messages.jsonl` plus `snapshots/*.jsonl`, so the parse
+/// unit is the directory rather than a single file. The incremental
+/// fingerprint is therefore the combined size of the session's JSONL files,
+/// and the rebuild is scoped to the session's `messages.jsonl` path.
+pub(crate) fn sync_mcode_usage_logs(conn: &mut Connection, mcode_dir: &Path) -> Result<(), String> {
+    let session_dirs = crate::mcode::find_session_dirs(mcode_dir);
+    // The runtime ledger is opened lazily and only when a session actually
+    // changed, so an uninstalled MiniMax Code runtime costs nothing.
+    let mut runtime_meta: Option<HashMap<String, McodeRuntimeSessionMeta>> = None;
+
+    for session_dir in session_dirs {
+        let files = crate::mcode::session_jsonl_files(&session_dir);
+        if files.is_empty() {
+            continue;
+        }
+
+        let mut current_size: u64 = 0;
+        let mut complete = true;
+        for file in &files {
+            match complete_file_len(file) {
+                Some(len) => current_size = current_size.saturating_add(len),
+                None => {
+                    complete = false;
+                    break;
+                }
+            }
+        }
+        if !complete {
+            continue;
+        }
+
+        let state_name = portable_relative_path(mcode_dir, &session_dir);
+        let state_key = format!("mcode:{state_name}");
+        let last_synced_size: u64 = conn
+            .query_row(
+                "SELECT last_synced_size FROM sync_state WHERE filename = ?",
+                params![state_key],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        if current_size == last_synced_size {
+            continue;
+        }
+
+        let runtime_meta = runtime_meta
+            .get_or_insert_with(|| load_mcode_runtime_session_meta(&get_mcode_state_db_path()));
+        let session_id = crate::mcode::read_session_metadata(&session_dir);
+        let runtime_session = runtime_meta.get(&session_id);
+        let cwd = runtime_session
+            .and_then(|meta| meta.workspace_dir.as_deref())
+            .filter(|directory| !directory.trim().is_empty());
+        let session_name = runtime_session
+            .and_then(|meta| meta.title.as_deref())
+            .filter(|title| !title.trim().is_empty());
+
+        let parsed_entries =
+            match crate::mcode::parse_session_usage(&session_dir, cwd, session_name) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    eprintln!(
+                        "解析 MiniMax Code session 目錄 {:?} 失敗: {}",
+                        session_dir, error
+                    );
+                    continue;
+                }
+            };
+
+        let transcript_path = crate::mcode::session_transcript_path(&session_dir)
+            .to_string_lossy()
+            .into_owned();
+        let tx = conn
+            .transaction()
+            .map_err(|error| format!("MiniMax Code transaction BEGIN 失敗: {error}"))?;
+        delete_usage_entries_for_transcript(&tx, "mcode", &transcript_path, "MiniMax Code")?;
+        insert_usage_entries(&tx, "mcode", "MiniMax Code", &parsed_entries)?;
+
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        tx.execute(
+            "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES (?, ?, ?)",
+            params![state_key, current_size as i64, now],
+        )
+        .map_err(|error| format!("更新 MiniMax Code sync state 失敗: {error}"))?;
+        tx.commit()
+            .map_err(|error| format!("提交 MiniMax Code transaction 失敗: {error}"))?;
+    }
+
+    Ok(())
 }
 
 /// Unified sync function triggering sync for all supported assistants
@@ -4457,6 +4683,12 @@ pub fn sync_usage_logs(conn: &mut Connection) -> Result<(), String> {
     let muse_dir = get_muse_dir();
     if let Err(e) = sync_muse_usage_logs(conn, &muse_dir) {
         eprintln!("❌ 同步 Muse 失敗: {}", e);
+    }
+
+    // 12. Sync MiniMax Code sessions
+    let mcode_dir = get_mcode_dir();
+    if let Err(e) = sync_mcode_usage_logs(conn, &mcode_dir) {
+        eprintln!("❌ 同步 MiniMax Code 失敗: {}", e);
     }
     Ok(())
 }
@@ -15005,6 +15237,460 @@ mod tests {
             .unwrap();
         assert_eq!(imported.0, 2);
         assert!((imported.1 - 0.03).abs() < 1e-12);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // --- MiniMax Code (mcode) -------------------------------------------------
+
+    const MCODE_TEST_SESSION_ID: &str = "mvs_59b7ff115fc9409aa7b017aac208fb28";
+    const MCODE_TEST_SESSION_DIR_NAME: &str =
+        "15-16-05-177-session_bXZzXzU5YjdmZjExNWZjOTQwOWFhN2IwMTdhYWMyMDhmYjI4";
+
+    fn mcode_test_root(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "token-insights-mcode-{}-{}-{}",
+            label,
+            std::process::id(),
+            TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&root);
+        root
+    }
+
+    /// `<root>/v2/sessions/2026/09/19/<dir>` — the layout `get_mcode_dir()`
+    /// points at when `MCODE_DIR=<root>/v2`.
+    fn mcode_test_session_dir(root: &Path) -> PathBuf {
+        let dir = root
+            .join("v2")
+            .join("sessions")
+            .join("2026")
+            .join("09")
+            .join("19")
+            .join(MCODE_TEST_SESSION_DIR_NAME);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn mcode_test_assistant_record(
+        message_id: &str,
+        timestamp: i64,
+        input: u64,
+        output: u64,
+        cache_read: u64,
+    ) -> String {
+        format!(
+            r#"{{"message_id":"{message_id}","turn_id":"turn_1","message":{{"role":"assistant","content":[{{"type":"text","text":"done"}}],"provider":"custom_provider:llmshare","model":"deepseek-v4.1-flash","usage":{{"input":{input},"output":{output},"cacheRead":{cache_read},"cacheWrite":0,"totalTokens":{},"cost":{{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}}}},"timestamp":{timestamp}}}}}"#,
+            input + output + cache_read
+        )
+    }
+
+    fn write_mcode_lines(path: &Path, lines: &[String]) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, format!("{}\n", lines.join("\n"))).unwrap();
+    }
+
+    /// Creates MiniMax Code's runtime ledger with a single session row.
+    fn write_mcode_runtime_ledger(
+        path: &Path,
+        session_id: &str,
+        workspace_dir: Option<&str>,
+        title: Option<&str>,
+    ) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute(
+            "CREATE TABLE local_runtime_sessions (
+                session_id TEXT PRIMARY KEY,
+                record_json TEXT NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                workspace_dir TEXT,
+                title TEXT
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO local_runtime_sessions
+                (session_id, record_json, updated_at_ms, workspace_dir, title)
+             VALUES (?, '{}', 0, ?, ?)",
+            params![session_id, workspace_dir, title],
+        )
+        .unwrap();
+    }
+
+    /// Applies `MCODE_DIR` / `MCODE_STATE_DB` for the duration of `run` and
+    /// restores the previous values afterwards so neighbouring tests are not
+    /// affected (callers must hold `ENV_LOCK`).
+    fn with_mcode_env<T>(mcode_dir: &Path, state_db: &Path, run: impl FnOnce() -> T) -> T {
+        let previous_dir = std::env::var_os("MCODE_DIR");
+        let previous_db = std::env::var_os("MCODE_STATE_DB");
+        std::env::set_var("MCODE_DIR", mcode_dir);
+        std::env::set_var("MCODE_STATE_DB", state_db);
+        let result = run();
+        match previous_dir {
+            Some(value) => std::env::set_var("MCODE_DIR", value),
+            None => std::env::remove_var("MCODE_DIR"),
+        }
+        match previous_db {
+            Some(value) => std::env::set_var("MCODE_STATE_DB", value),
+            None => std::env::remove_var("MCODE_STATE_DB"),
+        }
+        result
+    }
+
+    fn mcode_synced_rows(conn: &Connection) -> Vec<(u64, String, String, Option<String>, String)> {
+        let mut statement = conn
+            .prepare(
+                "SELECT turn_no, source_kind, session_id, cwd, model
+                 FROM usage_entries WHERE assistant_type = 'mcode' ORDER BY turn_no",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    #[test]
+    fn sync_mcode_usage_logs_persists_turns_with_runtime_workspace() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = mcode_test_root("sync-persist");
+        let session_dir = mcode_test_session_dir(&root);
+        fs::write(
+            session_dir.join("manifest.json"),
+            format!(r#"{{"schemaVersion":1,"sessionId":"{MCODE_TEST_SESSION_ID}"}}"#),
+        )
+        .unwrap();
+        write_mcode_lines(
+            &session_dir.join("messages.jsonl"),
+            &[
+                mcode_test_assistant_record("msg-1", 1_789_830_965_412, 3_000, 200, 1_000),
+                mcode_test_assistant_record("msg-2", 1_789_830_975_412, 4_000, 300, 2_000),
+            ],
+        );
+        let state_db = root.join("runtime-state.sqlite");
+        write_mcode_runtime_ledger(
+            &state_db,
+            MCODE_TEST_SESSION_ID,
+            Some("/tmp/mcode-project"),
+            None,
+        );
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        with_mcode_env(&root.join("v2"), &state_db, || {
+            sync_mcode_usage_logs(&mut conn, &root.join("v2")).unwrap();
+            // An unchanged session must not be re-imported on the next pass.
+            sync_mcode_usage_logs(&mut conn, &root.join("v2")).unwrap();
+        });
+
+        let rows = mcode_synced_rows(&conn);
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    1,
+                    crate::mcode::SOURCE_KIND.to_string(),
+                    MCODE_TEST_SESSION_ID.to_string(),
+                    Some("/tmp/mcode-project".to_string()),
+                    "deepseek-v4.1-flash".to_string(),
+                ),
+                (
+                    2,
+                    crate::mcode::SOURCE_KIND.to_string(),
+                    MCODE_TEST_SESSION_ID.to_string(),
+                    Some("/tmp/mcode-project".to_string()),
+                    "deepseek-v4.1-flash".to_string(),
+                ),
+            ]
+        );
+
+        let (transcript_path, session_name, cache_read, reported_cost): (
+            String,
+            Option<String>,
+            u64,
+            Option<f64>,
+        ) = conn
+            .query_row(
+                "SELECT transcript_path, session_name, tokens_cache_read, reported_cost_usd
+                 FROM usage_entries WHERE assistant_type = 'mcode' ORDER BY turn_no LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            transcript_path,
+            session_dir.join("messages.jsonl").to_string_lossy()
+        );
+        assert_eq!(session_name, None, "an empty runtime title stays NULL");
+        assert_eq!(cache_read, 1_000);
+        assert_eq!(
+            reported_cost, None,
+            "cost.total == 0 must fall back to pricing.csv estimation"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sync_mcode_usage_logs_rebuilds_when_a_snapshot_stream_grows() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = mcode_test_root("sync-snapshot");
+        let session_dir = mcode_test_session_dir(&root);
+        fs::write(
+            session_dir.join("manifest.json"),
+            format!(r#"{{"schemaVersion":1,"sessionId":"{MCODE_TEST_SESSION_ID}"}}"#),
+        )
+        .unwrap();
+        write_mcode_lines(
+            &session_dir.join("messages.jsonl"),
+            &[mcode_test_assistant_record(
+                "msg-late",
+                1_789_830_975_412,
+                4_000,
+                300,
+                2_000,
+            )],
+        );
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        with_mcode_env(&root.join("v2"), &root.join("missing.sqlite"), || {
+            sync_mcode_usage_logs(&mut conn, &root.join("v2")).unwrap();
+        });
+        assert_eq!(mcode_synced_rows(&conn).len(), 1);
+
+        // A new snapshot stream adds an earlier turn; the combined fingerprint
+        // must change and the session must be rebuilt rather than appended to.
+        write_mcode_lines(
+            &session_dir
+                .join("snapshots")
+                .join("g000000000000--ctx_a.jsonl"),
+            &[mcode_test_assistant_record(
+                "msg-early",
+                1_789_830_965_412,
+                3_000,
+                200,
+                1_000,
+            )],
+        );
+        with_mcode_env(&root.join("v2"), &root.join("missing.sqlite"), || {
+            sync_mcode_usage_logs(&mut conn, &root.join("v2")).unwrap();
+        });
+
+        let rows = mcode_synced_rows(&conn);
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.0, row.1.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, crate::mcode::SOURCE_KIND),
+                (2, crate::mcode::SOURCE_KIND)
+            ]
+        );
+        let totals: Vec<u64> = conn
+            .prepare("SELECT tokens_input FROM usage_entries WHERE assistant_type = 'mcode' ORDER BY turn_no")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            totals,
+            vec![3_000, 4_000],
+            "earlier turn must be numbered 1"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sync_mcode_usage_logs_skips_a_session_with_an_incomplete_record() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = mcode_test_root("sync-incomplete");
+        let session_dir = mcode_test_session_dir(&root);
+        let messages = session_dir.join("messages.jsonl");
+        fs::write(
+            &messages,
+            mcode_test_assistant_record("msg-1", 1_789_830_965_412, 3_000, 200, 1_000),
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        with_mcode_env(&root.join("v2"), &root.join("missing.sqlite"), || {
+            sync_mcode_usage_logs(&mut conn, &root.join("v2")).unwrap();
+        });
+
+        assert!(
+            mcode_synced_rows(&conn).is_empty(),
+            "a partially written final record must not be imported"
+        );
+        let synced_states: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state WHERE filename LIKE 'mcode:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            synced_states, 0,
+            "the fingerprint must not advance past a partial record"
+        );
+
+        // Completing the record makes the session importable.
+        let mut content = fs::read_to_string(&messages).unwrap();
+        content.push('\n');
+        fs::write(&messages, content).unwrap();
+        with_mcode_env(&root.join("v2"), &root.join("missing.sqlite"), || {
+            sync_mcode_usage_logs(&mut conn, &root.join("v2")).unwrap();
+        });
+        assert_eq!(mcode_synced_rows(&conn).len(), 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sync_mcode_usage_logs_keeps_importing_without_the_runtime_ledger() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = mcode_test_root("sync-no-ledger");
+        let session_dir = mcode_test_session_dir(&root);
+        write_mcode_lines(
+            &session_dir.join("messages.jsonl"),
+            &[mcode_test_assistant_record(
+                "msg-1",
+                1_789_830_965_412,
+                3_000,
+                200,
+                1_000,
+            )],
+        );
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        with_mcode_env(&root.join("v2"), &root.join("missing.sqlite"), || {
+            sync_mcode_usage_logs(&mut conn, &root.join("v2")).unwrap();
+        });
+
+        let rows = mcode_synced_rows(&conn);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].2, MCODE_TEST_SESSION_ID);
+        assert_eq!(
+            rows[0].3, None,
+            "a missing runtime ledger must not drop the session"
+        );
+
+        // A ledger without the expected table is equally tolerated.
+        let empty_db = root.join("empty.sqlite");
+        {
+            let conn = Connection::open(&empty_db).unwrap();
+            conn.execute("CREATE TABLE unrelated (id INTEGER)", [])
+                .unwrap();
+        }
+        let mut second_conn = Connection::open_in_memory().unwrap();
+        init_db(&second_conn).unwrap();
+        with_mcode_env(&root.join("v2"), &empty_db, || {
+            sync_mcode_usage_logs(&mut second_conn, &root.join("v2")).unwrap();
+        });
+        assert_eq!(mcode_synced_rows(&second_conn).len(), 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sync_mcode_usage_logs_matches_the_runtime_ledger_by_decoded_session_id() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = mcode_test_root("sync-decoded-id");
+        let session_dir = mcode_test_session_dir(&root);
+        // No manifest.json, so the id comes from the base64url directory suffix.
+        write_mcode_lines(
+            &session_dir.join("messages.jsonl"),
+            &[mcode_test_assistant_record(
+                "msg-1",
+                1_789_830_965_412,
+                3_000,
+                200,
+                1_000,
+            )],
+        );
+        let state_db = root.join("runtime-state.sqlite");
+        write_mcode_runtime_ledger(
+            &state_db,
+            MCODE_TEST_SESSION_ID,
+            Some("/tmp/decoded-project"),
+            None,
+        );
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        with_mcode_env(&root.join("v2"), &state_db, || {
+            sync_mcode_usage_logs(&mut conn, &root.join("v2")).unwrap();
+        });
+
+        let rows = mcode_synced_rows(&conn);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].2, MCODE_TEST_SESSION_ID);
+        assert_eq!(
+            rows[0].3.as_deref(),
+            Some("/tmp/decoded-project"),
+            "the decoded directory id must join to the runtime ledger row"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sync_mcode_usage_logs_uses_runtime_title_when_present() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = mcode_test_root("sync-title");
+        let session_dir = mcode_test_session_dir(&root);
+        write_mcode_lines(
+            &session_dir.join("messages.jsonl"),
+            &[mcode_test_assistant_record(
+                "msg-1",
+                1_789_830_965_412,
+                3_000,
+                200,
+                1_000,
+            )],
+        );
+        let state_db = root.join("runtime-state.sqlite");
+        write_mcode_runtime_ledger(
+            &state_db,
+            MCODE_TEST_SESSION_ID,
+            Some("   "),
+            Some("  MiniMax Code 標題  "),
+        );
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        with_mcode_env(&root.join("v2"), &state_db, || {
+            sync_mcode_usage_logs(&mut conn, &root.join("v2")).unwrap();
+        });
+
+        let (session_name, cwd): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT session_name, cwd FROM usage_entries WHERE assistant_type = 'mcode'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(session_name.as_deref(), Some("  MiniMax Code 標題  "));
+        assert_eq!(
+            cwd, None,
+            "a blank workspace_dir must not become an empty cwd"
+        );
 
         let _ = fs::remove_dir_all(root);
     }

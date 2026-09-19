@@ -82,7 +82,7 @@ fn parse_token_stats(usage: &Value) -> Option<TokenStats> {
     })
 }
 
-fn parse_reported_cost(usage: &Value) -> Option<f64> {
+pub(crate) fn parse_reported_cost(usage: &Value) -> Option<f64> {
     usage
         .get("cost")
         .and_then(|cost| cost.get("total"))

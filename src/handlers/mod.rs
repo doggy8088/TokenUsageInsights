@@ -29,6 +29,8 @@ pub fn normalize_assistant_name(assistant: &str) -> String {
         "muse" | "muse-code" | "muse_code" | "musecode" | "code-muse" | "code_muse" => {
             "muse".to_string()
         }
+        "mcode" | "minimax-code" | "minimax_code" | "minimaxcode" | "mini-max-code"
+        | "mini_max_code" => "mcode".to_string(),
         _ => normalized,
     }
 }
@@ -36,7 +38,16 @@ pub fn normalize_assistant_name(assistant: &str) -> String {
 pub fn is_supported_assistant(assistant: &str) -> bool {
     matches!(
         normalize_assistant_name(assistant).as_str(),
-        "antigravity" | "copilot" | "codex" | "claude" | "cursor" | "grok" | "pi" | "omp" | "muse"
+        "antigravity"
+            | "copilot"
+            | "codex"
+            | "claude"
+            | "cursor"
+            | "grok"
+            | "pi"
+            | "omp"
+            | "muse"
+            | "mcode"
     )
 }
 
@@ -65,6 +76,7 @@ pub struct SetupInfoResponse {
     pub pi: AssistantSetupStatus,
     pub omp: AssistantSetupStatus,
     pub muse: AssistantSetupStatus,
+    pub mcode: AssistantSetupStatus,
 }
 
 #[derive(Serialize)]

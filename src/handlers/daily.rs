@@ -208,6 +208,9 @@ pub async fn get_setup_info(Path(assistant): Path<String>) -> impl IntoResponse 
     let muse_dir = db::get_muse_dir();
     let muse_exists = muse_dir.join("sessions").exists();
 
+    let mcode_dir = db::get_mcode_dir();
+    let mcode_exists = mcode_dir.join("sessions").exists();
+
     Json(SetupInfoResponse {
         platform: std::env::consts::OS.to_string(),
         workspace_dir,
@@ -302,6 +305,14 @@ pub async fn get_setup_info(Path(assistant): Path<String>) -> impl IntoResponse 
             dir_path: muse_dir.to_string_lossy().into_owned(),
             data_path: muse_dir.join("sessions").to_string_lossy().into_owned(),
             exists: muse_exists,
+            script_path: "".to_string(),
+            source_script_path: "".to_string(),
+            settings_path: "".to_string(),
+        },
+        mcode: AssistantSetupStatus {
+            dir_path: mcode_dir.to_string_lossy().into_owned(),
+            data_path: mcode_dir.join("sessions").to_string_lossy().into_owned(),
+            exists: mcode_exists,
             script_path: "".to_string(),
             source_script_path: "".to_string(),
             settings_path: "".to_string(),

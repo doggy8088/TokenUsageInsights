@@ -1,6 +1,6 @@
 # Token 战情室
 
-**Token 战情室是本地优先的 AI Coding Agent Token 使用量与会话还原看板。** 它会读取本机上的 Google Antigravity CLI、GitHub Copilot CLI、GitHub Copilot App、GitHub Copilot Chat（VS Code）、Codex Desktop、Codex CLI、Claude Code、Cursor、Grok Build、Pi Coding Agent、OMP 与 Muse Code 记录，集中呈现每日、月度、年度的 Token 消耗、缓存使用、推理 Token、估算费用、模型分布、项目目录分布与完整 Session 时间轴。
+**Token 战情室是本地优先的 AI Coding Agent Token 使用量与会话还原看板。** 它会读取本机上的 Google Antigravity CLI、GitHub Copilot CLI、GitHub Copilot App、GitHub Copilot Chat（VS Code）、Codex Desktop、Codex CLI、Claude Code、Cursor、Grok Build、Pi Coding Agent、OMP、Muse Code 与 MiniMax Code 记录，集中呈现每日、月度、年度的 Token 消耗、缓存使用、推理 Token、估算费用、模型分布、项目目录分布与完整 Session 时间轴。
 
 本项目不会代你调用 AI 供应商 API 查询数据；核心数据来源是本地日志、Status Line 收集文件与本地 SQLite。
 
@@ -57,8 +57,9 @@ http://localhost:3003
 | Pi Coding Agent | 不需要 | `~/.pi/agent/sessions` | 看板会直接扫描 Pi Coding Agent 自动保存的本地 Session JSONL 文件 |
 | OMP | 不需要 | `~/.omp/agent/sessions` | 看板会直接扫描 OMP 自动保存的本地 Session JSONL 文件 |
 | Muse Code | 不需要 | `~/.local/share/muse/sessions` | 看板会直接扫描 Muse Code 自动保存的本地 Session JSONL 文件 |
+| MiniMax Code | 不需要 | `~/.minimax/v2/sessions` | 看板会直接扫描 MiniMax Code 自动保存的本地 Session JSONL 文件，并以只读方式取得工作目录与 Session 名称 |
 
-**只使用 Copilot App、VS Code Copilot、Codex Desktop、Codex CLI、Claude Code、Cursor、Grok Build、Pi Coding Agent、OMP 或 Muse Code 时，执行一行安装命令并打开看板即可。**
+**只使用 Copilot App、VS Code Copilot、Codex Desktop、Codex CLI、Claude Code、Cursor、Grok Build、Pi Coding Agent、OMP、Muse Code 或 MiniMax Code 时，执行一行安装命令并打开看板即可。**
 
 ### Windows 原生使用
 
@@ -78,6 +79,7 @@ Windows 默认使用以下原生路径：
 | Pi Coding Agent | `%USERPROFILE%\.pi` |
 | OMP | `%USERPROFILE%\.omp` |
 | Muse Code | `%USERPROFILE%\.local\share\muse` |
+| MiniMax Code | `%USERPROFILE%\.minimax\v2` |
 
 看板内的设置指南会在 Windows 显示 PowerShell 复制、设置与诊断命令。PowerShell collector 使用 .NET JSON 与文件 API，不依赖 Bash、`jq`、`sed` 或 `awk`。
 
@@ -456,6 +458,27 @@ Muse Code 的费用会根据 Session 报告的模型与 `pricing.csv` 进行估�
 
 * * *
 
+## MiniMax Code 设置
+
+**MiniMax Code 不需要安装 Hook、Status Line 或额外收集脚本。** 看板会直接扫描：
+
+```text
+~/.minimax/v2/sessions
+```
+
+MiniMax Code 会将每个 Session 按年份、月份与日期分层保存，并在 Session 目录中写入 `messages.jsonl` 与 `snapshots/*.jsonl`。看板会合并这两个来源，依 `message_id` 去重后，以单一时间轴还原每个 Session 的提示词、工具步骤与 Agent 回复。
+
+使用方式：
+
+1. 先正常使用 MiniMax Code 创建至少一个 Session。
+2. 启动或刷新本项目看板。
+3. 在左侧选择 MiniMax Code。
+4. 按右上角同步按钮，或等待后台同步。
+
+MiniMax Code 的本地日志不提供费用字段，因此本看板会依 Session 回报的 Token 数量，对照 `pricing.csv` 的模型单价估算费用。工作目录与 Session 名称会以只读方式从 MiniMax Code 运行期的 `runtime-state.sqlite` 取得，本项目不会写入或修改该数据库。如果数据不在默认位置，可设置 `MCODE_DIR` 指向包含 `sessions` 的 MiniMax Code 数据目录。
+
+* * *
+
 ## 本地数据同步方式
 
 启动服务时，后端会初始化本地 SQLite 并立即同步一次数据。服务启动后，也会每 5 秒进行一次后台同步。
@@ -548,6 +571,8 @@ cargo build --release --bin token-usage-insights
 | `PI_DIR` | `~/.pi` | Pi Coding Agent 数据目录 |
 | `OMP_DIR` | `~/.omp` | OMP 数据目录 |
 | `MUSE_DIR` | `~/.local/share/muse` | Muse Code 数据目录，应包含 `sessions` |
+| `MCODE_DIR` | `~/.minimax/v2` | MiniMax Code 数据目录，应包含 `sessions` |
+| `MCODE_STATE_DB` | `~/.minimax/v2/sqlite/runtime-state.sqlite` | MiniMax Code 运行期数据库（只读），提供工作目录与 Session 名称 |
 | `CORS_ALLOWED_ORIGINS` | `http://localhost:<PORT>,http://127.0.0.1:<PORT>` | 允许的 CORS 来源，以逗号分隔 |
 
 ### 配置文件 (config.yaml)

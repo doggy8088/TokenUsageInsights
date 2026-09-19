@@ -1,6 +1,6 @@
 # Token 전황실
 
-**Token 전황실은 로컬 우선 방식의 AI Coding Agent Token 사용량 및 세션 복원 대시보드입니다.** Google Antigravity CLI, GitHub Copilot CLI, GitHub Copilot App, GitHub Copilot Chat(VS Code), Codex Desktop, Codex CLI, Claude Code, Cursor, Grok Build, Pi Coding Agent, OMP, Muse Code의 로컬 기록을 읽어 일별·월별·연별 Token 소비량, 캐시 사용량, 추론 Token, 예상 비용, 모델 분포, 프로젝트 디렉터리 분포와 전체 Session 타임라인을 한곳에 표시합니다.
+**Token 전황실은 로컬 우선 방식의 AI Coding Agent Token 사용량 및 세션 복원 대시보드입니다.** Google Antigravity CLI, GitHub Copilot CLI, GitHub Copilot App, GitHub Copilot Chat(VS Code), Codex Desktop, Codex CLI, Claude Code, Cursor, Grok Build, Pi Coding Agent, OMP, Muse Code, MiniMax Code의 로컬 기록을 읽어 일별·월별·연별 Token 소비량, 캐시 사용량, 추론 Token, 예상 비용, 모델 분포, 프로젝트 디렉터리 분포와 전체 Session 타임라인을 한곳에 표시합니다.
 
 이 프로젝트는 AI 공급자 API를 대신 호출하여 데이터를 조회하지 않습니다. 핵심 데이터 원본은 로컬 로그, Status Line 수집 파일, 로컬 SQLite입니다.
 
@@ -57,8 +57,9 @@ http://localhost:3003
 | Pi Coding Agent | 불필요 | `~/.pi/agent/sessions` | Pi Coding Agent가 자동 저장하는 로컬 Session JSONL 파일을 직접 스캔 |
 | OMP | 불필요 | `~/.omp/agent/sessions` | OMP가 자동 저장하는 로컬 Session JSONL 파일을 직접 스캔 |
 | Muse Code | 불필요 | `~/.local/share/muse/sessions` | Muse Code가 자동 저장하는 로컬 Session JSONL 파일을 직접 스캔 |
+| MiniMax Code | 불필요 | `~/.minimax/v2/sessions` | MiniMax Code가 자동 저장하는 로컬 Session JSONL 파일을 직접 스캔하고 작업 디렉터리와 Session 이름을 읽기 전용으로 확인 |
 
-**Copilot App, VS Code Copilot, Codex Desktop, Codex CLI, Claude Code, Cursor, Grok Build, Pi Coding Agent, OMP 또는 Muse Code만 사용하는 경우 한 줄 설치 명령을 실행하고 대시보드를 열기만 하면 됩니다.**
+**Copilot App, VS Code Copilot, Codex Desktop, Codex CLI, Claude Code, Cursor, Grok Build, Pi Coding Agent, OMP, Muse Code 또는 MiniMax Code만 사용하는 경우 한 줄 설치 명령을 실행하고 대시보드를 열기만 하면 됩니다.**
 
 ### Windows 네이티브 사용
 
@@ -78,6 +79,7 @@ Windows는 기본적으로 다음 네이티브 경로를 사용합니다.
 | Pi Coding Agent | `%USERPROFILE%\.pi` |
 | OMP | `%USERPROFILE%\.omp` |
 | Muse Code | `%USERPROFILE%\.local\share\muse` |
+| MiniMax Code | `%USERPROFILE%\.minimax\v2` |
 
 대시보드의 설정 안내는 Windows에서 PowerShell 복사, 설정 및 진단 명령을 표시합니다. PowerShell collector는 .NET JSON 및 파일 API를 사용하며 Bash, `jq`, `sed`, `awk`에 의존하지 않습니다.
 
@@ -456,6 +458,27 @@ Muse Code 비용은 Session이 보고한 모델과 `pricing.csv`를 기준으로
 
 * * *
 
+## MiniMax Code 설정
+
+**MiniMax Code에는 Hook, Status Line 또는 추가 수집 스크립트가 필요하지 않습니다.** 대시보드는 다음 디렉터리를 직접 스캔합니다.
+
+```text
+~/.minimax/v2/sessions
+```
+
+MiniMax Code는 각 Session을 연, 월, 일 계층 디렉터리에 저장하고, Session 디렉터리 안에 `messages.jsonl`과 `snapshots/*.jsonl`을 기록합니다. 대시보드는 두 stream을 병합하고 `message_id`로 중복을 제거한 뒤, Session마다 사용자 프롬프트, 도구 단계 및 Agent 응답을 하나의 타임라인으로 복원합니다.
+
+사용 방법:
+
+1. MiniMax Code를 평소처럼 사용하여 Session을 하나 이상 만듭니다.
+2. 대시보드를 시작하거나 새로 고칩니다.
+3. 왼쪽에서 MiniMax Code를 선택합니다.
+4. 오른쪽 위 동기화 버튼을 클릭하거나 백그라운드 동기화를 기다립니다.
+
+MiniMax Code 로컬 로그에는 비용 필드가 없으므로, 이 대시보드는 Session이 보고하는 Token 수를 `pricing.csv`의 모델 단가와 대조해 비용을 추정합니다. 작업 디렉터리와 Session 이름은 MiniMax Code runtime의 `runtime-state.sqlite`에서 읽기 전용으로 가져오며, 이 프로젝트는 해당 데이터베이스에 쓰거나 수정하지 않습니다. 데이터가 기본 위치에 없다면 `MCODE_DIR`을 `sessions`가 포함된 MiniMax Code 데이터 디렉터리로 설정합니다.
+
+* * *
+
 ## 로컬 데이터 동기화 방식
 
 서비스가 시작되면 백엔드가 로컬 SQLite를 초기화하고 즉시 한 번 데이터를 동기화합니다. 시작 후에는 5초마다 백그라운드 동기화도 수행합니다.
@@ -548,6 +571,8 @@ cargo build --release --bin token-usage-insights
 | `PI_DIR` | `~/.pi` | Pi Coding Agent 데이터 디렉터리 |
 | `OMP_DIR` | `~/.omp` | OMP 데이터 디렉터리 |
 | `MUSE_DIR` | `~/.local/share/muse` | Muse Code 데이터 디렉터리. `sessions`를 포함해야 함 |
+| `MCODE_DIR` | `~/.minimax/v2` | MiniMax Code 데이터 디렉터리. `sessions`를 포함해야 함 |
+| `MCODE_STATE_DB` | `~/.minimax/v2/sqlite/runtime-state.sqlite` | MiniMax Code runtime 데이터베이스(읽기 전용). 작업 디렉터리와 Session 이름 제공 |
 | `CORS_ALLOWED_ORIGINS` | `http://localhost:<PORT>,http://127.0.0.1:<PORT>` | 쉼표로 구분한 허용 CORS origin |
 
 ### 설정 파일 (config.yaml)

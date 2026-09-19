@@ -85,6 +85,10 @@
             <img class="assistant-logo" src="/static/favicon-v2.png" alt="Muse" />
             <span class="agent-name-tooltip">Muse</span>
           </button>
+          <button class="assistant-badge-btn" data-value="mcode" title="MiniMax Code" aria-label="MiniMax Code">
+            <img class="assistant-logo" src="/static/mcode-logo.svg" alt="MiniMax Code" />
+            <span class="agent-name-tooltip">MiniMax Code</span>
+          </button>
         </div>
       </div>
 
@@ -1170,6 +1174,28 @@ cd TokenUsageInsights</code></pre>
           <p class="modal-text" data-i18n="omp_setup_step_3_desc">OMP 的每個 session turn 都會回報自己的 <code>usage.cost</code>，本看板會直接讀取該欄位作為權威成本資料，無需額外估算。</p>
         </div>
       </div>
+
+      <!-- MiniMax Code Setup Content -->
+      <div class="modal-body" id="setup-body-mcode" style="display: none;">
+        <div class="modal-text">
+          <p data-i18n="mcode_setup_modal_intro">本看板會讀取 MiniMax Code 自動保存的本地 session stream。MiniMax Code 不需要額外安裝狀態列腳本。</p>
+        </div>
+
+        <div class="modal-section">
+          <h3 data-i18n="mcode_setup_step_1"><span>01</span> 1. 確認 MiniMax Code 已在使用</h3>
+          <p class="modal-text" data-i18n="mcode_setup_step_1_desc">在終端機中使用過 MiniMax Code 後，session 會自動保存至 <code>~/.minimax/v2/sessions</code>。</p>
+        </div>
+
+        <div class="modal-section">
+          <h3 data-i18n="mcode_setup_step_2"><span>02</span> 2. 偵測本機資料路徑</h3>
+          <p class="modal-text" data-i18n="mcode_setup_step_2_desc">目前偵測到的 MiniMax Code session 目錄為：<code id="lbl-detected-home-mcode">~/.minimax/v2/sessions</code>。</p>
+        </div>
+
+        <div class="modal-section">
+          <h3 data-i18n="mcode_setup_step_3"><span>03</span> 3. 了解計費資料來源</h3>
+          <p class="modal-text" data-i18n="mcode_setup_step_3_desc">MiniMax Code 的本地日誌未提供費用欄位，本看板會依 session 回報的 Token 數量，對照 <code>pricing.csv</code> 的模型單價估算費用；工作目錄與 Session 名稱則取自 MiniMax Code 的 runtime 資料庫。</p>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -1250,6 +1276,7 @@ cd TokenUsageInsights</code></pre>
             <option value="grok">Grok Build</option>
             <option value="pi">Pi Coding Agent</option>
             <option value="omp">OMP</option>
+            <option value="mcode">MiniMax Code</option>
           </select>
         </label>
         <div id="usage-import-validation" class="usage-import-validation" role="status"></div>

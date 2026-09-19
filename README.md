@@ -57,8 +57,9 @@ http://localhost:3003
 | Pi Coding Agent | 不需要 | `~/.pi/agent/sessions` | 看板會直接掃描 Pi Coding Agent 自動保存的本機 Session JSONL 檔案 |
 | OMP | 不需要 | `~/.omp/agent/sessions` | 看板會直接掃描 OMP 自動保存的本機 Session JSONL 檔案 |
 | Muse Code | 不需要 | `~/.local/share/muse/sessions` | 看板會直接掃描 Muse Code 自動保存的本機 Session JSONL 檔案 |
+| MiniMax Code | 不需要 | `~/.minimax/v2/sessions` | 看板會直接掃描 MiniMax Code 自動保存的本機 Session JSONL 檔案，並唯讀取得工作目錄與 Session 名稱 |
 
-**只使用 Copilot App、VS Code Copilot、Codex Desktop、Codex CLI、Claude Code、Cursor、Grok Build、Pi Coding Agent、OMP 或 Muse Code 時，執行一行安裝指令並開啟看板即可。**
+**只使用 Copilot App、VS Code Copilot、Codex Desktop、Codex CLI、Claude Code、Cursor、Grok Build、Pi Coding Agent、OMP、Muse Code 或 MiniMax Code 時，執行一行安裝指令並開啟看板即可。**
 
 ### Windows 原生使用
 
@@ -456,6 +457,27 @@ Muse Code 的費用會依 Session 回報的模型與 `pricing.csv` 估算。若�
 
 * * *
 
+## MiniMax Code 設定
+
+**MiniMax Code 不需要安裝 Hook、Status Line 或額外收集腳本。** 看板會直接掃描：
+
+```text
+~/.minimax/v2/sessions
+```
+
+MiniMax Code 會將每個 Session 依年份、月份與日期分層保存，並在 Session 目錄中寫入 `messages.jsonl` 與 `snapshots/*.jsonl`。看板會合併這兩個來源、依 `message_id` 去重後，以單一時間軸還原每個 Session 的提示詞、工具步驟與 Agent 回覆。
+
+使用方式：
+
+1. 先正常使用 MiniMax Code 產生至少一個 Session。
+2. 啟動或重新整理本專案看板。
+3. 在左側選擇 MiniMax Code。
+4. 按右上角同步按鈕，或等待背景同步。
+
+MiniMax Code 的本地日誌不提供費用欄位，因此本看板會依 Session 回報的 Token 數量，對照 `pricing.csv` 的模型單價估算費用。工作目錄與 Session 名稱會以唯讀方式讀取 MiniMax Code 執行期的 `runtime-state.sqlite` 取得，本專案不會寫入或修改該資料庫。若資料不在預設位置，可設定 `MCODE_DIR` 指向包含 `sessions` 的 MiniMax Code 資料目錄。
+
+* * *
+
 ## 本地資料同步方式
 
 啟動服務時，後端會初始化本機 SQLite 並立即同步一次資料。服務啟動後，也會每 5 秒背景同步一次。
@@ -563,6 +585,8 @@ cargo build --release --bin token-usage-insights
 | `PI_DIR` | `~/.pi` | Pi Coding Agent 資料目錄 |
 | `OMP_DIR` | `~/.omp` | OMP 資料目錄 |
 | `MUSE_DIR` | `~/.local/share/muse` | Muse Code 資料目錄，應包含 `sessions` |
+| `MCODE_DIR` | `~/.minimax/v2` | MiniMax Code 資料目錄，應包含 `sessions` |
+| `MCODE_STATE_DB` | `~/.minimax/v2/sqlite/runtime-state.sqlite` | MiniMax Code 執行期資料庫（唯讀），提供工作目錄與 Session 名稱 |
 | `CORS_ALLOWED_ORIGINS` | `http://localhost:<PORT>,http://127.0.0.1:<PORT>` | 允許的 CORS 來源，逗號分隔 |
 
 ### 設定檔 (config.yaml)

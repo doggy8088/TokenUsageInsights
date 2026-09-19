@@ -5,6 +5,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
+use std::path::Path;
 
 /// Timeline Item definition for Session Reconstruction
 #[derive(Serialize)]
@@ -2983,6 +2984,215 @@ pub fn parse_muse_timeline(
     metadata.insert("cwd".to_string(), serde_json::Value::String(String::new()));
 }
 
+/// Reconstructs the conversation timeline of one MiniMax Code session. Unlike
+/// the other assistants a single session spans several JSONL files
+/// (`messages.jsonl` plus `snapshots/*.jsonl`), so the session directory is
+/// passed in instead of one reader. Turns are numbered with
+/// [`crate::mcode::assistant_usage`] so they line up with the rows written by
+/// `crate::mcode::parse_session_usage`. `metadata["cwd"]` is deliberately left
+/// unset so the DB-sourced working directory stays authoritative.
+pub fn parse_mcode_timeline(
+    session_dir: &Path,
+    db_entries: &HashMap<u32, (TokenStats, String)>,
+    timeline: &mut Vec<TimelineItem>,
+    metadata: &mut HashMap<String, serde_json::Value>,
+) {
+    let records = crate::mcode::collect_session_records(session_dir);
+    let mut turn_no = 1u32;
+    let mut current_model = UNKNOWN_MODEL.to_string();
+    let mut tool_indices: HashMap<String, usize> = HashMap::new();
+    let mut session_started = false;
+
+    for record in &records {
+        let Some(message) = record.get("message") else {
+            continue;
+        };
+        let timestamp = crate::mcode::record_timestamp(record)
+            .map(crate::mcode::epoch_ms_to_rfc3339)
+            .unwrap_or_default();
+
+        if !session_started {
+            timeline.push(TimelineItem::SystemStatus {
+                timestamp: timestamp.clone(),
+                status_type: "session_start".to_string(),
+                message: "MiniMax Code session started".to_string(),
+            });
+            session_started = true;
+        }
+
+        match message.get("role").and_then(Value::as_str).unwrap_or("") {
+            "user" => {
+                let prompt = value_to_text(message.get("content"));
+                if !prompt.is_empty() {
+                    timeline.push(TimelineItem::UserPrompt {
+                        timestamp,
+                        prompt,
+                        context: None,
+                        turn_no,
+                    });
+                }
+            }
+            "compactionSummary" => {
+                if let Some(summary) = message.get("summary").and_then(Value::as_str) {
+                    timeline.push(TimelineItem::SystemStatus {
+                        timestamp,
+                        status_type: "compaction".to_string(),
+                        message: summary.to_string(),
+                    });
+                }
+            }
+            "assistant" => {
+                let mut reply_parts = Vec::new();
+                let mut reasoning_parts = Vec::new();
+                if let Some(content) = message.get("content").and_then(Value::as_array) {
+                    for block in content {
+                        match block.get("type").and_then(Value::as_str) {
+                            Some("text") => {
+                                if let Some(text) = block.get("text").and_then(Value::as_str) {
+                                    reply_parts.push(text.to_string());
+                                }
+                            }
+                            Some("thinking") => {
+                                if let Some(text) = block.get("thinking").and_then(Value::as_str) {
+                                    reasoning_parts.push(text.to_string());
+                                }
+                            }
+                            Some("toolCall") => {
+                                let call_id = block
+                                    .get("id")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string();
+                                let tool_name = block
+                                    .get("name")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("tool_call")
+                                    .to_string();
+                                let arguments =
+                                    block.get("arguments").cloned().unwrap_or(Value::Null);
+                                let index = timeline.len();
+                                if !call_id.is_empty() {
+                                    tool_indices.insert(call_id.clone(), index);
+                                }
+                                timeline.push(TimelineItem::ToolStep {
+                                    timestamp: timestamp.clone(),
+                                    tool_name,
+                                    arguments,
+                                    env: None,
+                                    exit_code: None,
+                                    stdout: String::new(),
+                                    stderr: String::new(),
+                                    tool_call_id: (!call_id.is_empty()).then_some(call_id),
+                                    status: "running".to_string(),
+                                });
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
+                if let Some(model) = message.get("model").and_then(Value::as_str) {
+                    current_model = model.to_string();
+                }
+                // Gate the DB lookup on the same predicate that assigns turn
+                // numbers; otherwise a reply that never consumed a turn would
+                // borrow the next billable turn's token stats.
+                let billable = crate::mcode::assistant_usage(message);
+                let (tokens, model) = match (billable.as_ref(), db_entries.get(&turn_no)) {
+                    (Some(_), Some((stats, model))) => (Some(stats.clone()), model.clone()),
+                    _ => (None, current_model.clone()),
+                };
+                current_model = model.clone();
+
+                let reply = reply_parts.join("");
+                let reasoning = (!reasoning_parts.is_empty()).then(|| reasoning_parts.join(""));
+                if !reply.is_empty() || tokens.is_some() {
+                    timeline.push(TimelineItem::AgentReply {
+                        timestamp,
+                        reply,
+                        reasoning,
+                        turn_no,
+                        model,
+                        tokens,
+                        duration_ms: None,
+                        reasoning_effort: None,
+                    });
+                }
+
+                if billable.is_some() {
+                    turn_no += 1;
+                }
+            }
+            "toolResult" => {
+                let call_id = message
+                    .get("toolCallId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let is_error = message
+                    .get("isError")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let text = value_to_text(message.get("content"));
+                let (stdout, stderr) = if is_error {
+                    (String::new(), text)
+                } else {
+                    (text, String::new())
+                };
+                if let Some(index) = tool_indices.get(call_id).copied() {
+                    if let Some(TimelineItem::ToolStep {
+                        stdout: current_stdout,
+                        stderr: current_stderr,
+                        exit_code,
+                        status,
+                        ..
+                    }) = timeline.get_mut(index)
+                    {
+                        if !stdout.is_empty() {
+                            *current_stdout = stdout;
+                        }
+                        if !stderr.is_empty() {
+                            *current_stderr = stderr;
+                        }
+                        *status = if is_error {
+                            "failed".to_string()
+                        } else {
+                            "success".to_string()
+                        };
+                        *exit_code = Some(if is_error { 1 } else { 0 });
+                    }
+                } else {
+                    let tool_name = message
+                        .get("toolName")
+                        .and_then(Value::as_str)
+                        .unwrap_or("tool_result")
+                        .to_string();
+                    timeline.push(TimelineItem::ToolStep {
+                        timestamp,
+                        tool_name,
+                        arguments: Value::Null,
+                        env: None,
+                        exit_code: Some(if is_error { 1 } else { 0 }),
+                        stdout,
+                        stderr,
+                        tool_call_id: (!call_id.is_empty()).then(|| call_id.to_string()),
+                        status: if is_error {
+                            "failed".to_string()
+                        } else {
+                            "success".to_string()
+                        },
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    metadata.insert(
+        "selected_model".to_string(),
+        serde_json::Value::String(current_model),
+    );
+}
+
 #[cfg(test)]
 mod pi_family_tests {
     use super::*;
@@ -3127,5 +3337,176 @@ mod grok_tests {
         assert_eq!(reply.1, UNKNOWN_MODEL);
 
         let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
+mod mcode_tests {
+    use super::*;
+    use std::io::Write;
+    use std::path::PathBuf;
+
+    fn temp_session_dir(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "token-usage-insights-mcode-timeline-test-{}-{}",
+            label,
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&root).ok();
+        let dir = root
+            .join("sessions")
+            .join("2026")
+            .join("09")
+            .join("19")
+            .join("15-16-05-177-session_bXZzXzU5YjdmZjExNWZjOTQwOWFhN2IwMTdhYWMyMDhmYjI4");
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_lines(path: &Path, lines: &[String]) {
+        let mut file = File::create(path).unwrap();
+        for line in lines {
+            writeln!(file, "{line}").unwrap();
+        }
+    }
+
+    #[test]
+    fn parse_mcode_timeline_reconstructs_prompt_reply_and_tool_call() {
+        let session_dir = temp_session_dir("basic");
+        write_lines(
+            &session_dir.join("messages.jsonl"),
+            &[
+                r#"{"message_id":"msg-user","turn_id":"turn_1","message":{"role":"user","content":[{"type":"text","text":"please run the tests"}],"timestamp":1789826600000}}"#.to_string(),
+                r#"{"message_id":"msg-assistant","turn_id":"turn_1","message":{"role":"assistant","content":[{"type":"thinking","thinking":"plan"},{"type":"text","text":"running"},{"type":"toolCall","id":"call_1","name":"bash","arguments":{"command":"cargo test"}}],"model":"deepseek-v4.1-flash","usage":{"input":10,"output":5,"cacheRead":0,"cacheWrite":0,"totalTokens":15,"cost":{"total":0}},"timestamp":1789826601000}}"#.to_string(),
+                r#"{"message_id":"msg-tool","turn_id":"turn_1","message":{"role":"toolResult","toolCallId":"call_1","toolName":"bash","content":[{"type":"text","text":"ok"}],"isError":false,"timestamp":1789826602000}}"#.to_string(),
+                r#"{"message_id":"msg-compaction","turn_id":"turn_1","message":{"role":"compactionSummary","summary":"compacted","tokensBefore":100,"timestamp":1789826603000}}"#.to_string(),
+            ],
+        );
+
+        let mut db_entries: HashMap<u32, (TokenStats, String)> = HashMap::new();
+        db_entries.insert(
+            1,
+            (
+                crate::mcode::assistant_usage(&serde_json::json!({
+                    "role": "assistant",
+                    "usage": {"input": 10, "output": 5, "totalTokens": 15}
+                }))
+                .unwrap(),
+                "deepseek-v4.1-flash".to_string(),
+            ),
+        );
+        let mut timeline = Vec::new();
+        let mut metadata = HashMap::new();
+        parse_mcode_timeline(&session_dir, &db_entries, &mut timeline, &mut metadata);
+        std::fs::remove_dir_all(
+            session_dir
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap(),
+        )
+        .ok();
+
+        assert!(matches!(
+            &timeline[0],
+            TimelineItem::SystemStatus { status_type, .. } if status_type == "session_start"
+        ));
+        assert!(matches!(
+            &timeline[1],
+            TimelineItem::UserPrompt { prompt, turn_no: 1, .. } if prompt == "please run the tests"
+        ));
+        // The `toolResult` matched `call_1`, so it must update the tool call in
+        // place instead of appending a second tool step.
+        assert!(matches!(
+            &timeline[2],
+            TimelineItem::ToolStep { tool_name, stdout, status, exit_code, .. }
+                if tool_name == "bash" && stdout == "ok" && status == "success" && *exit_code == Some(0)
+        ));
+        match &timeline[3] {
+            TimelineItem::AgentReply {
+                reply,
+                reasoning,
+                turn_no,
+                model,
+                tokens,
+                ..
+            } => {
+                assert_eq!(reply, "running");
+                assert_eq!(reasoning.as_deref(), Some("plan"));
+                assert_eq!(*turn_no, 1);
+                assert_eq!(model, "deepseek-v4.1-flash");
+                assert_eq!(tokens.as_ref().unwrap().total, 15);
+            }
+            _ => panic!("expected agent reply after the tool step"),
+        }
+        assert!(matches!(
+            &timeline[4],
+            TimelineItem::SystemStatus { status_type, message, .. }
+                if status_type == "compaction" && message == "compacted"
+        ));
+        assert_eq!(timeline.len(), 5);
+        assert_eq!(
+            metadata.get("selected_model").and_then(Value::as_str),
+            Some("deepseek-v4.1-flash")
+        );
+        assert!(
+            !metadata.contains_key("cwd"),
+            "cwd must come from the DB, not the transcript"
+        );
+    }
+
+    #[test]
+    fn parse_mcode_timeline_numbers_turns_with_the_usage_predicate() {
+        let session_dir = temp_session_dir("turn-numbers");
+        write_lines(
+            &session_dir.join("messages.jsonl"),
+            &[
+                r#"{"message_id":"msg-without-usage","turn_id":"turn_1","message":{"role":"assistant","content":[],"model":"deepseek-v4.1-flash","timestamp":1789828000000}}"#.to_string(),
+                r#"{"message_id":"msg-first","turn_id":"turn_1","message":{"role":"assistant","content":[{"type":"text","text":"one"}],"model":"deepseek-v4.1-flash","usage":{"input":10,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":11,"cost":{"total":0}},"timestamp":1789828001000}}"#.to_string(),
+                r#"{"message_id":"msg-second","turn_id":"turn_2","message":{"role":"assistant","content":[{"type":"text","text":"two"}],"model":"deepseek-v4.1-flash","usage":{"input":20,"output":2,"cacheRead":0,"cacheWrite":0,"totalTokens":22,"cost":{"total":0}},"timestamp":1789828002000}}"#.to_string(),
+            ],
+        );
+
+        let mut db_entries: HashMap<u32, (TokenStats, String)> = HashMap::new();
+        db_entries.insert(
+            1,
+            (
+                crate::mcode::assistant_usage(&serde_json::json!({
+                    "role": "assistant",
+                    "usage": {"input": 10, "output": 1, "totalTokens": 11}
+                }))
+                .unwrap(),
+                "deepseek-v4.1-flash".to_string(),
+            ),
+        );
+        let mut timeline = Vec::new();
+        let mut metadata = HashMap::new();
+        parse_mcode_timeline(&session_dir, &db_entries, &mut timeline, &mut metadata);
+        std::fs::remove_dir_all(
+            session_dir
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap(),
+        )
+        .ok();
+
+        let reply_turns = timeline
+            .iter()
+            .filter_map(|item| match item {
+                TimelineItem::AgentReply { turn_no, .. } => Some(*turn_no),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(reply_turns, vec![1, 2]);
+        assert_eq!(
+            timeline.len(),
+            3,
+            "the usage-less assistant must not emit a reply or consume a turn"
+        );
     }
 }

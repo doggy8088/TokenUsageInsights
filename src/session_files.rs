@@ -605,6 +605,16 @@ pub(crate) fn resolve_session_file_path(
             resolve_pi_family_transcript_path(&db::get_muse_dir(), "Muse", path)
                 .map_err(|error| SessionFileError::new(StatusCode::BAD_REQUEST, error))
         }
+        "mcode" => {
+            let path = transcript_path_db.ok_or_else(|| {
+                SessionFileError::new(
+                    StatusCode::NOT_FOUND,
+                    "找不到 MiniMax Code session 日誌檔案路徑。".to_string(),
+                )
+            })?;
+            resolve_pi_family_transcript_path(&db::get_mcode_dir(), "MiniMax Code", path)
+                .map_err(|error| SessionFileError::new(StatusCode::BAD_REQUEST, error))
+        }
         _ => Err(SessionFileError::new(
             StatusCode::BAD_REQUEST,
             "不支援的助理類型",

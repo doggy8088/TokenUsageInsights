@@ -98,6 +98,11 @@ const assistantAliasMap = {
   'musecode': 'muse',
   'code-muse': 'muse',
   'code_muse': 'muse',
+  'minimax-code': 'mcode',
+  'minimax_code': 'mcode',
+  'minimaxcode': 'mcode',
+  'mini-max-code': 'mcode',
+  'mini_max_code': 'mcode',
 };
 
 const assistantMeta = {
@@ -190,6 +195,16 @@ const assistantMeta = {
     senderName: 'MUSE AGENT',
     highlightColor: '#3b82f6',
     nameHighlights: ['Muse Code'],
+  },
+  mcode: {
+    logo: '/static/mcode-logo.svg',
+    label: 'MiniMax Code',
+    shortLabel: 'MiniMax Code',
+    alt: 'MiniMax Code',
+    badgeStyle: 'background: rgba(255, 107, 74, 0.15); color: #ff8a6b; border: 1px solid rgba(255, 107, 74, 0.3); display: inline-flex; align-items: center;',
+    senderName: 'MINIMAX CODE AGENT',
+    highlightColor: '#ff8a6b',
+    nameHighlights: ['MiniMax Code'],
   },
 };
 
@@ -599,6 +614,7 @@ const setupModalTitleKeys = {
   grok: 'grok_setup_modal_title',
   pi: 'pi_setup_modal_title',
   omp: 'omp_setup_modal_title',
+  mcode: 'mcode_setup_modal_title',
 };
 
 function getSetupModalTitleKey(assistant) {
@@ -624,6 +640,7 @@ function setSetupModalBody(assistant) {
     grok: 'setup-body-grok',
     pi: 'setup-body-pi',
     omp: 'setup-body-omp',
+    mcode: 'setup-body-mcode',
   };
   const bodyElements = Object.values(bodyIds)
     .filter((bodyId, index, ids) => ids.indexOf(bodyId) === index)
@@ -6689,6 +6706,9 @@ async function loadSetupInfo(assistant = currentAssistant) {
     } else if (resolvedAssistant === 'omp') {
       const homeLabelOmp = document.getElementById('lbl-detected-home-omp');
       if (homeLabelOmp) homeLabelOmp.textContent = abbreviateHomePath(data.omp?.data_path || '');
+    } else if (resolvedAssistant === 'mcode') {
+      const homeLabelMcode = document.getElementById('lbl-detected-home-mcode');
+      if (homeLabelMcode) homeLabelMcode.textContent = abbreviateHomePath(data.mcode?.data_path || '');
     }
 
     // Apply updated language translations

@@ -4,6 +4,21 @@
 
 ## [未發行]
 
+### 新增與改善
+
+- 新增 `mcode`（MiniMax Code）Agent 類型。看板會掃描 `~/.minimax/v2/sessions` 下的 Session 目錄，合併 `messages.jsonl` 與 `snapshots/*.jsonl`、依 `message_id` 去重且以 `message.timestamp` 排序後，呈現 Token 用量、模型分布、工作目錄分布、Session 清單與完整時間軸。
+- 工作目錄與 Session 名稱以唯讀方式取自 MiniMax Code 執行期的 `runtime-state.sqlite`（`local_runtime_sessions.workspace_dir` 與 `title`），不寫入或修改該資料庫；若資料庫或資料表不存在，Session 仍可正常匯入，僅缺少工作目錄與名稱。
+- 新增 `MCODE_DIR` 與 `MCODE_STATE_DB` 環境變數，可分別自訂 MiniMax Code 資料目錄與執行期資料庫路徑。
+
+### 變更
+
+- 服務常駐安裝腳本（`install.sh`、`install.ps1`）與更新流程的關鍵環境變數清單納入 `MCODE_DIR`、`MCODE_STATE_DB`，確保自訂路徑在服務重啟時仍可正確帶入。
+
+### 資料影響
+
+- MiniMax Code 的 Session 以 `assistant_type = 'mcode'`、`source_kind = 'mcode-session'` 寫入既有 `usage_entries` 資料表，無需額外資料庫結構遷移。
+- MiniMax Code 本地日誌未提供費用欄位（`cost.total` 一律為 0），費用改以 Session 回報的 Token 數量對照 `pricing.csv` 模型單價估算；`pricing.csv` 未新增任何項目。
+
 ## [1.0.0] - 2026-09-14
 
 ### 新增與改善

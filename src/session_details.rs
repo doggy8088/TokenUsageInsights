@@ -11,8 +11,8 @@ use crate::{
     timeline::{
         parse_antigravity_timeline, parse_claude_timeline, parse_codex_timeline,
         parse_copilot_timeline_filtered, parse_cursor_timeline, parse_grok_timeline,
-        parse_muse_timeline, parse_omp_timeline, parse_pi_timeline, parse_vscode_timeline,
-        TimelineItem,
+        parse_mcode_timeline, parse_muse_timeline, parse_omp_timeline, parse_pi_timeline,
+        parse_vscode_timeline, TimelineItem,
     },
 };
 
@@ -71,6 +71,20 @@ pub(crate) fn parse_session_timeline_file(
         let session = crate::vscode::read_session_file(filepath)
             .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
         parse_vscode_timeline(&session, db_entries, &mut timeline, &mut metadata);
+        return Ok((timeline, metadata));
+    }
+
+    if source_kind == crate::mcode::SOURCE_KIND {
+        // A MiniMax Code session is spread over several JSONL files, so the
+        // whole session directory is needed rather than the single transcript
+        // path recorded in the DB.
+        let Some(session_dir) = filepath.parent() else {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "無法解析 MiniMax Code session 目錄。".to_string(),
+            ));
+        };
+        parse_mcode_timeline(session_dir, db_entries, &mut timeline, &mut metadata);
         return Ok((timeline, metadata));
     }
 

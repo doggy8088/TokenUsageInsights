@@ -1,6 +1,6 @@
 # Token War Room
 
-**Token War Room is a local-first dashboard for AI coding-agent token usage and session reconstruction.** It reads local records from Google Antigravity CLI, GitHub Copilot CLI, GitHub Copilot App, GitHub Copilot Chat (VS Code), Codex Desktop, Codex CLI, Claude Code, Cursor, Grok Build, Pi Coding Agent, OMP, and Muse Code, presenting daily, monthly, and yearly token consumption, cache usage, reasoning tokens, estimated costs, model distribution, project-directory distribution, and complete session timelines in one place.
+**Token War Room is a local-first dashboard for AI coding-agent token usage and session reconstruction.** It reads local records from Google Antigravity CLI, GitHub Copilot CLI, GitHub Copilot App, GitHub Copilot Chat (VS Code), Codex Desktop, Codex CLI, Claude Code, Cursor, Grok Build, Pi Coding Agent, OMP, Muse Code, and MiniMax Code, presenting daily, monthly, and yearly token consumption, cache usage, reasoning tokens, estimated costs, model distribution, project-directory distribution, and complete session timelines in one place.
 
 This project does not call AI provider APIs on your behalf. Its core data sources are local logs, Status Line collector files, and local SQLite.
 
@@ -57,8 +57,9 @@ http://localhost:3003
 | Pi Coding Agent | Not required | `~/.pi/agent/sessions` | The dashboard scans the local session JSONL files saved automatically by Pi Coding Agent |
 | OMP | Not required | `~/.omp/agent/sessions` | The dashboard scans the local session JSONL files saved automatically by OMP |
 | Muse Code | Not required | `~/.local/share/muse/sessions` | The dashboard scans the local session JSONL files saved automatically by Muse Code |
+| MiniMax Code | Not required | `~/.minimax/v2/sessions` | The dashboard scans the local session JSONL files saved automatically by MiniMax Code, and read-only resolves the working directory and session name |
 
-**If you only use Copilot App, VS Code Copilot, Codex Desktop, Codex CLI, Claude Code, Cursor, Grok Build, Pi Coding Agent, OMP, or Muse Code, run the one-line installation command and open the dashboard.**
+**If you only use Copilot App, VS Code Copilot, Codex Desktop, Codex CLI, Claude Code, Cursor, Grok Build, Pi Coding Agent, OMP, Muse Code, or MiniMax Code, run the one-line installation command and open the dashboard.**
 
 ### Native Windows usage
 
@@ -78,6 +79,7 @@ Windows uses the following native paths by default:
 | Pi Coding Agent | `%USERPROFILE%\.pi` |
 | OMP | `%USERPROFILE%\.omp` |
 | Muse Code | `%USERPROFILE%\.local\share\muse` |
+| MiniMax Code | `%USERPROFILE%\.minimax\v2` |
 
 The dashboard's setup guide shows PowerShell copy, configuration, and diagnostic commands on Windows. The PowerShell collector uses .NET JSON and file APIs and does not depend on Bash, `jq`, `sed`, or `awk`.
 
@@ -456,6 +458,27 @@ Muse Code costs are estimated from the model reported by the session and `pricin
 
 * * *
 
+## MiniMax Code setup
+
+**MiniMax Code requires no hooks, a Status Line, or an additional collector script.** The dashboard scans this directory directly:
+
+```text
+~/.minimax/v2/sessions
+```
+
+MiniMax Code stores each session under nested year, month, and day directories, writing `messages.jsonl` and `snapshots/*.jsonl` inside the session directory. The dashboard merges both streams, deduplicates by `message_id`, and reconstructs a single timeline of user prompts, tool steps, and Agent replies per session.
+
+Usage:
+
+1. Use MiniMax Code normally to create at least one session.
+2. Start or refresh the dashboard.
+3. Select MiniMax Code on the left.
+4. Click the sync button in the upper-right corner, or wait for background sync.
+
+MiniMax Code local logs do not report a cost field, so the dashboard estimates cost from the tokens each session reports against the model prices in `pricing.csv`. The working directory and session name are read read-only from MiniMax Code's runtime `runtime-state.sqlite`; this project never writes to or modifies that database. If the data is not in the default location, set `MCODE_DIR` to the MiniMax Code data directory that contains `sessions`.
+
+* * *
+
 ## Local data synchronization
 
 When the service starts, the backend initializes local SQLite and performs an immediate data sync. After startup, it also syncs in the background every 5 seconds.
@@ -548,6 +571,8 @@ Paths specified by environment variables are authoritative and do not need to be
 | `PI_DIR` | `~/.pi` | Pi Coding Agent data directory |
 | `OMP_DIR` | `~/.omp` | OMP data directory |
 | `MUSE_DIR` | `~/.local/share/muse` | Muse Code data directory; should contain `sessions` |
+| `MCODE_DIR` | `~/.minimax/v2` | MiniMax Code data directory; should contain `sessions` |
+| `MCODE_STATE_DB` | `~/.minimax/v2/sqlite/runtime-state.sqlite` | MiniMax Code runtime database (read-only) providing the working directory and session name |
 | `CORS_ALLOWED_ORIGINS` | `http://localhost:<PORT>,http://127.0.0.1:<PORT>` | Comma-separated allowed CORS origins |
 
 ### Configuration file (config.yaml)

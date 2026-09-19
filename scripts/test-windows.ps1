@@ -1050,6 +1050,7 @@ if (Restore-ServiceBackup -InstallDir '$linkedInstallDir') { exit 2 } else { exi
     Assert-True ($runtimeVarText -match '"COPILOT_APP_DIR"') "install.ps1 runtimeEnvVars should contain COPILOT_APP_DIR."
     Assert-True ($runtimeVarText -match '"CURSOR_STATE_DB"') "install.ps1 runtimeEnvVars should contain CURSOR_STATE_DB."
     Assert-True ($runtimeVarText -match '"MUSE_DIR"') "install.ps1 runtimeEnvVars should contain MUSE_DIR."
+    Assert-True ($runtimeVarText -match '"MCODE_DIR"') "install.ps1 runtimeEnvVars should contain MCODE_DIR."
     Assert-True ($runtimeVarText -match '"VSCODE_USER_DATA_DIR"') "install.ps1 runtimeEnvVars should contain VSCODE_USER_DATA_DIR."
     Assert-True ($runtimeVarText -match '"VSCODE_PORTABLE_DATA_DIR"') "install.ps1 runtimeEnvVars should contain VSCODE_PORTABLE_DATA_DIR."
 

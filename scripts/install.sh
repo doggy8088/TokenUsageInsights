@@ -97,6 +97,8 @@ if [[ "$install_service" == true ]]; then
     PI_DIR
     OMP_DIR
     MUSE_DIR
+    MCODE_DIR
+    MCODE_STATE_DB
     VSCODE_DIR
     VSCODE_USER_DATA_DIR
     VSCODE_PORTABLE_DATA_DIR

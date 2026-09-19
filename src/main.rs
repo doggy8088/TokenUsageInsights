@@ -17,6 +17,7 @@ mod cli;
 mod db;
 mod grok;
 mod handlers;
+mod mcode;
 mod muse;
 mod omp;
 mod paths;
