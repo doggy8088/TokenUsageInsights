@@ -4,6 +4,8 @@
 
 ## [未發行]
 
+## [1.0.1] - 2026-09-20
+
 ### 新增與改善
 
 - 新增 `mcode`（MiniMax Code）Agent 類型。看板會掃描 `~/.minimax/v2/sessions` 下的 Session 目錄，合併 `messages.jsonl` 與 `snapshots/*.jsonl`、依 `message_id` 去重且以 `message.timestamp` 排序後，呈現 Token 用量、模型分布、工作目錄分布、Session 清單與完整時間軸。
@@ -18,6 +20,10 @@
 
 - MiniMax Code 的 Session 以 `assistant_type = 'mcode'`、`source_kind = 'mcode-session'` 寫入既有 `usage_entries` 資料表，無需額外資料庫結構遷移。
 - MiniMax Code 本地日誌未提供費用欄位（`cost.total` 一律為 0），費用改以 Session 回報的 Token 數量對照 `pricing.csv` 模型單價估算；`pricing.csv` 未新增任何項目。
+
+### 相容性
+
+- 本次不涉及資料庫結構、HTTP API 或既有資料來源的變更；既有 Agent 的同步邏輯與資料不受影響。新增的 `MCODE_DIR`、`MCODE_STATE_DB` 均為選用環境變數，未設定時沿用 MiniMax Code 的預設路徑。
 
 ## [1.0.0] - 2026-09-14
 
@@ -683,7 +689,8 @@
 - 修正行動版側邊欄遮擋、黑畫面、標題擠壓、圖表導覽索引與年度版面問題。
 - 修正並補齊多個 Gemini、Claude、GPT 與 GPT-OSS 模型的定價規則。
 
-[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.0.0...HEAD
+[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.0.1...HEAD
+[1.0.1]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.9.9...v1.0.0
 [0.9.9]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.9.8...v0.9.9
 [0.9.8]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.9.5...v0.9.8
