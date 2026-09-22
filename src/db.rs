@@ -1924,9 +1924,12 @@ fn run_codex_rollout_identity_migration(conn: &mut Connection) -> Result<(), Str
     }
 
     // Rows without a transcript path cannot belong to any transcript, so a
-    // session that is tracked by a rollout transcript supersedes them. Imported
-    // rows are excluded from both sides: they are keyed by `import_source_id`,
-    // have no local transcript, and must stay until the import is rolled back.
+    // session that is tracked by a rollout transcript of the same source
+    // supersedes them. The source kind is part of the session identity, so a
+    // tracked rollout of another source kind says nothing about these rows.
+    // Imported rows are excluded from both sides: they are keyed by
+    // `import_source_id`, have no local transcript, and must stay until the
+    // import is rolled back.
     tx.execute(
         "DELETE FROM usage_entries
          WHERE assistant_type = 'codex'
@@ -1938,6 +1941,7 @@ fn run_codex_rollout_identity_migration(conn: &mut Connection) -> Result<(), Str
                 SELECT 1 FROM usage_entries AS tracked
                 WHERE tracked.assistant_type = 'codex'
                   AND tracked.session_id = usage_entries.session_id
+                  AND tracked.source_kind = usage_entries.source_kind
                   AND tracked.usage_identity <> ''
                   AND tracked.import_source_id IS NULL
                   AND tracked.import_batch_id IS NULL
@@ -1945,6 +1949,30 @@ fn run_codex_rollout_identity_migration(conn: &mut Connection) -> Result<(), Str
         [],
     )
     .map_err(|error| format!("清除未追蹤的 Codex 舊資料失敗: {error}"))?;
+
+    // Imports own their turns, so a locally stored row that duplicates an
+    // imported row of the same rollout, session and turn disappears once both
+    // rows carry the identity. This resolves the duplicates that older releases
+    // left behind when an imported row and a locally synced row of the same turn
+    // disagreed about the source kind and therefore never collided.
+    tx.execute(
+        "DELETE FROM usage_entries
+         WHERE assistant_type = 'codex'
+           AND import_source_id IS NULL
+           AND import_batch_id IS NULL
+           AND usage_identity <> ''
+           AND EXISTS (
+                SELECT 1 FROM usage_entries AS imported
+                WHERE imported.assistant_type = usage_entries.assistant_type
+                  AND imported.usage_identity = usage_entries.usage_identity
+                  AND imported.session_id = usage_entries.session_id
+                  AND imported.turn_no = usage_entries.turn_no
+                  AND (imported.import_source_id IS NOT NULL
+                       OR imported.import_batch_id IS NOT NULL)
+           )",
+        [],
+    )
+    .map_err(|error| format!("清除與匯入重複的 Codex 資料失敗: {error}"))?;
 
     tx.execute(
         "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time)
@@ -5844,6 +5872,7 @@ pub fn import_usage_day_entries(
                      WHERE assistant_type = 'codex'
                        AND session_id = ?
                        AND turn_no = ?
+                       AND usage_identity <> ''
                        AND usage_identity = ?
                        AND import_source_id IS NULL
                        AND import_batch_id IS NULL
@@ -8445,6 +8474,187 @@ mod tests {
             )
             .unwrap();
         assert_eq!(untracked_rows, 0);
+    }
+
+    #[test]
+    fn codex_rollout_identity_migration_removes_local_duplicates_of_imported_turns() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let rollout_path =
+            "/codex/archived_sessions/2026/09/11/rollout-2026-09-11T00-06-46-dupe.jsonl";
+        // An older release stored this turn locally and also imported it, but the
+        // two rows disagreed about the source kind, so they never shared the
+        // unique key and both were counted.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, timestamp, date, session_id, transcript_path,
+                turn_no, usage_identity
+             ) VALUES ('codex', 'codex-desktop', '2026-09-10T16:06:50Z', '2026-09-10',
+                'dupe-session', ?1, 1, '')",
+            params![rollout_path],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, timestamp, date, session_id, transcript_path,
+                turn_no, usage_identity, import_source_id, import_batch_id
+             ) VALUES ('codex', 'legacy', '2026-09-10T16:06:50Z', '2026-09-10',
+                'dupe-session', ?1, 1, '', 'codex-import:7', 'batch-7')",
+            params![rollout_path],
+        )
+        .unwrap();
+        // The local transcript is already marked as synced, so no later sync pass
+        // would revisit the rollout on its own.
+        conn.execute(
+            "INSERT INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES ('codex:archived_sessions/2026/09/11/rollout-2026-09-11T00-06-46-dupe.jsonl', 10, 0)",
+            [],
+        )
+        .unwrap();
+
+        run_codex_rollout_identity_migration(&mut conn).unwrap();
+
+        let rows: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'codex' AND session_id = 'dupe-session' AND turn_no = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1, "an imported turn must not be counted twice");
+        let imported_rows: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'codex' AND import_batch_id = 'batch-7'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(imported_rows, 1, "the import owns the turn");
+    }
+
+    #[test]
+    fn codex_rollout_identity_migration_scopes_pathless_rows_by_source_kind() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // A pathless row of another source kind is a different session, so a
+        // tracked rollout of this kind says nothing about it.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, timestamp, date, session_id, turn_no
+             ) VALUES ('codex', 'codex-other', '2026-09-10T16:06:50Z', '2026-09-10',
+                'cross-kind-session', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, timestamp, date, session_id, transcript_path,
+                turn_no, usage_identity
+             ) VALUES ('codex', 'codex-desktop', '2026-09-10T16:06:50Z', '2026-09-10',
+                'cross-kind-session',
+                '/codex/sessions/2026/09/11/rollout-2026-09-11T00-06-46-cross.jsonl', 2,
+                'rollout=rollout-2026-09-11T00-06-46-cross')",
+            [],
+        )
+        .unwrap();
+        // A pathless row of the tracked kind is superseded by the rollout.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, timestamp, date, session_id, turn_no
+             ) VALUES ('codex', 'codex-desktop', '2026-09-10T16:06:50Z', '2026-09-10',
+                'same-kind-session', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, timestamp, date, session_id, transcript_path,
+                turn_no, usage_identity
+             ) VALUES ('codex', 'codex-desktop', '2026-09-10T16:06:50Z', '2026-09-10',
+                'same-kind-session',
+                '/codex/sessions/2026/09/11/rollout-2026-09-11T00-06-46-same.jsonl', 2,
+                'rollout=rollout-2026-09-11T00-06-46-same')",
+            [],
+        )
+        .unwrap();
+
+        run_codex_rollout_identity_migration(&mut conn).unwrap();
+
+        let cross_kind_rows: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'codex' AND session_id = 'cross-kind-session'
+                   AND COALESCE(transcript_path, '') = ''",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            cross_kind_rows, 1,
+            "a rollout of another source kind must not delete pathless rows"
+        );
+        let same_kind_rows: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'codex' AND session_id = 'same-kind-session'
+                   AND COALESCE(transcript_path, '') = ''",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            same_kind_rows, 0,
+            "a tracked rollout of the same source kind still supersedes pathless rows"
+        );
+    }
+
+    #[test]
+    fn codex_import_source_kind_lookup_uses_the_rollout_identity_index() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // The planner only prefers the partial identity index once it actually
+        // holds rows, so the table is seeded before the plan is inspected.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, session_id, turn_no, usage_identity, transcript_path,
+                timestamp, date
+             )
+             WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 200)
+             SELECT 'codex', 'codex-desktop', 'session-' || (n % 50), n % 200,
+                    'rollout=rollout-' || n, '/codex/sessions/rollout-' || n || '.jsonl',
+                    '2026-09-11T00:00:00Z', '2026-09-11'
+             FROM seq",
+            [],
+        )
+        .unwrap();
+
+        let mut query_plan = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT source_kind FROM usage_entries
+                 WHERE assistant_type = 'codex'
+                   AND session_id = ?
+                   AND turn_no = ?
+                   AND usage_identity <> ''
+                   AND usage_identity = ?
+                   AND import_source_id IS NULL
+                   AND import_batch_id IS NULL
+                 LIMIT 1",
+            )
+            .unwrap();
+        let details: Vec<String> = query_plan
+            .query_map(params!["session", 1, "rollout=rollout-x"], |row| row.get(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("idx_assistant_usage_identity")),
+            "查詢計畫未使用 rollout 身分索引：{details:?}"
+        );
     }
 
     #[test]
