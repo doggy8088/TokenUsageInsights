@@ -4,6 +4,38 @@
 
 ## [未發行]
 
+### 修正
+
+- 修正 Codex Session 在 `~/.codex/sessions` 與 `~/.codex/archived_sessions` 之間移動、或同一 Session 同時存在多個 rollout 檔案時，看板數字每隔幾秒在兩組數值間反覆跳動的問題（Issue #54）。
+- 修正 Codex 同步可能誤刪匯入資料的問題：rollout 身分遷移與本地 transcript 清除流程現在一律排除 `import_source_id` / `import_batch_id` 非空的資料列，匯入批次的生命週期不再被本機檔案同步影響。
+- 修正非 rollout 檔名的 `.jsonl`（例如 `notes.jsonl`、`history.jsonl`）被誤判為 rollout 身分而可能誤刪同名資料列的問題；現在僅接受 `rollout-` 前綴的檔名。
+- 修正重複 rollout 副本的清除與 canonical 檔案的寫入分屬不同交易、導致讀取端可能觀察到短暫空窗的問題；副本清除已納入同一個交易，canonical 檔案為空、解析失敗，或檔案仍在寫入而含有無法解析的行時，都不會先行刪除既有資料與副本。
+- 修正匯入資料列與本機 rollout 資料列佔用同一唯一鍵時，本機同步會因唯一鍵衝突而整批回滾、導致該 rollout 較新回合永遠無法寫入並每隔數秒重試失敗的問題；本機寫入改為 `INSERT OR IGNORE`，同鍵的匯入資料優先保留，其餘回合仍正常寫入。
+- 修正舊版匯出檔（未含 `usage_identity`）匯入後與本機 rollout 資料列以不同身分並存、同一回合被重複計算的問題；匯入時會由 transcript 路徑推導 rollout 身分，身分遷移也會為既有匯入資料列補上身分（附 `NOT EXISTS` 保護，避免唯一鍵衝突中斷遷移）。
+- 撤銷 Codex 匯入批次時會一併清除受影響 rollout 的同步狀態，下一次同步會重新解析該 rollout，將讓位給匯入資料的本機資料列補回。
+- 修正舊匯出檔（未含 `source_kind`）匯入 Codex 資料時，因來源類型預設為 `legacy` 而無法與本機的 `codex-desktop` / `codex-cli` 資料列落在同一個唯一鍵、同一回合仍被重複計算的問題；匯入時會沿用本機既有資料列的來源類型，讓匯入列正確去重。
+- 修正身分遷移的孤兒清除可能把僅有匯入資料的 Session 視為已追蹤，而誤刪本機無 transcript 路徑的舊資料列的問題；孤兒判定現在只採計本機資料列。
+- 修正匯出檔帶有 `legacy` 來源類型時仍無法與本機資料列去重的問題；匯入時只要來源類型不是可辨識的 Codex 類型，就會改用本機既有資料列的來源類型。
+- 修正 rollout 先匯入、後才被本機同步解析時，因來源類型不同而多出一筆重複資料列的問題；本機同步現在會讓位給同一 rollout 與回合的匯入資料，即使來源類型不同。
+- 修正「本機是否已存有某個 rollout」的判斷把匯入資料列一併算入的問題；同步狀態現在只反映本機資料列，全部回合都由匯入批次提供的 rollout 會以既有的空內容標記記錄狀態，避免每個同步週期重複解析，撤銷匯入後下一次同步即補回本機資料列。
+- 修正 canonical 檔案因正在寫入或損毀而無法完整解析時，仍可能被視為該 rollout 的唯一來源的問題；此時若副本能完整解析且涵蓋更多回合，會改由該副本提供資料，避免新資料庫永久漏掉整個 rollout 的用量。
+- 修正只解析到部分內容的 rollout 仍會以「已同步」狀態記錄、進而在後續週期被當成可安全刪除副本的問題；解析不完整的狀態不再觸發副本清除，直到 canonical 檔案能完整解析。
+- 修正 rollout 身分判定未檢查副檔名，導致同名的非 `.jsonl` 檔案（例如 `rollout-x.txt`）與真正的 `rollout-x.jsonl` 共用身分而可能互相清除資料的問題；現在只接受 `.jsonl` 副檔名（不分大小寫）。
+- 修正舊版本遺留的跨來源重複資料列在該 rollout 的同步狀態已是最新時仍會永久重複計算的問題；身分遷移現在會清除與匯入資料屬於同一回合的本機資料列，讓同鍵的匯入資料優先保留。
+- 修正身分遷移的孤兒資料清除未比對來源類型、可能把其他來源類型中同樣沒有 transcript 路徑的資料列一併刪除的問題；孤兒判定現在限定相同的 `source_kind`。
+- 修正匯入時查詢本機既有資料列來源類型的語句未帶 `usage_identity <> ''`、無法命中部分索引的問題；大型資料庫改走 `idx_assistant_usage_identity`，避免逐筆掃描 `idx_assistant_type` 或 `idx_assistant_transcript_path`。
+
+### 資料影響
+
+- `usage_entries` 既有的 `usage_identity` 欄位（1.0.0 導入，預設空字串不需人工調整）自本次起由 Codex 的 rollout 檔案以檔名寫入穩定身分；啟動時會自動執行一次性遷移 `migration:codex_rollout_identity_v1`，回填既有資料並清除已無對應檔案的孤兒資料列（僅影響 `assistant_type = 'codex'` 且非匯入的資料列）。
+- 新增部分索引 `idx_assistant_usage_identity`（`WHERE usage_identity <> ''`）以加速身分範圍的刪除；大型資料庫可顯著降低同步時的刪除耗時。
+- 手動匯入的資料列（`import_source_id` / `import_batch_id` 非空）改由匯入批次管理：本機 Codex transcript 同步不再刪除或改寫其 `usage_identity`，rollout 遷移亦不會將其視為孤兒資料清除；「本機已存有此 rollout」的判定與重複副本清除也只採計本機資料列。
+
+### 相容性
+
+- 同一 Session ID 的不同 rollout 檔案（續傳分段）改為各自保留資料列，報表由既有 Session 身分模型自動合併，每日、每月、年度、模型明細與時間軸的計算結果維持一致或更完整。
+- 匯出／匯入格式新增選用的 `usage_identity` 欄位；缺少該欄位的既有匯出檔仍可正常匯入。
+
 ## [1.0.1] - 2026-09-20
 
 ### 新增與改善
