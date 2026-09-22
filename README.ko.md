@@ -780,14 +780,14 @@ token-usage-insights update --check
 # 최신 버전으로 자동 업데이트 (--force, --target-version 지원)
 token-usage-insights update
 token-usage-insights update --force
-token-usage-insights update --target-version v1.0.2
+token-usage-insights update --target-version v1.0.3
 ```
 
 환경 변수로 버전과 설치 경로를 제어할 수 있습니다(모두 선택 사항).
 
 | 변수 | 대상 플랫폼 | 설명 |
 | --- | --- | --- |
-| `TOKEN_USAGE_INSIGHTS_VERSION` | Linux / macOS / Windows | 설치할 Release tag(예: `v1.0.2`); 기본값은 `latest` |
+| `TOKEN_USAGE_INSIGHTS_VERSION` | Linux / macOS / Windows | 설치할 Release tag(예: `v1.0.3`); 기본값은 `latest` |
 | `TOKEN_USAGE_INSIGHTS_INSTALL_DIR` | Linux / macOS | `install.sh`에 전달할 설치 디렉터리 |
 | `TOKEN_USAGE_INSIGHTS_BIN_DIR` | Linux / macOS | `install.sh`에 전달할 실행 파일 링크 디렉터리 |
 

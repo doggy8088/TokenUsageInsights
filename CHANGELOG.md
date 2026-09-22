@@ -4,7 +4,9 @@
 
 ## [未發行]
 
-## [1.0.2] - 2026-09-22
+## [1.0.3] - 2026-09-22
+
+> 註：先前的 `v1.0.2` 標籤因 Release workflow 的 Windows 測試失敗而未產生任何 Release 成品，本節內容與該測試修正一併以 `v1.0.3` 發佈；`v1.0.2` 標籤維持原狀，未移動或刪除。
 
 ### 新增與改善
 
@@ -33,6 +35,7 @@
 - 修正身分遷移的孤兒資料清除未比對來源類型、可能把其他來源類型中同樣沒有 transcript 路徑的資料列一併刪除的問題；孤兒判定現在限定相同的 `source_kind`。
 - 修正匯入時查詢本機既有資料列來源類型的語句未帶 `usage_identity <> ''`、無法命中部分索引的問題；大型資料庫改走 `idx_assistant_usage_identity`，避免逐筆掃描 `idx_assistant_type` 或 `idx_assistant_transcript_path`。
 - 修正 rollout 身分遷移在大型資料庫上耗時過久的效能問題：遷移的三個相互關聯子查詢原先無法使用部分索引、退化成每個資料列各掃描一次全部 Codex 資料列，179,312 筆的資料庫會卡在同步中數十分鐘以上；遷移期間改為建立兩個非部分索引供其尋址並於交易內移除，同一資料庫的首次同步實測 74 秒完成。
+- 修正 Codex 同步測試在 Windows 上以混合路徑分隔符號（`sessions/2026/09/11`）建立測試目錄，導致字串比對與 collector 實際寫入的原生分隔符號不一致、Release workflow 的 Windows 測試（330 passed / 36 failed）失敗而阻斷 `v1.0.2` 發佈的問題；測試改以逐層 `join` 建立路徑，三個平台的行為與資料列寫入路徑拼法一致。產品邏輯本身不受影響。
 
 ### 資料影響
 
@@ -733,8 +736,8 @@
 - 修正行動版側邊欄遮擋、黑畫面、標題擠壓、圖表導覽索引與年度版面問題。
 - 修正並補齊多個 Gemini、Claude、GPT 與 GPT-OSS 模型的定價規則。
 
-[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.0.2...HEAD
-[1.0.2]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.0.1...v1.0.2
+[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.0.3...HEAD
+[1.0.3]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.0.1...v1.0.3
 [1.0.1]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.9.9...v1.0.0
 [0.9.9]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.9.8...v0.9.9

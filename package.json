@@ -1,6 +1,6 @@
 {
   "name": "token-usage-insights",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "type": "module",
   "description": "Local-first AI coding agent token usage dashboard and CLI",
   "bin": {

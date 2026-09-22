@@ -780,14 +780,14 @@ token-usage-insights update --check
 # 原地自我更新至最新版本（亦支持 --force 强制覆盖、--target-version 指定版本）
 token-usage-insights update
 token-usage-insights update --force
-token-usage-insights update --target-version v1.0.2
+token-usage-insights update --target-version v1.0.3
 ```
 
 环境变量可控制版本与安装路径（均为可选）：
 
 | 变量 | 适用平台 | 说明 |
 | --- | --- | --- |
-| `TOKEN_USAGE_INSIGHTS_VERSION` | Linux / macOS / Windows | 指定要安装的 Release tag，例如 `v1.0.2`。默认 `latest` |
+| `TOKEN_USAGE_INSIGHTS_VERSION` | Linux / macOS / Windows | 指定要安装的 Release tag，例如 `v1.0.3`。默认 `latest` |
 | `TOKEN_USAGE_INSIGHTS_INSTALL_DIR` | Linux / macOS | 安装目录，会传递给 `install.sh` |
 | `TOKEN_USAGE_INSIGHTS_BIN_DIR` | Linux / macOS | 可执行文件链接目录，会传递给 `install.sh` |
 
