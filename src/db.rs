@@ -1,6 +1,6 @@
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -160,6 +160,7 @@ pub struct UsageImportRollbackSummary {
 
 const CODEX_PARSER_MIGRATION_KEY: &str = "migration:codex_session_identity_v7";
 const CODEX_SOURCE_KIND_MIGRATION_KEY: &str = "migration:codex_source_kind_v1";
+const CODEX_ROLLOUT_IDENTITY_MIGRATION_KEY: &str = "migration:codex_rollout_identity_v1";
 const CODEX_CLI_SOURCE_KIND: &str = "codex-cli";
 const CODEX_DESKTOP_SOURCE_KIND: &str = "codex-desktop";
 const CODEX_OTHER_SOURCE_KIND: &str = "codex-other";
@@ -875,6 +876,17 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
             e
         )
     })?;
+
+    // Collectors that assign a non-empty usage_identity (Copilot per-model
+    // rows and Codex rollout transcripts) replace their rows by identity, so
+    // the identity lookup must not scan the whole table.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_assistant_usage_identity
+         ON usage_entries(assistant_type, usage_identity)
+         WHERE usage_identity <> ''",
+        [],
+    )
+    .map_err(|e| format!("建立來源身分索引 idx_assistant_usage_identity 失敗: {}", e))?;
 
     let _ = conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS uidx_assistant_import_source_id ON usage_entries(assistant_type, import_source_id) WHERE import_source_id IS NOT NULL",
@@ -1836,6 +1848,88 @@ fn run_codex_source_kind_migration(conn: &mut Connection) -> Result<(), String> 
     .map_err(|error| format!("記錄 Codex 來源分類遷移失敗: {error}"))?;
     tx.commit()
         .map_err(|error| format!("Codex 來源分類遷移 COMMIT 失敗: {error}"))
+}
+
+/// Attach every stored Codex row to the rollout transcript it came from.
+///
+/// Rows written before rollout identities existed could only be matched by
+/// `transcript_path`, which changes as soon as Codex moves a session between
+/// `sessions` and `archived_sessions`. Backfilling the identity keeps those
+/// rows attached to their rollout while the sync rewrites them.
+fn run_codex_rollout_identity_migration(conn: &mut Connection) -> Result<(), String> {
+    let migration_done: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = ?)",
+            params![CODEX_ROLLOUT_IDENTITY_MIGRATION_KEY],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    if migration_done {
+        return Ok(());
+    }
+
+    let untracked_paths = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT transcript_path
+                 FROM usage_entries
+                 WHERE assistant_type = 'codex'
+                   AND usage_identity = ''
+                   AND transcript_path IS NOT NULL",
+            )
+            .map_err(|error| format!("準備讀取未標記 Codex transcript 失敗: {error}"))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("讀取未標記 Codex transcript 失敗: {error}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("解析未標記 Codex transcript 失敗: {error}"))?
+    };
+
+    let tx = conn
+        .transaction()
+        .map_err(|error| format!("Codex rollout 身分遷移 BEGIN 失敗: {error}"))?;
+
+    for stored_path in untracked_paths {
+        let Some(identity) = codex_rollout_identity(&stored_path) else {
+            continue;
+        };
+        tx.execute(
+            "UPDATE usage_entries
+             SET usage_identity = ?
+             WHERE assistant_type = 'codex'
+               AND transcript_path = ?
+               AND usage_identity = ''",
+            params![identity, stored_path],
+        )
+        .map_err(|error| format!("標記 Codex rollout 身分失敗: {error}"))?;
+    }
+
+    // Rows without a transcript path cannot belong to any transcript, so a
+    // session that is tracked by a rollout transcript supersedes them.
+    tx.execute(
+        "DELETE FROM usage_entries
+         WHERE assistant_type = 'codex'
+           AND usage_identity = ''
+           AND COALESCE(transcript_path, '') = ''
+           AND EXISTS (
+                SELECT 1 FROM usage_entries AS tracked
+                WHERE tracked.assistant_type = 'codex'
+                  AND tracked.session_id = usage_entries.session_id
+                  AND tracked.usage_identity <> ''
+           )",
+        [],
+    )
+    .map_err(|error| format!("清除未追蹤的 Codex 舊資料失敗: {error}"))?;
+
+    tx.execute(
+        "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time)
+         VALUES (?, 1, 0)",
+        params![CODEX_ROLLOUT_IDENTITY_MIGRATION_KEY],
+    )
+    .map_err(|error| format!("記錄 Codex rollout 身分遷移失敗: {error}"))?;
+    tx.commit()
+        .map_err(|error| format!("Codex rollout 身分遷移 COMMIT 失敗: {error}"))
 }
 
 fn portable_relative_path(root: &Path, path: &Path) -> String {
@@ -3657,6 +3751,136 @@ fn load_codex_transcript_paths(conn: &Connection) -> Result<HashMap<String, Vec<
     Ok(group_codex_transcript_paths(paths, cfg!(windows)))
 }
 
+/// Stable identity of one Codex rollout transcript.
+///
+/// Codex writes every transcript as
+/// `rollout-<timestamp>-<session>[_<rollout>].jsonl` and keeps that file name
+/// when it moves a session from `sessions` to `archived_sessions`. The file
+/// name therefore identifies one transcript across directory moves, keeps
+/// continuation segments of one session apart, and collapses copied
+/// transcripts of the same rollout into a single identity.
+fn codex_rollout_identity(path: &str) -> Option<String> {
+    let file_name = path.rsplit(['/', '\\']).next()?;
+    let stem = file_name
+        .rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(file_name)
+        .trim();
+
+    if stem.is_empty() {
+        return None;
+    }
+
+    Some(format!("rollout={stem}"))
+}
+
+/// One Codex transcript file together with the identity of its file name.
+#[derive(Debug, Clone)]
+struct CodexTranscript {
+    path: PathBuf,
+    identity: String,
+    size: u64,
+}
+
+fn collect_codex_transcripts(dir: &Path) -> Vec<CodexTranscript> {
+    let mut transcripts = Vec::new();
+
+    for filepath in find_codex_session_files(dir) {
+        let Ok(metadata) = fs::metadata(&filepath) else {
+            continue;
+        };
+        let Some(identity) = codex_rollout_identity(&filepath.to_string_lossy()) else {
+            continue;
+        };
+
+        transcripts.push(CodexTranscript {
+            path: filepath,
+            identity,
+            size: metadata.len(),
+        });
+    }
+
+    transcripts
+}
+
+/// Rank transcripts that share one rollout identity so that the most complete
+/// copy wins: more content first, then the live `sessions` directory (Codex
+/// only moves a transcript to `archived_sessions` once it stops appending to
+/// it), and finally the path so the choice never depends on directory order.
+fn codex_transcript_canonical_rank(
+    sessions_dir: &Path,
+    transcript: &CodexTranscript,
+) -> (u64, bool, String) {
+    (
+        transcript.size,
+        transcript.path.starts_with(sessions_dir),
+        transcript.path.to_string_lossy().into_owned(),
+    )
+}
+
+/// Drop rows that were written from a copy of a rollout whose canonical
+/// transcript lives under another path.
+fn drop_codex_rows_for_transcript_path(
+    conn: &Connection,
+    transcript_paths: &HashMap<String, Vec<String>>,
+    path: &Path,
+) -> Result<(), String> {
+    let path = path.to_string_lossy();
+    let Some(stored_paths) = transcript_paths.get(&codex_transcript_path_key(&path)) else {
+        return Ok(());
+    };
+
+    for stored_path in stored_paths {
+        conn.execute(
+            "DELETE FROM usage_entries
+             WHERE assistant_type = 'codex' AND transcript_path = ?",
+            params![stored_path],
+        )
+        .map_err(|error| format!("清除重複 Codex transcript 資料失敗: {error}"))?;
+    }
+
+    Ok(())
+}
+
+/// Remove every row of one rollout before its transcript is rewritten: rows
+/// carrying the rollout identity (written from another location or by an older
+/// parser), rows stored under a previous spelling of the path, and rows written
+/// before rollout identities existed.
+fn purge_codex_transcript_rows(
+    tx: &rusqlite::Transaction<'_>,
+    identity: &str,
+    transcript_path: &str,
+    known_transcript_paths: Option<&Vec<String>>,
+) -> Result<(), String> {
+    // `usage_identity <> ''` keeps the partial identity index usable.
+    tx.execute(
+        "DELETE FROM usage_entries
+         WHERE assistant_type = 'codex'
+           AND usage_identity <> ''
+           AND usage_identity = ?",
+        params![identity],
+    )
+    .map_err(|error| format!("清空舊 Codex rollout 資料失敗: {error}"))?;
+
+    for existing_path in known_transcript_paths.into_iter().flatten() {
+        tx.execute(
+            "DELETE FROM usage_entries
+             WHERE assistant_type = 'codex' AND transcript_path = ?",
+            params![existing_path],
+        )
+        .map_err(|error| format!("清空舊 Codex transcript 資料失敗: {error}"))?;
+    }
+
+    tx.execute(
+        "DELETE FROM usage_entries
+         WHERE assistant_type = 'codex' AND transcript_path = ?",
+        params![transcript_path],
+    )
+    .map_err(|error| format!("清空舊 Codex transcript 資料失敗: {error}"))?;
+
+    Ok(())
+}
+
 fn codex_transcript_needs_sync(
     current_size: u64,
     last_synced_state: Option<(u64, i64)>,
@@ -3676,178 +3900,188 @@ fn sync_codex_usage_logs(conn: &mut Connection) -> Result<(), String> {
 
     run_codex_parser_migration(conn)?;
     run_codex_source_kind_migration(conn)?;
+    run_codex_rollout_identity_migration(conn)?;
 
-    let mut files = Vec::new();
-    for directory in [
-        codex_dir.join("sessions"),
-        codex_dir.join("archived_sessions"),
-    ] {
-        files.extend(find_codex_session_files(&directory));
-    }
-    files.sort();
+    let sessions_dir = codex_dir.join("sessions");
+    let mut transcripts = collect_codex_transcripts(&sessions_dir);
+    transcripts.extend(collect_codex_transcripts(
+        &codex_dir.join("archived_sessions"),
+    ));
 
-    if files.is_empty() {
+    if transcripts.is_empty() {
         return Ok(());
+    }
+
+    transcripts.sort_by(|left, right| left.path.cmp(&right.path));
+
+    // Codex keeps the transcript file name when a session moves between
+    // `sessions` and `archived_sessions`, so one file name identifies one
+    // rollout across moves. Copies of the same rollout share an identity and
+    // are synced once, while continuation segments of one session keep their
+    // own identities and stay side by side instead of deleting each other on
+    // every sync pass.
+    let mut transcripts_by_identity: BTreeMap<String, Vec<CodexTranscript>> = BTreeMap::new();
+    for transcript in transcripts {
+        transcripts_by_identity
+            .entry(transcript.identity.clone())
+            .or_default()
+            .push(transcript);
     }
 
     let transcript_paths = load_codex_transcript_paths(conn)?;
 
-    for filepath in files {
-        let state_path = portable_relative_path(&codex_dir, &filepath);
-        let state_key = format!("codex:{}", state_path);
-
-        let last_synced_state: Option<(u64, i64)> = conn
-            .query_row(
-                "SELECT last_synced_size, last_synced_time
-                 FROM sync_state
-                 WHERE filename = ?",
-                params![state_key],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .ok();
-
-        let metadata = match fs::metadata(&filepath) {
-            Ok(metadata) => metadata,
-            Err(_) => continue,
+    for (identity, group) in transcripts_by_identity {
+        let Some(canonical) = group
+            .iter()
+            .max_by_key(|transcript| codex_transcript_canonical_rank(&sessions_dir, transcript))
+            .cloned()
+        else {
+            continue;
         };
-        let current_size = metadata.len();
-        let transcript_path = filepath.to_string_lossy().into_owned();
-        let transcript_path_key = codex_transcript_path_key(&transcript_path);
-        let known_transcript_paths = transcript_paths.get(&transcript_path_key);
-        let transcript_is_current = known_transcript_paths.is_some();
 
-        if codex_transcript_needs_sync(current_size, last_synced_state, transcript_is_current) {
-            let parsed_entries = match parse_codex_session_file(&filepath) {
-                Ok(entries) => entries,
-                Err(e) => {
-                    eprintln!("解析 Codex 會話檔案 {:?} 失敗: {}", filepath, e);
-                    continue;
-                }
-            };
+        for duplicate in group.iter().filter(|entry| entry.path != canonical.path) {
+            drop_codex_rows_for_transcript_path(conn, &transcript_paths, &duplicate.path)?;
+        }
 
-            if parsed_entries.is_empty() {
-                conn.execute(
-                    "INSERT OR REPLACE INTO sync_state
-                     (filename, last_synced_size, last_synced_time)
-                     VALUES (?, ?, ?)",
-                    params![
-                        state_key,
-                        current_size as i64,
-                        CODEX_EMPTY_TRANSCRIPT_SYNC_TIME
-                    ],
-                )
-                .map_err(|error| format!("記錄空白 Codex transcript 同步狀態失敗: {error}"))?;
-                continue;
-            }
+        sync_codex_transcript(conn, &codex_dir, &identity, &canonical, &transcript_paths)?;
+    }
 
-            let tx = conn
-                .transaction()
-                .map_err(|e| format!("Transaction BEGIN 失敗: {}", e))?;
+    Ok(())
+}
 
-            if let Some(existing_paths) = known_transcript_paths {
-                for existing_path in existing_paths {
-                    tx.execute(
-                        "DELETE FROM usage_entries
-                         WHERE assistant_type = 'codex' AND transcript_path = ?",
-                        params![existing_path],
-                    )
-                    .map_err(|e| format!("清空舊 Codex transcript 資料失敗: {}", e))?;
-                }
-            } else {
-                tx.execute(
-                    "DELETE FROM usage_entries
-                     WHERE assistant_type = 'codex' AND transcript_path = ?",
-                    params![transcript_path],
-                )
-                .map_err(|e| format!("清空舊 Codex transcript 資料失敗: {}", e))?;
-            }
+/// Sync one Codex rollout transcript, replacing every row of that rollout.
+fn sync_codex_transcript(
+    conn: &mut Connection,
+    codex_dir: &Path,
+    identity: &str,
+    transcript: &CodexTranscript,
+    transcript_paths: &HashMap<String, Vec<String>>,
+) -> Result<(), String> {
+    let state_path = portable_relative_path(codex_dir, &transcript.path);
+    let state_key = format!("codex:{}", state_path);
 
-            let session_ids: HashSet<String> = parsed_entries
-                .iter()
-                .map(|entry| entry.session_id.clone())
-                .collect();
-            for session_id in session_ids {
-                tx.execute(
-                    "DELETE FROM usage_entries WHERE assistant_type = 'codex' AND session_id = ?",
-                    params![session_id],
-                )
-                .map_err(|e| format!("清空舊 Codex Session 資料失敗: {}", e))?;
-            }
+    let last_synced_state: Option<(u64, i64)> = conn
+        .query_row(
+            "SELECT last_synced_size, last_synced_time
+             FROM sync_state
+             WHERE filename = ?",
+            params![state_key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .ok();
 
-            let mut success = true;
-            for entry in &parsed_entries {
-                let tokens = entry.tokens.as_ref();
-                let delta = entry.delta_tokens.as_ref();
-                let cost = entry.cost.as_ref();
+    let current_size = transcript.size;
+    let transcript_path = transcript.path.to_string_lossy().into_owned();
+    let transcript_path_key = codex_transcript_path_key(&transcript_path);
+    let known_transcript_paths = transcript_paths.get(&transcript_path_key);
+    let transcript_is_current = known_transcript_paths.is_some();
 
-                let insert_res = tx.execute(
-                    "INSERT INTO usage_entries (
-                        assistant_type, source_kind, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
-                        tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_cache_write_5m, tokens_cache_write_1h, tokens_reasoning, tokens_total,
-                        delta_input, delta_output, delta_cache_read, delta_cache_write, delta_cache_write_5m, delta_cache_write_1h, delta_reasoning, delta_total,
-                        duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, reasoning_effort
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    params![
-                        "codex",
-                        entry.source_kind.as_deref().unwrap_or(CODEX_OTHER_SOURCE_KIND),
-                        entry.timestamp,
-                        entry.timestamp.get(0..10).unwrap_or("unknown"),
-                        entry.session_id,
-                        entry.session_name.as_deref(),
-                        entry.transcript_path.as_deref(),
-                        entry.cwd.as_deref(),
-                        entry.version.as_deref(),
-                        entry.turn_no as i64,
-                        entry.model.as_deref(),
-                        entry.model_id.as_deref(),
-                        tokens.map(|t| t.input as i64),
-                        tokens.map(|t| t.output as i64),
-                        tokens.and_then(|t| t.cache_read.map(|v| v as i64)),
-                        tokens.and_then(|t| t.cache_write.map(|v| v as i64)),
-                        tokens.and_then(|t| t.cache_write_5m.map(|v| v as i64)),
-                        tokens.and_then(|t| t.cache_write_1h.map(|v| v as i64)),
-                        tokens.and_then(|t| t.reasoning.map(|v| v as i64)),
-                        tokens.map(|t| t.total as i64),
-                        delta.map(|t| t.input as i64),
-                        delta.map(|t| t.output as i64),
-                        delta.and_then(|t| t.cache_read.map(|v| v as i64)),
-                        delta.and_then(|t| t.cache_write.map(|v| v as i64)),
-                        delta.and_then(|t| t.cache_write_5m.map(|v| v as i64)),
-                        delta.and_then(|t| t.cache_write_1h.map(|v| v as i64)),
-                        delta.and_then(|t| t.reasoning.map(|v| v as i64)),
-                        delta.map(|t| t.total as i64),
-                        cost.and_then(|c| c.total_api_duration_ms.map(|d| d as i64)),
-                        cost.and_then(|c| c.total_premium_requests.map(|r| r as i64)),
-                        entry.parent_session_id.as_deref(),
-                        entry.agent_nickname.as_deref(),
-                        entry.agent_role.as_deref(),
-                        entry.reasoning_effort.as_deref()
-                    ],
-                );
+    if !codex_transcript_needs_sync(current_size, last_synced_state, transcript_is_current) {
+        return Ok(());
+    }
 
-                if let Err(e) = insert_res {
-                    eprintln!("寫入 Codex 資料庫失敗 (turn_no {}): {}", entry.turn_no, e);
-                    success = false;
-                    break;
-                }
-            }
+    let parsed_entries = match parse_codex_session_file(&transcript.path) {
+        Ok(entries) => entries,
+        Err(error) => {
+            eprintln!("解析 Codex 會話檔案 {:?} 失敗: {}", transcript.path, error);
+            return Ok(());
+        }
+    };
 
-            if success {
-                let now = SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i64;
+    if parsed_entries.is_empty() {
+        conn.execute(
+            "INSERT OR REPLACE INTO sync_state
+             (filename, last_synced_size, last_synced_time)
+             VALUES (?, ?, ?)",
+            params![
+                state_key,
+                current_size as i64,
+                CODEX_EMPTY_TRANSCRIPT_SYNC_TIME
+            ],
+        )
+        .map_err(|error| format!("記錄空白 Codex transcript 同步狀態失敗: {error}"))?;
+        return Ok(());
+    }
 
-                let update_state_res = tx.execute(
-                    "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time) VALUES (?, ?, ?)",
-                    params![state_key, current_size as i64, now],
-                );
+    let tx = conn
+        .transaction()
+        .map_err(|error| format!("Transaction BEGIN 失敗: {error}"))?;
 
-                if update_state_res.is_ok() {
-                    if let Err(e) = tx.commit() {
-                        eprintln!("Transaction COMMIT 失敗: {}", e);
-                    }
-                }
+    purge_codex_transcript_rows(&tx, identity, &transcript_path, known_transcript_paths)?;
+
+    let mut success = true;
+    for entry in &parsed_entries {
+        let tokens = entry.tokens.as_ref();
+        let delta = entry.delta_tokens.as_ref();
+        let cost = entry.cost.as_ref();
+
+        let insert_res = tx.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, usage_identity, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
+                tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_cache_write_5m, tokens_cache_write_1h, tokens_reasoning, tokens_total,
+                delta_input, delta_output, delta_cache_read, delta_cache_write, delta_cache_write_5m, delta_cache_write_1h, delta_reasoning, delta_total,
+                duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, reasoning_effort
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                "codex",
+                entry.source_kind.as_deref().unwrap_or(CODEX_OTHER_SOURCE_KIND),
+                identity,
+                entry.timestamp,
+                entry.timestamp.get(0..10).unwrap_or("unknown"),
+                entry.session_id,
+                entry.session_name.as_deref(),
+                entry.transcript_path.as_deref(),
+                entry.cwd.as_deref(),
+                entry.version.as_deref(),
+                entry.turn_no as i64,
+                entry.model.as_deref(),
+                entry.model_id.as_deref(),
+                tokens.map(|t| t.input as i64),
+                tokens.map(|t| t.output as i64),
+                tokens.and_then(|t| t.cache_read.map(|v| v as i64)),
+                tokens.and_then(|t| t.cache_write.map(|v| v as i64)),
+                tokens.and_then(|t| t.cache_write_5m.map(|v| v as i64)),
+                tokens.and_then(|t| t.cache_write_1h.map(|v| v as i64)),
+                tokens.and_then(|t| t.reasoning.map(|v| v as i64)),
+                tokens.map(|t| t.total as i64),
+                delta.map(|t| t.input as i64),
+                delta.map(|t| t.output as i64),
+                delta.and_then(|t| t.cache_read.map(|v| v as i64)),
+                delta.and_then(|t| t.cache_write.map(|v| v as i64)),
+                delta.and_then(|t| t.cache_write_5m.map(|v| v as i64)),
+                delta.and_then(|t| t.cache_write_1h.map(|v| v as i64)),
+                delta.and_then(|t| t.reasoning.map(|v| v as i64)),
+                delta.map(|t| t.total as i64),
+                cost.and_then(|c| c.total_api_duration_ms.map(|d| d as i64)),
+                cost.and_then(|c| c.total_premium_requests.map(|r| r as i64)),
+                entry.parent_session_id.as_deref(),
+                entry.agent_nickname.as_deref(),
+                entry.agent_role.as_deref(),
+                entry.reasoning_effort.as_deref()
+            ],
+        );
+
+        if let Err(e) = insert_res {
+            eprintln!("寫入 Codex 資料庫失敗 (turn_no {}): {}", entry.turn_no, e);
+            success = false;
+            break;
+        }
+    }
+
+    if success {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        let update_state_res = tx.execute(
+            "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time) VALUES (?, ?, ?)",
+            params![state_key, current_size as i64, now],
+        );
+
+        if update_state_res.is_ok() {
+            if let Err(e) = tx.commit() {
+                eprintln!("Transaction COMMIT 失敗: {}", e);
             }
         }
     }
@@ -7655,6 +7889,345 @@ mod tests {
             )
             .unwrap();
         assert_eq!(inserted, ("copilot-cli".to_string(), 42_530, 42_530));
+    }
+
+    fn codex_token_count_event(timestamp: &str, input: u64, cached: u64, output: u64) -> String {
+        let total = input + output;
+        format!(
+            r#"{{"timestamp":"{timestamp}","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":{input},"cached_input_tokens":{cached},"output_tokens":{output},"reasoning_output_tokens":0,"total_tokens":{total}}},"model_context_window":258400}}}}}}"#
+        )
+    }
+
+    fn codex_session_meta(session_id: &str) -> String {
+        format!(
+            r#"{{"timestamp":"2026-09-10T16:06:47.280Z","type":"session_meta","payload":{{"session_id":"{session_id}","id":"{session_id}","originator":"Codex Desktop","source":"vscode","cwd":"/tmp/project","cli_version":"0.153.4"}}}}"#
+        )
+    }
+
+    #[test]
+    fn codex_rollout_identity_follows_the_transcript_file_name() {
+        assert_eq!(
+            codex_rollout_identity(
+                "/home/u/.codex/sessions/2026/09/11/rollout-2026-09-11T00-06-46-abc.jsonl"
+            )
+            .as_deref(),
+            Some("rollout=rollout-2026-09-11T00-06-46-abc")
+        );
+        assert_eq!(
+            codex_rollout_identity(
+                r"C:\Users\u\.codex\archived_sessions\rollout-2026-09-11T00-06-46-abc.jsonl"
+            )
+            .as_deref(),
+            Some("rollout=rollout-2026-09-11T00-06-46-abc")
+        );
+        assert_eq!(
+            codex_rollout_identity("rollout-2026-09-11T00-09-32-abc_def.jsonl").as_deref(),
+            Some("rollout=rollout-2026-09-11T00-09-32-abc_def")
+        );
+        assert_eq!(codex_rollout_identity(""), None);
+        assert_eq!(codex_rollout_identity("/tmp/.jsonl"), None);
+    }
+
+    #[test]
+    fn codex_rollout_identity_migration_marks_stored_rows_once() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, transcript_path, turn_no
+             ) VALUES ('codex', '2026-09-10T16:06:50Z', '2026-09-10',
+                'shared-session', '/codex/sessions/2026/09/11/rollout-a.jsonl', 2)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, transcript_path, turn_no
+             ) VALUES ('codex', '2026-09-10T16:09:50Z', '2026-09-10',
+                'shared-session',
+                '/codex/archived_sessions/rollout-a_1.jsonl', 3)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, turn_no
+             ) VALUES ('codex', '2026-09-10T16:06:50Z', '2026-09-10',
+                'shared-session', 4)",
+            [],
+        )
+        .unwrap();
+
+        run_codex_rollout_identity_migration(&mut conn).unwrap();
+
+        let identities: Vec<String> = conn
+            .prepare(
+                "SELECT usage_identity
+                 FROM usage_entries
+                 WHERE assistant_type = 'codex' AND transcript_path IS NOT NULL
+                 ORDER BY transcript_path",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            identities,
+            vec![
+                "rollout=rollout-a_1".to_string(),
+                "rollout=rollout-a".to_string()
+            ]
+        );
+
+        let untracked_rows: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'codex' AND transcript_path IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(untracked_rows, 0);
+
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, transcript_path, turn_no
+             ) VALUES ('codex', '2026-09-10T16:06:50Z', '2026-09-10',
+                'later-session', '/codex/sessions/2026/09/11/rollout-b.jsonl', 1)",
+            [],
+        )
+        .unwrap();
+        run_codex_rollout_identity_migration(&mut conn).unwrap();
+        let later_identity: String = conn
+            .query_row(
+                "SELECT usage_identity FROM usage_entries
+                 WHERE assistant_type = 'codex' AND transcript_path = '/codex/sessions/2026/09/11/rollout-b.jsonl'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(later_identity, "");
+    }
+
+    #[test]
+    fn sync_codex_usage_logs_keeps_transcripts_sharing_one_session_id() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_codex_dir = std::env::var("CODEX_DIR").ok();
+        let mut codex_dir = std::env::temp_dir();
+        let unique = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        codex_dir.push(format!(
+            "codex-shared-session-{}-{}",
+            std::process::id(),
+            unique
+        ));
+
+        let sessions_dir = codex_dir.join("sessions/2026/09/11");
+        let archived_dir = codex_dir.join("archived_sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        fs::create_dir_all(&archived_dir).unwrap();
+
+        let session_id = "01a08c12-5574-74a1-877d-613d596f0a05";
+        let active_path =
+            sessions_dir.join(format!("rollout-2026-09-11T00-06-46-{session_id}.jsonl"));
+        let archived_path = archived_dir.join(format!(
+            "rollout-2026-09-11T00-09-32-{session_id}_01a08c14-db4d-7e50-bbf3-d5a48cce3e1f.jsonl"
+        ));
+
+        let content = |event: String| format!("{}\n{}\n", codex_session_meta(session_id), event);
+        fs::write(
+            &active_path,
+            content(codex_token_count_event(
+                "2026-09-10T16:06:50.000Z",
+                100,
+                20,
+                10,
+            )),
+        )
+        .unwrap();
+        fs::write(
+            &archived_path,
+            content(codex_token_count_event(
+                "2026-09-10T16:09:50.000Z",
+                50,
+                10,
+                5,
+            )),
+        )
+        .unwrap();
+        std::env::set_var("CODEX_DIR", &codex_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let codex_summary = |conn: &Connection| {
+            let rows: (u64, u64, u64) = conn
+                .query_row(
+                    "SELECT COUNT(*), COUNT(DISTINCT transcript_path), COALESCE(SUM(delta_total), 0)
+                     FROM usage_entries WHERE assistant_type = 'codex'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            let identities: Vec<String> = conn
+                .prepare(
+                    "SELECT DISTINCT usage_identity
+                     FROM usage_entries
+                     WHERE assistant_type = 'codex'
+                     ORDER BY usage_identity",
+                )
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            (rows, identities)
+        };
+
+        sync_codex_usage_logs(&mut conn).unwrap();
+        let (first_rows, first_identities) = codex_summary(&conn);
+        assert_eq!(first_rows, (2, 2, 165));
+        assert_eq!(first_identities.len(), 2);
+        assert!(first_identities
+            .iter()
+            .all(|identity| identity.starts_with("rollout=rollout-2026-09-11T00-")));
+
+        for _ in 0..3 {
+            sync_codex_usage_logs(&mut conn).unwrap();
+            let (rows, identities) = codex_summary(&conn);
+            assert_eq!(rows, first_rows);
+            assert_eq!(identities, first_identities);
+        }
+
+        let transcript_paths: Vec<String> = conn
+            .prepare(
+                "SELECT DISTINCT transcript_path
+                 FROM usage_entries
+                 WHERE assistant_type = 'codex'
+                 ORDER BY transcript_path",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let mut expected_paths = vec![
+            active_path.to_string_lossy().into_owned(),
+            archived_path.to_string_lossy().into_owned(),
+        ];
+        expected_paths.sort();
+        assert_eq!(transcript_paths, expected_paths);
+
+        if let Some(value) = old_codex_dir {
+            std::env::set_var("CODEX_DIR", value);
+        } else {
+            std::env::remove_var("CODEX_DIR");
+        }
+        let _ = fs::remove_dir_all(&codex_dir);
+    }
+
+    #[test]
+    fn sync_codex_usage_logs_syncs_one_canonical_copy_of_a_rollout() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_codex_dir = std::env::var("CODEX_DIR").ok();
+        let mut codex_dir = std::env::temp_dir();
+        let unique = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        codex_dir.push(format!(
+            "codex-copy-session-{}-{}",
+            std::process::id(),
+            unique
+        ));
+
+        let sessions_dir = codex_dir.join("sessions/2026/09/11");
+        let archived_dir = codex_dir.join("archived_sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        fs::create_dir_all(&archived_dir).unwrap();
+
+        let file_name = "rollout-2026-09-11T00-06-46-desktop-session.jsonl";
+        let active_path = sessions_dir.join(file_name);
+        let archived_path = archived_dir.join(file_name);
+
+        // The archived copy is more complete, so it wins over the live file.
+        fs::write(
+            &active_path,
+            format!(
+                "{}\n{}\n",
+                codex_session_meta("desktop-session"),
+                codex_token_count_event("2026-09-10T16:06:50.000Z", 100, 20, 10)
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &archived_path,
+            format!(
+                "{}\n{}\n{}\n",
+                codex_session_meta("desktop-session"),
+                codex_token_count_event("2026-09-10T16:06:50.000Z", 100, 20, 10),
+                codex_token_count_event("2026-09-10T16:09:50.000Z", 150, 30, 15)
+            ),
+        )
+        .unwrap();
+        std::env::set_var("CODEX_DIR", &codex_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, transcript_path, turn_no
+             ) VALUES ('codex', '2026-09-10T16:06:50Z', '2026-09-10',
+                'desktop-session', ?, 1)",
+            params![active_path.to_string_lossy().as_ref()],
+        )
+        .unwrap();
+
+        let codex_rows = |conn: &Connection| {
+            let rows: (u64, u64, u64) = conn
+                .query_row(
+                    "SELECT COUNT(*), COUNT(DISTINCT transcript_path), COALESCE(SUM(delta_total), 0)
+                     FROM usage_entries WHERE assistant_type = 'codex'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            let transcript_path: String = conn
+                .query_row(
+                    "SELECT transcript_path FROM usage_entries
+                     WHERE assistant_type = 'codex' LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            (rows, transcript_path)
+        };
+
+        sync_codex_usage_logs(&mut conn).unwrap();
+        let (first_rows, first_path) = codex_rows(&conn);
+        assert_eq!(first_rows, (2, 1, 165));
+        assert_eq!(PathBuf::from(&first_path), archived_path);
+
+        sync_codex_usage_logs(&mut conn).unwrap();
+        assert_eq!(codex_rows(&conn), (first_rows, first_path));
+
+        // An equally complete live copy takes over because Codex only archives
+        // a transcript after it stops writing to it.
+        let shared_content = format!(
+            "{}\n{}\n",
+            codex_session_meta("desktop-session"),
+            codex_token_count_event("2026-09-10T16:06:50.000Z", 100, 20, 10)
+        );
+        fs::write(&active_path, &shared_content).unwrap();
+        fs::write(&archived_path, &shared_content).unwrap();
+        sync_codex_usage_logs(&mut conn).unwrap();
+        let (copied_rows, copied_path) = codex_rows(&conn);
+        assert_eq!(copied_rows, (1, 1, 110));
+        assert_eq!(PathBuf::from(&copied_path), active_path);
+
+        if let Some(value) = old_codex_dir {
+            std::env::set_var("CODEX_DIR", value);
+        } else {
+            std::env::remove_var("CODEX_DIR");
+        }
+        let _ = fs::remove_dir_all(&codex_dir);
     }
 
     #[test]

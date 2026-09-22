@@ -4,6 +4,20 @@
 
 ## [未發行]
 
+### 修正
+
+- 修正 Codex Session 在 `~/.codex/sessions` 與 `~/.codex/archived_sessions` 之間移動、或同一 Session 同時存在多個 rollout 檔案時，看板數字每隔幾秒在兩組數值間反覆跳動的問題（Issue #54）。
+
+### 資料影響
+
+- 新增 `usage_identity` 欄位（既有 `usage_entries` 資料表，預設空字串不需人工調整），Codex 的 rollout 檔案以檔名作為穩定身分寫入；啟動時會自動執行一次性遷移 `migration:codex_rollout_identity_v1`，回填既有資料並清除已無對應檔案的孤兒資料列（僅影響 `assistant_type = 'codex'`）。
+- 新增部分索引 `idx_assistant_usage_identity`（`WHERE usage_identity <> ''`）以加速身分範圍的刪除；大型資料庫可顯著降低同步時的刪除耗時。
+
+### 相容性
+
+- 同一 Session ID 的不同 rollout 檔案（續傳分段）改為各自保留資料列，報表由既有 Session 身分模型自動合併，每日、每月、年度、模型明細與時間軸的計算結果維持一致或更完整。
+- 匯出／匯入格式新增選用的 `usage_identity` 欄位；缺少該欄位的既有匯出檔仍可正常匯入。
+
 ## [1.0.1] - 2026-09-20
 
 ### 新增與改善
