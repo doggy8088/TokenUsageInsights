@@ -3756,12 +3756,19 @@ fn group_codex_transcript_paths(
     grouped_paths
 }
 
+/// Stored transcript paths of the local Codex rows, grouped by their normalized
+/// spelling. Imported rows are excluded: they carry the path of the machine the
+/// export came from and are owned by the import batch, so they must not make a
+/// local transcript look like it is already stored.
 fn load_codex_transcript_paths(conn: &Connection) -> Result<HashMap<String, Vec<String>>, String> {
     let mut stmt = conn
         .prepare(
             "SELECT DISTINCT transcript_path
              FROM usage_entries
-             WHERE assistant_type = 'codex' AND transcript_path IS NOT NULL",
+             WHERE assistant_type = 'codex'
+               AND transcript_path IS NOT NULL
+               AND import_source_id IS NULL
+               AND import_batch_id IS NULL",
         )
         .map_err(|error| format!("準備讀取 Codex transcript 路徑失敗: {error}"))?;
     let rows = stmt
@@ -4105,6 +4112,7 @@ fn sync_codex_transcript(
     )?;
 
     let mut success = true;
+    let mut wrote_local_rows = false;
     // Turns this rollout already covers through an import batch must not be
     // written again by the local parse. The check ignores the source kind: an
     // import created before the rollout existed locally keeps its `legacy` kind,
@@ -4192,17 +4200,29 @@ fn sync_codex_transcript(
             success = false;
             break;
         }
+
+        if insert_res.unwrap_or(0) > 0 {
+            wrote_local_rows = true;
+        }
     }
 
     if success {
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        // Every turn of this rollout is owned by an import batch, so the local
+        // store has nothing for it yet. Recording the empty-transcript marker
+        // keeps the next passes from re-parsing the file; rolling the import back
+        // clears this state, which makes the following pass store the local rows.
+        let last_synced_time = if wrote_local_rows || transcript_is_current {
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64
+        } else {
+            CODEX_EMPTY_TRANSCRIPT_SYNC_TIME
+        };
 
         let update_state_res = tx.execute(
             "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time) VALUES (?, ?, ?)",
-            params![state_key, current_size as i64, now],
+            params![state_key, current_size as i64, last_synced_time],
         );
 
         if update_state_res.is_ok() {
@@ -8776,6 +8796,121 @@ mod tests {
             )
             .unwrap();
         assert_eq!(synced_state, 1, "the sync transaction must commit");
+
+        if let Some(value) = old_codex_dir {
+            std::env::set_var("CODEX_DIR", value);
+        } else {
+            std::env::remove_var("CODEX_DIR");
+        }
+        let _ = fs::remove_dir_all(&codex_dir);
+    }
+
+    #[test]
+    fn sync_codex_usage_logs_defers_a_fully_imported_rollout_until_its_import_is_rolled_back() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_codex_dir = std::env::var("CODEX_DIR").ok();
+        let mut codex_dir = std::env::temp_dir();
+        let unique = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        codex_dir.push(format!(
+            "codex-fully-imported-{}-{}",
+            std::process::id(),
+            unique
+        ));
+
+        let sessions_dir = codex_dir.join("sessions/2026/09/11");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        let transcript_path = sessions_dir.join("rollout-2026-09-11T00-06-46-imported.jsonl");
+        fs::write(
+            &transcript_path,
+            format!(
+                "{}\n{}\n",
+                codex_session_meta("fully-imported-session"),
+                codex_token_count_event("2026-09-10T16:06:50.000Z", 100, 20, 10)
+            ),
+        )
+        .unwrap();
+        let transcript_size = fs::metadata(&transcript_path).unwrap().len();
+        std::env::set_var("CODEX_DIR", &codex_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let mut record = sample_import_record();
+        record.entry.session_id = "fully-imported-session".to_string();
+        record.entry.turn_no = 1;
+        record.entry.transcript_path = Some(transcript_path.to_string_lossy().into_owned());
+        record.usage_identity = None;
+        let summary = import_usage_day_entries(
+            &mut conn,
+            "codex",
+            "2026-09-10",
+            vec![record],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+
+        sync_codex_usage_logs(&mut conn).unwrap();
+
+        let local_rows: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'codex'
+                   AND session_id = 'fully-imported-session'
+                   AND import_source_id IS NULL
+                   AND import_batch_id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            local_rows, 0,
+            "a rollout owned by an import batch must not be written again locally"
+        );
+
+        let synced_state: (u64, i64) = conn
+            .query_row(
+                "SELECT last_synced_size, last_synced_time FROM sync_state
+                 WHERE filename LIKE 'codex:%imported.jsonl'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(synced_state.0, transcript_size);
+        assert_eq!(
+            synced_state.1, CODEX_EMPTY_TRANSCRIPT_SYNC_TIME,
+            "with no local rows stored yet the state must carry the empty-transcript marker"
+        );
+
+        // The marker keeps the following passes from re-parsing a rollout that is
+        // still owned by the import.
+        sync_codex_usage_logs(&mut conn).unwrap();
+        let state_after_second_pass: i64 = conn
+            .query_row(
+                "SELECT last_synced_time FROM sync_state WHERE filename LIKE 'codex:%imported.jsonl'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state_after_second_pass, CODEX_EMPTY_TRANSCRIPT_SYNC_TIME);
+
+        rollback_usage_import_batch(&mut conn, "codex", &summary.batch_id).unwrap();
+        sync_codex_usage_logs(&mut conn).unwrap();
+
+        let local_rows_after_rollback: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'codex'
+                   AND session_id = 'fully-imported-session'
+                   AND import_source_id IS NULL
+                   AND import_batch_id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            local_rows_after_rollback, 1,
+            "rolling the import back must let the local parse store the rollout again"
+        );
 
         if let Some(value) = old_codex_dir {
             std::env::set_var("CODEX_DIR", value);
