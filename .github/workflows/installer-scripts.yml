@@ -1,0 +1,41 @@
+name: Validate installer scripts
+
+on:
+  pull_request:
+    paths:
+      - "scripts/install.sh"
+      - "scripts/get.sh"
+      - "shell/token-usage-insights.service"
+      - "tests/install-systemd.test.sh"
+      - ".github/workflows/installer-scripts.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "scripts/install.sh"
+      - "scripts/get.sh"
+      - "shell/token-usage-insights.service"
+      - "tests/install-systemd.test.sh"
+      - ".github/workflows/installer-scripts.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test installer scripts and generated service units
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Lint installer scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n scripts/install.sh
+          bash -n scripts/get.sh
+          bash -n tests/install-systemd.test.sh
+
+      - name: Test generated systemd unit
+        run: bash tests/install-systemd.test.sh

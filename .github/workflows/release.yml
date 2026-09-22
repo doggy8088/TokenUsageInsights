@@ -73,6 +73,9 @@ jobs:
           set -euo pipefail
           bash -n scripts/install.sh
           bash -n scripts/get.sh
+          if [[ "${RUNNER_OS}" != "Windows" ]]; then
+            bash -n tests/install-systemd.test.sh
+          fi
           if command -v pwsh >/dev/null 2>&1; then
             # This is PowerShell source; Bash must not expand its variables.
             # shellcheck disable=SC2016
@@ -88,6 +91,11 @@ jobs:
               }
             '
           fi
+
+      - name: Test generated systemd unit (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: bash tests/install-systemd.test.sh
 
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }}

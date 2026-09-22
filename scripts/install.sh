@@ -115,10 +115,17 @@ if [[ "$install_service" == true ]]; then
       service_file="${service_dir}/${app_name}.service"
       mkdir -p "$service_dir"
 
-      # General unit value escaping (for WorkingDirectory and Environment):
+      # Quoted unit value escaping (for Environment values):
       # Escapes \, ", and % (specifier expansion)
       systemd_escape_value() {
         printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/%/%%/g'
+      }
+
+      # WorkingDirectory= escaping:
+      # systemd 取用該值時不做引號剝除與反斜線還原，會把引號視為路徑的一部分並因此
+      # 判定「path is not absolute」，所以此值不得加引號；只需要處理規格符展開（%）。
+      systemd_escape_working_directory() {
+        printf '%s' "$1" | sed -e 's/%/%%/g'
       }
 
       # General unit value unescaping (when reading existing Environment values):
@@ -134,6 +141,7 @@ if [[ "$install_service" == true ]]; then
       }
 
       install_dir_systemd="$(systemd_escape_value "$install_dir")"
+      working_directory_systemd="$(systemd_escape_working_directory "$install_dir")"
       executable_systemd="$(systemd_escape_exec "${install_dir}/${app_name}")"
       host_systemd="$(systemd_escape_value "$host")"
       port_systemd="$(systemd_escape_value "$port")"
@@ -209,7 +217,7 @@ After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory="${install_dir_systemd}"
+WorkingDirectory=${working_directory_systemd}
 ExecStart="${executable_systemd}"
 Restart=always
 RestartSec=2

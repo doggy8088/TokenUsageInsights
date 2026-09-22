@@ -4,6 +4,14 @@
 
 ## [未發行]
 
+### 修正
+
+- 修正 `scripts/install.sh --service` 在 Linux 產生的 systemd 使用者服務單元把 `WorkingDirectory` 以雙引號包住的問題（Issue #59）：systemd 取用該值時不會剝除引號，會將引號視為路徑的一部分，並以 `WorkingDirectory= path is not absolute` 拒絕載入單元，導致透過 `get.sh --service` 安裝或更新後服務無法啟動。`WorkingDirectory` 現在以未加引號、且只轉義規格符（`%` → `%%`）的形式輸出，`ExecStart` 仍保留雙引號；重新執行 installer 會就地修正既有單元。
+
+### 測試
+
+- 新增 `tests/install-systemd.test.sh`：以 stub 取代 `uname` 與 `systemctl`，在暫存目錄中執行真正的 `scripts/install.sh --service`，驗證產生的單元內容（`WorkingDirectory` 未加引號且為絕對路徑、`ExecStart` 保留雙引號、`%` 正確轉義、由舊版加引號單元升級後仍保留 `PORT` 與 `HOST`），並確認 `shell/token-usage-insights.service` 範本同樣不加引號；環境中若有 `systemd-analyze` 時，會額外執行 `systemd-analyze --user verify` 驗證產生的單元。此測試已納入 Release workflow，並由新增的 installer 檢查 workflow 在 PR 觸及安裝腳本時執行。
+
 ## [1.0.3] - 2026-09-22
 
 > 註：先前的 `v1.0.2` 標籤因 Release workflow 的 Windows 測試失敗而未產生任何 Release 成品，本節內容與該測試修正一併以 `v1.0.3` 發佈；`v1.0.2` 標籤維持原狀，未移動或刪除。

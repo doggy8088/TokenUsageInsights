@@ -985,6 +985,12 @@ cargo build --release
 ./target/release/token-usage-insights
 ```
 
+インストーラースクリプトの systemd ユニットテストに systemd は不要です。`uname` と `systemctl` をスタブに置き換え、一時ディレクトリ内で `scripts/install.sh --service` を実行してから、生成されたユニット（`WorkingDirectory` に引用符が付かないこと、規格子がエスケープされることを含む）を検査します。
+
+```bash
+bash tests/install-systemd.test.sh
+```
+
 * * *
 
 ## プロジェクトファイル
