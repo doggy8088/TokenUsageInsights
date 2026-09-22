@@ -1088,6 +1088,57 @@ mod tests {
     }
 
     #[test]
+    fn packaged_grok_47_pricing_uses_context_tiers_and_fast_mode_multiplier() {
+        let rules = load_pricing_rules();
+
+        for model_name in [
+            "grok-4.7",
+            "Grok 4.7 (Low)",
+            "Grok 4.7 (Medium)",
+            "Grok 4.7 (High)",
+            "Grok 4.7 (Extra High)",
+        ] {
+            let short_context =
+                calculate_usage_cost(&rules, Some(model_name), 100_000, 1_000_000, 100_000, 0, 0)
+                    .unwrap();
+            let long_context =
+                calculate_usage_cost(&rules, Some(model_name), 201_000, 1_000_000, 0, 0, 0)
+                    .unwrap();
+
+            assert!(
+                (short_context - 6.25).abs() < 1e-12,
+                "unexpected short-context cost for {model_name}: {short_context}"
+            );
+            assert!(
+                (long_context - 12.804).abs() < 1e-12,
+                "unexpected long-context cost for {model_name}: {long_context}"
+            );
+        }
+
+        for model_name in [
+            "grok-4.7-fast",
+            "Grok 4.7 Fast",
+            "Grok 4.7 Fast (Extra High)",
+        ] {
+            let short_context =
+                calculate_usage_cost(&rules, Some(model_name), 100_000, 1_000_000, 100_000, 0, 0)
+                    .unwrap();
+            let long_context =
+                calculate_usage_cost(&rules, Some(model_name), 201_000, 1_000_000, 0, 0, 0)
+                    .unwrap();
+
+            assert!(
+                (short_context - 12.5).abs() < 1e-12,
+                "unexpected short-context fast cost for {model_name}: {short_context}"
+            );
+            assert!(
+                (long_context - 25.608).abs() < 1e-12,
+                "unexpected long-context fast cost for {model_name}: {long_context}"
+            );
+        }
+    }
+
+    #[test]
     fn kimi_k3_resolves_pricing_from_csv() {
         let rules = load_pricing_rules();
 

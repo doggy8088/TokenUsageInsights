@@ -4,6 +4,16 @@
 
 ## [未發行]
 
+### 新增與改善
+
+- 新增 Grok 4.7 定價規則（`pricing.csv`），涵蓋 200k 上下文門檻的短／長上下文費率、Low／Medium／High／Extra High 推理層級，以及價格為一般版 2 倍的 Fast 模式，共 30 筆 xAI API 規則（輸入 2.00／4.00、快取輸入 0.50／1.00、輸出 6.00／12.00，Fast 模式為兩倍）。
+- 看板可辨識 Grok 4.7 的模型 ID（`grok-4.7`、`grok-4.7-latest`），並依推理層級顯示為「Grok 4.7 (High)」等名稱；xAI 的最高推理層級 `xhigh` 以「Extra High」呈現。
+- 新增 Fast 模式辨識（`grok-4.7-fast`、`grok-4.7-fast-latest`），模型名稱顯示為「Grok 4.7 Fast」並套用 2 倍費率，避免 Fast 模式用量被以一般版價格低估。
+
+### 資料影響
+
+- Grok Build 解析器版本提升至 `migration:grok_parser_v8`，啟動時會重新解析既有的 Grok Session，讓先前以原始模型 ID（例如 `grok-4.7`）儲存的資料列改用新的顯示名稱與價格規則；重解析僅更新模型、推理層級與未回報成本的估算值，不會刪除 Session 或歷史資料。
+
 ## [1.0.1] - 2026-09-20
 
 ### 新增與改善
