@@ -1881,8 +1881,6 @@ fn run_codex_rollout_identity_migration(conn: &mut Connection) -> Result<(), Str
                  FROM usage_entries
                  WHERE assistant_type = 'codex'
                    AND usage_identity = ''
-                   AND import_source_id IS NULL
-                   AND import_batch_id IS NULL
                    AND transcript_path IS NOT NULL",
             )
             .map_err(|error| format!("準備讀取未標記 Codex transcript 失敗: {error}"))?;
@@ -1901,15 +1899,26 @@ fn run_codex_rollout_identity_migration(conn: &mut Connection) -> Result<(), Str
         let Some(identity) = codex_rollout_identity(&stored_path) else {
             continue;
         };
+        // Imported rows are marked as well: without an identity an older import
+        // would no longer match the locally synced rows of the same rollout and
+        // the same turn would be counted twice. The `NOT EXISTS` guard keeps a
+        // row that would collide with an already marked row untouched instead of
+        // failing the whole migration.
         tx.execute(
             "UPDATE usage_entries
              SET usage_identity = ?
              WHERE assistant_type = 'codex'
                AND transcript_path = ?
                AND usage_identity = ''
-               AND import_source_id IS NULL
-               AND import_batch_id IS NULL",
-            params![identity, stored_path],
+               AND NOT EXISTS (
+                    SELECT 1 FROM usage_entries AS marked
+                    WHERE marked.id <> usage_entries.id
+                      AND marked.assistant_type = usage_entries.assistant_type
+                      AND marked.source_kind = usage_entries.source_kind
+                      AND marked.session_id = usage_entries.session_id
+                      AND marked.turn_no = usage_entries.turn_no
+                      AND marked.usage_identity = ?)",
+            params![identity, stored_path, identity],
         )
         .map_err(|error| format!("標記 Codex rollout 身分失敗: {error}"))?;
     }
@@ -4099,8 +4108,12 @@ fn sync_codex_transcript(
         let delta = entry.delta_tokens.as_ref();
         let cost = entry.cost.as_ref();
 
+        // A surviving imported row of the same rollout owns this turn, so the
+        // local write yields to it instead of failing the unique index and
+        // rolling back the whole transaction (which would stall the sync of
+        // every later turn of this rollout as well).
         let insert_res = tx.execute(
-            "INSERT INTO usage_entries (
+            "INSERT OR IGNORE INTO usage_entries (
                 assistant_type, source_kind, usage_identity, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
                 tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_cache_write_5m, tokens_cache_write_1h, tokens_reasoning, tokens_total,
                 delta_input, delta_output, delta_cache_read, delta_cache_write, delta_cache_write_5m, delta_cache_write_1h, delta_reasoning, delta_total,
@@ -5661,6 +5674,16 @@ pub fn import_usage_day_entries(
                     model
                         .map(|model| format!("model:{model}"))
                         .unwrap_or_default()
+                } else if assistant == "codex" {
+                    // Exports written before rollout identities existed carry a
+                    // transcript path but no identity. Deriving it here keeps the
+                    // imported row on the same unique key as the locally synced
+                    // row, so the import dedupes instead of counting twice.
+                    entry
+                        .transcript_path
+                        .as_deref()
+                        .and_then(codex_rollout_identity)
+                        .unwrap_or_default()
                 } else {
                     String::new()
                 }
@@ -5838,6 +5861,19 @@ pub fn list_usage_import_batches(
         .map_err(|e| format!("讀取匯入批次失敗: {e}"))
 }
 
+/// Escape `LIKE` wildcards in a literal rollout stem so a name such as
+/// `rollout-...-a_b` only matches its own sync-state key.
+fn escape_like_pattern(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
 pub fn rollback_usage_import_batch(
     conn: &mut Connection,
     assistant: &str,
@@ -5861,6 +5897,42 @@ pub fn rollback_usage_import_batch(
     };
     if rolled_back_at.is_some() {
         return Err("指定的匯入批次已撤銷".to_string());
+    }
+
+    // Codex rows that were rolled back may have shadowed local transcript rows:
+    // the local sync yields to an existing row of the same rollout and turn, so
+    // clearing the sync state of exactly those rollouts makes the next sync pass
+    // rebuild the local rows instead of leaving them missing.
+    if assistant == "codex" {
+        let rolled_back_stems = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT DISTINCT usage_identity
+                     FROM usage_entries
+                     WHERE assistant_type = 'codex' AND import_batch_id = ?",
+                )
+                .map_err(|e| format!("準備讀取匯入的 Codex rollout 身分失敗: {e}"))?;
+            let rows = stmt
+                .query_map(params![batch_id], |row| row.get::<_, String>(0))
+                .map_err(|e| format!("讀取匯入的 Codex rollout 身分失敗: {e}"))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("解析匯入的 Codex rollout 身分失敗: {e}"))?
+                .into_iter()
+                .filter_map(|identity| {
+                    identity
+                        .strip_prefix("rollout=")
+                        .map(str::to_string)
+                        .filter(|stem| !stem.is_empty())
+                })
+                .collect::<Vec<_>>()
+        };
+        for stem in rolled_back_stems {
+            tx.execute(
+                "DELETE FROM sync_state WHERE filename LIKE ? ESCAPE '\\'",
+                params![format!("codex:%{}.jsonl", escape_like_pattern(&stem))],
+            )
+            .map_err(|e| format!("清除 Codex 同步狀態失敗: {e}"))?;
+        }
     }
 
     let removed_records = tx
@@ -8139,8 +8211,10 @@ mod tests {
             [],
         )
         .unwrap();
-        // An imported path from another machine must never be adopted as a
-        // rollout identity, even when its file name looks plausible.
+        // Imported rows carry the rollout identity of the file name they came
+        // from so that a re-import of the same rollout dedupes against the
+        // locally synced rows instead of counting every turn twice. The import
+        // exclusions keep them out of every identity and path purge.
         conn.execute(
             "INSERT INTO usage_entries (
                 assistant_type, timestamp, date, session_id, transcript_path, turn_no,
@@ -8172,7 +8246,7 @@ mod tests {
                 (
                     "other-machine-session".to_string(),
                     "/other/.codex/sessions/2026/09/11/rollout-b.jsonl".to_string(),
-                    String::new()
+                    "rollout=rollout-b".to_string()
                 ),
                 ("shared-session".to_string(), String::new(), String::new()),
             ]
@@ -8209,9 +8283,10 @@ mod tests {
         fs::write(
             &transcript_path,
             format!(
-                "{}\n{}\n",
+                "{}\n{}\n{}\n",
                 codex_session_meta("imported-session"),
-                codex_token_count_event("2026-09-10T16:06:50.000Z", 100, 20, 10)
+                codex_token_count_event("2026-09-10T16:06:50.000Z", 100, 20, 10),
+                codex_token_count_event("2026-09-10T16:08:50.000Z", 150, 30, 15)
             ),
         )
         .unwrap();
@@ -8225,11 +8300,14 @@ mod tests {
 
         let mut conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
+        // The imported row carries the same source kind, session, turn and
+        // identity as the locally parsed row, so it occupies the same unique
+        // key: the local write for that turn must yield instead of failing.
         conn.execute(
             "INSERT INTO usage_entries (
-                assistant_type, timestamp, date, session_id, transcript_path, turn_no,
-                usage_identity, import_source_id, import_batch_id
-             ) VALUES ('codex', '2026-09-10T16:06:50Z', '2026-09-10',
+                assistant_type, source_kind, timestamp, date, session_id, transcript_path,
+                turn_no, usage_identity, import_source_id, import_batch_id
+             ) VALUES ('codex', 'codex-desktop', '2026-09-10T16:06:50Z', '2026-09-10',
                 'imported-session', ?, 1, ?, 'codex-import:1', 'batch-1')",
             params![
                 transcript_path.to_string_lossy().as_ref(),
@@ -8265,6 +8343,37 @@ mod tests {
             .unwrap();
         assert!(local_rows > 0);
 
+        // The turn the import already covers is not duplicated, while the turn
+        // only the transcript knows about is still written: the collision must
+        // not roll back the whole transaction of this rollout.
+        let shared_turn_rows: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'codex' AND session_id = 'imported-session' AND turn_no = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(shared_turn_rows, 1);
+        let later_turn_rows: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'codex' AND session_id = 'imported-session' AND turn_no = 2
+                   AND import_source_id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(later_turn_rows, 1);
+        let synced_state: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state WHERE filename LIKE 'codex:%imported.jsonl'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(synced_state, 1, "the sync transaction must commit");
+
         let notes_rows: u64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM usage_entries
@@ -8281,6 +8390,96 @@ mod tests {
             std::env::remove_var("CODEX_DIR");
         }
         let _ = fs::remove_dir_all(&codex_dir);
+    }
+
+    #[test]
+    fn import_usage_day_entries_derives_the_codex_rollout_identity() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut record = sample_import_record();
+        record.entry.transcript_path = Some(
+            "/other/.codex/sessions/2026/09/11/rollout-2026-09-11T00-06-46-legacy.jsonl"
+                .to_string(),
+        );
+        record.usage_identity = None;
+
+        let summary = import_usage_day_entries(
+            &mut conn,
+            "codex",
+            "2026-07-10",
+            vec![record],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        assert_eq!(summary.imported, 1);
+
+        // An export written before rollout identities existed still lands on the
+        // same unique key as the locally synced row of that rollout, so it
+        // dedupes instead of counting the turn twice.
+        let identity: String = conn
+            .query_row(
+                "SELECT usage_identity FROM usage_entries
+                 WHERE assistant_type = 'codex' AND import_batch_id = ?",
+                params![summary.batch_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(identity, "rollout=rollout-2026-09-11T00-06-46-legacy");
+    }
+
+    #[test]
+    fn rollback_usage_import_batch_clears_only_the_affected_codex_sync_state() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut record = sample_import_record();
+        record.entry.transcript_path =
+            Some("/codex/sessions/2026/09/11/rollout-2026-09-11T00-06-46-rolled.jsonl".to_string());
+        record.usage_identity = None;
+        let summary = import_usage_day_entries(
+            &mut conn,
+            "codex",
+            "2026-07-10",
+            vec![record],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES ('codex:sessions/2026/09/11/rollout-2026-09-11T00-06-46-rolled.jsonl', 10, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES ('codex:sessions/2026/09/11/rollout-2026-09-11T00-06-46-kept.jsonl', 10, 0)",
+            [],
+        )
+        .unwrap();
+
+        let rolled_back =
+            rollback_usage_import_batch(&mut conn, "codex", &summary.batch_id).unwrap();
+        assert_eq!(rolled_back.removed_records, 1);
+
+        let rolled_back_state: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state WHERE filename LIKE '%rolled.jsonl'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            rolled_back_state, 0,
+            "the rolled back rollout must be re-synced so its local rows come back"
+        );
+        let kept_state: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state WHERE filename LIKE '%kept.jsonl'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept_state, 1);
     }
 
     #[test]
