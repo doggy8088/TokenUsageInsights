@@ -985,6 +985,12 @@ cargo build --release
 ./target/release/token-usage-insights
 ```
 
+설치 스크립트의 systemd 유닛 테스트에는 systemd가 필요하지 않습니다. `uname`과 `systemctl`을 스텁으로 대체하고 임시 디렉터리에서 `scripts/install.sh --service`를 실행한 뒤, 생성된 유닛(`WorkingDirectory`에 따옴표가 붙지 않는지와 규격자 이스케이프 포함)을 검사합니다.
+
+```bash
+bash tests/install-systemd.test.sh
+```
+
 * * *
 
 ## 프로젝트 파일

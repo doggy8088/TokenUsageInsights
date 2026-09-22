@@ -1011,6 +1011,12 @@ cargo build --release
 ./target/release/token-usage-insights
 ```
 
+安裝腳本的 systemd 單元測試不需要 systemd：它會以 stub 取代 `uname` 與 `systemctl`，在暫存目錄中執行 `scripts/install.sh --service`，再檢查產生的單元內容（含 `WorkingDirectory` 不加引號與規格符轉義）：
+
+```bash
+bash tests/install-systemd.test.sh
+```
+
 * * *
 
 ## 專案檔案

@@ -985,6 +985,12 @@ cargo build --release
 ./target/release/token-usage-insights
 ```
 
+The systemd unit test for the installer scripts does not need systemd: it replaces `uname` and `systemctl` with stubs, runs `scripts/install.sh --service` inside a temporary directory, and then inspects the generated unit (including that `WorkingDirectory` stays unquoted and specifiers stay escaped):
+
+```bash
+bash tests/install-systemd.test.sh
+```
+
 * * *
 
 ## Project files
