@@ -1925,8 +1925,8 @@ fn run_codex_rollout_identity_migration(conn: &mut Connection) -> Result<(), Str
 
     // Rows without a transcript path cannot belong to any transcript, so a
     // session that is tracked by a rollout transcript supersedes them. Imported
-    // rows are excluded: they are keyed by `import_source_id`, have no local
-    // transcript, and must stay until the import is rolled back.
+    // rows are excluded from both sides: they are keyed by `import_source_id`,
+    // have no local transcript, and must stay until the import is rolled back.
     tx.execute(
         "DELETE FROM usage_entries
          WHERE assistant_type = 'codex'
@@ -1939,6 +1939,8 @@ fn run_codex_rollout_identity_migration(conn: &mut Connection) -> Result<(), Str
                 WHERE tracked.assistant_type = 'codex'
                   AND tracked.session_id = usage_entries.session_id
                   AND tracked.usage_identity <> ''
+                  AND tracked.import_source_id IS NULL
+                  AND tracked.import_batch_id IS NULL
            )",
         [],
     )
@@ -5640,7 +5642,7 @@ pub fn import_usage_day_entries(
         let record_date = entry_date_from_timestamp(&entry.timestamp)
             .ok_or_else(|| "無效的 timestamp 格式，無法取得日期".to_string())?
             .to_string();
-        let source_kind = entry
+        let mut source_kind = entry
             .source_kind
             .clone()
             .unwrap_or_else(|| "legacy".to_string());
@@ -5694,6 +5696,35 @@ pub fn import_usage_day_entries(
             &entry,
             Some(&usage_identity),
         );
+        // A codex export without a source kind would store `legacy`, which never
+        // matches the locally parsed `codex-desktop` / `codex-cli` rows and would
+        // therefore keep its own copy of a turn the local sync already knows
+        // about. Adopting the local row's source kind puts the imported row on
+        // the same unique key so it dedupes instead of counting twice.
+        if assistant == "codex" && entry.source_kind.is_none() && !usage_identity.is_empty() {
+            let local_source_kind: Option<String> = tx
+                .query_row(
+                    "SELECT source_kind FROM usage_entries
+                     WHERE assistant_type = 'codex'
+                       AND session_id = ?
+                       AND turn_no = ?
+                       AND usage_identity = ?
+                       AND import_source_id IS NULL
+                       AND import_batch_id IS NULL
+                     LIMIT 1",
+                    params![
+                        entry.session_id,
+                        entry.turn_no as i64,
+                        usage_identity.as_str()
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| format!("查詢本機 Codex 來源類型失敗: {error}"))?;
+            if let Some(local_source_kind) = local_source_kind {
+                source_kind = local_source_kind;
+            }
+        }
         if assistant == "copilot" && matches!(source_kind.as_str(), "copilot-cli" | "legacy") {
             normalize_copilot_cli_usage_entry(&mut entry);
         } else if assistant == "claude" {
@@ -8390,6 +8421,124 @@ mod tests {
             std::env::remove_var("CODEX_DIR");
         }
         let _ = fs::remove_dir_all(&codex_dir);
+    }
+
+    #[test]
+    fn import_usage_day_entries_dedupes_codex_rollouts_against_local_rows() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, timestamp, date, session_id, transcript_path,
+                turn_no, usage_identity
+             ) VALUES ('codex', 'codex-desktop', '2026-07-10T12:34:56Z', '2026-07-10',
+                'import-session', '/codex/sessions/2026/09/11/rollout-2026-09-11T00-06-46-legacy.jsonl',
+                1, 'rollout=rollout-2026-09-11T00-06-46-legacy')",
+            [],
+        )
+        .unwrap();
+
+        let mut record = sample_import_record();
+        record.entry.transcript_path =
+            Some("/codex/sessions/2026/09/11/rollout-2026-09-11T00-06-46-legacy.jsonl".to_string());
+        record.entry.source_kind = None;
+        record.usage_identity = None;
+        let summary = import_usage_day_entries(
+            &mut conn,
+            "codex",
+            "2026-07-10",
+            vec![record],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+
+        // The imported row adopts the local source kind so it lands on the same
+        // unique key as the local row and is reported as a duplicate instead of
+        // being stored next to it and counting the turn twice.
+        assert_eq!(summary.imported, 0);
+        assert_eq!(summary.skipped_duplicates, 1);
+        let rows: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'codex' AND session_id = 'import-session' AND turn_no = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    #[test]
+    fn import_usage_day_entries_keeps_foreign_codex_kind_without_a_local_row() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut record = sample_import_record();
+        record.entry.transcript_path = Some(
+            "/other/.codex/sessions/2026/09/11/rollout-2026-09-11T00-06-46-foreign.jsonl"
+                .to_string(),
+        );
+        record.entry.source_kind = None;
+        record.usage_identity = None;
+        let summary = import_usage_day_entries(
+            &mut conn,
+            "codex",
+            "2026-07-10",
+            vec![record],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        assert_eq!(summary.imported, 1);
+        let row: (String, String) = conn
+            .query_row(
+                "SELECT source_kind, usage_identity FROM usage_entries
+                 WHERE assistant_type = 'codex' AND import_batch_id = ?",
+                params![summary.batch_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0, "legacy");
+        assert_eq!(row.1, "rollout=rollout-2026-09-11T00-06-46-foreign");
+    }
+
+    #[test]
+    fn codex_rollout_identity_migration_keeps_pathless_rows_next_to_imports() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // A local row written before transcripts were tracked has no path.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, turn_no
+             ) VALUES ('codex', '2026-09-10T16:06:50Z', '2026-09-10', 'imported-session', 1)",
+            [],
+        )
+        .unwrap();
+        // An imported row of the same session carries a rollout path.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, transcript_path, turn_no,
+                import_source_id, import_batch_id
+             ) VALUES ('codex', '2026-09-10T16:06:50Z', '2026-09-10', 'imported-session',
+                '/other/.codex/sessions/2026/09/11/rollout-c.jsonl', 2,
+                'codex-import:3', 'batch-2')",
+            [],
+        )
+        .unwrap();
+
+        run_codex_rollout_identity_migration(&mut conn).unwrap();
+
+        // A transient import must never supersede local rows: the pathless row
+        // stays until the local transcript of that session is synced.
+        let pathless_rows: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'codex'
+                   AND COALESCE(transcript_path, '') = ''
+                   AND import_source_id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pathless_rows, 1);
     }
 
     #[test]
