@@ -627,6 +627,61 @@ mod tests {
     }
 
     #[test]
+    fn gpt_6_sol_and_luna_context_tiers_use_packaged_pricing() {
+        let rules = load_pricing_rules();
+
+        for (model_name, input_price, cached_price, output_price) in [
+            ("GPT-6 Sol", 2.00, 0.20, 10.00),
+            ("GPT-6 Sol (<272k)", 2.00, 0.20, 10.00),
+            ("gpt-6-sol", 2.00, 0.20, 10.00),
+            ("GPT-6-Sol", 2.00, 0.20, 10.00),
+            ("GPT-6 Luna", 0.10, 0.01, 0.50),
+            ("GPT-6 Luna (<272k)", 0.10, 0.01, 0.50),
+            ("gpt-6-luna", 0.10, 0.01, 0.50),
+            ("GPT-6-Luna", 0.10, 0.01, 0.50),
+        ] {
+            let cost =
+                calculate_usage_cost(&rules, Some(model_name), 100_000, 50_000, 50_000, 0, 0)
+                    .unwrap_or_else(|error| {
+                        panic!("{model_name} should have a pricing rule: {error}")
+                    });
+
+            let expected = (100_000.0 / 1_000_000.0) * input_price
+                + (50_000.0 / 1_000_000.0) * cached_price
+                + (50_000.0 / 1_000_000.0) * output_price;
+            assert!(
+                (cost - expected).abs() < 1e-9,
+                "unexpected short-context cost for {model_name}: {cost}"
+            );
+        }
+
+        for (model_name, input_price, cached_price, output_price) in [
+            ("GPT-6 Sol", 4.00, 0.40, 15.00),
+            ("GPT-6 Sol (>272k)", 4.00, 0.40, 15.00),
+            ("gpt-6-sol", 4.00, 0.40, 15.00),
+            ("GPT-6-Sol", 4.00, 0.40, 15.00),
+            ("GPT-6 Luna", 0.20, 0.02, 0.75),
+            ("GPT-6 Luna (>272k)", 0.20, 0.02, 0.75),
+            ("gpt-6-luna", 0.20, 0.02, 0.75),
+            ("GPT-6-Luna", 0.20, 0.02, 0.75),
+        ] {
+            let cost =
+                calculate_usage_cost(&rules, Some(model_name), 300_000, 50_000, 50_000, 0, 0)
+                    .unwrap_or_else(|error| {
+                        panic!("{model_name} should have a pricing rule: {error}")
+                    });
+
+            let expected = (300_000.0 / 1_000_000.0) * input_price
+                + (50_000.0 / 1_000_000.0) * cached_price
+                + (50_000.0 / 1_000_000.0) * output_price;
+            assert!(
+                (cost - expected).abs() < 1e-9,
+                "unexpected long-context cost for {model_name}: {cost}"
+            );
+        }
+    }
+
+    #[test]
     fn gpt_daybreak_blue_uses_packaged_pricing() {
         let rules = load_pricing_rules();
 
