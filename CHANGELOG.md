@@ -4,6 +4,8 @@
 
 ## [未發行]
 
+## [1.0.4] - 2026-09-23
+
 ### 修正
 
 - 修正 `scripts/install.sh --service` 在 Linux 產生的 systemd 使用者服務單元把 `WorkingDirectory` 以雙引號包住的問題（Issue #59）：systemd 取用該值時不會剝除引號，會將引號視為路徑的一部分，並以 `WorkingDirectory= path is not absolute` 拒絕載入單元，導致透過 `get.sh --service` 安裝或更新後服務無法啟動。`WorkingDirectory` 現在以未加引號、且只轉義規格符（`%` → `%%`）的形式輸出，`ExecStart` 仍保留雙引號；重新執行 installer 會就地修正既有單元。
@@ -11,6 +13,11 @@
 ### 測試
 
 - 新增 `tests/install-systemd.test.sh`：以 stub 取代 `uname` 與 `systemctl`，在暫存目錄中執行真正的 `scripts/install.sh --service`，驗證產生的單元內容（`WorkingDirectory` 未加引號且為絕對路徑、`ExecStart` 保留雙引號、`%` 正確轉義、由舊版加引號單元升級後仍保留 `PORT` 與 `HOST`），並確認 `shell/token-usage-insights.service` 範本同樣不加引號；環境中若有 `systemd-analyze` 時，會額外執行 `systemd-analyze --user verify` 驗證產生的單元。此測試已納入 Release workflow，並由新增的 installer 檢查 workflow 在 PR 觸及安裝腳本時執行。
+
+### 相容性
+
+- 重新執行 `get.sh --service` 或 `install.sh --service` 即會就地覆寫既有單元，帶引號的舊 `WorkingDirectory` 會自動修正，無須手動 `sed -i`；使用者自訂的 `PORT`、`HOST` 與 `Environment` 設定仍會沿用。
+- 未變更資料庫結構、環境變數與安裝流程；僅 Linux `--service` 產生的 systemd 單元內容不同。
 
 ## [1.0.3] - 2026-09-22
 
@@ -744,7 +751,8 @@
 - 修正行動版側邊欄遮擋、黑畫面、標題擠壓、圖表導覽索引與年度版面問題。
 - 修正並補齊多個 Gemini、Claude、GPT 與 GPT-OSS 模型的定價規則。
 
-[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.0.3...HEAD
+[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.0.4...HEAD
+[1.0.4]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.0.3...v1.0.4
 [1.0.3]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.0.1...v1.0.3
 [1.0.1]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.9.9...v1.0.0
