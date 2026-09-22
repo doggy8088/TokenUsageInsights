@@ -4110,6 +4110,29 @@ fn sync_codex_transcript(
         let delta = entry.delta_tokens.as_ref();
         let cost = entry.cost.as_ref();
 
+        // An imported row of the same rollout and turn owns that turn even when
+        // its source kind differs (an export written by this app stores the
+        // `legacy` kind of its original import): the purge above already removed
+        // every local row of this identity, so a row still present for the same
+        // turn can only belong to an import batch, which must not be duplicated.
+        let owned_by_import: bool = tx
+            .query_row(
+                "SELECT EXISTS (
+                    SELECT 1 FROM usage_entries
+                    WHERE assistant_type = 'codex'
+                      AND session_id = ?
+                      AND turn_no = ?
+                      AND usage_identity = ?
+                      AND (import_source_id IS NOT NULL OR import_batch_id IS NOT NULL)
+                 )",
+                params![entry.session_id, entry.turn_no as i64, identity],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("檢查 Codex rollout 匯入資料失敗: {error}"))?;
+        if owned_by_import {
+            continue;
+        }
+
         // A surviving imported row of the same rollout owns this turn, so the
         // local write yields to it instead of failing the unique index and
         // rolling back the whole transaction (which would stall the sync of
@@ -5696,12 +5719,19 @@ pub fn import_usage_day_entries(
             &entry,
             Some(&usage_identity),
         );
-        // A codex export without a source kind would store `legacy`, which never
-        // matches the locally parsed `codex-desktop` / `codex-cli` rows and would
-        // therefore keep its own copy of a turn the local sync already knows
-        // about. Adopting the local row's source kind puts the imported row on
-        // the same unique key so it dedupes instead of counting twice.
-        if assistant == "codex" && entry.source_kind.is_none() && !usage_identity.is_empty() {
+        // A codex export without a usable source kind (`legacy` is what this app
+        // writes when an import has no local counterpart, and older exports omit
+        // the field) would never match the locally parsed `codex-desktop` /
+        // `codex-cli` rows and would therefore keep its own copy of a turn the
+        // local sync already knows about. Adopting the local row's source kind
+        // puts the imported row on the same unique key so it dedupes instead of
+        // counting twice.
+        let exported_source_kind = entry
+            .source_kind
+            .as_deref()
+            .map(str::trim)
+            .filter(|kind| !kind.is_empty() && *kind != "legacy");
+        if assistant == "codex" && exported_source_kind.is_none() && !usage_identity.is_empty() {
             let local_source_kind: Option<String> = tx
                 .query_row(
                     "SELECT source_kind FROM usage_entries
@@ -8469,6 +8499,41 @@ mod tests {
     }
 
     #[test]
+    fn import_usage_day_entries_dedupes_exports_that_carry_the_legacy_kind() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, timestamp, date, session_id, transcript_path,
+                turn_no, usage_identity
+             ) VALUES ('codex', 'codex-cli', '2026-07-10T12:34:56Z', '2026-07-10',
+                'import-session', '/codex/sessions/2026/09/11/rollout-2026-09-11T00-06-46-legacy.jsonl',
+                1, 'rollout=rollout-2026-09-11T00-06-46-legacy')",
+            [],
+        )
+        .unwrap();
+
+        // This app exports the stored kind verbatim, so a re-export of an import
+        // that had no local counterpart carries `legacy`.
+        let mut record = sample_import_record();
+        record.entry.transcript_path =
+            Some("/codex/sessions/2026/09/11/rollout-2026-09-11T00-06-46-legacy.jsonl".to_string());
+        record.entry.source_kind = Some("legacy".to_string());
+        record.usage_identity = None;
+        let summary = import_usage_day_entries(
+            &mut conn,
+            "codex",
+            "2026-07-10",
+            vec![record],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+
+        assert_eq!(summary.imported, 0);
+        assert_eq!(summary.skipped_duplicates, 1);
+    }
+
+    #[test]
     fn import_usage_day_entries_keeps_foreign_codex_kind_without_a_local_row() {
         let mut conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
@@ -8629,6 +8694,91 @@ mod tests {
             )
             .unwrap();
         assert_eq!(kept_state, 1);
+    }
+
+    #[test]
+    fn sync_codex_usage_logs_yields_to_an_imported_rollout_with_another_source_kind() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_codex_dir = std::env::var("CODEX_DIR").ok();
+        let mut codex_dir = std::env::temp_dir();
+        let unique = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        codex_dir.push(format!(
+            "codex-legacy-kind-{}-{}",
+            std::process::id(),
+            unique
+        ));
+
+        let sessions_dir = codex_dir.join("sessions/2026/09/11");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        let transcript_path = sessions_dir.join("rollout-2026-09-11T00-06-46-restored.jsonl");
+        fs::write(
+            &transcript_path,
+            format!(
+                "{}\n{}\n{}\n",
+                codex_session_meta("restored-session"),
+                codex_token_count_event("2026-09-10T16:06:50.000Z", 100, 20, 10),
+                codex_token_count_event("2026-09-10T16:08:50.000Z", 150, 30, 15)
+            ),
+        )
+        .unwrap();
+        std::env::set_var("CODEX_DIR", &codex_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // The rollout was imported before it existed locally, so the imported row
+        // carries the `legacy` kind while the local parser writes `codex-desktop`.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, timestamp, date, session_id, transcript_path,
+                turn_no, usage_identity, import_source_id, import_batch_id
+             ) VALUES ('codex', 'legacy', '2026-09-10T16:06:50Z', '2026-09-10',
+                'restored-session', ?, 1, ?, 'codex-import:9', 'batch-9')",
+            params![
+                transcript_path.to_string_lossy().as_ref(),
+                "rollout=rollout-2026-09-11T00-06-46-restored"
+            ],
+        )
+        .unwrap();
+
+        sync_codex_usage_logs(&mut conn).unwrap();
+
+        let shared_turn_rows: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'codex' AND session_id = 'restored-session' AND turn_no = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            shared_turn_rows, 1,
+            "an imported turn must not be duplicated under another source kind"
+        );
+        let later_turn_rows: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'codex' AND session_id = 'restored-session' AND turn_no = 2
+                   AND import_source_id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(later_turn_rows, 1);
+        let synced_state: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state WHERE filename LIKE 'codex:%restored.jsonl'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(synced_state, 1, "the sync transaction must commit");
+
+        if let Some(value) = old_codex_dir {
+            std::env::set_var("CODEX_DIR", value);
+        } else {
+            std::env::remove_var("CODEX_DIR");
+        }
+        let _ = fs::remove_dir_all(&codex_dir);
     }
 
     #[test]
