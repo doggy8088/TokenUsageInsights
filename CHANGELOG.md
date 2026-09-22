@@ -7,11 +7,15 @@
 ### 修正
 
 - 修正 Codex Session 在 `~/.codex/sessions` 與 `~/.codex/archived_sessions` 之間移動、或同一 Session 同時存在多個 rollout 檔案時，看板數字每隔幾秒在兩組數值間反覆跳動的問題（Issue #54）。
+- 修正 Codex 同步可能誤刪匯入資料的問題：rollout 身分遷移與本地 transcript 清除流程現在一律排除 `import_source_id` / `import_batch_id` 非空的資料列，匯入批次的生命週期不再被本機檔案同步影響。
+- 修正非 rollout 檔名的 `.jsonl`（例如 `notes.jsonl`、`history.jsonl`）被誤判為 rollout 身分而可能誤刪同名資料列的問題；現在僅接受 `rollout-` 前綴的檔名。
+- 修正重複 rollout 副本的清除與 canonical 檔案的寫入分屬不同交易、導致讀取端可能觀察到短暫空窗的問題；副本清除已納入同一個交易，canonical 檔案為空或解析失敗時不會先行刪除既有資料。
 
 ### 資料影響
 
 - 新增 `usage_identity` 欄位（既有 `usage_entries` 資料表，預設空字串不需人工調整），Codex 的 rollout 檔案以檔名作為穩定身分寫入；啟動時會自動執行一次性遷移 `migration:codex_rollout_identity_v1`，回填既有資料並清除已無對應檔案的孤兒資料列（僅影響 `assistant_type = 'codex'`）。
 - 新增部分索引 `idx_assistant_usage_identity`（`WHERE usage_identity <> ''`）以加速身分範圍的刪除；大型資料庫可顯著降低同步時的刪除耗時。
+- 手動匯入的資料列（`import_source_id` / `import_batch_id` 非空）改由匯入批次管理：本機 Codex transcript 同步不再刪除或改寫其 `usage_identity`，rollout 遷移亦不會將其視為孤兒資料清除。
 
 ### 相容性
 

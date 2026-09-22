@@ -165,6 +165,11 @@ const CODEX_CLI_SOURCE_KIND: &str = "codex-cli";
 const CODEX_DESKTOP_SOURCE_KIND: &str = "codex-desktop";
 const CODEX_OTHER_SOURCE_KIND: &str = "codex-other";
 const CODEX_EMPTY_TRANSCRIPT_SYNC_TIME: i64 = -1;
+
+/// Every Codex rollout transcript is named `rollout-<timestamp>-<session>
+/// [_<rollout>].jsonl`. Other files can live in the same directories, so only
+/// this prefix may become a rollout identity.
+const CODEX_ROLLOUT_FILE_PREFIX: &str = "rollout-";
 const COPILOT_SOURCE_KIND_MIGRATION_KEY: &str = "migration:copilot_source_kind_v1";
 
 /// Source kind written for usage entries originating from the Copilot App
@@ -1876,6 +1881,8 @@ fn run_codex_rollout_identity_migration(conn: &mut Connection) -> Result<(), Str
                  FROM usage_entries
                  WHERE assistant_type = 'codex'
                    AND usage_identity = ''
+                   AND import_source_id IS NULL
+                   AND import_batch_id IS NULL
                    AND transcript_path IS NOT NULL",
             )
             .map_err(|error| format!("準備讀取未標記 Codex transcript 失敗: {error}"))?;
@@ -1899,19 +1906,25 @@ fn run_codex_rollout_identity_migration(conn: &mut Connection) -> Result<(), Str
              SET usage_identity = ?
              WHERE assistant_type = 'codex'
                AND transcript_path = ?
-               AND usage_identity = ''",
+               AND usage_identity = ''
+               AND import_source_id IS NULL
+               AND import_batch_id IS NULL",
             params![identity, stored_path],
         )
         .map_err(|error| format!("標記 Codex rollout 身分失敗: {error}"))?;
     }
 
     // Rows without a transcript path cannot belong to any transcript, so a
-    // session that is tracked by a rollout transcript supersedes them.
+    // session that is tracked by a rollout transcript supersedes them. Imported
+    // rows are excluded: they are keyed by `import_source_id`, have no local
+    // transcript, and must stay until the import is rolled back.
     tx.execute(
         "DELETE FROM usage_entries
          WHERE assistant_type = 'codex'
            AND usage_identity = ''
            AND COALESCE(transcript_path, '') = ''
+           AND import_source_id IS NULL
+           AND import_batch_id IS NULL
            AND EXISTS (
                 SELECT 1 FROM usage_entries AS tracked
                 WHERE tracked.assistant_type = 'codex'
@@ -3759,6 +3772,11 @@ fn load_codex_transcript_paths(conn: &Connection) -> Result<HashMap<String, Vec<
 /// name therefore identifies one transcript across directory moves, keeps
 /// continuation segments of one session apart, and collapses copied
 /// transcripts of the same rollout into a single identity.
+///
+/// Only that documented prefix yields an identity. Other `.jsonl` files can
+/// live in the Codex directories, and an imported row can carry a path from
+/// another machine, so adopting them as rollouts would let a later local file
+/// with the same name purge unrelated rows.
 fn codex_rollout_identity(path: &str) -> Option<String> {
     let file_name = path.rsplit(['/', '\\']).next()?;
     let stem = file_name
@@ -3767,7 +3785,7 @@ fn codex_rollout_identity(path: &str) -> Option<String> {
         .unwrap_or(file_name)
         .trim();
 
-    if stem.is_empty() {
+    if !stem.starts_with(CODEX_ROLLOUT_FILE_PREFIX) {
         return None;
     }
 
@@ -3818,23 +3836,44 @@ fn codex_transcript_canonical_rank(
     )
 }
 
-/// Drop rows that were written from a copy of a rollout whose canonical
-/// transcript lives under another path.
-fn drop_codex_rows_for_transcript_path(
-    conn: &Connection,
+/// Stored transcript path spellings whose rows must disappear once the
+/// canonical copy of a rollout has been written.
+fn stale_codex_copy_paths(
     transcript_paths: &HashMap<String, Vec<String>>,
-    path: &Path,
-) -> Result<(), String> {
-    let path = path.to_string_lossy();
-    let Some(stored_paths) = transcript_paths.get(&codex_transcript_path_key(&path)) else {
-        return Ok(());
-    };
+    duplicates: &[CodexTranscript],
+) -> Vec<String> {
+    let mut stale_paths: Vec<String> = Vec::new();
 
-    for stored_path in stored_paths {
-        conn.execute(
+    for duplicate in duplicates {
+        let key = codex_transcript_path_key(&duplicate.path.to_string_lossy());
+        let Some(stored_paths) = transcript_paths.get(&key) else {
+            continue;
+        };
+
+        for stored_path in stored_paths {
+            if !stale_paths.contains(stored_path) {
+                stale_paths.push(stored_path.clone());
+            }
+        }
+    }
+
+    stale_paths
+}
+
+/// Drop the rows of rollout copies that lost the canonical choice. Imported
+/// rows are kept: they belong to the import batch, not to the local copy.
+fn remove_stale_codex_copy_rows(
+    tx: &rusqlite::Transaction<'_>,
+    stale_copy_paths: &[String],
+) -> Result<(), String> {
+    for stale_path in stale_copy_paths {
+        tx.execute(
             "DELETE FROM usage_entries
-             WHERE assistant_type = 'codex' AND transcript_path = ?",
-            params![stored_path],
+             WHERE assistant_type = 'codex'
+               AND transcript_path = ?
+               AND import_source_id IS NULL
+               AND import_batch_id IS NULL",
+            params![stale_path],
         )
         .map_err(|error| format!("清除重複 Codex transcript 資料失敗: {error}"))?;
     }
@@ -3844,20 +3883,25 @@ fn drop_codex_rows_for_transcript_path(
 
 /// Remove every row of one rollout before its transcript is rewritten: rows
 /// carrying the rollout identity (written from another location or by an older
-/// parser), rows stored under a previous spelling of the path, and rows written
-/// before rollout identities existed.
+/// parser), rows stored under a previous spelling of the path, rows of copies
+/// that lost the canonical choice, and rows written before rollout identities
+/// existed. Imported rows are excluded everywhere so a local transcript never
+/// deletes data that belongs to an import batch.
 fn purge_codex_transcript_rows(
     tx: &rusqlite::Transaction<'_>,
     identity: &str,
     transcript_path: &str,
     known_transcript_paths: Option<&Vec<String>>,
+    stale_copy_paths: &[String],
 ) -> Result<(), String> {
     // `usage_identity <> ''` keeps the partial identity index usable.
     tx.execute(
         "DELETE FROM usage_entries
          WHERE assistant_type = 'codex'
            AND usage_identity <> ''
-           AND usage_identity = ?",
+           AND usage_identity = ?
+           AND import_source_id IS NULL
+           AND import_batch_id IS NULL",
         params![identity],
     )
     .map_err(|error| format!("清空舊 Codex rollout 資料失敗: {error}"))?;
@@ -3865,15 +3909,23 @@ fn purge_codex_transcript_rows(
     for existing_path in known_transcript_paths.into_iter().flatten() {
         tx.execute(
             "DELETE FROM usage_entries
-             WHERE assistant_type = 'codex' AND transcript_path = ?",
+             WHERE assistant_type = 'codex'
+               AND transcript_path = ?
+               AND import_source_id IS NULL
+               AND import_batch_id IS NULL",
             params![existing_path],
         )
         .map_err(|error| format!("清空舊 Codex transcript 資料失敗: {error}"))?;
     }
 
+    remove_stale_codex_copy_rows(tx, stale_copy_paths)?;
+
     tx.execute(
         "DELETE FROM usage_entries
-         WHERE assistant_type = 'codex' AND transcript_path = ?",
+         WHERE assistant_type = 'codex'
+           AND transcript_path = ?
+           AND import_source_id IS NULL
+           AND import_batch_id IS NULL",
         params![transcript_path],
     )
     .map_err(|error| format!("清空舊 Codex transcript 資料失敗: {error}"))?;
@@ -3939,11 +3991,23 @@ fn sync_codex_usage_logs(conn: &mut Connection) -> Result<(), String> {
             continue;
         };
 
-        for duplicate in group.iter().filter(|entry| entry.path != canonical.path) {
-            drop_codex_rows_for_transcript_path(conn, &transcript_paths, &duplicate.path)?;
-        }
+        // Copies of the same rollout are dropped inside the canonical write's
+        // transaction, so a reader never observes the rollout without rows and
+        // a failed or empty canonical file leaves the copies intact.
+        let duplicates: Vec<CodexTranscript> = group
+            .iter()
+            .filter(|entry| entry.path != canonical.path)
+            .cloned()
+            .collect();
 
-        sync_codex_transcript(conn, &codex_dir, &identity, &canonical, &transcript_paths)?;
+        sync_codex_transcript(
+            conn,
+            &codex_dir,
+            &identity,
+            &canonical,
+            &transcript_paths,
+            &duplicates,
+        )?;
     }
 
     Ok(())
@@ -3956,6 +4020,7 @@ fn sync_codex_transcript(
     identity: &str,
     transcript: &CodexTranscript,
     transcript_paths: &HashMap<String, Vec<String>>,
+    duplicates: &[CodexTranscript],
 ) -> Result<(), String> {
     let state_path = portable_relative_path(codex_dir, &transcript.path);
     let state_key = format!("codex:{}", state_path);
@@ -3975,8 +4040,19 @@ fn sync_codex_transcript(
     let transcript_path_key = codex_transcript_path_key(&transcript_path);
     let known_transcript_paths = transcript_paths.get(&transcript_path_key);
     let transcript_is_current = known_transcript_paths.is_some();
+    let stale_copy_paths = stale_codex_copy_paths(transcript_paths, duplicates);
 
     if !codex_transcript_needs_sync(current_size, last_synced_state, transcript_is_current) {
+        // The canonical transcript is already stored, so copies that were
+        // synced before it won the canonical choice can be dropped safely.
+        if transcript_is_current && !stale_copy_paths.is_empty() {
+            let tx = conn
+                .transaction()
+                .map_err(|error| format!("Transaction BEGIN 失敗: {error}"))?;
+            remove_stale_codex_copy_rows(&tx, &stale_copy_paths)?;
+            tx.commit()
+                .map_err(|error| format!("Transaction COMMIT 失敗: {error}"))?;
+        }
         return Ok(());
     }
 
@@ -3989,6 +4065,8 @@ fn sync_codex_transcript(
     };
 
     if parsed_entries.is_empty() {
+        // The rollout has no usage yet, so existing rows (including copies)
+        // stay until the transcript carries data.
         conn.execute(
             "INSERT OR REPLACE INTO sync_state
              (filename, last_synced_size, last_synced_time)
@@ -4007,7 +4085,13 @@ fn sync_codex_transcript(
         .transaction()
         .map_err(|error| format!("Transaction BEGIN 失敗: {error}"))?;
 
-    purge_codex_transcript_rows(&tx, identity, &transcript_path, known_transcript_paths)?;
+    purge_codex_transcript_rows(
+        &tx,
+        identity,
+        &transcript_path,
+        known_transcript_paths,
+        &stale_copy_paths,
+    )?;
 
     let mut success = true;
     for entry in &parsed_entries {
@@ -7926,6 +8010,17 @@ mod tests {
         );
         assert_eq!(codex_rollout_identity(""), None);
         assert_eq!(codex_rollout_identity("/tmp/.jsonl"), None);
+        // Anything that is not a documented rollout file is not a rollout:
+        // adopting it would let a later local file with the same name purge
+        // rows that came from an import or from an unrelated file.
+        assert_eq!(
+            codex_rollout_identity("/tmp/.codex/sessions/notes.jsonl"),
+            None
+        );
+        assert_eq!(
+            codex_rollout_identity(r"C:\Users\u\.codex\archived_sessions\history.jsonl"),
+            None
+        );
     }
 
     #[test]
@@ -8008,6 +8103,304 @@ mod tests {
             )
             .unwrap();
         assert_eq!(later_identity, "");
+    }
+
+    #[test]
+    fn codex_rollout_identity_migration_keeps_imported_rows() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, transcript_path, turn_no
+             ) VALUES ('codex', '2026-09-10T16:06:50Z', '2026-09-10',
+                'shared-session', '/codex/sessions/2026/09/11/rollout-a.jsonl', 1)",
+            [],
+        )
+        .unwrap();
+        // Rows written before transcripts were tracked have no path and no
+        // import: they duplicate the session tracked by the rollout above.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, turn_no
+             ) VALUES ('codex', '2026-09-10T16:06:50Z', '2026-09-10',
+                'shared-session', 2)",
+            [],
+        )
+        .unwrap();
+        // Imported rows belong to the import batch and must survive both the
+        // migration and the local sync.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, turn_no,
+                import_source_id, import_batch_id
+             ) VALUES ('codex', '2026-09-10T16:06:50Z', '2026-09-10',
+                'shared-session', 3, 'codex-import:1', 'batch-1')",
+            [],
+        )
+        .unwrap();
+        // An imported path from another machine must never be adopted as a
+        // rollout identity, even when its file name looks plausible.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, transcript_path, turn_no,
+                import_source_id, import_batch_id
+             ) VALUES ('codex', '2026-09-10T16:09:50Z', '2026-09-10',
+                'other-machine-session', '/other/.codex/sessions/2026/09/11/rollout-b.jsonl', 1,
+                'codex-import:2', 'batch-1')",
+            [],
+        )
+        .unwrap();
+
+        run_codex_rollout_identity_migration(&mut conn).unwrap();
+
+        let imported_rows: Vec<(String, String, String)> = conn
+            .prepare(
+                "SELECT session_id, COALESCE(transcript_path, ''), usage_identity
+                 FROM usage_entries
+                 WHERE assistant_type = 'codex' AND import_source_id IS NOT NULL
+                 ORDER BY session_id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            imported_rows,
+            vec![
+                (
+                    "other-machine-session".to_string(),
+                    "/other/.codex/sessions/2026/09/11/rollout-b.jsonl".to_string(),
+                    String::new()
+                ),
+                ("shared-session".to_string(), String::new(), String::new()),
+            ]
+        );
+
+        let untracked_rows: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'codex'
+                   AND transcript_path IS NULL
+                   AND import_source_id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(untracked_rows, 0);
+    }
+
+    #[test]
+    fn sync_codex_usage_logs_keeps_imported_rows_of_a_synced_rollout() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_codex_dir = std::env::var("CODEX_DIR").ok();
+        let mut codex_dir = std::env::temp_dir();
+        let unique = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        codex_dir.push(format!(
+            "codex-import-sync-{}-{}",
+            std::process::id(),
+            unique
+        ));
+
+        let sessions_dir = codex_dir.join("sessions/2026/09/11");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        let transcript_path = sessions_dir.join("rollout-2026-09-11T00-06-46-imported.jsonl");
+        fs::write(
+            &transcript_path,
+            format!(
+                "{}\n{}\n",
+                codex_session_meta("imported-session"),
+                codex_token_count_event("2026-09-10T16:06:50.000Z", 100, 20, 10)
+            ),
+        )
+        .unwrap();
+        // A second file that is not a rollout transcript must be ignored.
+        fs::write(
+            sessions_dir.join("notes.jsonl"),
+            format!("{}\n", codex_session_meta("notes-session")),
+        )
+        .unwrap();
+        std::env::set_var("CODEX_DIR", &codex_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, transcript_path, turn_no,
+                usage_identity, import_source_id, import_batch_id
+             ) VALUES ('codex', '2026-09-10T16:06:50Z', '2026-09-10',
+                'imported-session', ?, 1, ?, 'codex-import:1', 'batch-1')",
+            params![
+                transcript_path.to_string_lossy().as_ref(),
+                "rollout=rollout-2026-09-11T00-06-46-imported"
+            ],
+        )
+        .unwrap();
+
+        sync_codex_usage_logs(&mut conn).unwrap();
+
+        let imported_identity: String = conn
+            .query_row(
+                "SELECT usage_identity FROM usage_entries
+                 WHERE assistant_type = 'codex' AND import_source_id = 'codex-import:1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            imported_identity,
+            "rollout=rollout-2026-09-11T00-06-46-imported"
+        );
+
+        let local_rows: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'codex'
+                   AND transcript_path = ?
+                   AND import_source_id IS NULL",
+                params![transcript_path.to_string_lossy().as_ref()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(local_rows > 0);
+
+        let notes_rows: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'codex' AND session_id = 'notes-session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(notes_rows, 0, "non-rollout files must not be synced");
+
+        if let Some(value) = old_codex_dir {
+            std::env::set_var("CODEX_DIR", value);
+        } else {
+            std::env::remove_var("CODEX_DIR");
+        }
+        let _ = fs::remove_dir_all(&codex_dir);
+    }
+
+    #[test]
+    fn sync_codex_usage_logs_keeps_rollout_copies_when_the_canonical_file_is_empty() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_codex_dir = std::env::var("CODEX_DIR").ok();
+        let mut codex_dir = std::env::temp_dir();
+        let unique = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        codex_dir.push(format!(
+            "codex-copy-atomic-{}-{}",
+            std::process::id(),
+            unique
+        ));
+
+        let sessions_dir = codex_dir.join("sessions/2026/09/11");
+        let archived_dir = codex_dir.join("archived_sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        fs::create_dir_all(&archived_dir).unwrap();
+
+        let file_name = "rollout-2026-09-11T00-07-00-atomic-session.jsonl";
+        let active_path = sessions_dir.join(file_name);
+        let archived_path = archived_dir.join(file_name);
+
+        // The live file is the canonical copy (larger and inside `sessions`)
+        // but carries no usage, so nothing may be rewritten or dropped.
+        fs::write(&active_path, "not json\n".repeat(400)).unwrap();
+        fs::write(
+            &archived_path,
+            format!(
+                "{}\n{}\n",
+                codex_session_meta("atomic-session"),
+                codex_token_count_event("2026-09-10T16:07:00.000Z", 100, 20, 10)
+            ),
+        )
+        .unwrap();
+        std::env::set_var("CODEX_DIR", &codex_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        for (turn_no, path) in [(1, &active_path), (2, &archived_path)] {
+            conn.execute(
+                "INSERT INTO usage_entries (
+                    assistant_type, timestamp, date, session_id, transcript_path, turn_no,
+                    usage_identity
+                 ) VALUES ('codex', '2026-09-10T16:07:00Z', '2026-09-10',
+                    'atomic-session', ?, ?, 'rollout=rollout-2026-09-11T00-07-00-atomic-session')",
+                params![path.to_string_lossy().as_ref(), turn_no],
+            )
+            .unwrap();
+        }
+
+        sync_codex_usage_logs(&mut conn).unwrap();
+
+        let mut stored_paths: Vec<String> = conn
+            .prepare(
+                "SELECT DISTINCT transcript_path FROM usage_entries
+                 WHERE assistant_type = 'codex' ORDER BY transcript_path",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        stored_paths.sort();
+        let mut expected_paths = vec![
+            active_path.to_string_lossy().into_owned(),
+            archived_path.to_string_lossy().into_owned(),
+        ];
+        expected_paths.sort();
+        assert_eq!(
+            stored_paths, expected_paths,
+            "an empty canonical transcript must not drop the stored copies"
+        );
+
+        // Once the canonical file carries usage, the copy is dropped together
+        // with the canonical write in one transaction.
+        fs::write(
+            &active_path,
+            format!(
+                "{}\n{}\n{}\n",
+                codex_session_meta("atomic-session"),
+                codex_token_count_event("2026-09-10T16:07:00.000Z", 100, 20, 10),
+                codex_token_count_event("2026-09-10T16:09:00.000Z", 150, 30, 15)
+            ),
+        )
+        .unwrap();
+
+        sync_codex_usage_logs(&mut conn).unwrap();
+
+        let stored_paths: Vec<String> = conn
+            .prepare(
+                "SELECT DISTINCT transcript_path FROM usage_entries
+                 WHERE assistant_type = 'codex' ORDER BY transcript_path",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            stored_paths,
+            vec![active_path.to_string_lossy().into_owned()]
+        );
+
+        let total: u64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(delta_total), 0) FROM usage_entries
+                 WHERE assistant_type = 'codex'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(total, 165);
+
+        if let Some(value) = old_codex_dir {
+            std::env::set_var("CODEX_DIR", value);
+        } else {
+            std::env::remove_var("CODEX_DIR");
+        }
+        let _ = fs::remove_dir_all(&codex_dir);
     }
 
     #[test]
@@ -9180,7 +9573,7 @@ mod tests {
 
         let sessions_dir = codex_dir.join("sessions/2026/07/26");
         fs::create_dir_all(&sessions_dir).unwrap();
-        let transcript_path = sessions_dir.join("empty-session.jsonl");
+        let transcript_path = sessions_dir.join("rollout-2026-07-26T10-00-00-empty-session.jsonl");
         let content = r#"{"timestamp":"2026-07-26T10:00:00Z","type":"session_meta","payload":{"id":"empty-session","session_id":"empty-session","originator":"Codex Desktop"}}"#;
         fs::write(&transcript_path, content).unwrap();
         std::env::set_var("CODEX_DIR", &codex_dir);
