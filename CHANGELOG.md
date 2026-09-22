@@ -4,6 +4,8 @@
 
 ## [未發行]
 
+## [1.0.2] - 2026-09-22
+
 ### 新增與改善
 
 - 新增 Grok 4.7 定價規則（`pricing.csv`），涵蓋 200k 上下文門檻的短／長上下文費率、Low／Medium／High／Extra High 推理層級，以及價格為一般版 2 倍的 Fast 模式，共 30 筆 xAI API 規則（輸入 2.00／4.00、快取輸入 0.50／1.00、輸出 6.00／12.00，Fast 模式為兩倍）。
@@ -731,7 +733,8 @@
 - 修正行動版側邊欄遮擋、黑畫面、標題擠壓、圖表導覽索引與年度版面問題。
 - 修正並補齊多個 Gemini、Claude、GPT 與 GPT-OSS 模型的定價規則。
 
-[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.0.1...HEAD
+[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.0.2...HEAD
+[1.0.2]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.9.9...v1.0.0
 [0.9.9]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.9.8...v0.9.9
