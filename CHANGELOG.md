@@ -30,12 +30,14 @@
 - 修正舊版本遺留的跨來源重複資料列在該 rollout 的同步狀態已是最新時仍會永久重複計算的問題；身分遷移現在會清除與匯入資料屬於同一回合的本機資料列，讓同鍵的匯入資料優先保留。
 - 修正身分遷移的孤兒資料清除未比對來源類型、可能把其他來源類型中同樣沒有 transcript 路徑的資料列一併刪除的問題；孤兒判定現在限定相同的 `source_kind`。
 - 修正匯入時查詢本機既有資料列來源類型的語句未帶 `usage_identity <> ''`、無法命中部分索引的問題；大型資料庫改走 `idx_assistant_usage_identity`，避免逐筆掃描 `idx_assistant_type` 或 `idx_assistant_transcript_path`。
+- 修正 rollout 身分遷移在大型資料庫上耗時過久的效能問題：遷移的三個相互關聯子查詢原先無法使用部分索引、退化成每個資料列各掃描一次全部 Codex 資料列，179,312 筆的資料庫會卡在同步中數十分鐘以上；遷移期間改為建立兩個非部分索引供其尋址並於交易內移除，同一資料庫的首次同步實測 74 秒完成。
 
 ### 資料影響
 
 - Grok Build 解析器版本提升至 `migration:grok_parser_v8`，啟動時會重新解析既有的 Grok Session，讓先前以原始模型 ID（例如 `grok-4.7`）儲存的資料列改用新的顯示名稱與價格規則；重解析僅更新模型、推理層級與未回報成本的估算值，不會刪除 Session 或歷史資料。
 - `usage_entries` 既有的 `usage_identity` 欄位（1.0.0 導入，預設空字串不需人工調整）自本次起由 Codex 的 rollout 檔案以檔名寫入穩定身分；啟動時會自動執行一次性遷移 `migration:codex_rollout_identity_v1`，回填既有資料並清除已無對應檔案的孤兒資料列（僅影響 `assistant_type = 'codex'` 且非匯入的資料列）。
 - 新增部分索引 `idx_assistant_usage_identity`（`WHERE usage_identity <> ''`）以加速身分範圍的刪除；大型資料庫可顯著降低同步時的刪除耗時。
+- 身分遷移另行建立兩個暫時索引（`tmp_codex_rollout_identity_guard`、`tmp_codex_rollout_import_identity`）並在同一交易內移除，遷移結束後資料庫結構與先前相同。
 - 手動匯入的資料列（`import_source_id` / `import_batch_id` 非空）改由匯入批次管理：本機 Codex transcript 同步不再刪除或改寫其 `usage_identity`，rollout 遷移亦不會將其視為孤兒資料清除；「本機已存有此 rollout」的判定與重複副本清除也只採計本機資料列。
 
 ### 相容性

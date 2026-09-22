@@ -166,6 +166,64 @@ const CODEX_DESKTOP_SOURCE_KIND: &str = "codex-desktop";
 const CODEX_OTHER_SOURCE_KIND: &str = "codex-other";
 const CODEX_EMPTY_TRANSCRIPT_SYNC_TIME: i64 = -1;
 
+/// Temporary indexes that only the rollout identity migration uses.
+///
+/// The permanent unique indexes are partial (`WHERE source_dir_key IS NULL`),
+/// and SQLite cannot prove that predicate from the migration's correlated
+/// subqueries, so it degraded to scanning every Codex row of the
+/// `assistant_type` for each outer row. The migration therefore builds
+/// non-partial indexes for its own lookups and drops them before committing.
+const CODEX_ROLLOUT_IDENTITY_GUARD_INDEX: &str = "tmp_codex_rollout_identity_guard";
+const CODEX_ROLLOUT_IDENTITY_GUARD_INDEX_SQL: &str =
+    "CREATE INDEX IF NOT EXISTS tmp_codex_rollout_identity_guard
+     ON usage_entries(assistant_type, source_kind, session_id, turn_no, usage_identity)";
+const CODEX_ROLLOUT_IMPORT_IDENTITY_INDEX: &str = "tmp_codex_rollout_import_identity";
+const CODEX_ROLLOUT_IMPORT_IDENTITY_INDEX_SQL: &str =
+    "CREATE INDEX IF NOT EXISTS tmp_codex_rollout_import_identity
+     ON usage_entries(assistant_type, usage_identity, session_id, turn_no)";
+const CODEX_ROLLOUT_IDENTITY_BACKFILL_SQL: &str = "UPDATE usage_entries
+     SET usage_identity = ?
+     WHERE assistant_type = 'codex'
+       AND transcript_path = ?
+       AND usage_identity = ''
+       AND NOT EXISTS (
+            SELECT 1 FROM usage_entries AS marked
+            WHERE marked.id <> usage_entries.id
+              AND marked.assistant_type = usage_entries.assistant_type
+              AND marked.source_kind = usage_entries.source_kind
+              AND marked.session_id = usage_entries.session_id
+              AND marked.turn_no = usage_entries.turn_no
+              AND marked.usage_identity = ?)";
+const CODEX_ROLLOUT_IDENTITY_ORPHAN_DELETE_SQL: &str = "DELETE FROM usage_entries
+     WHERE assistant_type = 'codex'
+       AND usage_identity = ''
+       AND COALESCE(transcript_path, '') = ''
+       AND import_source_id IS NULL
+       AND import_batch_id IS NULL
+       AND EXISTS (
+            SELECT 1 FROM usage_entries AS tracked
+            WHERE tracked.assistant_type = 'codex'
+              AND tracked.session_id = usage_entries.session_id
+              AND tracked.source_kind = usage_entries.source_kind
+              AND tracked.usage_identity <> ''
+              AND tracked.import_source_id IS NULL
+              AND tracked.import_batch_id IS NULL
+       )";
+const CODEX_ROLLOUT_IMPORT_DEDUPE_DELETE_SQL: &str = "DELETE FROM usage_entries
+     WHERE assistant_type = 'codex'
+       AND import_source_id IS NULL
+       AND import_batch_id IS NULL
+       AND usage_identity <> ''
+       AND EXISTS (
+            SELECT 1 FROM usage_entries AS imported
+            WHERE imported.assistant_type = usage_entries.assistant_type
+              AND imported.usage_identity = usage_entries.usage_identity
+              AND imported.session_id = usage_entries.session_id
+              AND imported.turn_no = usage_entries.turn_no
+              AND (imported.import_source_id IS NOT NULL
+                   OR imported.import_batch_id IS NOT NULL)
+       )";
+
 /// Every Codex rollout transcript is named `rollout-<timestamp>-<session>
 /// [_<rollout>].jsonl`. Other files can live in the same directories, so only
 /// this prefix may become a rollout identity.
@@ -1896,6 +1954,17 @@ fn run_codex_rollout_identity_migration(conn: &mut Connection) -> Result<(), Str
         .transaction()
         .map_err(|error| format!("Codex rollout 身分遷移 BEGIN 失敗: {error}"))?;
 
+    // The correlated guards below only reach the temporary indexes; without
+    // them a large `usage_entries` table turns this migration into one scan of
+    // every Codex row per outer row.
+    for create_index_sql in [
+        CODEX_ROLLOUT_IDENTITY_GUARD_INDEX_SQL,
+        CODEX_ROLLOUT_IMPORT_IDENTITY_INDEX_SQL,
+    ] {
+        tx.execute(create_index_sql, [])
+            .map_err(|error| format!("建立 Codex rollout 身分遷移索引失敗: {error}"))?;
+    }
+
     for stored_path in untracked_paths {
         let Some(identity) = codex_rollout_identity(&stored_path) else {
             continue;
@@ -1906,19 +1975,7 @@ fn run_codex_rollout_identity_migration(conn: &mut Connection) -> Result<(), Str
         // row that would collide with an already marked row untouched instead of
         // failing the whole migration.
         tx.execute(
-            "UPDATE usage_entries
-             SET usage_identity = ?
-             WHERE assistant_type = 'codex'
-               AND transcript_path = ?
-               AND usage_identity = ''
-               AND NOT EXISTS (
-                    SELECT 1 FROM usage_entries AS marked
-                    WHERE marked.id <> usage_entries.id
-                      AND marked.assistant_type = usage_entries.assistant_type
-                      AND marked.source_kind = usage_entries.source_kind
-                      AND marked.session_id = usage_entries.session_id
-                      AND marked.turn_no = usage_entries.turn_no
-                      AND marked.usage_identity = ?)",
+            CODEX_ROLLOUT_IDENTITY_BACKFILL_SQL,
             params![identity, stored_path, identity],
         )
         .map_err(|error| format!("標記 Codex rollout 身分失敗: {error}"))?;
@@ -1931,49 +1988,24 @@ fn run_codex_rollout_identity_migration(conn: &mut Connection) -> Result<(), Str
     // Imported rows are excluded from both sides: they are keyed by
     // `import_source_id`, have no local transcript, and must stay until the
     // import is rolled back.
-    tx.execute(
-        "DELETE FROM usage_entries
-         WHERE assistant_type = 'codex'
-           AND usage_identity = ''
-           AND COALESCE(transcript_path, '') = ''
-           AND import_source_id IS NULL
-           AND import_batch_id IS NULL
-           AND EXISTS (
-                SELECT 1 FROM usage_entries AS tracked
-                WHERE tracked.assistant_type = 'codex'
-                  AND tracked.session_id = usage_entries.session_id
-                  AND tracked.source_kind = usage_entries.source_kind
-                  AND tracked.usage_identity <> ''
-                  AND tracked.import_source_id IS NULL
-                  AND tracked.import_batch_id IS NULL
-           )",
-        [],
-    )
-    .map_err(|error| format!("清除未追蹤的 Codex 舊資料失敗: {error}"))?;
+    tx.execute(CODEX_ROLLOUT_IDENTITY_ORPHAN_DELETE_SQL, [])
+        .map_err(|error| format!("清除未追蹤的 Codex 舊資料失敗: {error}"))?;
 
     // Imports own their turns, so a locally stored row that duplicates an
     // imported row of the same rollout, session and turn disappears once both
     // rows carry the identity. This resolves the duplicates that older releases
     // left behind when an imported row and a locally synced row of the same turn
     // disagreed about the source kind and therefore never collided.
-    tx.execute(
-        "DELETE FROM usage_entries
-         WHERE assistant_type = 'codex'
-           AND import_source_id IS NULL
-           AND import_batch_id IS NULL
-           AND usage_identity <> ''
-           AND EXISTS (
-                SELECT 1 FROM usage_entries AS imported
-                WHERE imported.assistant_type = usage_entries.assistant_type
-                  AND imported.usage_identity = usage_entries.usage_identity
-                  AND imported.session_id = usage_entries.session_id
-                  AND imported.turn_no = usage_entries.turn_no
-                  AND (imported.import_source_id IS NOT NULL
-                       OR imported.import_batch_id IS NOT NULL)
-           )",
-        [],
-    )
-    .map_err(|error| format!("清除與匯入重複的 Codex 資料失敗: {error}"))?;
+    tx.execute(CODEX_ROLLOUT_IMPORT_DEDUPE_DELETE_SQL, [])
+        .map_err(|error| format!("清除與匯入重複的 Codex 資料失敗: {error}"))?;
+
+    for drop_index_sql in [
+        format!("DROP INDEX IF EXISTS {CODEX_ROLLOUT_IDENTITY_GUARD_INDEX}"),
+        format!("DROP INDEX IF EXISTS {CODEX_ROLLOUT_IMPORT_IDENTITY_INDEX}"),
+    ] {
+        tx.execute(&drop_index_sql, [])
+            .map_err(|error| format!("移除 Codex rollout 身分遷移索引失敗: {error}"))?;
+    }
 
     tx.execute(
         "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time)
@@ -8533,6 +8565,110 @@ mod tests {
             )
             .unwrap();
         assert_eq!(imported_rows, 1, "the import owns the turn");
+    }
+
+    #[test]
+    fn codex_rollout_identity_migration_guards_use_its_temporary_indexes() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // The correlated guards must not rescan every Codex row per outer row,
+        // so the migration builds non-partial indexes for its own lookups.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, timestamp, date, session_id, turn_no,
+                transcript_path, usage_identity, import_source_id
+             )
+             WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 400)
+             SELECT 'codex', 'codex-desktop', '2026-09-11T00:00:00Z', '2026-09-11',
+                    'session-' || (n % 40), n % 400,
+                    '/codex/sessions/2026/09/11/rollout-' || n || '.jsonl',
+                    CASE WHEN n % 2 = 0 THEN 'rollout=rollout-' || n ELSE '' END,
+                    CASE WHEN n % 4 = 0 THEN 1000000 + n ELSE NULL END
+             FROM seq",
+            [],
+        )
+        .unwrap();
+        for create_index_sql in [
+            CODEX_ROLLOUT_IDENTITY_GUARD_INDEX_SQL,
+            CODEX_ROLLOUT_IMPORT_IDENTITY_INDEX_SQL,
+        ] {
+            conn.execute(create_index_sql, []).unwrap();
+        }
+
+        let plans = [
+            (
+                CODEX_ROLLOUT_IDENTITY_BACKFILL_SQL,
+                CODEX_ROLLOUT_IDENTITY_GUARD_INDEX,
+                3,
+            ),
+            (
+                CODEX_ROLLOUT_IDENTITY_ORPHAN_DELETE_SQL,
+                CODEX_ROLLOUT_IDENTITY_GUARD_INDEX,
+                0,
+            ),
+            (
+                CODEX_ROLLOUT_IMPORT_DEDUPE_DELETE_SQL,
+                CODEX_ROLLOUT_IMPORT_IDENTITY_INDEX,
+                0,
+            ),
+        ];
+        for (statement, expected_index, bound_params) in plans {
+            let mut query_plan = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {statement}"))
+                .unwrap();
+            let bound: Vec<&str> = vec!["rollout=rollout-x"; bound_params];
+            let details: Vec<String> = query_plan
+                .query_map(rusqlite::params_from_iter(bound), |row| row.get(3))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert!(
+                details.iter().any(|detail| detail.contains(expected_index)),
+                "查詢計畫未使用 {expected_index}：{details:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_rollout_identity_migration_drops_its_temporary_indexes() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, timestamp, date, session_id, transcript_path,
+                turn_no, usage_identity
+             ) VALUES ('codex', 'codex-desktop', '2026-09-11T00:00:00Z', '2026-09-11',
+                'temporary-index-session',
+                '/codex/sessions/2026/09/11/rollout-2026-09-11T00-06-46-temporary.jsonl', 1, '')",
+            [],
+        )
+        .unwrap();
+
+        run_codex_rollout_identity_migration(&mut conn).unwrap();
+
+        let temporary_indexes: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name LIKE 'tmp_%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            temporary_indexes, 0,
+            "the migration must drop the indexes it created"
+        );
+        let identity: String = conn
+            .query_row(
+                "SELECT usage_identity FROM usage_entries
+                 WHERE assistant_type = 'codex' AND session_id = 'temporary-index-session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            identity, "rollout=rollout-2026-09-11T00-06-46-temporary",
+            "the migration must still backfill the identity"
+        );
     }
 
     #[test]
