@@ -4105,31 +4105,35 @@ fn sync_codex_transcript(
     )?;
 
     let mut success = true;
+    // Turns this rollout already covers through an import batch must not be
+    // written again by the local parse. The check ignores the source kind: an
+    // import created before the rollout existed locally keeps its `legacy` kind,
+    // and the purge above only ever removes local rows, so a surviving row of
+    // this identity belongs to an import that owns its turn. `usage_identity <> ''`
+    // keeps the partial identity index usable.
+    let imported_turns: HashSet<i64> = {
+        let mut stmt = tx
+            .prepare(
+                "SELECT turn_no FROM usage_entries
+                 WHERE assistant_type = 'codex'
+                   AND usage_identity <> ''
+                   AND usage_identity = ?
+                   AND (import_source_id IS NOT NULL OR import_batch_id IS NOT NULL)",
+            )
+            .map_err(|error| format!("準備讀取 Codex 匯入回合失敗: {error}"))?;
+        let rows = stmt
+            .query_map(params![identity], |row| row.get::<_, i64>(0))
+            .map_err(|error| format!("讀取 Codex 匯入回合失敗: {error}"))?;
+        rows.collect::<Result<HashSet<_>, _>>()
+            .map_err(|error| format!("解析 Codex 匯入回合失敗: {error}"))?
+    };
+
     for entry in &parsed_entries {
         let tokens = entry.tokens.as_ref();
         let delta = entry.delta_tokens.as_ref();
         let cost = entry.cost.as_ref();
 
-        // An imported row of the same rollout and turn owns that turn even when
-        // its source kind differs (an export written by this app stores the
-        // `legacy` kind of its original import): the purge above already removed
-        // every local row of this identity, so a row still present for the same
-        // turn can only belong to an import batch, which must not be duplicated.
-        let owned_by_import: bool = tx
-            .query_row(
-                "SELECT EXISTS (
-                    SELECT 1 FROM usage_entries
-                    WHERE assistant_type = 'codex'
-                      AND session_id = ?
-                      AND turn_no = ?
-                      AND usage_identity = ?
-                      AND (import_source_id IS NOT NULL OR import_batch_id IS NOT NULL)
-                 )",
-                params![entry.session_id, entry.turn_no as i64, identity],
-                |row| row.get(0),
-            )
-            .map_err(|error| format!("檢查 Codex rollout 匯入資料失敗: {error}"))?;
-        if owned_by_import {
+        if imported_turns.contains(&(entry.turn_no as i64)) {
             continue;
         }
 
