@@ -141,7 +141,19 @@ fn codex_usage_delta_to_stats(
     }
 }
 
-pub(super) fn parse_codex_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String> {
+/// Result of parsing one Codex rollout transcript.
+pub(super) struct CodexSessionParse {
+    pub(super) entries: Vec<UsageEntry>,
+    /// Number of lines that could not be read or were not valid JSON.
+    ///
+    /// Codex appends to a rollout while it runs, so a torn last line means the
+    /// read caught the file mid-write and the parsed entries may be incomplete.
+    pub(super) malformed_lines: usize,
+}
+
+pub(super) fn parse_codex_session_file_with_diagnostics(
+    filepath: &Path,
+) -> Result<CodexSessionParse, String> {
     let file = File::open(filepath).map_err(|e| format!("無法開啟檔案: {}", e))?;
     let reader = BufReader::new(file);
     let fallback_session_id = filepath
@@ -152,13 +164,22 @@ pub(super) fn parse_codex_session_file(filepath: &Path) -> Result<Vec<UsageEntry
         .to_string();
 
     let mut events = Vec::new();
+    let mut malformed_lines = 0usize;
     for line_res in reader.lines() {
         let line = match line_res {
             Ok(line) => line,
-            Err(_) => continue,
+            Err(_) => {
+                malformed_lines += 1;
+                continue;
+            }
         };
+        if line.trim().is_empty() {
+            continue;
+        }
         if let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) {
             events.push(event);
+        } else {
+            malformed_lines += 1;
         }
     }
 
@@ -386,7 +407,10 @@ pub(super) fn parse_codex_session_file(filepath: &Path) -> Result<Vec<UsageEntry
         });
     }
 
-    Ok(results)
+    Ok(CodexSessionParse {
+        entries: results,
+        malformed_lines,
+    })
 }
 #[cfg(test)]
 mod tests {
@@ -411,7 +435,9 @@ mod tests {
 "#;
 
         fs::write(&path, content).unwrap();
-        let entries = parse_codex_session_file(&path).unwrap();
+        let entries = parse_codex_session_file_with_diagnostics(&path)
+            .unwrap()
+            .entries;
         let _ = fs::remove_file(&path);
 
         assert_eq!(entries.len(), 3);
@@ -459,7 +485,9 @@ mod tests {
 "#;
 
         fs::write(&path, content).unwrap();
-        let entries = parse_codex_session_file(&path).unwrap();
+        let entries = parse_codex_session_file_with_diagnostics(&path)
+            .unwrap()
+            .entries;
         let _ = fs::remove_file(&path);
 
         assert_eq!(entries.len(), 2);
@@ -484,7 +512,9 @@ mod tests {
 "#;
 
         fs::write(&path, content).unwrap();
-        let entries = parse_codex_session_file(&path).unwrap();
+        let entries = parse_codex_session_file_with_diagnostics(&path)
+            .unwrap()
+            .entries;
         let _ = fs::remove_file(&path);
 
         assert_eq!(entries.len(), 1);
@@ -503,7 +533,9 @@ mod tests {
 "#;
 
         fs::write(&path, content).unwrap();
-        let entries = parse_codex_session_file(&path).unwrap();
+        let entries = parse_codex_session_file_with_diagnostics(&path)
+            .unwrap()
+            .entries;
         let _ = fs::remove_file(&path);
 
         assert_eq!(entries.len(), 4);
@@ -528,7 +560,9 @@ mod tests {
 "#;
 
         fs::write(&path, content).unwrap();
-        let entries = parse_codex_session_file(&path).unwrap();
+        let entries = parse_codex_session_file_with_diagnostics(&path)
+            .unwrap()
+            .entries;
         let _ = fs::remove_file(&path);
 
         assert_eq!(entries.len(), 1);
@@ -550,7 +584,9 @@ mod tests {
 "#;
 
         fs::write(&path, content).unwrap();
-        let entries = parse_codex_session_file(&path).unwrap();
+        let entries = parse_codex_session_file_with_diagnostics(&path)
+            .unwrap()
+            .entries;
         let _ = fs::remove_file(&path);
 
         assert_eq!(entries.len(), 2);
@@ -568,5 +604,31 @@ mod tests {
         assert_eq!(second.output, 5);
         assert_eq!(second.reasoning, Some(3));
         assert_eq!(second.total, 55);
+    }
+
+    #[test]
+    fn parse_codex_session_file_reports_malformed_lines() {
+        let path = temp_jsonl_path("codex-malformed");
+
+        fs::write(&path, b"{\"type\":\"event_msg\"}\n").unwrap();
+        let complete = parse_codex_session_file_with_diagnostics(&path).unwrap();
+        assert_eq!(complete.malformed_lines, 0);
+
+        // A torn trailing line is what a transcript looks like while Codex is
+        // still appending to it.
+        fs::write(
+            &path,
+            b"{\"type\":\"event_msg\"}\n{\"timestamp\":\"2026-07-26T10:00:0",
+        )
+        .unwrap();
+        let truncated = parse_codex_session_file_with_diagnostics(&path).unwrap();
+        assert_eq!(truncated.malformed_lines, 1);
+        assert!(truncated.entries.is_empty());
+
+        fs::write(&path, b"{\"type\":\"event_msg\"}\n\n\n").unwrap();
+        let blank_lines = parse_codex_session_file_with_diagnostics(&path).unwrap();
+        assert_eq!(blank_lines.malformed_lines, 0, "blank lines are not damage");
+
+        let _ = fs::remove_file(&path);
     }
 }

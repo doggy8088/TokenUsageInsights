@@ -9,7 +9,7 @@
 - 修正 Codex Session 在 `~/.codex/sessions` 與 `~/.codex/archived_sessions` 之間移動、或同一 Session 同時存在多個 rollout 檔案時，看板數字每隔幾秒在兩組數值間反覆跳動的問題（Issue #54）。
 - 修正 Codex 同步可能誤刪匯入資料的問題：rollout 身分遷移與本地 transcript 清除流程現在一律排除 `import_source_id` / `import_batch_id` 非空的資料列，匯入批次的生命週期不再被本機檔案同步影響。
 - 修正非 rollout 檔名的 `.jsonl`（例如 `notes.jsonl`、`history.jsonl`）被誤判為 rollout 身分而可能誤刪同名資料列的問題；現在僅接受 `rollout-` 前綴的檔名。
-- 修正重複 rollout 副本的清除與 canonical 檔案的寫入分屬不同交易、導致讀取端可能觀察到短暫空窗的問題；副本清除已納入同一個交易，canonical 檔案為空或解析失敗時不會先行刪除既有資料。
+- 修正重複 rollout 副本的清除與 canonical 檔案的寫入分屬不同交易、導致讀取端可能觀察到短暫空窗的問題；副本清除已納入同一個交易，canonical 檔案為空、解析失敗，或檔案仍在寫入而含有無法解析的行時，都不會先行刪除既有資料與副本。
 - 修正匯入資料列與本機 rollout 資料列佔用同一唯一鍵時，本機同步會因唯一鍵衝突而整批回滾、導致該 rollout 較新回合永遠無法寫入並每隔數秒重試失敗的問題；本機寫入改為 `INSERT OR IGNORE`，同鍵的匯入資料優先保留，其餘回合仍正常寫入。
 - 修正舊版匯出檔（未含 `usage_identity`）匯入後與本機 rollout 資料列以不同身分並存、同一回合被重複計算的問題；匯入時會由 transcript 路徑推導 rollout 身分，身分遷移也會為既有匯入資料列補上身分（附 `NOT EXISTS` 保護，避免唯一鍵衝突中斷遷移）。
 - 撤銷 Codex 匯入批次時會一併清除受影響 rollout 的同步狀態，下一次同步會重新解析該 rollout，將讓位給匯入資料的本機資料列補回。

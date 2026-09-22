@@ -12,7 +12,7 @@ mod codex;
 mod cursor;
 
 use claude::{find_claude_session_files, parse_claude_session_file};
-use codex::{find_codex_session_files, parse_codex_session_file};
+use codex::{find_codex_session_files, parse_codex_session_file_with_diagnostics};
 pub(crate) use cursor::parse_cursor_timestamp;
 use cursor::sync_cursor_usage_logs;
 
@@ -4074,15 +4074,15 @@ fn sync_codex_transcript(
         return Ok(());
     }
 
-    let parsed_entries = match parse_codex_session_file(&transcript.path) {
-        Ok(entries) => entries,
+    let parsed = match parse_codex_session_file_with_diagnostics(&transcript.path) {
+        Ok(parsed) => parsed,
         Err(error) => {
             eprintln!("解析 Codex 會話檔案 {:?} 失敗: {}", transcript.path, error);
             return Ok(());
         }
     };
 
-    if parsed_entries.is_empty() {
+    if parsed.entries.is_empty() {
         // The rollout has no usage yet, so existing rows (including copies)
         // stay until the transcript carries data.
         conn.execute(
@@ -4099,17 +4099,25 @@ fn sync_codex_transcript(
         return Ok(());
     }
 
+    // A transcript with unreadable lines was caught mid-write or is damaged, so
+    // the parsed entries may be a prefix of the real usage. Replacing the stored
+    // rows in that state would drop the turns that only the other copies still
+    // hold, so the parsed entries are added without clearing anything.
+    let parsed_completely = parsed.malformed_lines == 0;
+
     let tx = conn
         .transaction()
         .map_err(|error| format!("Transaction BEGIN 失敗: {error}"))?;
 
-    purge_codex_transcript_rows(
-        &tx,
-        identity,
-        &transcript_path,
-        known_transcript_paths,
-        &stale_copy_paths,
-    )?;
+    if parsed_completely {
+        purge_codex_transcript_rows(
+            &tx,
+            identity,
+            &transcript_path,
+            known_transcript_paths,
+            &stale_copy_paths,
+        )?;
+    }
 
     let mut success = true;
     let mut wrote_local_rows = false;
@@ -4136,7 +4144,7 @@ fn sync_codex_transcript(
             .map_err(|error| format!("解析 Codex 匯入回合失敗: {error}"))?
     };
 
-    for entry in &parsed_entries {
+    for entry in &parsed.entries {
         let tokens = entry.tokens.as_ref();
         let delta = entry.delta_tokens.as_ref();
         let cost = entry.cost.as_ref();
@@ -4195,13 +4203,16 @@ fn sync_codex_transcript(
             ],
         );
 
-        if let Err(e) = insert_res {
-            eprintln!("寫入 Codex 資料庫失敗 (turn_no {}): {}", entry.turn_no, e);
-            success = false;
-            break;
-        }
+        let inserted_rows = match insert_res {
+            Ok(inserted_rows) => inserted_rows,
+            Err(e) => {
+                eprintln!("寫入 Codex 資料庫失敗 (turn_no {}): {}", entry.turn_no, e);
+                success = false;
+                break;
+            }
+        };
 
-        if insert_res.unwrap_or(0) > 0 {
+        if inserted_rows > 0 {
             wrote_local_rows = true;
         }
     }
@@ -8911,6 +8922,105 @@ mod tests {
             local_rows_after_rollback, 1,
             "rolling the import back must let the local parse store the rollout again"
         );
+
+        if let Some(value) = old_codex_dir {
+            std::env::set_var("CODEX_DIR", value);
+        } else {
+            std::env::remove_var("CODEX_DIR");
+        }
+        let _ = fs::remove_dir_all(&codex_dir);
+    }
+
+    #[test]
+    fn sync_codex_usage_logs_keeps_the_stored_turns_of_a_partially_parsed_canonical_file() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_codex_dir = std::env::var("CODEX_DIR").ok();
+        let mut codex_dir = std::env::temp_dir();
+        let unique = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        codex_dir.push(format!(
+            "codex-partial-canonical-{}-{}",
+            std::process::id(),
+            unique
+        ));
+
+        let archived_dir = codex_dir.join("archived_sessions/2026/09/11");
+        let sessions_dir = codex_dir.join("sessions/2026/09/11");
+        fs::create_dir_all(&archived_dir).unwrap();
+        fs::create_dir_all(&sessions_dir).unwrap();
+
+        let complete_copy = archived_dir.join("rollout-2026-09-11T00-06-46-torn.jsonl");
+        fs::write(
+            &complete_copy,
+            format!(
+                "{}\n{}\n{}\n",
+                codex_session_meta("torn-session"),
+                codex_token_count_event("2026-09-10T16:06:50.000Z", 100, 20, 10),
+                codex_token_count_event("2026-09-10T16:08:50.000Z", 150, 30, 15)
+            ),
+        )
+        .unwrap();
+        std::env::set_var("CODEX_DIR", &codex_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // Only the copy exists at first, so both turns are stored from it.
+        sync_codex_usage_logs(&mut conn).unwrap();
+        let stored_turns: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'codex' AND session_id = 'torn-session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_turns, 2);
+
+        // The copy is moved into `sessions/` while Codex keeps appending, so the
+        // read catches a torn trailing line that parses into a prefix of the
+        // usage stored from the copy.
+        let canonical = sessions_dir.join("rollout-2026-09-11T00-06-46-torn.jsonl");
+        let padding = "x".repeat(400);
+        fs::write(
+            &canonical,
+            format!(
+                "{}\n{}\n{{\"timestamp\":\"2026-09-10T16:09:50.000Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":{{\"input_tokens\":180,{padding}",
+                codex_session_meta("torn-session"),
+                codex_token_count_event("2026-09-10T16:06:50.000Z", 100, 20, 10)
+            ),
+        )
+        .unwrap();
+        assert!(
+            fs::metadata(&canonical).unwrap().len() > fs::metadata(&complete_copy).unwrap().len(),
+            "the larger file wins the canonical choice, so the torn one must be bigger"
+        );
+
+        sync_codex_usage_logs(&mut conn).unwrap();
+
+        let surviving_turns: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'codex' AND session_id = 'torn-session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            surviving_turns, 2,
+            "a transcript with unreadable lines must not replace the turns already stored"
+        );
+        let surviving_turn_numbers: Vec<i64> = conn
+            .prepare(
+                "SELECT turn_no FROM usage_entries
+                 WHERE assistant_type = 'codex' AND session_id = 'torn-session'
+                 ORDER BY turn_no",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(surviving_turn_numbers, vec![1, 2]);
 
         if let Some(value) = old_codex_dir {
             std::env::set_var("CODEX_DIR", value);
