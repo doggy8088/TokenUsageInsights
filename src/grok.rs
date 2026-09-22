@@ -340,10 +340,20 @@ fn extract_model_from_value(value: &Value) -> Option<String> {
 }
 
 fn normalize_reasoning_effort(value: &str) -> Option<String> {
-    match value.trim().to_ascii_lowercase().as_str() {
+    let normalized: String = value
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .collect();
+
+    match normalized.as_str() {
         "low" => Some("Low".to_string()),
         "medium" => Some("Medium".to_string()),
         "high" => Some("High".to_string()),
+        // xAI exposes the highest reasoning tier as `xhigh`; the pricing page
+        // and dashboard both label it "Extra High".
+        "xhigh" | "extrahigh" => Some("Extra High".to_string()),
         _ => None,
     }
 }
@@ -400,6 +410,24 @@ fn is_grok46_model_id(model: &str) -> bool {
     )
 }
 
+/// Grok 4.7 Fast is billed at twice the standard rates. Fast mode has no
+/// separate API parameter in every client, so it reaches the dashboard as its
+/// own model id (`grok-4.7-fast`, alias `grok-4.7-fast-latest`) and must not
+/// fall back to the standard Grok 4.7 rates.
+fn is_grok47_fast_model_id(model: &str) -> bool {
+    matches!(
+        normalize_model_id(model).as_str(),
+        "grok47fast" | "grok47fastlatest"
+    )
+}
+
+fn is_grok47_model_id(model: &str) -> bool {
+    matches!(
+        normalize_model_id(model).as_str(),
+        "grok47" | "grok47latest"
+    )
+}
+
 fn is_grok_build_01_model_id(model: &str) -> bool {
     matches!(
         normalize_model_id(model).as_str(),
@@ -422,6 +450,18 @@ pub(crate) fn display_model_name(model: &str, reasoning_effort: Option<&str>) ->
             return format!("Grok 4.6 ({effort})");
         }
         return "Grok 4.6".to_string();
+    }
+    if is_grok47_fast_model_id(model) {
+        if let Some(effort) = reasoning_effort.and_then(normalize_reasoning_effort) {
+            return format!("Grok 4.7 Fast ({effort})");
+        }
+        return "Grok 4.7 Fast".to_string();
+    }
+    if is_grok47_model_id(model) {
+        if let Some(effort) = reasoning_effort.and_then(normalize_reasoning_effort) {
+            return format!("Grok 4.7 ({effort})");
+        }
+        return "Grok 4.7".to_string();
     }
     if is_grok_build_01_model_id(model) {
         return "Grok Build 0.1".to_string();
@@ -1210,6 +1250,36 @@ mod tests {
         assert!(!is_grok45_model_id("grok-build-0.1"));
         assert!(is_grok46_model_id("grok-4.6"));
         assert!(is_grok_build_01_model_id("grok-build-0.1"));
+    }
+
+    #[test]
+    fn normalizes_grok_47_extra_high_effort_and_fast_mode() {
+        assert_eq!(display_model_name("grok-4.7", None), "Grok 4.7");
+        assert_eq!(display_model_name("grok-4.7-latest", None), "Grok 4.7");
+        assert_eq!(
+            display_model_name("grok-4.7", Some("high")),
+            "Grok 4.7 (High)"
+        );
+        assert_eq!(
+            display_model_name("grok-4.7", Some("xhigh")),
+            "Grok 4.7 (Extra High)"
+        );
+        assert_eq!(
+            display_model_name("grok-4.7", Some("extra_high")),
+            "Grok 4.7 (Extra High)"
+        );
+        assert_eq!(display_model_name("grok-4.7-fast", None), "Grok 4.7 Fast");
+        assert_eq!(
+            display_model_name("grok-4.7-fast-latest", Some("xhigh")),
+            "Grok 4.7 Fast (Extra High)"
+        );
+
+        assert!(is_grok47_model_id("grok-4.7"));
+        assert!(is_grok47_model_id("grok-4.7-latest"));
+        assert!(!is_grok47_model_id("grok-4.7-fast"));
+        assert!(is_grok47_fast_model_id("grok-4.7-fast"));
+        assert!(is_grok47_fast_model_id("grok-4.7-fast-latest"));
+        assert!(!is_grok47_model_id("grok-4.6"));
     }
 
     #[test]

@@ -4,6 +4,12 @@
 
 ## [未發行]
 
+### 新增與改善
+
+- 新增 Grok 4.7 定價規則（`pricing.csv`），涵蓋 200k 上下文門檻的短／長上下文費率、Low／Medium／High／Extra High 推理層級，以及價格為一般版 2 倍的 Fast 模式，共 30 筆 xAI API 規則（輸入 2.00／4.00、快取輸入 0.50／1.00、輸出 6.00／12.00，Fast 模式為兩倍）。
+- 看板可辨識 Grok 4.7 的模型 ID（`grok-4.7`、`grok-4.7-latest`），並依推理層級顯示為「Grok 4.7 (High)」等名稱；xAI 的最高推理層級 `xhigh` 以「Extra High」呈現。
+- 新增 Fast 模式辨識（`grok-4.7-fast`、`grok-4.7-fast-latest`），模型名稱顯示為「Grok 4.7 Fast」並套用 2 倍費率，避免 Fast 模式用量被以一般版價格低估。
+
 ### 修正
 
 - 修正 Codex Session 在 `~/.codex/sessions` 與 `~/.codex/archived_sessions` 之間移動、或同一 Session 同時存在多個 rollout 檔案時，看板數字每隔幾秒在兩組數值間反覆跳動的問題（Issue #54）。
@@ -27,6 +33,7 @@
 
 ### 資料影響
 
+- Grok Build 解析器版本提升至 `migration:grok_parser_v8`，啟動時會重新解析既有的 Grok Session，讓先前以原始模型 ID（例如 `grok-4.7`）儲存的資料列改用新的顯示名稱與價格規則；重解析僅更新模型、推理層級與未回報成本的估算值，不會刪除 Session 或歷史資料。
 - `usage_entries` 既有的 `usage_identity` 欄位（1.0.0 導入，預設空字串不需人工調整）自本次起由 Codex 的 rollout 檔案以檔名寫入穩定身分；啟動時會自動執行一次性遷移 `migration:codex_rollout_identity_v1`，回填既有資料並清除已無對應檔案的孤兒資料列（僅影響 `assistant_type = 'codex'` 且非匯入的資料列）。
 - 新增部分索引 `idx_assistant_usage_identity`（`WHERE usage_identity <> ''`）以加速身分範圍的刪除；大型資料庫可顯著降低同步時的刪除耗時。
 - 手動匯入的資料列（`import_source_id` / `import_batch_id` 非空）改由匯入批次管理：本機 Codex transcript 同步不再刪除或改寫其 `usage_identity`，rollout 遷移亦不會將其視為孤兒資料清除；「本機已存有此 rollout」的判定與重複副本清除也只採計本機資料列。
@@ -35,6 +42,7 @@
 
 - 同一 Session ID 的不同 rollout 檔案（續傳分段）改為各自保留資料列，報表由既有 Session 身分模型自動合併，每日、每月、年度、模型明細與時間軸的計算結果維持一致或更完整。
 - 匯出／匯入格式新增選用的 `usage_identity` 欄位；缺少該欄位的既有匯出檔仍可正常匯入。
+
 
 ## [1.0.1] - 2026-09-20
 

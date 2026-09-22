@@ -23,6 +23,36 @@ Grok 4.6 (Medium),xAI API,1M Tokens,2.00,0.50,6.00,N/A
 Grok 4.6 (High) (<200k),xAI API,1M Tokens,2.00,0.50,6.00,N/A
 Grok 4.6 (High) (>200k),xAI API,1M Tokens,4.00,1.00,12.00,N/A
 Grok 4.6 (High),xAI API,1M Tokens,2.00,0.50,6.00,N/A
+Grok 4.7 (<200k),xAI API,1M Tokens,2.00,0.50,6.00,N/A
+Grok 4.7 (>200k),xAI API,1M Tokens,4.00,1.00,12.00,N/A
+Grok 4.7,xAI API,1M Tokens,2.00,0.50,6.00,N/A
+Grok 4.7 (Low) (<200k),xAI API,1M Tokens,2.00,0.50,6.00,N/A
+Grok 4.7 (Low) (>200k),xAI API,1M Tokens,4.00,1.00,12.00,N/A
+Grok 4.7 (Low),xAI API,1M Tokens,2.00,0.50,6.00,N/A
+Grok 4.7 (Medium) (<200k),xAI API,1M Tokens,2.00,0.50,6.00,N/A
+Grok 4.7 (Medium) (>200k),xAI API,1M Tokens,4.00,1.00,12.00,N/A
+Grok 4.7 (Medium),xAI API,1M Tokens,2.00,0.50,6.00,N/A
+Grok 4.7 (High) (<200k),xAI API,1M Tokens,2.00,0.50,6.00,N/A
+Grok 4.7 (High) (>200k),xAI API,1M Tokens,4.00,1.00,12.00,N/A
+Grok 4.7 (High),xAI API,1M Tokens,2.00,0.50,6.00,N/A
+Grok 4.7 (Extra High) (<200k),xAI API,1M Tokens,2.00,0.50,6.00,N/A
+Grok 4.7 (Extra High) (>200k),xAI API,1M Tokens,4.00,1.00,12.00,N/A
+Grok 4.7 (Extra High),xAI API,1M Tokens,2.00,0.50,6.00,N/A
+Grok 4.7 Fast (<200k),xAI API,1M Tokens,4.00,1.00,12.00,N/A
+Grok 4.7 Fast (>200k),xAI API,1M Tokens,8.00,2.00,24.00,N/A
+Grok 4.7 Fast,xAI API,1M Tokens,4.00,1.00,12.00,N/A
+Grok 4.7 Fast (Low) (<200k),xAI API,1M Tokens,4.00,1.00,12.00,N/A
+Grok 4.7 Fast (Low) (>200k),xAI API,1M Tokens,8.00,2.00,24.00,N/A
+Grok 4.7 Fast (Low),xAI API,1M Tokens,4.00,1.00,12.00,N/A
+Grok 4.7 Fast (Medium) (<200k),xAI API,1M Tokens,4.00,1.00,12.00,N/A
+Grok 4.7 Fast (Medium) (>200k),xAI API,1M Tokens,8.00,2.00,24.00,N/A
+Grok 4.7 Fast (Medium),xAI API,1M Tokens,4.00,1.00,12.00,N/A
+Grok 4.7 Fast (High) (<200k),xAI API,1M Tokens,4.00,1.00,12.00,N/A
+Grok 4.7 Fast (High) (>200k),xAI API,1M Tokens,8.00,2.00,24.00,N/A
+Grok 4.7 Fast (High),xAI API,1M Tokens,4.00,1.00,12.00,N/A
+Grok 4.7 Fast (Extra High) (<200k),xAI API,1M Tokens,4.00,1.00,12.00,N/A
+Grok 4.7 Fast (Extra High) (>200k),xAI API,1M Tokens,8.00,2.00,24.00,N/A
+Grok 4.7 Fast (Extra High),xAI API,1M Tokens,4.00,1.00,12.00,N/A
 Grok Build 0.1 (<200k),xAI API,1M Tokens,1.00,0.20,2.00,N/A
 Grok Build 0.1 (>200k),xAI API,1M Tokens,2.00,0.40,4.00,N/A
 Grok Build 0.1,xAI API,1M Tokens,1.00,0.20,2.00,N/A

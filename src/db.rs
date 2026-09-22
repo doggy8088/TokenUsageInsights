@@ -193,7 +193,7 @@ const CURSOR_MODEL_ATTRIBUTION_MIGRATION_KEY: &str = "migration:cursor_model_att
 const CURSOR_CACHE_TOKENS_UNKNOWN_MIGRATION_KEY: &str = "migration:cursor_cache_tokens_unknown_v1";
 const CURSOR_AGENT_SOURCE_KIND: &str = "cursor-agent";
 const CURSOR_IDE_SOURCE_KIND: &str = "cursor-ide";
-const GROK_PARSER_MIGRATION_KEY: &str = "migration:grok_parser_v7";
+const GROK_PARSER_MIGRATION_KEY: &str = "migration:grok_parser_v8";
 const LEGACY_GROK_PARSER_MIGRATION_KEYS: &[&str] = &[
     "migration:grok_parser_v1",
     "migration:grok_model_normalization_v2",
@@ -201,6 +201,7 @@ const LEGACY_GROK_PARSER_MIGRATION_KEYS: &[&str] = &[
     "migration:grok_parser_v4",
     "migration:grok_parser_v5",
     "migration:grok_parser_v6",
+    "migration:grok_parser_v7",
 ];
 
 /// Source kind written for usage entries originating from the Copilot CLI
@@ -17122,6 +17123,152 @@ mod tests {
                 ("Grok 4.6 (High)".to_string(), Some("High".to_string())),
             ]
         );
+    }
+
+    #[test]
+    fn grok_parser_v8_migration_reparses_existing_grok_47_session() {
+        let root = temp_jsonl_path("grok-v8-migration");
+        let session_dir_xhigh = root.join("sessions").join("work").join("grok-47-session");
+        fs::create_dir_all(&session_dir_xhigh).unwrap();
+        fs::write(
+            session_dir_xhigh.join("summary.json"),
+            r#"{"info":{"cwd":"/tmp/grok-project"},"current_model_id":"grok-4.7","reasoning_effort":"xhigh","generated_title":"Grok 4.7 migration test"}"#,
+        )
+        .unwrap();
+        let updates_xhigh_path = session_dir_xhigh.join("updates.jsonl");
+        fs::write(
+            &updates_xhigh_path,
+            concat!(
+                r#"{"timestamp":1710000000,"params":{"update":{"sessionUpdate":"turn_started","turn_number":0}}}"#, "\n",
+                r#"{"timestamp":1710000001,"params":{"update":{"sessionUpdate":"user_message_chunk","content":{"text":"hello grok 4.7"}}}}"#, "\n",
+                r#"{"timestamp":1710000002,"params":{"update":{"sessionUpdate":"turn_completed","usage":{"input_tokens":100,"cache_read_input_tokens":50,"output_tokens":50,"total_tokens":200},"total_cost_usd":0.0005}}}"#, "\n"
+            ),
+        )
+        .unwrap();
+        let file_size_xhigh = fs::metadata(&updates_xhigh_path).unwrap().len();
+
+        let session_dir_fast = root
+            .join("sessions")
+            .join("work")
+            .join("grok-47-fast-session");
+        fs::create_dir_all(&session_dir_fast).unwrap();
+        fs::write(
+            session_dir_fast.join("summary.json"),
+            r#"{"info":{"cwd":"/tmp/grok-project"},"current_model_id":"grok-4.7-fast","generated_title":"Grok 4.7 Fast migration test"}"#,
+        )
+        .unwrap();
+        let updates_fast_path = session_dir_fast.join("updates.jsonl");
+        fs::write(
+            &updates_fast_path,
+            concat!(
+                r#"{"timestamp":1710000010,"params":{"update":{"sessionUpdate":"turn_started","turn_number":0}}}"#, "\n",
+                r#"{"timestamp":1710000011,"params":{"update":{"sessionUpdate":"user_message_chunk","content":{"text":"hello grok 4.7 fast"}}}}"#, "\n",
+                r#"{"timestamp":1710000012,"params":{"update":{"sessionUpdate":"turn_completed","usage":{"input_tokens":200,"cache_read_input_tokens":0,"output_tokens":80,"total_tokens":280},"total_cost_usd":0.0008}}}"#, "\n"
+            ),
+        )
+        .unwrap();
+        let file_size_fast = fs::metadata(&updates_fast_path).unwrap().len();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // Simulate database state that already executed grok_parser_v7 with the
+        // files marked as synced and raw "grok-4.7" / "grok-4.7-fast" persisted.
+        conn.execute(
+            "DELETE FROM sync_state WHERE filename = ?",
+            params![GROK_PARSER_MIGRATION_KEY],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES ('migration:grok_parser_v7', 1, 0)",
+            [],
+        )
+        .unwrap();
+
+        let relative_xhigh_path = portable_relative_path(&root, &updates_xhigh_path);
+        conn.execute(
+            "INSERT INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES (?, ?, 0)",
+            params![format!("grok:{relative_xhigh_path}"), file_size_xhigh],
+        )
+        .unwrap();
+
+        let relative_fast_path = portable_relative_path(&root, &updates_fast_path);
+        conn.execute(
+            "INSERT INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES (?, ?, 0)",
+            params![format!("grok:{relative_fast_path}"), file_size_fast],
+        )
+        .unwrap();
+
+        let transcript_xhigh = updates_xhigh_path.to_string_lossy().into_owned();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, turn_no, model,
+                source_kind, transcript_path, delta_input, delta_output, delta_total
+             ) VALUES ('grok', '2024-03-09T18:40:00Z', '2024-03-09', 'grok-47-session', 0, 'grok-4.7',
+                'grok-build', ?, 100, 50, 150)",
+            params![transcript_xhigh],
+        )
+        .unwrap();
+
+        let transcript_fast = updates_fast_path.to_string_lossy().into_owned();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, turn_no, model,
+                source_kind, transcript_path, delta_input, delta_output, delta_total
+             ) VALUES ('grok', '2024-03-09T18:40:10Z', '2024-03-09', 'grok-47-fast-session', 0, 'grok-4.7-fast',
+                'grok-build', ?, 200, 80, 280)",
+            params![transcript_fast],
+        )
+        .unwrap();
+
+        // Re-run init_db to execute the v8 migration.
+        init_db(&conn).unwrap();
+
+        let v7_marker_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = 'migration:grok_parser_v7')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!v7_marker_exists);
+
+        let grok_sync_count: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state WHERE filename LIKE 'grok:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(grok_sync_count, 0);
+
+        // Running sync re-parses with the Grok 4.7 display names and Extra High effort.
+        sync_grok_usage_logs(&mut conn, &root).unwrap();
+
+        let updated_entries: Vec<(String, Option<String>)> = {
+            let mut stmt = conn
+                .prepare("SELECT model, reasoning_effort FROM usage_entries WHERE assistant_type = 'grok' ORDER BY session_id")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap();
+            rows.map(Result::unwrap).collect()
+        };
+        assert_eq!(
+            updated_entries,
+            vec![
+                ("Grok 4.7 Fast".to_string(), None),
+                (
+                    "Grok 4.7 (Extra High)".to_string(),
+                    Some("Extra High".to_string())
+                ),
+            ]
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
