@@ -3797,11 +3797,15 @@ fn load_codex_transcript_paths(conn: &Connection) -> Result<HashMap<String, Vec<
 /// with the same name purge unrelated rows.
 fn codex_rollout_identity(path: &str) -> Option<String> {
     let file_name = path.rsplit(['/', '\\']).next()?;
-    let stem = file_name
-        .rsplit_once('.')
-        .map(|(stem, _)| stem)
-        .unwrap_or(file_name)
-        .trim();
+    let (stem, extension) = file_name.rsplit_once('.')?;
+
+    // Codex always writes rollouts as `.jsonl`, so another extension (or none)
+    // can only come from an unrelated file that happens to share the name.
+    if !extension.eq_ignore_ascii_case("jsonl") {
+        return None;
+    }
+
+    let stem = stem.trim();
 
     if !stem.starts_with(CODEX_ROLLOUT_FILE_PREFIX) {
         return None;
@@ -3852,6 +3856,26 @@ fn codex_transcript_canonical_rank(
         transcript.path.starts_with(sessions_dir),
         transcript.path.to_string_lossy().into_owned(),
     )
+}
+
+/// Highest ranked copy of a rollout that parses completely *and* covers more
+/// turns than the canonical transcript could provide, or `None` when no copy can
+/// stand in for the canonical file.
+fn usable_codex_duplicate<'a>(
+    sessions_dir: &Path,
+    duplicates: &'a [CodexTranscript],
+    canonical_entries: usize,
+) -> Option<&'a CodexTranscript> {
+    duplicates
+        .iter()
+        .filter(|duplicate| {
+            matches!(
+                parse_codex_session_file_with_diagnostics(&duplicate.path),
+                Ok(parsed) if parsed.malformed_lines == 0
+                    && parsed.entries.len() > canonical_entries
+            )
+        })
+        .max_by_key(|duplicate| codex_transcript_canonical_rank(sessions_dir, duplicate))
 }
 
 /// Stored transcript path spellings whose rows must disappear once the
@@ -4025,6 +4049,7 @@ fn sync_codex_usage_logs(conn: &mut Connection) -> Result<(), String> {
             &canonical,
             &transcript_paths,
             &duplicates,
+            true,
         )?;
     }
 
@@ -4039,6 +4064,7 @@ fn sync_codex_transcript(
     transcript: &CodexTranscript,
     transcript_paths: &HashMap<String, Vec<String>>,
     duplicates: &[CodexTranscript],
+    allow_fallback: bool,
 ) -> Result<(), String> {
     let state_path = portable_relative_path(codex_dir, &transcript.path);
     let state_key = format!("codex:{}", state_path);
@@ -4059,11 +4085,18 @@ fn sync_codex_transcript(
     let known_transcript_paths = transcript_paths.get(&transcript_path_key);
     let transcript_is_current = known_transcript_paths.is_some();
     let stale_copy_paths = stale_codex_copy_paths(transcript_paths, duplicates);
+    // The empty marker also covers transcripts that only parsed partially, so a
+    // state that carries it must never justify dropping the copies: the rows
+    // stored for them may be the only complete record of the rollout.
+    let state_is_complete = !matches!(
+        last_synced_state,
+        Some((_, CODEX_EMPTY_TRANSCRIPT_SYNC_TIME))
+    );
 
     if !codex_transcript_needs_sync(current_size, last_synced_state, transcript_is_current) {
         // The canonical transcript is already stored, so copies that were
         // synced before it won the canonical choice can be dropped safely.
-        if transcript_is_current && !stale_copy_paths.is_empty() {
+        if transcript_is_current && state_is_complete && !stale_copy_paths.is_empty() {
             let tx = conn
                 .transaction()
                 .map_err(|error| format!("Transaction BEGIN 失敗: {error}"))?;
@@ -4074,12 +4107,48 @@ fn sync_codex_transcript(
         return Ok(());
     }
 
-    let parsed = match parse_codex_session_file_with_diagnostics(&transcript.path) {
-        Ok(parsed) => parsed,
-        Err(error) => {
-            eprintln!("解析 Codex 會話檔案 {:?} 失敗: {}", transcript.path, error);
-            return Ok(());
+    let parsed = parse_codex_session_file_with_diagnostics(&transcript.path);
+
+    if let Err(error) = &parsed {
+        eprintln!("解析 Codex 會話檔案 {:?} 失敗: {}", transcript.path, error);
+    }
+
+    let parsed_completely = matches!(&parsed, Ok(parsed) if parsed.malformed_lines == 0);
+    let has_usage = matches!(&parsed, Ok(parsed) if !parsed.entries.is_empty());
+
+    // The canonical choice prefers the longest file, which can be a transcript
+    // that is still being written or is damaged, while a copy of it still holds
+    // the complete usage. With no local rows stored yet there is nothing to
+    // protect, so the usage is taken from the copy that parses cleanly and covers
+    // more turns instead of recording the rollout as incomplete.
+    if allow_fallback && !transcript_is_current && (!has_usage || !parsed_completely) {
+        let canonical_entries = match &parsed {
+            Ok(parsed) => parsed.entries.len(),
+            Err(_) => 0,
+        };
+        let sessions_dir = codex_dir.join("sessions");
+        if let Some(fallback) = usable_codex_duplicate(&sessions_dir, duplicates, canonical_entries)
+        {
+            let remaining: Vec<CodexTranscript> = duplicates
+                .iter()
+                .filter(|duplicate| duplicate.path != fallback.path)
+                .cloned()
+                .collect();
+            return sync_codex_transcript(
+                conn,
+                codex_dir,
+                identity,
+                fallback,
+                transcript_paths,
+                &remaining,
+                false,
+            );
         }
+    }
+
+    let parsed = match parsed {
+        Ok(parsed) => parsed,
+        Err(_) => return Ok(()),
     };
 
     if parsed.entries.is_empty() {
@@ -4218,11 +4287,13 @@ fn sync_codex_transcript(
     }
 
     if success {
-        // Every turn of this rollout is owned by an import batch, so the local
-        // store has nothing for it yet. Recording the empty-transcript marker
-        // keeps the next passes from re-parsing the file; rolling the import back
-        // clears this state, which makes the following pass store the local rows.
-        let last_synced_time = if wrote_local_rows || transcript_is_current {
+        // A complete parse whose rows are stored (or were already stored) is the
+        // only state that counts as synced. Anything else — the rollout has no
+        // usage yet, or the file was caught mid-write — carries the marker that
+        // means "nothing complete stored yet", which keeps the next passes from
+        // re-parsing the file and stops a damaged transcript from being treated
+        // as a safe replacement for its copies.
+        let last_synced_time = if parsed_completely && (wrote_local_rows || transcript_is_current) {
             SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -8189,6 +8260,21 @@ mod tests {
             codex_rollout_identity(r"C:\Users\u\.codex\archived_sessions\history.jsonl"),
             None
         );
+        // Only `.jsonl` rollouts exist, so an unrelated file that happens to
+        // carry the same stem must not share the identity of the real rollout.
+        assert_eq!(
+            codex_rollout_identity("/tmp/.codex/uploads/rollout-2026-09-11T00-06-46-abc.txt"),
+            None
+        );
+        assert_eq!(
+            codex_rollout_identity("/tmp/.codex/uploads/rollout-2026-09-11T00-06-46-abc"),
+            None
+        );
+        assert_eq!(
+            codex_rollout_identity("/tmp/.codex/sessions/rollout-2026-09-11T00-06-46-abc.JSONL")
+                .as_deref(),
+            Some("rollout=rollout-2026-09-11T00-06-46-abc")
+        );
     }
 
     #[test]
@@ -9021,6 +9107,198 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(surviving_turn_numbers, vec![1, 2]);
+
+        if let Some(value) = old_codex_dir {
+            std::env::set_var("CODEX_DIR", value);
+        } else {
+            std::env::remove_var("CODEX_DIR");
+        }
+        let _ = fs::remove_dir_all(&codex_dir);
+    }
+
+    #[test]
+    fn sync_codex_usage_logs_falls_back_to_a_parsable_copy_of_a_damaged_transcript() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_codex_dir = std::env::var("CODEX_DIR").ok();
+        let mut codex_dir = std::env::temp_dir();
+        let unique = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        codex_dir.push(format!(
+            "codex-damaged-canonical-{}-{}",
+            std::process::id(),
+            unique
+        ));
+
+        let archived_dir = codex_dir.join("archived_sessions/2026/09/11");
+        let sessions_dir = codex_dir.join("sessions/2026/09/11");
+        fs::create_dir_all(&archived_dir).unwrap();
+        fs::create_dir_all(&sessions_dir).unwrap();
+
+        let complete_copy = archived_dir.join("rollout-2026-09-11T00-06-46-damaged.jsonl");
+        fs::write(
+            &complete_copy,
+            format!(
+                "{}\n{}\n{}\n",
+                codex_session_meta("damaged-session"),
+                codex_token_count_event("2026-09-10T16:06:50.000Z", 100, 20, 10),
+                codex_token_count_event("2026-09-10T16:08:50.000Z", 150, 30, 15)
+            ),
+        )
+        .unwrap();
+
+        // The larger canonical file is still being written while the copy already
+        // holds the complete usage, so the copy has to provide the rows.
+        let damaged = sessions_dir.join("rollout-2026-09-11T00-06-46-damaged.jsonl");
+        let padding = "x".repeat(400);
+        fs::write(
+            &damaged,
+            format!(
+                "{}\n{}\n{{\"timestamp\":\"2026-09-10T16:09:50.000Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":{{\"input_tokens\":180,{padding}",
+                codex_session_meta("damaged-session"),
+                codex_token_count_event("2026-09-10T16:06:50.000Z", 100, 20, 10)
+            ),
+        )
+        .unwrap();
+        assert!(
+            fs::metadata(&damaged).unwrap().len() > fs::metadata(&complete_copy).unwrap().len(),
+            "the damaged file must win the canonical choice for the fallback to matter"
+        );
+        std::env::set_var("CODEX_DIR", &codex_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        sync_codex_usage_logs(&mut conn).unwrap();
+
+        let stored_paths: Vec<String> = conn
+            .prepare(
+                "SELECT DISTINCT transcript_path FROM usage_entries
+                 WHERE assistant_type = 'codex' AND session_id = 'damaged-session'",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            stored_paths.len(),
+            1,
+            "the rollout must be stored from exactly one transcript"
+        );
+        assert_eq!(
+            stored_paths[0],
+            complete_copy.to_string_lossy(),
+            "a transcript with unreadable lines must not be the source of the rows"
+        );
+
+        let turns: Vec<i64> = conn
+            .prepare(
+                "SELECT turn_no FROM usage_entries
+                 WHERE assistant_type = 'codex' AND session_id = 'damaged-session'
+                 ORDER BY turn_no",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            turns,
+            vec![1, 2],
+            "the complete copy carries the usage that the damaged file cannot provide"
+        );
+
+        if let Some(value) = old_codex_dir {
+            std::env::set_var("CODEX_DIR", value);
+        } else {
+            std::env::remove_var("CODEX_DIR");
+        }
+        let _ = fs::remove_dir_all(&codex_dir);
+    }
+
+    #[test]
+    fn sync_codex_usage_logs_keeps_copy_rows_of_an_incompletely_parsed_canonical() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_codex_dir = std::env::var("CODEX_DIR").ok();
+        let mut codex_dir = std::env::temp_dir();
+        let unique = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        codex_dir.push(format!(
+            "codex-torn-skip-cleanup-{}-{}",
+            std::process::id(),
+            unique
+        ));
+
+        let archived_dir = codex_dir.join("archived_sessions/2026/09/11");
+        let sessions_dir = codex_dir.join("sessions/2026/09/11");
+        fs::create_dir_all(&archived_dir).unwrap();
+        fs::create_dir_all(&sessions_dir).unwrap();
+
+        let archived = archived_dir.join("rollout-2026-09-11T00-06-46-gated.jsonl");
+        fs::write(
+            &archived,
+            format!(
+                "{}\n{}\n",
+                codex_session_meta("gated-session"),
+                codex_token_count_event("2026-09-10T16:06:50.000Z", 100, 20, 10)
+            ),
+        )
+        .unwrap();
+        std::env::set_var("CODEX_DIR", &codex_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // The first turn is stored from the archived copy.
+        sync_codex_usage_logs(&mut conn).unwrap();
+        let stored_turns: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'codex' AND session_id = 'gated-session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_turns, 1);
+
+        // The same rollout is copied into `sessions/` where it keeps growing, so
+        // the copy is damaged, larger, and chosen as canonical while the archived
+        // file still holds the first turn.
+        let growing = sessions_dir.join("rollout-2026-09-11T00-06-46-gated.jsonl");
+        let padding = "x".repeat(600);
+        fs::write(
+            &growing,
+            format!(
+                "{}\n{}\n{}\n{{\"timestamp\":\"2026-09-10T16:10:50.000Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":{{\"input_tokens\":220,{padding}",
+                codex_session_meta("gated-session"),
+                codex_token_count_event("2026-09-10T16:06:50.000Z", 100, 20, 10),
+                codex_token_count_event("2026-09-10T16:08:50.000Z", 150, 30, 15)
+            ),
+        )
+        .unwrap();
+        assert!(
+            fs::metadata(&growing).unwrap().len() > fs::metadata(&archived).unwrap().len(),
+            "the growing file must win the canonical choice"
+        );
+
+        sync_codex_usage_logs(&mut conn).unwrap();
+        // The damaged transcript is now the rollout with the most rows, so the
+        // next pass takes the branch that only cleans up copies. It must not drop
+        // the archived rows while the canonical file cannot replace them.
+        sync_codex_usage_logs(&mut conn).unwrap();
+
+        let surviving_turns: Vec<i64> = conn
+            .prepare(
+                "SELECT turn_no FROM usage_entries
+                 WHERE assistant_type = 'codex' AND session_id = 'gated-session'
+                 ORDER BY turn_no",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            surviving_turns,
+            vec![1, 2],
+            "rows of a rollout that only parsed partially must not be cleaned up as copies"
+        );
 
         if let Some(value) = old_codex_dir {
             std::env::set_var("CODEX_DIR", value);
