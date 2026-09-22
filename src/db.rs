@@ -8806,7 +8806,11 @@ mod tests {
             unique
         ));
 
-        let sessions_dir = codex_dir.join("sessions/2026/09/11");
+        let sessions_dir = codex_dir
+            .join("sessions")
+            .join("2026")
+            .join("09")
+            .join("11");
         fs::create_dir_all(&sessions_dir).unwrap();
         let transcript_path = sessions_dir.join("rollout-2026-09-11T00-06-46-imported.jsonl");
         fs::write(
@@ -9176,7 +9180,11 @@ mod tests {
             unique
         ));
 
-        let sessions_dir = codex_dir.join("sessions/2026/09/11");
+        let sessions_dir = codex_dir
+            .join("sessions")
+            .join("2026")
+            .join("09")
+            .join("11");
         fs::create_dir_all(&sessions_dir).unwrap();
         let transcript_path = sessions_dir.join("rollout-2026-09-11T00-06-46-restored.jsonl");
         fs::write(
@@ -9261,7 +9269,11 @@ mod tests {
             unique
         ));
 
-        let sessions_dir = codex_dir.join("sessions/2026/09/11");
+        let sessions_dir = codex_dir
+            .join("sessions")
+            .join("2026")
+            .join("09")
+            .join("11");
         fs::create_dir_all(&sessions_dir).unwrap();
         let transcript_path = sessions_dir.join("rollout-2026-09-11T00-06-46-imported.jsonl");
         fs::write(
@@ -9376,8 +9388,16 @@ mod tests {
             unique
         ));
 
-        let archived_dir = codex_dir.join("archived_sessions/2026/09/11");
-        let sessions_dir = codex_dir.join("sessions/2026/09/11");
+        let archived_dir = codex_dir
+            .join("archived_sessions")
+            .join("2026")
+            .join("09")
+            .join("11");
+        let sessions_dir = codex_dir
+            .join("sessions")
+            .join("2026")
+            .join("09")
+            .join("11");
         fs::create_dir_all(&archived_dir).unwrap();
         fs::create_dir_all(&sessions_dir).unwrap();
 
@@ -9475,8 +9495,16 @@ mod tests {
             unique
         ));
 
-        let archived_dir = codex_dir.join("archived_sessions/2026/09/11");
-        let sessions_dir = codex_dir.join("sessions/2026/09/11");
+        let archived_dir = codex_dir
+            .join("archived_sessions")
+            .join("2026")
+            .join("09")
+            .join("11");
+        let sessions_dir = codex_dir
+            .join("sessions")
+            .join("2026")
+            .join("09")
+            .join("11");
         fs::create_dir_all(&archived_dir).unwrap();
         fs::create_dir_all(&sessions_dir).unwrap();
 
@@ -9573,8 +9601,16 @@ mod tests {
             unique
         ));
 
-        let archived_dir = codex_dir.join("archived_sessions/2026/09/11");
-        let sessions_dir = codex_dir.join("sessions/2026/09/11");
+        let archived_dir = codex_dir
+            .join("archived_sessions")
+            .join("2026")
+            .join("09")
+            .join("11");
+        let sessions_dir = codex_dir
+            .join("sessions")
+            .join("2026")
+            .join("09")
+            .join("11");
         fs::create_dir_all(&archived_dir).unwrap();
         fs::create_dir_all(&sessions_dir).unwrap();
 
@@ -9667,7 +9703,11 @@ mod tests {
             unique
         ));
 
-        let sessions_dir = codex_dir.join("sessions/2026/09/11");
+        let sessions_dir = codex_dir
+            .join("sessions")
+            .join("2026")
+            .join("09")
+            .join("11");
         let archived_dir = codex_dir.join("archived_sessions");
         fs::create_dir_all(&sessions_dir).unwrap();
         fs::create_dir_all(&archived_dir).unwrap();
@@ -9787,7 +9827,11 @@ mod tests {
             unique
         ));
 
-        let sessions_dir = codex_dir.join("sessions/2026/09/11");
+        let sessions_dir = codex_dir
+            .join("sessions")
+            .join("2026")
+            .join("09")
+            .join("11");
         let archived_dir = codex_dir.join("archived_sessions");
         fs::create_dir_all(&sessions_dir).unwrap();
         fs::create_dir_all(&archived_dir).unwrap();
@@ -9903,7 +9947,11 @@ mod tests {
             unique
         ));
 
-        let sessions_dir = codex_dir.join("sessions/2026/09/11");
+        let sessions_dir = codex_dir
+            .join("sessions")
+            .join("2026")
+            .join("09")
+            .join("11");
         let archived_dir = codex_dir.join("archived_sessions");
         fs::create_dir_all(&sessions_dir).unwrap();
         fs::create_dir_all(&archived_dir).unwrap();
@@ -10007,7 +10055,11 @@ mod tests {
             unique
         ));
 
-        let sessions_dir = codex_dir.join("sessions/2026/07/26");
+        let sessions_dir = codex_dir
+            .join("sessions")
+            .join("2026")
+            .join("07")
+            .join("26");
         let archived_dir = codex_dir.join("archived_sessions");
         fs::create_dir_all(&sessions_dir).unwrap();
         fs::create_dir_all(&archived_dir).unwrap();
@@ -10077,7 +10129,11 @@ mod tests {
         let unique = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
         codex_dir.push(format!("codex-sync-{}-{}", std::process::id(), unique));
 
-        let sessions_dir = codex_dir.join("sessions/2026/07/07");
+        let sessions_dir = codex_dir
+            .join("sessions")
+            .join("2026")
+            .join("07")
+            .join("07");
         fs::create_dir_all(&sessions_dir).unwrap();
         let session_path = sessions_dir.join("rollout-2026-07-07T10-58-17-session-sync.jsonl");
 
@@ -10168,7 +10224,11 @@ mod tests {
             unique
         ));
 
-        let sessions_dir = codex_dir.join("sessions/2026/07/10");
+        let sessions_dir = codex_dir
+            .join("sessions")
+            .join("2026")
+            .join("07")
+            .join("10");
         fs::create_dir_all(&sessions_dir).unwrap();
         let parent_path = sessions_dir.join("rollout-2026-07-10T03-43-00-parent-session.jsonl");
         let child_path = sessions_dir.join("rollout-2026-07-10T03-45-00-child-session.jsonl");
@@ -10363,7 +10423,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         let old_claude_dir = std::env::var("CLAUDE_DIR").ok();
         let claude_dir = temp_jsonl_path("claude-cache-sync").with_extension("");
-        let projects_dir = claude_dir.join("projects/test-project");
+        let projects_dir = claude_dir.join("projects").join("test-project");
         fs::create_dir_all(&projects_dir).unwrap();
         let session_path = projects_dir.join("session-cache-sync.jsonl");
         let content = r#"{"type":"assistant","sessionId":"session-cache-sync","timestamp":"2026-07-04T19:28:51.753Z","uuid":"a1","requestId":"req_1","message":{"id":"msg_1","role":"assistant","model":"claude-haiku-4-5-20251001","content":[{"type":"text","text":"Done"}],"usage":{"input_tokens":10,"cache_creation_input_tokens":3,"cache_read_input_tokens":7,"output_tokens":5,"cache_creation":{"ephemeral_5m_input_tokens":1,"ephemeral_1h_input_tokens":2}}}}
@@ -10943,7 +11003,11 @@ mod tests {
             unique
         ));
 
-        let sessions_dir = codex_dir.join("sessions/2026/07/26");
+        let sessions_dir = codex_dir
+            .join("sessions")
+            .join("2026")
+            .join("07")
+            .join("26");
         fs::create_dir_all(&sessions_dir).unwrap();
         let transcript_path = sessions_dir.join("rollout-2026-07-26T10-00-00-empty-session.jsonl");
         let content = r#"{"timestamp":"2026-07-26T10:00:00Z","type":"session_meta","payload":{"id":"empty-session","session_id":"empty-session","originator":"Codex Desktop"}}"#;
