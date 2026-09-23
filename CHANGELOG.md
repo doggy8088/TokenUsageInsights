@@ -4,6 +4,18 @@
 
 ## [未發行]
 
+### 修正
+
+- 修正 Windows 依 README 執行 `irm https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.ps1 | iex` 時直接出現 `Missing closing ')'`（`子運算式中缺少結尾 ')'`）ParserError、installer 完全無法啟動的問題（Issue #62）：`scripts/get.ps1` 開頭的 UTF-8 BOM 會被 `irm` 保留成字串第一個字元 `U+FEFF`，PowerShell 剖析器不把它當成空白，`<#` 因此不被視為區塊註解開頭，說明文字被當成程式碼剖析。`[scriptblock]::Create((irm ...)) -Service` 與 `Invoke-Expression "& { $script } ..."` 兩種 README 記載的帶參數寫法同樣受影響。`get.ps1` 現已改存為不含 BOM、且只包含 ASCII 字元的檔案（原本唯一的非 ASCII 內容是註解中的產品名稱），因此不論經由 `irm` 取得或下載後在 Windows PowerShell 5.1 以 `.\get.ps1` 執行，剖析結果都一致。
+
+### 測試
+
+- 新增 `tests/get-ps1-bootstrap.test.ps1`：以 `irm` 的方式把 `get.ps1` 的位元組解碼成字串（不剝除 BOM），再依 README 記載的 `irm | iex`、`[scriptblock]::Create` 與 `Invoke-Expression "& { $script } ..."` 三種方式剖析，並檢查檔案不含 BOM 且只包含 ASCII。原有的 `Parser::ParseFile` 檢查讀檔時會自動剝除 BOM，因此先前的 CI 無法發現此問題。此測試已納入 Release workflow 的 installer lint 步驟，並由 installer 檢查 workflow 在 PR 觸及 `get.ps1` 時執行。
+
+### 相容性
+
+- 僅 `scripts/get.ps1` 的檔案編碼與一行註解改變，參數與安裝流程不變；未變更資料庫結構與環境變數。`install.ps1`、`run-service.ps1` 等以檔案形式執行的腳本仍保留 UTF-8 BOM，以維持 Windows PowerShell 5.1 的中文訊息解析。
+
 ## [1.0.5] - 2026-09-23
 
 ### 新增與改善

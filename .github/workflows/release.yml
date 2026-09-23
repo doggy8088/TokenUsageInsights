@@ -90,6 +90,8 @@ jobs:
                 }
               }
             '
+            # ParseFile strips a UTF-8 BOM, so also parse get.ps1 the way irm | iex receives it.
+            pwsh -NoProfile -File tests/get-ps1-bootstrap.test.ps1
           fi
 
       - name: Test generated systemd unit (Linux/macOS)
