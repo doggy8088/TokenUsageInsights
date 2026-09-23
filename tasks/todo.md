@@ -1,3 +1,44 @@
+# 2026-09-23 新增 GPT-6 Sol 與 Luna 定價
+
+## Goal and acceptance criteria
+
+- [x] `pricing.csv` 新增 GPT-6 Sol、GPT-6 Luna 的 Global 短／長上下文、預設及 Cursor 規則，採用官方 Standard 與 Batch/Flex 每百萬 Token 費率。
+- [x] 回歸測試驗證兩個模型的短／長上下文計價與模型 ID／顯示名稱別名。
+- [x] 研究紀錄說明官方來源、272K 門檻、Batch/Flex 折扣及 CSV 未表達的額外費用。
+- [x] `CHANGELOG.md` 的未發行區記錄這項可見變更。
+- [x] `cargo test --locked`、`cargo fmt -- --check`、Release 全目標 build 與 `git diff --check` 通過；Rust compiler 零警告。
+- [ ] `cargo clippy --all-targets --all-features -- -D warnings` 無警告；若既有 lint 阻擋，需在 Results 記錄。
+- [x] 依專案規範建立繁體中文 Conventional Commit。
+
+## Plan
+
+- [x] Checkpoint A：查核官方 GPT-6 定價與既有 GPT-6 Astra 資料格式。
+- [x] Checkpoint B：確認最小修改範圍及測試案例。
+- [x] Checkpoint C：更新價格資料、研究紀錄、回歸測試與變更記錄。
+- [x] Checkpoint D：執行 Rust 驗證並檢查最終差異。
+- [x] Checkpoint E：提交變更並記錄結果。
+
+## Risk and rollback
+
+- Risk：低；只影響本機 Token 成本估算資料與其回歸測試，不會改動帳務、資料庫結構或外部服務。
+- Rollback：以單一提交回復 CSV、研究文件、測試與變更記錄即可。
+
+## Dependencies and environment
+
+- Rust stable 與 Cargo lockfile；CSV 仍使用每百萬 Token 的美元費率。
+
+## Working notes
+
+- 官方標準定價依 Prompt 輸入 Token 是否超過 272K 分級；本專案門檻計算使用輸入加快取讀取 Token。
+- Batch/Flex 採 Standard 費率 50%；快取寫入、Fast mode、區域處理加價不屬於目前 CSV 欄位範圍。
+
+## Results
+
+- 新增 GPT-6 Sol、GPT-6 Luna 的 Global 短／長上下文及預設費率，並補上 Cursor Standard 價格；官方 Standard 與 Batch/Flex 數值來源與範圍記於 `docs/research/gpt-6-sol-luna-pricing.md`。
+- `pricing::tests::gpt_6_sol_and_luna_context_tiers_use_packaged_pricing` 通過；完整 `cargo test --locked` 通過 376 個主 binary 測試及 2 個 CLI 測試。
+- `cargo fmt -- --check`、`cargo build --release --locked --all-targets`、`git diff --check` 通過；Release 建置沒有 Rust 編譯警告。CSV 驗證結果為 217 筆資料、7 欄，無格式錯誤。
+- `cargo clippy --locked --all-targets --all-features -- -D warnings` 仍被既有 `clippy::uninlined_format_args` lint 擋下（216 項）；本次 `src/pricing.rs` 的 lint 訊息僅在原有第 361、403 行，新增測試沒有 lint 訊息。未擴大修改不相關程式碼。
+
 # 2026-07-29 Issue #27 動態模型 Token 計價門檻
 
 ## Goal and acceptance criteria
