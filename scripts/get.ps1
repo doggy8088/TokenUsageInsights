@@ -1,6 +1,6 @@
-﻿<#
+<#
 .SYNOPSIS
-  One-line bootstrap installer for Token 戰情室 (Windows).
+  One-line bootstrap installer for Token Usage Insights (Windows).
 
 .DESCRIPTION
   Downloads the correct prebuilt release archive from GitHub Releases (no

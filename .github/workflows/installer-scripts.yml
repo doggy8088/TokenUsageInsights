@@ -5,8 +5,10 @@ on:
     paths:
       - "scripts/install.sh"
       - "scripts/get.sh"
+      - "scripts/get.ps1"
       - "shell/token-usage-insights.service"
       - "tests/install-systemd.test.sh"
+      - "tests/get-ps1-bootstrap.test.ps1"
       - ".github/workflows/installer-scripts.yml"
   push:
     branches:
@@ -14,8 +16,10 @@ on:
     paths:
       - "scripts/install.sh"
       - "scripts/get.sh"
+      - "scripts/get.ps1"
       - "shell/token-usage-insights.service"
       - "tests/install-systemd.test.sh"
+      - "tests/get-ps1-bootstrap.test.ps1"
       - ".github/workflows/installer-scripts.yml"
 
 permissions:
@@ -39,3 +43,7 @@ jobs:
 
       - name: Test generated systemd unit
         run: bash tests/install-systemd.test.sh
+
+      - name: Test get.ps1 via the documented irm | iex path
+        shell: pwsh
+        run: ./tests/get-ps1-bootstrap.test.ps1
