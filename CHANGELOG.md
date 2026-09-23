@@ -4,9 +4,15 @@
 
 ## [未發行]
 
+## [1.0.5] - 2026-09-23
+
 ### 新增與改善
 
 - 新增 GPT-6 Sol 與 GPT-6 Luna 的 Global、Cursor 定價規則，涵蓋 272K 長上下文門檻及 Batch/Flex 費率；看板可依模型名稱與上下文長度估算 Token 成本。
+
+### 相容性
+
+- 本次僅新增模型定價資料與對應測試，不涉及資料庫結構、環境變數或安裝流程變更。
 
 ## [1.0.4] - 2026-09-23
 
@@ -755,7 +761,8 @@
 - 修正行動版側邊欄遮擋、黑畫面、標題擠壓、圖表導覽索引與年度版面問題。
 - 修正並補齊多個 Gemini、Claude、GPT 與 GPT-OSS 模型的定價規則。
 
-[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.0.4...HEAD
+[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.0.5...HEAD
+[1.0.5]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.0.4...v1.0.5
 [1.0.4]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.0.3...v1.0.4
 [1.0.3]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.0.1...v1.0.3
 [1.0.1]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.0.0...v1.0.1
