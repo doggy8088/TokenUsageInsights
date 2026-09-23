@@ -4,6 +4,8 @@
 
 ## [未發行]
 
+## [1.0.6] - 2026-09-23
+
 ### 修正
 
 - 修正 Windows 依 README 執行 `irm https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.ps1 | iex` 時直接出現 `Missing closing ')'`（`子運算式中缺少結尾 ')'`）ParserError、installer 完全無法啟動的問題（Issue #62）：`scripts/get.ps1` 開頭的 UTF-8 BOM 會被 `irm` 保留成字串第一個字元 `U+FEFF`，PowerShell 剖析器不把它當成空白，`<#` 因此不被視為區塊註解開頭，說明文字被當成程式碼剖析。`[scriptblock]::Create((irm ...)) -Service` 與 `Invoke-Expression "& { $script } ..."` 兩種 README 記載的帶參數寫法同樣受影響。`get.ps1` 現已改存為不含 BOM、且只包含 ASCII 字元的檔案（原本唯一的非 ASCII 內容是註解中的產品名稱），因此不論經由 `irm` 取得或下載後在 Windows PowerShell 5.1 以 `.\get.ps1` 執行，剖析結果都一致。
