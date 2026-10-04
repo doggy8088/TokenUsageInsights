@@ -829,14 +829,14 @@ token-usage-insights update --check
 # Self-update to the latest release (also supports --force and --target-version)
 token-usage-insights update
 token-usage-insights update --force
-token-usage-insights update --target-version v1.1.3
+token-usage-insights update --target-version v1.1.4
 ```
 
 Environment variables can control the version and installation paths (all optional):
 
 | Variable | Platforms | Description |
 | --- | --- | --- |
-| `TOKEN_USAGE_INSIGHTS_VERSION` | Linux / macOS / Windows | Release tag to install, such as `v1.1.3`; defaults to `latest` |
+| `TOKEN_USAGE_INSIGHTS_VERSION` | Linux / macOS / Windows | Release tag to install, such as `v1.1.4`; defaults to `latest` |
 | `TOKEN_USAGE_INSIGHTS_INSTALL_DIR` | Linux / macOS | Installation directory, passed to `install.sh` |
 | `TOKEN_USAGE_INSIGHTS_BIN_DIR` | Linux / macOS | Executable-link directory, passed to `install.sh` |
 
