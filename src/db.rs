@@ -158,7 +158,7 @@ pub struct UsageImportRollbackSummary {
     pub removed_records: usize,
 }
 
-const CODEX_PARSER_MIGRATION_KEY: &str = "migration:codex_session_identity_v7";
+const CODEX_PARSER_MIGRATION_KEY: &str = "migration:codex_session_identity_v8";
 const CODEX_SOURCE_KIND_MIGRATION_KEY: &str = "migration:codex_source_kind_v1";
 const CODEX_ROLLOUT_IDENTITY_MIGRATION_KEY: &str = "migration:codex_rollout_identity_v1";
 const CODEX_CLI_SOURCE_KIND: &str = "codex-cli";
@@ -1895,12 +1895,11 @@ fn run_codex_parser_migration(conn: &mut Connection) -> Result<(), String> {
             [],
         )
         .map_err(|e| format!("修正 Codex self-parent 資料失敗: {}", e))?;
+        // Additional roots use absolute transcript paths in their cursor keys.
+        // Reset those too so existing child titles receive the parser fix.
         tx.execute(
             "DELETE FROM sync_state
-             WHERE filename LIKE 'codex:sessions/%'
-                OR filename LIKE 'codex:sessions\\%'
-                OR filename LIKE 'codex:archived_sessions/%'
-                OR filename LIKE 'codex:archived_sessions\\%'",
+             WHERE filename LIKE 'codex:%' AND filename NOT LIKE 'codex:claude:%'",
             [],
         )
         .map_err(|e| format!("清除 Codex 同步狀態失敗: {}", e))?;
@@ -10212,6 +10211,76 @@ mod tests {
             std::env::remove_var("CODEX_DIR");
         }
         let _ = fs::remove_dir_all(&codex_dir);
+    }
+
+    #[test]
+    fn sync_codex_usage_logs_refreshes_subagent_names_in_additional_sources() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-subagent-name-sync-{}-{}",
+            std::process::id(),
+            TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let primary = root.join("primary");
+        let additional = root.join("additional");
+        let archive = additional.join("archived_sessions");
+        fs::create_dir_all(&archive).unwrap();
+        let path = archive.join("rollout-2026-10-04T10-00-00-child.jsonl");
+        fs::write(
+            &path,
+            r#"{"type":"session_meta","payload":{"id":"child","parent_thread_id":"parent","source":{"subagent":{"thread_spawn":{"agent_path":"/root/reviewer"}}}}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":"主代理的提示詞"}}
+{"type":"response_item","payload":{"type":"agent_message","recipient":"/root/reviewer","content":"Message Type: NEW_TASK\nTask name: /root/reviewer\nSender: /root\nPayload:\n檢查匯入流程"}}
+{"timestamp":"2026-10-04T10:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":10,"total_tokens":110}}}}
+"#,
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let roots = [primary, additional];
+        sync_codex_usage_logs_from(&mut conn, &roots).unwrap();
+
+        // Simulate v7 data whose transcript size and path have not changed.
+        conn.execute(
+            "UPDATE usage_entries SET session_name = '主代理的提示詞'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM sync_state WHERE filename = ?",
+            params![CODEX_PARSER_MIGRATION_KEY],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES ('migration:codex_session_identity_v7', 1, 0),
+                    ('claude:untouched.jsonl', 123, 456)",
+            [],
+        )
+        .unwrap();
+
+        // Reparse once, then verify an incremental sync keeps the same totals.
+        for _ in 0..2 {
+            sync_codex_usage_logs_from(&mut conn, &roots).unwrap();
+            let stored: (String, u64, u64) = conn
+                .query_row(
+                    "SELECT session_name, SUM(delta_total), COUNT(*)
+                     FROM usage_entries WHERE session_id = 'child'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(stored, ("檢查匯入流程".to_string(), 110, 1));
+        }
+        let unrelated_cursor: u64 = conn
+            .query_row(
+                "SELECT last_synced_size FROM sync_state WHERE filename = 'claude:untouched.jsonl'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unrelated_cursor, 123);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

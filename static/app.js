@@ -1,4 +1,4 @@
-import i18n from './i18n.js?v=37';
+import i18n from './i18n.js?v=38';
 import {
   aggregateDailyTokenCandles,
   calculateCandleViewport,
@@ -4686,8 +4686,7 @@ function renderSessionTable(sessions) {
       // Subagent 第一列只顯示具實際語意的角色，排除與 Subagent badge 重複的 sub-agent/subagent
       const rawRole = (s.agent_role || '').trim();
       const semanticRole = rawRole && !['sub-agent', 'subagent'].includes(rawRole.toLowerCase()) ? rawRole : '';
-      // Subagent 顯示 parent session title，避免 collector 自動產生的 (subagent call_xxx) 後綴
-      const subagentDisplayName = s.parentName || s.session_name;
+      const subagentDisplayName = s.session_name || s.session_id;
       nameCellContent = `
         <div class="session-name-wrapper is-subagent" style="padding-left: ${paddingLeft}px;">
           <span class="tree-connector" style="left: ${connectorLeft}px;">└─</span>
