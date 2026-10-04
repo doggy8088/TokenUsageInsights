@@ -1104,3 +1104,56 @@ h3 {
     backdrop-filter: none;
   }
 }
+
+.source-config-section {
+  border-top: 1px solid var(--line);
+}
+
+.source-config-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  align-items: center;
+  gap: clamp(32px, 6vw, 88px);
+}
+
+.source-config-grid .feature-copy p + p {
+  margin-top: 20px;
+}
+
+.source-config-grid a {
+  display: inline-block;
+  margin-top: 24px;
+  text-underline-offset: 4px;
+}
+
+.source-config-example {
+  min-width: 0;
+  margin: 0;
+}
+
+.source-config-example figcaption {
+  margin-bottom: 12px;
+  font-weight: 700;
+}
+
+.source-config-example pre {
+  overflow-x: auto;
+  padding: 24px;
+  background: var(--ink);
+  color: var(--surface);
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  line-height: 1.8;
+}
+
+.source-config-example p {
+  margin-top: 16px;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+@media (max-width: 800px) {
+  .source-config-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

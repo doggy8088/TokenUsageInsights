@@ -14,7 +14,7 @@ pub fn env_path(name: &str) -> Option<PathBuf> {
     Some(expand_common_prefix(PathBuf::from(value)))
 }
 
-fn expand_common_prefix(path: PathBuf) -> PathBuf {
+pub(crate) fn expand_common_prefix(path: PathBuf) -> PathBuf {
     let raw = path.to_string_lossy();
     let home = dirs::home_dir();
 

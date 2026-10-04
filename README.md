@@ -593,7 +593,7 @@ cargo build --release --bin token-usage-insights
 
 ### 設定檔 (config.yaml)
 
-除了環境變數與命令列旗標（如 `--no-auto-update`）之外，亦可在資料目錄中的 `config.yaml`（預設為 `~/.token-usage-insights/config.yaml`，Windows 為 `%LOCALAPPDATA%\TokenUsageInsights\config.yaml`；若設定 `INSIGHTS_DIR` 環境變數則優先讀取該目錄下的 `config.yaml`，且支援預設路徑作為備援）中設定更新行為：
+除了環境變數與命令列旗標（如 `--no-auto-update`）之外，亦可在資料目錄中的 `config.yaml`（預設為 `~/.token-usage-insights/config.yaml`，Windows 為 `%LOCALAPPDATA%\TokenUsageInsights\config.yaml`；若設定 `INSIGHTS_DIR` 環境變數則優先讀取該目錄下的 `config.yaml`，且支援預設路徑作為備援）中設定更新行為與額外資料來源：
 
 ```yaml
 # ~/.token-usage-insights/config.yaml
@@ -601,7 +601,64 @@ auto_update: true          # 是否在服務啟動時自動檢查並更新（可
 update_check_interval: 1   # 自動檢查更新的間隔週期（天）
 ```
 
-優先順序：命令列旗標（如 `--no-auto-update`） > 環境變數（如 `TOKEN_USAGE_INSIGHTS_AUTO_UPDATE`） > `config.yaml` 設定檔 > 預設值。
+更新設定的優先順序：命令列旗標（如 `--no-auto-update`） > 環境變數（如 `TOKEN_USAGE_INSIGHTS_AUTO_UPDATE`） > `config.yaml` 設定檔 > 預設值。
+
+<a id="additional-sources"></a>
+
+#### 額外資料來源：多個工具目錄與跨電腦集中分析
+
+在同一份 `config.yaml` 加入 `additional_sources`，即可為每種工具指定任意多個**資料根目錄**。例如本機有兩個不同的 `CODEX_HOME`，或將其他電腦的工具資料夾透過雲端硬碟同步到本機：
+
+```yaml
+additional_sources:
+  codex:
+    - '~/work-codex'
+    - '~/Cloud Drive/laptop/.codex'
+    - '~/Cloud Drive/desktop/.codex'
+  claude:
+    - '~/Cloud Drive/laptop/.claude'
+  copilot:
+    - '~/Cloud Drive/laptop/.copilot'
+  cursor:
+    - '~/Cloud Drive/laptop/.cursor'
+  antigravity:
+    - '~/Cloud Drive/laptop/antigravity-cli'
+  grok:
+    - '~/Cloud Drive/laptop/.grok'
+  pi:
+    - '~/Cloud Drive/laptop/.pi'
+  omp:
+    - '~/Cloud Drive/laptop/.omp'
+  muse:
+    - '~/Cloud Drive/laptop/muse'
+  mcode:
+    - '~/Cloud Drive/laptop/.minimax/v2'
+  vscode:
+    - '~/Cloud Drive/laptop/Code'
+  copilot_app:
+    - '~/Cloud Drive/desktop/.copilot'
+```
+
+| 設定鍵 | 根目錄內預期的資料 |
+| --- | --- |
+| `codex` | `sessions/` 與 `archived_sessions/`；填 `CODEX_HOME` 根目錄即可，兩個子目錄都會自動掃描 |
+| `claude`、`cursor` | `projects/` |
+| `copilot` | `usage/`、`session-state/`、`session-store.db`；同目錄有 Copilot App 資料時也會一併匯入 |
+| `copilot_app` | `data.db`、`session-store.db`、`session-state/`；適用於另外存放的 Copilot App 目錄 |
+| `antigravity` | `usage/` 與 `brain/`；需包含原本由 Status Line 收集的用量檔案 |
+| `grok`、`muse` | `sessions/` |
+| `pi`、`omp` | `agent/sessions/` |
+| `mcode` | `sessions/` 與選用的 `sqlite/runtime-state.sqlite`，即 `.minimax/v2` 根目錄 |
+| `vscode` | `User/workspaceStorage/`，即 VS Code 使用者資料根目錄 |
+
+- **額外來源是追加設定**：未設定時維持原有行為，預設 `~/.codex` 等目錄仍會掃描。既有 `CODEX_DIR` 等環境變數仍可覆寫主要來源，`additional_sources` 會追加在主要來源之後，不會被環境變數蓋掉。
+- **不用重新啟動**：程式啟動、背景增量同步與右上角「立即同步」都會重新讀取設定。存檔後按「立即同步」，即可掃描新增目錄。
+- **路徑格式**：支援絕對路徑、`~`、`$HOME`、`%USERPROFILE%`、`%LOCALAPPDATA%` 與 `%APPDATA%` 前綴；相對路徑以實際讀取的 `config.yaml` 所在目錄為準。Windows 路徑建議使用 YAML 單引號，例如 `'D:\Cloud Drive\laptop\.codex'`。可省略不需要的工具，或填 `[]`。
+- **雲端同步方式**：保留各電腦的獨立工具目錄與原有子目錄結構，待雲端硬碟下載成可讀取的本機檔案後，再加入集中電腦的設定。看板只讀取來源，不會代為同步雲端資料；不需共用看板的 `token_usage_insights.db`。
+- **重複與離線來源**：同一路徑或指向同一目錄的符號連結只掃描一次。Codex 相同 rollout 的副本會去重；不同工具保留各自既有的 Session 身分規則。不存在的目錄會略過，下次同步會再嘗試。移除設定不會刪除已匯入用量，但對話明細仍需要可存取的來源檔案。
+- **額外中繼資料**：Cursor 額外目錄可放入該電腦的 `state.vscdb`（原本位於 `User/globalStorage/`）以補充模型資訊；MiniMax Code 會讀取額外根目錄內的 `sqlite/runtime-state.sqlite`。主要來源仍沿用 `CURSOR_STATE_DB` 與 `MCODE_STATE_DB` 設定。
+- **設定檔選擇**：依序使用 `INSIGHTS_DIR` 的設定檔、平台預設資料目錄的設定檔、目前工作目錄的 `config.yaml`，只讀取第一份存在的檔案。若路徑清單或 YAML 格式錯誤，「立即同步」會顯示錯誤，不會默默切換成其他設定檔。
+
 
 > **預設綁定 `0.0.0.0`，同一區網內的其他裝置可能連線到看板。只需在本機瀏覽時，請將 `HOST` 設為 `127.0.0.1`。**
 

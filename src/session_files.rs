@@ -1,7 +1,10 @@
 use axum::http::StatusCode;
 use std::path::{Path as StdPath, PathBuf};
 
-use crate::db;
+use crate::{
+    config::{self, Harness},
+    db,
+};
 
 pub(crate) fn is_safe_session_id(session_id: &str) -> bool {
     if session_id.is_empty() || session_id.len() > 128 {
@@ -477,6 +480,77 @@ impl SessionFileError {
     }
 }
 
+fn resolve_in_roots(
+    roots: &[PathBuf],
+    resolve: impl Fn(&StdPath) -> Result<PathBuf, String>,
+) -> Result<PathBuf, String> {
+    let mut error = "找不到可用的資料來源目錄。".to_string();
+    for root in roots {
+        match resolve(root) {
+            Ok(path) => return Ok(path),
+            Err(message) => error = message,
+        }
+    }
+    Err(error)
+}
+
+fn resolve_configured_transcript(
+    harness: Harness,
+    resolve: impl Fn(&StdPath) -> Result<PathBuf, String>,
+) -> Result<PathBuf, String> {
+    resolve_in_roots(&config::configured_roots(harness)?, resolve)
+}
+
+fn resolve_hook_transcript(
+    harness: Harness,
+    assistant: &str,
+    session_id: &str,
+    stored_path: Option<&str>,
+) -> Result<PathBuf, SessionFileError> {
+    let roots = config::configured_roots(harness)
+        .map_err(|error| SessionFileError::new(StatusCode::BAD_REQUEST, error))?;
+    if !is_safe_session_id(session_id) {
+        return Err(SessionFileError::new(
+            StatusCode::BAD_REQUEST,
+            "Session id 格式不正確。",
+        ));
+    }
+    let mut candidates: Vec<_> = roots
+        .iter()
+        .filter_map(|root| {
+            let path = db::hook_transcript_path(root, assistant, session_id)?;
+            // Hook logs may have been copied from another computer. Construct the
+            // local path from the session id and retain the same containment check.
+            resolve_transcript_path(
+                root,
+                path.to_str()?,
+                TranscriptPathPolicy {
+                    assistant_label: assistant,
+                    validation: TranscriptValidation::Any,
+                },
+            )
+            .ok()
+        })
+        .collect();
+    let stored = stored_path.and_then(|path| StdPath::new(path).canonicalize().ok());
+    candidates.sort_by_key(|path| Some(path) != stored.as_ref());
+    candidates.into_iter().next().ok_or_else(|| {
+        let session_dir_exists = assistant == "copilot"
+            && roots
+                .iter()
+                .any(|root| root.join("session-state").join(session_id).is_dir());
+        SessionFileError::with_reason(
+            StatusCode::NOT_FOUND,
+            "找不到該會話的本地日誌檔。",
+            if session_dir_exists {
+                SessionFileReason::NoEventsYet
+            } else {
+                SessionFileReason::FileMissing
+            },
+        )
+    })
+}
+
 pub(crate) fn resolve_session_file_path(
     assistant: &str,
     session_id: &str,
@@ -485,10 +559,12 @@ pub(crate) fn resolve_session_file_path(
     context: SessionFileResolutionContext<'_>,
 ) -> Result<PathBuf, SessionFileError> {
     match assistant {
-        "antigravity" => Ok(db::get_antigravity_dir()
-            .join("brain")
-            .join(session_id)
-            .join(".system_generated/logs/transcript_full.jsonl")),
+        "antigravity" => resolve_hook_transcript(
+            Harness::Antigravity,
+            assistant,
+            session_id,
+            transcript_path_db,
+        ),
         "copilot" if source_kind == crate::vscode::SOURCE_KIND => {
             let path = transcript_path_db.ok_or_else(|| {
                 SessionFileError::new(
@@ -522,21 +598,29 @@ pub(crate) fn resolve_session_file_path(
                     "Copilot CLI subagent 缺少 parent session id。",
                 ));
             };
-            resolve_copilot_cli_subagent_events_path(&db::get_copilot_dir(), parent_session_id)
+            let mut roots = config::configured_roots(Harness::Copilot)
+                .map_err(|error| SessionFileError::new(StatusCode::BAD_REQUEST, error))?;
+            let stored = transcript_path_db.and_then(|path| StdPath::new(path).canonicalize().ok());
+            roots.sort_by_key(|root| !stored.as_ref().is_some_and(|path| path.starts_with(root)));
+            let mut error = None;
+            for root in &roots {
+                match resolve_copilot_cli_subagent_events_path(root, parent_session_id) {
+                    Ok(path) => return Ok(path),
+                    Err(message) => {
+                        if error.as_ref().is_none_or(|previous: &SessionFileError| {
+                            previous.reason != Some(SessionFileReason::NoEventsYet)
+                        }) {
+                            error = Some(message);
+                        }
+                    }
+                }
+            }
+            Err(error.unwrap_or_else(|| {
+                SessionFileError::new(StatusCode::NOT_FOUND, "找不到 Copilot 資料來源。")
+            }))
         }
         "copilot" => {
-            let copilot_dir = db::get_copilot_dir();
-            let events_path = copilot_dir
-                .join("session-state")
-                .join(session_id)
-                .join("events.jsonl");
-            if events_path.exists() {
-                Ok(events_path)
-            } else {
-                Ok(copilot_dir
-                    .join("session-state")
-                    .join(format!("{session_id}.jsonl")))
-            }
+            resolve_hook_transcript(Harness::Copilot, assistant, session_id, transcript_path_db)
         }
         "codex" => {
             let path = transcript_path_db.ok_or_else(|| {
@@ -545,8 +629,10 @@ pub(crate) fn resolve_session_file_path(
                     "找不到 Codex 會話日誌檔案路徑。".to_string(),
                 )
             })?;
-            resolve_codex_transcript_path(&db::get_codex_dir(), path)
-                .map_err(|error| SessionFileError::new(StatusCode::BAD_REQUEST, error))
+            resolve_configured_transcript(Harness::Codex, |root| {
+                resolve_codex_transcript_path(root, path)
+            })
+            .map_err(|error| SessionFileError::new(StatusCode::BAD_REQUEST, error))
         }
         "claude" => {
             let path = transcript_path_db.ok_or_else(|| {
@@ -555,15 +641,19 @@ pub(crate) fn resolve_session_file_path(
                     "找不到 Claude Code 會話日誌檔案路徑。",
                 )
             })?;
-            resolve_claude_transcript_path(&db::get_claude_dir(), session_id, path)
-                .map_err(|error| SessionFileError::new(StatusCode::BAD_REQUEST, error))
+            resolve_configured_transcript(Harness::Claude, |root| {
+                resolve_claude_transcript_path(root, session_id, path)
+            })
+            .map_err(|error| SessionFileError::new(StatusCode::BAD_REQUEST, error))
         }
         "cursor" => {
             let path = transcript_path_db.ok_or_else(|| {
                 SessionFileError::new(StatusCode::NOT_FOUND, "找不到 Cursor 會話日誌檔案路徑。")
             })?;
-            resolve_cursor_transcript_path(&db::get_cursor_dir(), session_id, path)
-                .map_err(|error| SessionFileError::new(StatusCode::BAD_REQUEST, error))
+            resolve_configured_transcript(Harness::Cursor, |root| {
+                resolve_cursor_transcript_path(root, session_id, path)
+            })
+            .map_err(|error| SessionFileError::new(StatusCode::BAD_REQUEST, error))
         }
         "grok" => {
             let path = transcript_path_db.ok_or_else(|| {
@@ -572,8 +662,10 @@ pub(crate) fn resolve_session_file_path(
                     "找不到 Grok Build session 日誌檔案路徑。".to_string(),
                 )
             })?;
-            resolve_grok_transcript_path(&db::get_grok_dir(), session_id, path)
-                .map_err(|error| SessionFileError::new(StatusCode::BAD_REQUEST, error))
+            resolve_configured_transcript(Harness::Grok, |root| {
+                resolve_grok_transcript_path(root, session_id, path)
+            })
+            .map_err(|error| SessionFileError::new(StatusCode::BAD_REQUEST, error))
         }
         "pi" => {
             let path = transcript_path_db.ok_or_else(|| {
@@ -582,8 +674,10 @@ pub(crate) fn resolve_session_file_path(
                     "找不到 Pi Coding Agent session 日誌檔案路徑。".to_string(),
                 )
             })?;
-            resolve_pi_family_transcript_path(&db::get_pi_dir(), "Pi Coding Agent", path)
-                .map_err(|error| SessionFileError::new(StatusCode::BAD_REQUEST, error))
+            resolve_configured_transcript(Harness::Pi, |root| {
+                resolve_pi_family_transcript_path(root, "Pi Coding Agent", path)
+            })
+            .map_err(|error| SessionFileError::new(StatusCode::BAD_REQUEST, error))
         }
         "omp" => {
             let path = transcript_path_db.ok_or_else(|| {
@@ -592,8 +686,10 @@ pub(crate) fn resolve_session_file_path(
                     "找不到 OMP session 日誌檔案路徑。".to_string(),
                 )
             })?;
-            resolve_pi_family_transcript_path(&db::get_omp_dir(), "OMP", path)
-                .map_err(|error| SessionFileError::new(StatusCode::BAD_REQUEST, error))
+            resolve_configured_transcript(Harness::Omp, |root| {
+                resolve_pi_family_transcript_path(root, "OMP", path)
+            })
+            .map_err(|error| SessionFileError::new(StatusCode::BAD_REQUEST, error))
         }
         "muse" => {
             let path = transcript_path_db.ok_or_else(|| {
@@ -602,8 +698,10 @@ pub(crate) fn resolve_session_file_path(
                     "找不到 Muse session 日誌檔案路徑。".to_string(),
                 )
             })?;
-            resolve_pi_family_transcript_path(&db::get_muse_dir(), "Muse", path)
-                .map_err(|error| SessionFileError::new(StatusCode::BAD_REQUEST, error))
+            resolve_configured_transcript(Harness::Muse, |root| {
+                resolve_pi_family_transcript_path(root, "Muse", path)
+            })
+            .map_err(|error| SessionFileError::new(StatusCode::BAD_REQUEST, error))
         }
         "mcode" => {
             let path = transcript_path_db.ok_or_else(|| {
@@ -612,8 +710,10 @@ pub(crate) fn resolve_session_file_path(
                     "找不到 MiniMax Code session 日誌檔案路徑。".to_string(),
                 )
             })?;
-            resolve_pi_family_transcript_path(&db::get_mcode_dir(), "MiniMax Code", path)
-                .map_err(|error| SessionFileError::new(StatusCode::BAD_REQUEST, error))
+            resolve_configured_transcript(Harness::Mcode, |root| {
+                resolve_pi_family_transcript_path(root, "MiniMax Code", path)
+            })
+            .map_err(|error| SessionFileError::new(StatusCode::BAD_REQUEST, error))
         }
         _ => Err(SessionFileError::new(
             StatusCode::BAD_REQUEST,
@@ -626,6 +726,55 @@ pub(crate) fn resolve_session_file_path(
 mod tests {
     use super::*;
     use std::{fs, time::SystemTime};
+
+    #[test]
+    fn multiple_roots_accept_only_transcripts_within_an_allowed_directory() {
+        let root = copilot_app_fixture_dir("multiple-roots");
+        let primary = root.join("primary");
+        let extra = root.join("extra");
+        fs::create_dir_all(&primary).unwrap();
+        fs::create_dir_all(&extra).unwrap();
+        let transcript = extra.join("session.jsonl");
+        let outside = root.join("outside.jsonl");
+        fs::write(&transcript, "{}\n").unwrap();
+        fs::write(&outside, "{}\n").unwrap();
+        let roots = vec![root.join("offline"), primary, extra];
+        assert_eq!(
+            resolve_in_roots(&roots, |base| resolve_codex_transcript_path(
+                base,
+                transcript.to_str().unwrap()
+            ))
+            .unwrap(),
+            transcript.canonicalize().unwrap()
+        );
+        assert!(
+            resolve_in_roots(&roots, |base| resolve_codex_transcript_path(
+                base,
+                outside.to_str().unwrap()
+            ))
+            .is_err()
+        );
+        assert!(
+            resolve_in_roots(&roots, |base| resolve_codex_transcript_path(
+                base,
+                "../outside.jsonl"
+            ))
+            .is_err()
+        );
+        #[cfg(unix)]
+        {
+            let link = roots[2].join("escape.jsonl");
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+            assert!(
+                resolve_in_roots(&roots, |base| resolve_codex_transcript_path(
+                    base,
+                    link.to_str().unwrap()
+                ))
+                .is_err()
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
 
     fn copilot_app_fixture_dir(prefix: &str) -> PathBuf {
         let unique = SystemTime::now()

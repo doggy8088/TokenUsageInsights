@@ -939,16 +939,23 @@ pub(super) fn sync_cursor_usage_logs(
     conn: &mut Connection,
     cursor_dir: &Path,
 ) -> Result<(), String> {
+    sync_cursor_usage_logs_with_ledger(conn, cursor_dir, &get_cursor_state_db_path())
+}
+
+pub(super) fn sync_cursor_usage_logs_with_ledger(
+    conn: &mut Connection,
+    cursor_dir: &Path,
+    state_db_path: &Path,
+) -> Result<(), String> {
     run_cursor_model_attribution_migration(conn)?;
     run_cursor_cache_tokens_unknown_migration(conn)?;
 
-    let state_db_path = get_cursor_state_db_path();
     let source_id = if state_db_path.exists() {
-        let source_id = cursor_model_source_id(&state_db_path);
-        if let Err(error) = sync_cursor_session_metadata(conn, &state_db_path) {
+        let source_id = cursor_model_source_id(state_db_path);
+        if let Err(error) = sync_cursor_session_metadata(conn, state_db_path) {
             eprintln!("同步 Cursor composerData Session 中繼資料失敗: {error}");
         }
-        if let Err(error) = sync_cursor_model_signatures(conn, &state_db_path) {
+        if let Err(error) = sync_cursor_model_signatures(conn, state_db_path) {
             eprintln!("同步 Cursor agentKv 模型資訊失敗: {error}");
         }
         Some(source_id)
@@ -984,7 +991,7 @@ pub(super) fn sync_cursor_usage_logs(
             .unwrap_or(&filepath)
             .to_string_lossy()
             .into_owned();
-        let state_key = format!("cursor:{}", state_path);
+        let state_key = source_sync_key("cursor", cursor_dir, &state_path);
 
         let last_synced_size: u64 = conn
             .query_row(

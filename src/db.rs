@@ -1346,8 +1346,8 @@ fn normalize_legacy_claude_usage_entry(entry: &mut UsageEntry) {
     normalize_legacy_claude_token_stats(&mut entry.delta_tokens);
 }
 
-fn get_antigravity_session_name(session_id: &str) -> Option<String> {
-    let path = get_antigravity_dir()
+fn get_antigravity_session_name(base_dir: &Path, session_id: &str) -> Option<String> {
+    let path = base_dir
         .join("brain")
         .join(session_id)
         .join(".system_generated/logs/transcript_full.jsonl");
@@ -1393,8 +1393,7 @@ fn get_antigravity_session_name(session_id: &str) -> Option<String> {
     selector.into_name()
 }
 
-fn get_copilot_session_name(session_id: &str) -> Option<String> {
-    let copilot_dir = get_copilot_dir();
+fn get_copilot_session_name(copilot_dir: &Path, session_id: &str) -> Option<String> {
     let events_path = copilot_dir
         .join("session-state")
         .join(session_id)
@@ -1447,6 +1446,33 @@ fn get_copilot_session_name(session_id: &str) -> Option<String> {
     }
 
     selector.into_name()
+}
+
+pub(crate) fn hook_transcript_path(
+    base_dir: &Path,
+    assistant: &str,
+    session_id: &str,
+) -> Option<PathBuf> {
+    if !crate::session_files::is_safe_session_id(session_id) {
+        return None;
+    }
+    let paths = if assistant == "antigravity" {
+        vec![base_dir
+            .join("brain")
+            .join(session_id)
+            .join(".system_generated/logs/transcript_full.jsonl")]
+    } else {
+        vec![
+            base_dir
+                .join("session-state")
+                .join(session_id)
+                .join("events.jsonl"),
+            base_dir
+                .join("session-state")
+                .join(format!("{session_id}.jsonl")),
+        ]
+    };
+    paths.into_iter().find(|path| path.is_file())
 }
 
 /// Sync usage logs for hooks-based assistant (Antigravity or Copilot)
@@ -1516,7 +1542,7 @@ fn sync_hook_usage_logs(
         let filepath = entry.path();
 
         // Scope the sync_state key with the assistant prefix to prevent key collision
-        let state_key = format!("{}:{}", assistant_type, filename);
+        let state_key = source_sync_key(assistant_type, base_dir, &filename);
 
         let last_synced_size: u64 = conn
             .query_row(
@@ -1565,6 +1591,14 @@ fn sync_hook_usage_logs(
                     continue;
                 }
 
+                for entry in &mut parsed_entries {
+                    if let Some(path) =
+                        hook_transcript_path(base_dir, assistant_type, &entry.session_id)
+                    {
+                        entry.transcript_path = Some(path.to_string_lossy().into_owned());
+                    }
+                }
+
                 let tx = conn
                     .transaction()
                     .map_err(|e| format!("Transaction BEGIN 失敗: {}", e))?;
@@ -1579,8 +1613,10 @@ fn sync_hook_usage_logs(
                     let resolved_name = resolved_names
                         .entry(entry.session_id.clone())
                         .or_insert_with(|| match assistant_type {
-                            "antigravity" => get_antigravity_session_name(&entry.session_id),
-                            "copilot" => get_copilot_session_name(&entry.session_id),
+                            "antigravity" => {
+                                get_antigravity_session_name(base_dir, &entry.session_id)
+                            }
+                            "copilot" => get_copilot_session_name(base_dir, &entry.session_id),
                             _ => None,
                         })
                         .clone()
@@ -1761,10 +1797,10 @@ fn vscode_sync_signature(filepath: &Path, metadata: &fs::Metadata) -> (u64, i64)
     (size, modified)
 }
 
-fn sync_vscode_chat_sessions(conn: &mut Connection) -> Result<(), String> {
+fn sync_vscode_chat_sessions_from(conn: &mut Connection, roots: &[PathBuf]) -> Result<(), String> {
     let mut seen_sessions = HashSet::new();
 
-    for filepath in crate::vscode::discover_session_files() {
+    for filepath in crate::vscode::session_files_in(roots) {
         let metadata = match fs::metadata(&filepath) {
             Ok(metadata) => metadata,
             Err(_) => continue,
@@ -2017,6 +2053,33 @@ fn run_codex_rollout_identity_migration(conn: &mut Connection) -> Result<(), Str
         .map_err(|error| format!("Codex rollout 身分遷移 COMMIT 失敗: {error}"))
 }
 
+/// Source-scoped cursors prevent equal relative names/sizes on different
+/// computers from hiding new usage. Keep the assistant prefix for migrations.
+fn source_sync_key(assistant: &str, root: &Path, relative_path: &str) -> String {
+    let root = crate::config::absolute_root(root);
+    let primary = match assistant {
+        "antigravity" => get_antigravity_dir(),
+        "copilot" => get_copilot_dir(),
+        "claude" => get_claude_dir(),
+        "cursor" => get_cursor_dir(),
+        "grok" => get_grok_dir(),
+        "pi" => get_pi_dir(),
+        "omp" => get_omp_dir(),
+        "muse" => get_muse_dir(),
+        "mcode" => get_mcode_dir(),
+        _ => root.clone(),
+    };
+    // Preserve the primary home's existing cursor, particularly hook offsets:
+    // replaying old hook rows can resurrect totals already split into agents.
+    if root == crate::config::absolute_root(&primary) {
+        return format!("{assistant}:{relative_path}");
+    }
+    format!(
+        "{assistant}:source:{}:{relative_path}",
+        encode_hex(root.as_os_str().as_encoded_bytes())
+    )
+}
+
 fn portable_relative_path(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
         .unwrap_or(path)
@@ -2135,8 +2198,12 @@ fn decode_registered_path(bytes: Vec<u8>) -> Option<PathBuf> {
 /// receive additional API calls after the first sync, affected turns are
 /// re-aggregated from the full event history (not just `created_at > cursor`)
 /// and upserted via `INSERT OR REPLACE` keyed on `import_source_id`.
+#[cfg(test)]
 fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
-    let app_dir = crate::paths::copilot_app_dir();
+    sync_copilot_app_usage_logs_from(conn, &crate::paths::copilot_app_dir())
+}
+
+fn sync_copilot_app_usage_logs_from(conn: &mut Connection, app_dir: &Path) -> Result<(), String> {
     let session_store_path = app_dir.join("session-store.db");
 
     // Canonicalize the source directory so the cursor is stable across trailing
@@ -2145,7 +2212,9 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
     // injective (no two distinct paths map to the same key) and free of LIKE
     // wildcard characters (`%`, `_`). Encoding raw bytes (not lossy UTF-8) avoids
     // collisions from Unicode replacement chars and from `\\` vs `/` normalization.
-    let canonical_app_dir = app_dir.canonicalize().unwrap_or_else(|_| app_dir.clone());
+    let canonical_app_dir = app_dir
+        .canonicalize()
+        .unwrap_or_else(|_| app_dir.to_path_buf());
     let source_key = encode_hex(canonical_app_dir.as_os_str().as_encoded_bytes());
     register_usage_source_directory(
         conn,
@@ -2334,7 +2403,7 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
             Ok((session_id, turn_index, created_at, id)) => {
                 max_event_cursor = Some((created_at, id));
                 if matches!(
-                    classify_copilot_app_session(&app_dir, &app_session_ids, &session_id),
+                    classify_copilot_app_session(app_dir, &app_session_ids, &session_id),
                     CopilotAppSessionKind::App
                 ) && touched_set.insert((session_id.clone(), turn_index))
                 {
@@ -3046,8 +3115,15 @@ struct CopilotCliAgentRow {
 /// ([`COPILOT_CLI_AGENT_MIGRATION_KEY`]) performs the first backfill of all
 /// existing CLI sessions. Both the cursor and the migration key are
 /// independent of the Copilot App collector's state.
+#[cfg(test)]
 fn sync_copilot_cli_agent_usage_logs(conn: &mut Connection) -> Result<(), String> {
-    let copilot_dir = get_copilot_dir();
+    sync_copilot_cli_agent_usage_logs_from(conn, &get_copilot_dir())
+}
+
+fn sync_copilot_cli_agent_usage_logs_from(
+    conn: &mut Connection,
+    copilot_dir: &Path,
+) -> Result<(), String> {
     let session_store_path = copilot_dir.join("session-store.db");
 
     // Canonicalize for a stable, per-COPILOT_DIR cursor key (mirrors the App
@@ -3055,7 +3131,7 @@ fn sync_copilot_cli_agent_usage_logs(conn: &mut Connection) -> Result<(), String
     // LIKE wildcards.
     let canonical_copilot_dir = copilot_dir
         .canonicalize()
-        .unwrap_or_else(|_| copilot_dir.clone());
+        .unwrap_or_else(|_| copilot_dir.to_path_buf());
     let source_key = encode_hex(canonical_copilot_dir.as_os_str().as_encoded_bytes());
     let cursor_key_prefix = format!("{}{}::", COPILOT_CLI_AGENT_CURSOR_PREFIX, source_key);
     let pending_key_prefix = format!("{}{}::", COPILOT_CLI_AGENT_PENDING_PREFIX, source_key);
@@ -3173,7 +3249,7 @@ fn sync_copilot_cli_agent_usage_logs(conn: &mut Connection) -> Result<(), String
             Ok((session_id, created_at, id)) => {
                 max_event_cursor = Some((created_at, id));
                 if matches!(
-                    classify_copilot_app_session(&copilot_dir, &app_session_ids, &session_id),
+                    classify_copilot_app_session(copilot_dir, &app_session_ids, &session_id),
                     CopilotAppSessionKind::Cli
                 ) {
                     touched_cli_sessions.insert(session_id);
@@ -3216,7 +3292,7 @@ fn sync_copilot_cli_agent_usage_logs(conn: &mut Connection) -> Result<(), String
             continue;
         };
         if matches!(
-            classify_copilot_app_session(&copilot_dir, &app_session_ids, session_id),
+            classify_copilot_app_session(copilot_dir, &app_session_ids, session_id),
             CopilotAppSessionKind::Cli
         ) {
             touched_cli_sessions.insert(session_id.to_string());
@@ -3240,7 +3316,7 @@ fn sync_copilot_cli_agent_usage_logs(conn: &mut Connection) -> Result<(), String
             match sid_res {
                 Ok(sid) => {
                     if matches!(
-                        classify_copilot_app_session(&copilot_dir, &app_session_ids, &sid),
+                        classify_copilot_app_session(copilot_dir, &app_session_ids, &sid),
                         CopilotAppSessionKind::Cli
                     ) {
                         touched_cli_sessions.insert(sid);
@@ -3491,7 +3567,7 @@ fn sync_copilot_cli_agent_usage_logs(conn: &mut Connection) -> Result<(), String
                     _ => (row.session_id.clone(), None, None, "main".to_string(), None),
                 };
 
-            let session_name = get_copilot_session_name(&row.session_id);
+            let session_name = get_copilot_session_name(copilot_dir, &row.session_id);
             let session_name = match (&row.agent_id, &session_name) {
                 (Some(agent), Some(name)) if !agent.is_empty() => {
                     Some(format!("{} (subagent {})", name, agent))
@@ -3527,7 +3603,7 @@ fn sync_copilot_cli_agent_usage_logs(conn: &mut Connection) -> Result<(), String
                     parent_session_id, agent_nickname, agent_role
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?, ?,
-                    NULL, ?, NULL, ?, ?, ?,
+                    ?, ?, NULL, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?,
                     ?, NULL, ?, NULL,
@@ -3541,6 +3617,8 @@ fn sync_copilot_cli_agent_usage_logs(conn: &mut Connection) -> Result<(), String
                     date_str,
                     row_session_id,
                     session_name,
+                    hook_transcript_path(copilot_dir, "copilot", &row.session_id)
+                        .map(|path| path.to_string_lossy().into_owned()),
                     row.cwd.as_deref(),
                     // CLI sessions aggregate across all turns into a single
                     // row per agent, so turn_no is fixed at 1.
@@ -3881,6 +3959,7 @@ struct CodexTranscript {
     path: PathBuf,
     identity: String,
     size: u64,
+    active: bool,
 }
 
 fn collect_codex_transcripts(dir: &Path) -> Vec<CodexTranscript> {
@@ -3898,6 +3977,7 @@ fn collect_codex_transcripts(dir: &Path) -> Vec<CodexTranscript> {
             path: filepath,
             identity,
             size: metadata.len(),
+            active: dir.file_name().is_some_and(|name| name == "sessions"),
         });
     }
 
@@ -3908,13 +3988,10 @@ fn collect_codex_transcripts(dir: &Path) -> Vec<CodexTranscript> {
 /// copy wins: more content first, then the live `sessions` directory (Codex
 /// only moves a transcript to `archived_sessions` once it stops appending to
 /// it), and finally the path so the choice never depends on directory order.
-fn codex_transcript_canonical_rank(
-    sessions_dir: &Path,
-    transcript: &CodexTranscript,
-) -> (u64, bool, String) {
+fn codex_transcript_canonical_rank(transcript: &CodexTranscript) -> (u64, bool, String) {
     (
         transcript.size,
-        transcript.path.starts_with(sessions_dir),
+        transcript.active,
         transcript.path.to_string_lossy().into_owned(),
     )
 }
@@ -3922,11 +3999,10 @@ fn codex_transcript_canonical_rank(
 /// Highest ranked copy of a rollout that parses completely *and* covers more
 /// turns than the canonical transcript could provide, or `None` when no copy can
 /// stand in for the canonical file.
-fn usable_codex_duplicate<'a>(
-    sessions_dir: &Path,
-    duplicates: &'a [CodexTranscript],
+fn usable_codex_duplicate(
+    duplicates: &[CodexTranscript],
     canonical_entries: usize,
-) -> Option<&'a CodexTranscript> {
+) -> Option<&CodexTranscript> {
     duplicates
         .iter()
         .filter(|duplicate| {
@@ -3936,7 +4012,7 @@ fn usable_codex_duplicate<'a>(
                     && parsed.entries.len() > canonical_entries
             )
         })
-        .max_by_key(|duplicate| codex_transcript_canonical_rank(sessions_dir, duplicate))
+        .max_by_key(|duplicate| codex_transcript_canonical_rank(duplicate))
 }
 
 /// Stored transcript path spellings whose rows must disappear once the
@@ -4050,18 +4126,25 @@ fn codex_transcript_needs_sync(
     }
 }
 
+#[cfg(test)]
 fn sync_codex_usage_logs(conn: &mut Connection) -> Result<(), String> {
-    let codex_dir = get_codex_dir();
+    sync_codex_usage_logs_from(conn, &[get_codex_dir()])
+}
+
+fn sync_codex_usage_logs_from(conn: &mut Connection, roots: &[PathBuf]) -> Result<(), String> {
+    let Some(codex_dir) = roots.first() else {
+        return Ok(());
+    };
 
     run_codex_parser_migration(conn)?;
     run_codex_source_kind_migration(conn)?;
     run_codex_rollout_identity_migration(conn)?;
 
-    let sessions_dir = codex_dir.join("sessions");
-    let mut transcripts = collect_codex_transcripts(&sessions_dir);
-    transcripts.extend(collect_codex_transcripts(
-        &codex_dir.join("archived_sessions"),
-    ));
+    let mut transcripts = Vec::new();
+    for root in roots {
+        transcripts.extend(collect_codex_transcripts(&root.join("sessions")));
+        transcripts.extend(collect_codex_transcripts(&root.join("archived_sessions")));
+    }
 
     if transcripts.is_empty() {
         return Ok(());
@@ -4088,7 +4171,7 @@ fn sync_codex_usage_logs(conn: &mut Connection) -> Result<(), String> {
     for (identity, group) in transcripts_by_identity {
         let Some(canonical) = group
             .iter()
-            .max_by_key(|transcript| codex_transcript_canonical_rank(&sessions_dir, transcript))
+            .max_by_key(|transcript| codex_transcript_canonical_rank(transcript))
             .cloned()
         else {
             continue;
@@ -4105,7 +4188,7 @@ fn sync_codex_usage_logs(conn: &mut Connection) -> Result<(), String> {
 
         sync_codex_transcript(
             conn,
-            &codex_dir,
+            codex_dir,
             &identity,
             &canonical,
             &transcript_paths,
@@ -4187,9 +4270,7 @@ fn sync_codex_transcript(
             Ok(parsed) => parsed.entries.len(),
             Err(_) => 0,
         };
-        let sessions_dir = codex_dir.join("sessions");
-        if let Some(fallback) = usable_codex_duplicate(&sessions_dir, duplicates, canonical_entries)
-        {
+        if let Some(fallback) = usable_codex_duplicate(duplicates, canonical_entries) {
             let remaining: Vec<CodexTranscript> = duplicates
                 .iter()
                 .filter(|duplicate| duplicate.path != fallback.path)
@@ -4395,7 +4476,12 @@ fn migrate_legacy_claude_usage_entries(conn: &Connection) -> Result<usize, Strin
 }
 
 /// Sync Claude Code local transcripts into the dashboard's Claude Code assistant slot.
+#[cfg(test)]
 fn sync_claude_usage_logs(conn: &mut Connection) -> Result<(), String> {
+    sync_claude_usage_logs_from(conn, &get_claude_dir())
+}
+
+fn sync_claude_usage_logs_from(conn: &mut Connection, claude_dir: &Path) -> Result<(), String> {
     // Move Claude Code data that was previously written into the Codex slot.
     let migration_done: bool = conn
         .query_row(
@@ -4440,7 +4526,6 @@ fn sync_claude_usage_logs(conn: &mut Connection) -> Result<(), String> {
         );
     }
 
-    let claude_dir = get_claude_dir();
     let projects_dir = claude_dir.join("projects");
     if !projects_dir.exists() {
         return Ok(());
@@ -4450,11 +4535,11 @@ fn sync_claude_usage_logs(conn: &mut Connection) -> Result<(), String> {
 
     for filepath in files {
         let state_path = filepath
-            .strip_prefix(&claude_dir)
+            .strip_prefix(claude_dir)
             .unwrap_or(&filepath)
             .to_string_lossy()
             .into_owned();
-        let state_key = format!("claude:{}", state_path);
+        let state_key = source_sync_key("claude", claude_dir, &state_path);
 
         let last_synced_size: u64 = conn
             .query_row(
@@ -4597,7 +4682,7 @@ pub(crate) fn sync_grok_usage_logs(conn: &mut Connection, grok_dir: &Path) -> Re
         };
         let current_size = metadata.len();
         let state_name = portable_relative_path(grok_dir, &filepath);
-        let state_key = format!("grok:{state_name}");
+        let state_key = source_sync_key("grok", grok_dir, &state_name);
         let last_synced_size: u64 = conn
             .query_row(
                 "SELECT last_synced_size FROM sync_state WHERE filename = ?",
@@ -4760,7 +4845,7 @@ fn sync_pi_family_usage_logs(
         };
         let current_size = metadata.len();
         let state_name = portable_relative_path(dir, &filepath);
-        let state_key = format!("{assistant_type}:{state_name}");
+        let state_key = source_sync_key(assistant_type, dir, &state_name);
         let last_synced_size: u64 = conn
             .query_row(
                 "SELECT last_synced_size FROM sync_state WHERE filename = ?",
@@ -5039,6 +5124,14 @@ fn complete_file_len(path: &Path) -> Option<u64> {
 /// fingerprint is therefore the combined size of the session's JSONL files,
 /// and the rebuild is scoped to the session's `messages.jsonl` path.
 pub(crate) fn sync_mcode_usage_logs(conn: &mut Connection, mcode_dir: &Path) -> Result<(), String> {
+    sync_mcode_usage_logs_with_ledger(conn, mcode_dir, &get_mcode_state_db_path())
+}
+
+fn sync_mcode_usage_logs_with_ledger(
+    conn: &mut Connection,
+    mcode_dir: &Path,
+    ledger: &Path,
+) -> Result<(), String> {
     let session_dirs = crate::mcode::find_session_dirs(mcode_dir);
     // The runtime ledger is opened lazily and only when a session actually
     // changed, so an uninstalled MiniMax Code runtime costs nothing.
@@ -5066,7 +5159,7 @@ pub(crate) fn sync_mcode_usage_logs(conn: &mut Connection, mcode_dir: &Path) -> 
         }
 
         let state_name = portable_relative_path(mcode_dir, &session_dir);
-        let state_key = format!("mcode:{state_name}");
+        let state_key = source_sync_key("mcode", mcode_dir, &state_name);
         let last_synced_size: u64 = conn
             .query_row(
                 "SELECT last_synced_size FROM sync_state WHERE filename = ?",
@@ -5079,8 +5172,8 @@ pub(crate) fn sync_mcode_usage_logs(conn: &mut Connection, mcode_dir: &Path) -> 
             continue;
         }
 
-        let runtime_meta = runtime_meta
-            .get_or_insert_with(|| load_mcode_runtime_session_meta(&get_mcode_state_db_path()));
+        let runtime_meta =
+            runtime_meta.get_or_insert_with(|| load_mcode_runtime_session_meta(ledger));
         let session_id = crate::mcode::read_session_metadata(&session_dir);
         let runtime_session = runtime_meta.get(&session_id);
         let cwd = runtime_session
@@ -5130,88 +5223,88 @@ pub(crate) fn sync_mcode_usage_logs(conn: &mut Connection, mcode_dir: &Path) -> 
 
 /// Unified sync function triggering sync for all supported assistants
 pub fn sync_usage_logs(conn: &mut Connection) -> Result<(), String> {
-    // 1. Sync Cursor metadata first so model and mode attribution is available
-    // before the potentially slower transcript collectors finish.
-    let cursor_dir = get_cursor_dir();
-    if let Err(e) = sync_cursor_usage_logs(conn, &cursor_dir) {
-        eprintln!("❌ 同步 Cursor 失敗: {}", e);
-    }
+    let config = crate::config::SourceConfig::load()?;
+    sync_configured_sources(conn, &config)
+}
 
-    // 2. Sync Google Antigravity CLI
-    let antigravity_dir = get_antigravity_dir();
-    if let Err(e) = sync_hook_usage_logs(conn, "antigravity", &antigravity_dir) {
-        eprintln!("❌ 同步 Antigravity 失敗: {}", e);
-    }
-
-    // 3. Sync GitHub Copilot CLI
-    let copilot_dir = get_copilot_dir();
-    if let Err(e) = sync_hook_usage_logs(conn, "copilot", &copilot_dir) {
-        eprintln!("❌ 同步 Copilot 失敗: {}", e);
-    }
-
-    // 3b. Sync GitHub Copilot sessions created in VS Code
-    if let Err(e) = sync_vscode_chat_sessions(conn) {
-        eprintln!("❌ 同步 VS Code Copilot 失敗: {}", e);
-    }
-
-    // 4. Sync GitHub Copilot App (Tauri desktop) usage
-    if let Err(e) = sync_copilot_app_usage_logs(conn) {
-        eprintln!("❌ 同步 Copilot App 失敗: {}", e);
-    }
-
-    // 5. Reconcile Copilot CLI subagent usage against session-store.db. Runs
-    // after the hook and App collectors so CLI sessions are classified against
-    // the authoritative App registry and the hook merged rows are available
-    // for total validation. Falls back to hook rows when session-store is
-    // missing, unclassifiable, or fails total validation.
-    if let Err(e) = sync_copilot_cli_agent_usage_logs(conn) {
-        eprintln!("❌ 同步 Copilot CLI agent reconciliation 失敗: {}", e);
-    }
-
-    // 5b. Backfill CWD for Copilot rows written before CWD was resolved from
-    // session-store.db.sessions.
-    if let Err(e) = backfill_copilot_cwd(conn) {
-        eprintln!("❌ 補填 Copilot CWD 失敗: {}", e);
-    }
-
-    // 6. Sync Codex CLI and Desktop
-    if let Err(e) = sync_codex_usage_logs(conn) {
-        eprintln!("❌ 同步 Codex 失敗: {}", e);
-    }
-
-    // 5. Sync Claude Code
-    if let Err(e) = sync_claude_usage_logs(conn) {
-        eprintln!("❌ 同步 Claude Code 失敗: {}", e);
-    }
-
-    // 8. Sync Grok Build sessions
-    let grok_dir = get_grok_dir();
-    if let Err(e) = sync_grok_usage_logs(conn, &grok_dir) {
-        eprintln!("❌ 同步 Grok Build 失敗: {}", e);
-    }
-
-    // 9. Sync Pi Coding Agent sessions
-    let pi_dir = get_pi_dir();
-    if let Err(e) = sync_pi_usage_logs(conn, &pi_dir) {
-        eprintln!("❌ 同步 Pi Coding Agent 失敗: {}", e);
-    }
-
-    // 10. Sync OMP sessions (Pi fork)
-    let omp_dir = get_omp_dir();
-    if let Err(e) = sync_omp_usage_logs(conn, &omp_dir) {
-        eprintln!("❌ 同步 OMP 失敗: {}", e);
-    }
-
-    // 11. Sync Muse sessions
-    let muse_dir = get_muse_dir();
-    if let Err(e) = sync_muse_usage_logs(conn, &muse_dir) {
-        eprintln!("❌ 同步 Muse 失敗: {}", e);
-    }
-
-    // 12. Sync MiniMax Code sessions
-    let mcode_dir = get_mcode_dir();
-    if let Err(e) = sync_mcode_usage_logs(conn, &mcode_dir) {
-        eprintln!("❌ 同步 MiniMax Code 失敗: {}", e);
+fn sync_configured_sources(
+    conn: &mut Connection,
+    config: &crate::config::SourceConfig,
+) -> Result<(), String> {
+    use crate::config::Harness;
+    // Preserve collector order: Cursor metadata first; Copilot hook/App rows
+    // before CLI reconciliation. A failed or offline source does not block others.
+    for harness in [
+        Harness::Cursor,
+        Harness::Antigravity,
+        Harness::Copilot,
+        Harness::Vscode,
+        Harness::CopilotApp,
+        Harness::Codex,
+        Harness::Claude,
+        Harness::Grok,
+        Harness::Pi,
+        Harness::Omp,
+        Harness::Muse,
+        Harness::Mcode,
+    ] {
+        let roots = config.roots(harness);
+        if harness == Harness::Vscode {
+            if let Err(error) = sync_vscode_chat_sessions_from(
+                conn,
+                &crate::vscode::workspace_storage_roots(&roots),
+            ) {
+                eprintln!("❌ 同步 VS Code Copilot 失敗: {error}");
+            }
+            continue;
+        }
+        if harness == Harness::Codex {
+            if let Err(error) = sync_codex_usage_logs_from(conn, &roots) {
+                eprintln!("❌ 同步 Codex 失敗: {error}");
+            }
+            continue;
+        }
+        for (index, root) in roots.iter().enumerate() {
+            let result = match harness {
+                Harness::Cursor if index == 0 => sync_cursor_usage_logs(conn, root),
+                Harness::Cursor => cursor::sync_cursor_usage_logs_with_ledger(
+                    conn,
+                    root,
+                    &root.join("state.vscdb"),
+                ),
+                Harness::Antigravity => sync_hook_usage_logs(conn, "antigravity", root),
+                Harness::Copilot => sync_hook_usage_logs(conn, "copilot", root),
+                Harness::CopilotApp => sync_copilot_app_usage_logs_from(conn, root),
+                Harness::Claude => sync_claude_usage_logs_from(conn, root),
+                Harness::Grok => sync_grok_usage_logs(conn, root),
+                Harness::Pi => sync_pi_usage_logs(conn, root),
+                Harness::Omp => sync_omp_usage_logs(conn, root),
+                Harness::Muse => sync_muse_usage_logs(conn, root),
+                Harness::Mcode if index == 0 => sync_mcode_usage_logs(conn, root),
+                Harness::Mcode => sync_mcode_usage_logs_with_ledger(
+                    conn,
+                    root,
+                    &root.join("sqlite/runtime-state.sqlite"),
+                ),
+                Harness::Vscode | Harness::Codex => unreachable!("handled as a group above"),
+            };
+            if let Err(error) = result {
+                eprintln!("❌ 同步 {harness:?} ({}) 失敗: {error}", root.display());
+            }
+        }
+        if harness == Harness::CopilotApp {
+            for root in config.roots(Harness::Copilot) {
+                if let Err(error) = sync_copilot_cli_agent_usage_logs_from(conn, &root) {
+                    eprintln!(
+                        "❌ 同步 Copilot CLI agent ({}) 失敗: {error}",
+                        root.display()
+                    );
+                }
+            }
+            if let Err(error) = backfill_copilot_cwd(conn) {
+                eprintln!("❌ 補填 Copilot CWD 失敗: {error}");
+            }
+        }
     }
     Ok(())
 }
@@ -7157,11 +7250,11 @@ mod tests {
         std::env::set_var("COPILOT_DIR", &copilot_dir);
 
         assert_eq!(
-            get_antigravity_session_name("antigravity-session").as_deref(),
+            get_antigravity_session_name(&get_antigravity_dir(), "antigravity-session").as_deref(),
             Some("第二條提示")
         );
         assert_eq!(
-            get_copilot_session_name("copilot-session").as_deref(),
+            get_copilot_session_name(&get_copilot_dir(), "copilot-session").as_deref(),
             Some("Second prompt")
         );
 

@@ -67,8 +67,8 @@
     </script>
 
     <script>document.documentElement.classList.add('js');</script>
-    <link rel="stylesheet" href="/assets/site.css?v=6">
-    <script src="/assets/site.js?v=6" defer></script>
+    <link rel="stylesheet" href="/assets/site.css?v=7">
+    <script src="/assets/site.js?v=7" defer></script>
   </head>
   <body>
     <a class="skip-link" href="#main-content" data-i18n="skip">跳到主要內容</a>
@@ -282,6 +282,29 @@
               height="960"
               alt="Token 戰情室行動版深色看板" data-i18n-alt="mobile_alt"
             >
+          </figure>
+        </div>
+      </section>
+
+      <section class="source-config-section section" id="additional-sources" aria-labelledby="source-config-title">
+        <div class="shell source-config-grid">
+          <div class="feature-copy" data-reveal>
+            <h2 id="source-config-title" data-i18n="source_config_title">多台電腦，一份用量總覽</h2>
+            <p data-i18n="source_config_desc">在 config.yaml 為每種工具追加多個資料根目錄。無論是不同的 CODEX_HOME，或雲端硬碟同步到本機的工作紀錄，都能集中分析。</p>
+            <p data-i18n="source_config_sync">保留預設來源，啟動與「立即同步」都會掃描新增目錄。Codex 只需指定根目錄，sessions 與 archived_sessions 會自動讀取。</p>
+            <a href="https://github.com/doggy8088/TokenUsageInsights/blob/main/README.md#additional-sources" target="_blank" rel="noreferrer" data-i18n="source_config_docs">查看所有工具的設定方式 →</a>
+          </div>
+          <figure class="source-config-example" data-reveal>
+            <figcaption data-i18n="source_config_caption">在資料目錄的 config.yaml 加入</figcaption>
+            <pre tabindex="0"><code>additional_sources:
+  codex:
+    - '~/Cloud Drive/laptop/.codex'
+    - '~/Cloud Drive/desktop/.codex'
+  claude:
+    - '~/Cloud Drive/laptop/.claude'
+  copilot:
+    - '~/Cloud Drive/laptop/.copilot'</code></pre>
+            <p data-i18n="source_config_note">先將來源資料夾下載到本機，並保留原有子目錄結構。看板會讀取檔案，不會代為同步雲端資料。</p>
           </figure>
         </div>
       </section>

@@ -589,6 +589,53 @@ update_check_interval: 1   # 更新チェックの間隔（日数）
 
 優先順位：コマンドラインフラグ（例: `--no-auto-update`） > 環境変数（例: `TOKEN_USAGE_INSIGHTS_AUTO_UPDATE`） > `config.yaml` 設定ファイル > デフォルト値。
 
+<a id="additional-sources"></a>
+
+#### 追加データソース：複数のホームと PC を集約
+
+同じ `config.yaml` に `additional_sources` を追加すると、ツールごとに複数のデータルートを指定できます。別々の `CODEX_HOME` や、クラウドドライブからローカルに同期した他の PC のログにも対応します。
+
+```yaml
+additional_sources:
+  codex:
+    - '~/work-codex'
+    - '~/Cloud Drive/laptop/.codex'
+    - '~/Cloud Drive/desktop/.codex'
+  claude: ['~/Cloud Drive/laptop/.claude']
+  copilot: ['~/Cloud Drive/laptop/.copilot']
+  copilot_app: ['~/Cloud Drive/desktop/.copilot']
+  cursor: ['~/Cloud Drive/laptop/.cursor']
+  antigravity: ['~/Cloud Drive/laptop/antigravity-cli']
+  grok: ['~/Cloud Drive/laptop/.grok']
+  pi: ['~/Cloud Drive/laptop/.pi']
+  omp: ['~/Cloud Drive/laptop/.omp']
+  muse: ['~/Cloud Drive/laptop/muse']
+  mcode: ['~/Cloud Drive/laptop/.minimax/v2']
+  vscode: ['~/Cloud Drive/laptop/Code']
+```
+
+- 追加先は主要ソースに**追加**されます。既定の場所は引き続き読み込まれ、`CODEX_DIR` などの環境変数は主要ソースを上書きします。不要なツールは省略するか `[]` を指定できます。
+- 起動時、バックグラウンド同期、**今すぐ同期**で設定を再読み込みします。保存後に今すぐ同期を押せば、再起動は不要です。
+- 絶対パス、`~`、`$HOME`、`%USERPROFILE%`、`%LOCALAPPDATA%`、`%APPDATA%` に対応します。相対パスは選択された設定ファイルのディレクトリが基準です。Windows の例：`'D:\Cloud Drive\laptop\.codex'`（YAML の単一引用符を使用）。
+- PC ごとに独立したフォルダーと元のサブディレクトリ構造を維持し、クラウドのファイルをローカルにダウンロードしてください。転送はクラウドドライブが担当し、看板の `token_usage_insights.db` を共有する必要はありません。
+- 同じパスや同一ディレクトリへのシンボリックリンクは一度だけ読み込みます。Codex の同じ rollout のコピーは重複排除され、他のツールは既存の Session 識別規則を維持します。存在しないディレクトリはスキップして次回再試行します。設定から削除しても取り込み済み使用量は残りますが、会話詳細には元ファイルが必要です。
+- 設定ファイルはデータディレクトリ（`INSIGHTS_DIR` を優先）、プラットフォーム既定のデータディレクトリ、作業ディレクトリの順に検索し、最初に存在する `config.yaml` のみを読みます。YAML やリストが不正な場合、同期エラーを表示します。
+
+| キー | ルート内のデータ |
+| --- | --- |
+| `codex` | `sessions/` と `archived_sessions/`。この子フォルダーではなく `CODEX_HOME` を指定 |
+| `claude`, `cursor` | `projects/` |
+| `copilot` | `usage/`, `session-state/`, `session-store.db`。同じホームの App データも取り込み |
+| `copilot_app` | 独立した App ホームの `data.db`, `session-store.db`, `session-state/` |
+| `antigravity` | `usage/` と `brain/`。既存の Status Line 使用量ログを含む |
+| `grok`, `muse` | `sessions/` |
+| `pi`, `omp` | `agent/sessions/` |
+| `mcode` | `.minimax/v2` 内の `sessions/` と任意の `sqlite/runtime-state.sqlite` |
+| `vscode` | VS Code ユーザーデータルート内の `User/workspaceStorage/` |
+
+Cursor の追加ルートには、その PC の `state.vscdb`（元は `User/globalStorage/` 内）を置くとモデル情報を補完できます。MiniMax Code の追加ルートは独自の `sqlite/runtime-state.sqlite` を読みます。主要ソースは引き続き `CURSOR_STATE_DB` と `MCODE_STATE_DB` を使用します。
+
+
 > **デフォルトのバインド先は `0.0.0.0` で、同じローカルネットワーク上の他のデバイスからダッシュボードに接続できる可能性があります。ローカルだけで閲覧する場合は `HOST` を `127.0.0.1` に設定してください。**
 
 例：

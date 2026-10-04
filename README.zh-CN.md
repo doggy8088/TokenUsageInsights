@@ -589,6 +589,53 @@ update_check_interval: 1   # 自动检查更新的间隔周期（天）
 
 优先级：命令行标志（如 `--no-auto-update`） > 环境变量（如 `TOKEN_USAGE_INSIGHTS_AUTO_UPDATE`） > `config.yaml` 配置文件 > 默认值。
 
+<a id="additional-sources"></a>
+
+#### 额外数据来源：多个工具目录与跨电脑集中分析
+
+在同一份 `config.yaml` 中添加 `additional_sources`，为每种工具指定多个额外数据根目录。适用于不同的 `CODEX_HOME`，以及从云盘下载到本机的其他电脑日志。
+
+```yaml
+additional_sources:
+  codex:
+    - '~/work-codex'
+    - '~/Cloud Drive/laptop/.codex'
+    - '~/Cloud Drive/desktop/.codex'
+  claude: ['~/Cloud Drive/laptop/.claude']
+  copilot: ['~/Cloud Drive/laptop/.copilot']
+  copilot_app: ['~/Cloud Drive/desktop/.copilot']
+  cursor: ['~/Cloud Drive/laptop/.cursor']
+  antigravity: ['~/Cloud Drive/laptop/antigravity-cli']
+  grok: ['~/Cloud Drive/laptop/.grok']
+  pi: ['~/Cloud Drive/laptop/.pi']
+  omp: ['~/Cloud Drive/laptop/.omp']
+  muse: ['~/Cloud Drive/laptop/muse']
+  mcode: ['~/Cloud Drive/laptop/.minimax/v2']
+  vscode: ['~/Cloud Drive/laptop/Code']
+```
+
+- 额外路径会**追加**到主要来源。默认目录仍会扫描；`CODEX_DIR` 等现有环境变量仍可覆盖主要目录。无需使用的工具可省略或填 `[]`。
+- 启动、后台同步和**立即同步**都会重新读取配置。保存后点击立即同步，无需重启。
+- 支持绝对路径、`~`、`$HOME`、`%USERPROFILE%`、`%LOCALAPPDATA%` 和 `%APPDATA%`。相对路径以配置文件所在目录为基准；Windows 路径建议使用 YAML 单引号，例如 `'D:\Cloud Drive\laptop\.codex'`。
+- 每台电脑保留独立目录和原有子目录结构，先将云端文件下载到本机。看板读取本地文件，云盘负责传输；无需共享 `token_usage_insights.db`。
+- 重复路径和指向同一目录的符号链接只扫描一次；Codex 相同 rollout 副本会去重，其他工具保留现有 Session 身份规则。不存在的目录会跳过并在下次重试。移除来源不会删除已导入用量，但对话详情仍需可访问的源文件。
+- 配置查找顺序为数据目录（优先 `INSIGHTS_DIR`）、平台默认数据目录、当前工作目录，只读取第一份存在的 `config.yaml`。YAML 或列表格式错误时，同步会报错，不会静默切换配置。
+
+| 配置键 | 根目录内预期的数据 |
+| --- | --- |
+| `codex` | `sessions/` 与 `archived_sessions/`；填写 `CODEX_HOME`，无需填写这两个子目录 |
+| `claude`、`cursor` | `projects/` |
+| `copilot` | `usage/`、`session-state/`、`session-store.db`；同目录的 App 数据也会导入 |
+| `copilot_app` | 独立 App 目录内的 `data.db`、`session-store.db`、`session-state/` |
+| `antigravity` | `usage/` 与 `brain/`，包括原有 Status Line 用量日志 |
+| `grok`、`muse` | `sessions/` |
+| `pi`、`omp` | `agent/sessions/` |
+| `mcode` | `.minimax/v2` 下的 `sessions/` 及可选的 `sqlite/runtime-state.sqlite` |
+| `vscode` | VS Code 用户数据目录下的 `User/workspaceStorage/` |
+
+Cursor 额外根目录可放入该电脑的 `state.vscdb`（原位于 `User/globalStorage/`）以补充模型信息。MiniMax Code 额外根目录使用自己的 `sqlite/runtime-state.sqlite`。主要来源仍遵循 `CURSOR_STATE_DB` 和 `MCODE_STATE_DB`。
+
+
 > **默认绑定 `0.0.0.0`，同一局域网内的其他设备可能连接到看板。只需在本机浏览时，请将 `HOST` 设置为 `127.0.0.1`。**
 
 示例：

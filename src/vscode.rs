@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::Value;
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -134,6 +134,12 @@ struct OperationLogEntry {
 }
 
 pub fn discover_workspace_storage_roots() -> Vec<PathBuf> {
+    let additional =
+        crate::config::configured_roots(crate::config::Harness::Vscode).unwrap_or_default();
+    workspace_storage_roots(&additional)
+}
+
+pub(crate) fn workspace_storage_roots(additional: &[PathBuf]) -> Vec<PathBuf> {
     let mut roots = Vec::new();
 
     #[cfg(target_os = "windows")]
@@ -189,15 +195,18 @@ pub fn discover_workspace_storage_roots() -> Vec<PathBuf> {
         roots.push(portable_root.join("User").join("workspaceStorage"));
     }
 
-    let mut seen = HashSet::new();
-    roots.retain(|root| seen.insert(root.to_string_lossy().to_lowercase()));
-    roots
+    roots.extend(
+        additional
+            .iter()
+            .map(|root| root.join("User/workspaceStorage")),
+    );
+    crate::config::deduplicate_roots(roots)
 }
 
-pub fn discover_session_files() -> Vec<PathBuf> {
+pub(crate) fn session_files_in(roots: &[PathBuf]) -> Vec<PathBuf> {
     let mut files = Vec::new();
 
-    for root in discover_workspace_storage_roots() {
+    for root in roots {
         let workspaces = match fs::read_dir(root) {
             Ok(entries) => entries,
             Err(_) => continue,

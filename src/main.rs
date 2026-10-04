@@ -14,6 +14,7 @@ use tower_http::set_header::SetResponseHeaderLayer;
 
 mod browser;
 mod cli;
+mod config;
 mod db;
 mod grok;
 mod handlers;

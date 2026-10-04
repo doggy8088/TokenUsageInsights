@@ -161,7 +161,27 @@ pub async fn get_setup_info(Path(assistant): Path<String>) -> impl IntoResponse 
         "statusline-token.sh"
     };
 
-    let anti_dir = db::get_antigravity_dir();
+    use crate::config::{Harness, SourceConfig};
+    let config = match SourceConfig::load() {
+        Ok(config) => config,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": error })),
+            )
+                .into_response()
+        }
+    };
+    let source_root = |harness: Harness, children: &[&str]| {
+        let roots = config.roots(harness);
+        roots
+            .iter()
+            .find(|root| children.iter().any(|child| root.join(child).exists()))
+            .or_else(|| roots.first())
+            .cloned()
+            .unwrap_or_default()
+    };
+    let anti_dir = source_root(Harness::Antigravity, &["usage", script_name]);
     let anti_script = anti_dir.join(script_name);
     let anti_source_relative = if cfg!(windows) {
         PathBuf::from("shell").join(script_name)
@@ -171,7 +191,7 @@ pub async fn get_setup_info(Path(assistant): Path<String>) -> impl IntoResponse 
     let anti_source_script =
         crate::paths::find_resource(&anti_source_relative).unwrap_or(anti_source_relative);
 
-    let copilot_dir = db::get_copilot_dir();
+    let copilot_dir = source_root(Harness::Copilot, &["usage", script_name]);
     let copilot_script = copilot_dir.join(script_name);
     let copilot_source_relative = if cfg!(windows) {
         PathBuf::from("shell").join(script_name)
@@ -181,34 +201,34 @@ pub async fn get_setup_info(Path(assistant): Path<String>) -> impl IntoResponse 
     let copilot_source_script =
         crate::paths::find_resource(&copilot_source_relative).unwrap_or(copilot_source_relative);
 
-    let codex_dir = db::get_codex_dir();
+    let codex_dir = source_root(Harness::Codex, &["sessions", "archived_sessions"]);
     let codex_exists =
         codex_dir.join("sessions").exists() || codex_dir.join("archived_sessions").exists();
 
-    let claude_dir = db::get_claude_dir();
+    let claude_dir = source_root(Harness::Claude, &["projects"]);
     let claude_exists = claude_dir.join("projects").exists();
 
-    let cursor_dir = db::get_cursor_dir();
+    let cursor_dir = source_root(Harness::Cursor, &["projects"]);
     let cursor_exists = cursor_dir.join("projects").exists();
 
-    let copilot_app_dir = crate::paths::copilot_app_dir();
+    let copilot_app_dir = source_root(Harness::CopilotApp, &["data.db", "session-store.db"]);
     let copilot_app_data_db = copilot_app_dir.join("data.db");
     let copilot_app_session_db = copilot_app_dir.join("session-store.db");
     let copilot_app_exists = copilot_app_data_db.exists() || copilot_app_session_db.exists();
 
-    let grok_dir = db::get_grok_dir();
+    let grok_dir = source_root(Harness::Grok, &["sessions"]);
     let grok_exists = grok_dir.join("sessions").exists();
 
-    let pi_dir = db::get_pi_dir();
+    let pi_dir = source_root(Harness::Pi, &["agent/sessions"]);
     let pi_exists = pi_dir.join("agent").join("sessions").exists();
 
-    let omp_dir = db::get_omp_dir();
+    let omp_dir = source_root(Harness::Omp, &["agent/sessions"]);
     let omp_exists = omp_dir.join("agent").join("sessions").exists();
 
-    let muse_dir = db::get_muse_dir();
+    let muse_dir = source_root(Harness::Muse, &["sessions"]);
     let muse_exists = muse_dir.join("sessions").exists();
 
-    let mcode_dir = db::get_mcode_dir();
+    let mcode_dir = source_root(Harness::Mcode, &["sessions"]);
     let mcode_exists = mcode_dir.join("sessions").exists();
 
     Json(SetupInfoResponse {
@@ -218,7 +238,7 @@ pub async fn get_setup_info(Path(assistant): Path<String>) -> impl IntoResponse 
         antigravity: AssistantSetupStatus {
             dir_path: anti_dir.to_string_lossy().into_owned(),
             data_path: anti_dir.join("usage").to_string_lossy().into_owned(),
-            exists: anti_script.exists(),
+            exists: anti_script.exists() || anti_dir.join("usage").exists(),
             script_path: anti_script.to_string_lossy().into_owned(),
             source_script_path: anti_source_script.to_string_lossy().into_owned(),
             settings_path: anti_dir
@@ -229,7 +249,7 @@ pub async fn get_setup_info(Path(assistant): Path<String>) -> impl IntoResponse 
         copilot: AssistantSetupStatus {
             dir_path: copilot_dir.to_string_lossy().into_owned(),
             data_path: copilot_dir.join("usage").to_string_lossy().into_owned(),
-            exists: copilot_script.exists(),
+            exists: copilot_script.exists() || copilot_dir.join("usage").exists(),
             script_path: copilot_script.to_string_lossy().into_owned(),
             source_script_path: copilot_source_script.to_string_lossy().into_owned(),
             settings_path: copilot_dir

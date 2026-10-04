@@ -589,6 +589,53 @@ update_check_interval: 1   # 업데이트 확인 주기 (일 단위)
 
 우선순위: 명령줄 플래그(예: `--no-auto-update`) > 환경 변수(예: `TOKEN_USAGE_INSIGHTS_AUTO_UPDATE`) > `config.yaml` 설정 파일 > 기본값.
 
+<a id="additional-sources"></a>
+
+#### 추가 데이터 소스: 여러 홈과 컴퓨터 통합
+
+같은 `config.yaml`에 `additional_sources`를 추가하면 도구별로 여러 데이터 루트를 지정할 수 있습니다. 서로 다른 `CODEX_HOME`이나 클라우드 드라이브에서 로컬로 내려받은 다른 컴퓨터의 로그를 함께 분석하세요.
+
+```yaml
+additional_sources:
+  codex:
+    - '~/work-codex'
+    - '~/Cloud Drive/laptop/.codex'
+    - '~/Cloud Drive/desktop/.codex'
+  claude: ['~/Cloud Drive/laptop/.claude']
+  copilot: ['~/Cloud Drive/laptop/.copilot']
+  copilot_app: ['~/Cloud Drive/desktop/.copilot']
+  cursor: ['~/Cloud Drive/laptop/.cursor']
+  antigravity: ['~/Cloud Drive/laptop/antigravity-cli']
+  grok: ['~/Cloud Drive/laptop/.grok']
+  pi: ['~/Cloud Drive/laptop/.pi']
+  omp: ['~/Cloud Drive/laptop/.omp']
+  muse: ['~/Cloud Drive/laptop/muse']
+  mcode: ['~/Cloud Drive/laptop/.minimax/v2']
+  vscode: ['~/Cloud Drive/laptop/Code']
+```
+
+- 추가 경로는 기본 소스에 **추가**됩니다. 기본 디렉터리는 계속 검색하며 `CODEX_DIR` 등 기존 환경 변수는 주 소스를 재정의합니다. 사용하지 않는 도구는 생략하거나 `[]`로 설정하세요.
+- 시작 시, 백그라운드 동기화, **지금 동기화** 실행 시 설정을 다시 읽습니다. 저장 후 지금 동기화를 누르면 재시작 없이 적용됩니다.
+- 절대 경로, `~`, `$HOME`, `%USERPROFILE%`, `%LOCALAPPDATA%`, `%APPDATA%`를 지원합니다. 상대 경로는 선택된 설정 파일의 디렉터리를 기준으로 합니다. Windows 경로는 YAML 작은따옴표로 감싸세요. 예: `'D:\Cloud Drive\laptop\.codex'`.
+- 컴퓨터별로 별도 폴더와 원래 하위 디렉터리 구조를 유지하고 클라우드 파일을 로컬에 다운로드하세요. 전송은 클라우드 드라이브가 담당하며 `token_usage_insights.db`를 공유할 필요가 없습니다.
+- 중복 경로와 같은 디렉터리를 가리키는 심볼릭 링크는 한 번만 읽습니다. 동일한 Codex rollout 사본은 중복 제거하며 다른 도구는 기존 Session 식별 규칙을 유지합니다. 없는 디렉터리는 건너뛰고 다음에 다시 시도합니다. 설정에서 소스를 제거해도 가져온 사용량은 남지만 대화 상세에는 원본 파일이 필요합니다.
+- 데이터 디렉터리(`INSIGHTS_DIR` 우선), 플랫폼 기본 데이터 디렉터리, 작업 디렉터리 순서로 검색하여 처음 존재하는 `config.yaml`만 읽습니다. YAML 또는 목록 형식이 잘못되면 동기화 오류를 표시합니다.
+
+| 키 | 루트 내부의 데이터 |
+| --- | --- |
+| `codex` | `sessions/`, `archived_sessions/`. 하위 폴더 대신 `CODEX_HOME` 지정 |
+| `claude`, `cursor` | `projects/` |
+| `copilot` | `usage/`, `session-state/`, `session-store.db`. 같은 홈의 App 데이터도 가져옴 |
+| `copilot_app` | 별도 App 홈의 `data.db`, `session-store.db`, `session-state/` |
+| `antigravity` | 기존 Status Line 사용량 로그를 포함한 `usage/`, `brain/` |
+| `grok`, `muse` | `sessions/` |
+| `pi`, `omp` | `agent/sessions/` |
+| `mcode` | `.minimax/v2` 아래 `sessions/` 및 선택적 `sqlite/runtime-state.sqlite` |
+| `vscode` | VS Code 사용자 데이터 루트 아래 `User/workspaceStorage/` |
+
+Cursor 추가 루트에 해당 컴퓨터의 `state.vscdb`(원래 `User/globalStorage/`에 위치)를 두면 모델 정보를 보완합니다. MiniMax Code 추가 루트는 자체 `sqlite/runtime-state.sqlite`를 사용합니다. 주 소스에는 기존 `CURSOR_STATE_DB` 및 `MCODE_STATE_DB` 설정이 적용됩니다.
+
+
 > **기본 바인딩은 `0.0.0.0`이므로 같은 로컬 네트워크의 다른 장치가 대시보드에 연결할 수 있습니다. 로컬에서만 보려면 `HOST`를 `127.0.0.1`로 설정하세요.**
 
 예:

@@ -589,6 +589,53 @@ update_check_interval: 1   # Update check interval in days
 
 Precedence: CLI flags (e.g. `--no-auto-update`) > Environment variables (e.g. `TOKEN_USAGE_INSIGHTS_AUTO_UPDATE`) > `config.yaml` > Defaults.
 
+<a id="additional-sources"></a>
+
+#### Additional sources: multiple homes and computers
+
+Add `additional_sources` to the same `config.yaml` to scan any number of extra data roots for each tool, including separate `CODEX_HOME` directories and folders downloaded by a cloud drive.
+
+```yaml
+additional_sources:
+  codex:
+    - '~/work-codex'
+    - '~/Cloud Drive/laptop/.codex'
+    - '~/Cloud Drive/desktop/.codex'
+  claude: ['~/Cloud Drive/laptop/.claude']
+  copilot: ['~/Cloud Drive/laptop/.copilot']
+  copilot_app: ['~/Cloud Drive/desktop/.copilot']
+  cursor: ['~/Cloud Drive/laptop/.cursor']
+  antigravity: ['~/Cloud Drive/laptop/antigravity-cli']
+  grok: ['~/Cloud Drive/laptop/.grok']
+  pi: ['~/Cloud Drive/laptop/.pi']
+  omp: ['~/Cloud Drive/laptop/.omp']
+  muse: ['~/Cloud Drive/laptop/muse']
+  mcode: ['~/Cloud Drive/laptop/.minimax/v2']
+  vscode: ['~/Cloud Drive/laptop/Code']
+```
+
+- These paths **extend** the primary source. Default locations remain enabled; existing variables such as `CODEX_DIR` still override the primary location. Omit unused tools or use `[]`.
+- Startup, background sync, and **Sync Now** reload the file. Save changes and click Sync Now; no restart is required.
+- Paths accept absolute paths, `~`, `$HOME`, `%USERPROFILE%`, `%LOCALAPPDATA%`, and `%APPDATA%`. Relative paths resolve against the selected config file's directory. Use YAML single quotes for Windows paths, e.g. `'D:\Cloud Drive\laptop\.codex'`.
+- Keep separate folders per computer and preserve each tool's directory structure. Download cloud files locally before syncing. The dashboard reads local files; your cloud drive handles transfer. Sharing `token_usage_insights.db` is unnecessary.
+- Repeated paths and symlinks to the same directory are scanned once. Copied Codex rollouts are deduplicated; other tools retain their existing session identity rules. Missing directories are skipped and retried later. Removing a source keeps imported usage; transcript details still require accessible source files.
+- Config search order is the insights directory (`INSIGHTS_DIR` if set), the platform default insights directory, then the working directory. Only the first existing `config.yaml` is used. Invalid YAML or source lists produce a sync error instead of silently falling back.
+
+| Key | Expected contents of each root |
+| --- | --- |
+| `codex` | `sessions/` and `archived_sessions/`; specify the `CODEX_HOME` root, not these subfolders |
+| `claude`, `cursor` | `projects/` |
+| `copilot` | `usage/`, `session-state/`, `session-store.db`; App data in the same home is also imported |
+| `copilot_app` | `data.db`, `session-store.db`, `session-state/` in a separate App home |
+| `antigravity` | `usage/` and `brain/`, including existing Status Line usage logs |
+| `grok`, `muse` | `sessions/` |
+| `pi`, `omp` | `agent/sessions/` |
+| `mcode` | `sessions/` and optional `sqlite/runtime-state.sqlite` under `.minimax/v2` |
+| `vscode` | `User/workspaceStorage/` under the VS Code user data root |
+
+Extra Cursor roots can include that computer's `state.vscdb` (copied from `User/globalStorage/`) for model metadata. Extra MiniMax Code roots use their own `sqlite/runtime-state.sqlite`. Primary sources still honor `CURSOR_STATE_DB` and `MCODE_STATE_DB`.
+
+
 > **The default binding is `0.0.0.0`, so other devices on the same local network may connect to the dashboard. For local-only browsing, set `HOST` to `127.0.0.1`.**
 
 Example:

@@ -1527,34 +1527,14 @@ pub fn parse_config_yaml(content: &str) -> (Option<bool>, Option<i64>) {
 }
 
 pub fn load_update_config() -> (Option<bool>, Option<i64>) {
-    let mut candidates = vec![crate::db::get_insights_dir().join("config.yaml")];
-
-    #[cfg(windows)]
-    if let Some(data_dir) = dirs::data_local_dir() {
-        let def = data_dir.join("TokenUsageInsights").join("config.yaml");
-        if !candidates.contains(&def) {
-            candidates.push(def);
+    match crate::config::read_config_file() {
+        Ok(Some((_, content))) => parse_config_yaml(&content),
+        Ok(None) => (None, None),
+        Err(error) => {
+            eprintln!("⚠️ {error}");
+            (None, None)
         }
     }
-    #[cfg(not(windows))]
-    if let Some(home) = dirs::home_dir() {
-        let def = home.join(".token-usage-insights").join("config.yaml");
-        if !candidates.contains(&def) {
-            candidates.push(def);
-        }
-    }
-
-    let local_cfg = PathBuf::from("config.yaml");
-    if !candidates.contains(&local_cfg) {
-        candidates.push(local_cfg);
-    }
-
-    for path in candidates {
-        if let Ok(content) = fs::read_to_string(&path) {
-            return parse_config_yaml(&content);
-        }
-    }
-    (None, None)
 }
 
 #[cfg(unix)]

@@ -1,5 +1,12 @@
 const siteTranslations = {
   'zh-TW': {
+    source_config_title: "多台電腦，一份用量總覽",
+    source_config_desc: "在 <code>config.yaml</code> 為每種工具追加多個資料根目錄。無論是不同的 <code>CODEX_HOME</code>，或雲端硬碟同步到本機的工作紀錄，都能集中分析。",
+    source_config_sync: "保留預設來源，啟動與「立即同步」都會掃描新增目錄。Codex 只需指定根目錄，<code>sessions</code> 與 <code>archived_sessions</code> 會自動讀取。",
+    source_config_docs: "查看所有工具的設定方式 →",
+    source_config_caption: "在資料目錄的 config.yaml 加入",
+    source_config_note: "先將來源資料夾下載到本機，並保留原有子目錄結構。看板會讀取檔案，不會代為同步雲端資料。",
+
     meta_locale: 'zh_TW', meta_title: 'Token 戰情室｜本機優先的 AI Coding Agent Token 看板',
     brand_name: 'Token 戰情室',
     meta_description: 'Token 戰情室集中分析多種 AI Coding Agent 的 Token、估算費用與完整 Session 時間軸。資料來自本機日誌與 SQLite。',
@@ -35,6 +42,13 @@ const siteTranslations = {
     copy_denied: '瀏覽器未允許自動複製，請手動選取指令。'
   },
   'zh-CN': {
+    source_config_title: "多台电脑，一份用量总览",
+    source_config_desc: "在 <code>config.yaml</code> 为每种工具添加多个数据根目录。无论是不同的 <code>CODEX_HOME</code>，还是通过云盘同步到本机的工作记录，都能集中分析。",
+    source_config_sync: "保留默认来源，启动与“立即同步”都会扫描新增目录。Codex 只需指定根目录，<code>sessions</code> 与 <code>archived_sessions</code> 会自动读取。",
+    source_config_docs: "查看所有工具的配置方式 →",
+    source_config_caption: "添加到数据目录的 config.yaml",
+    source_config_note: "先将来源文件夹下载到本机，并保留原有子目录结构。看板读取本地文件，不会自动同步云端数据。",
+
     meta_locale: 'zh_CN', meta_title: 'Token 战情室｜本地优先的 AI Coding Agent Token 看板',
     brand_name: 'Token 战情室',
     meta_description: 'Token 战情室集中分析多种 AI Coding Agent 的 Token、估算费用与完整 Session 时间轴。数据来自本地日志与 SQLite。',
@@ -70,6 +84,13 @@ const siteTranslations = {
     copy_denied: '浏览器不允许自动复制，请手动选择命令。'
   },
   en: {
+    source_config_title: "Multiple computers, one usage overview",
+    source_config_desc: "Add multiple data roots per tool in <code>config.yaml</code>. Analyze separate <code>CODEX_HOME</code> directories or logs downloaded locally by your cloud drive.",
+    source_config_sync: "Default sources stay included. Startup and Sync Now scan the added roots. For Codex, specify the home directory; <code>sessions</code> and <code>archived_sessions</code> are found automatically.",
+    source_config_docs: "Configure every supported tool →",
+    source_config_caption: "Add to config.yaml in your data directory",
+    source_config_note: "Download source folders locally and preserve their subdirectory structure. The dashboard reads local files; your cloud drive handles synchronization.",
+
     meta_locale: 'en_US', meta_title: 'Token War Room | Local-first AI Coding Agent Token dashboard',
     brand_name: 'Token War Room',
     meta_description: 'Token War Room analyzes Token usage, estimated costs, and complete Session timelines from local logs and SQLite.',
@@ -105,6 +126,13 @@ const siteTranslations = {
     copy_denied: 'The browser blocked automatic copying. Select the command manually.'
   },
   ja: {
+    source_config_title: "複数の PC の使用量を一つに",
+    source_config_desc: "<code>config.yaml</code> でツールごとに複数のデータルートを追加できます。別々の <code>CODEX_HOME</code> や、クラウドドライブからローカルに同期したログをまとめて分析します。",
+    source_config_sync: "既定のソースを維持し、起動時と「今すぐ同期」で追加先を読み込みます。Codex はホームだけを指定すれば、<code>sessions</code> と <code>archived_sessions</code> を自動検出します。",
+    source_config_docs: "すべてのツールの設定方法 →",
+    source_config_caption: "データディレクトリの config.yaml に追加",
+    source_config_note: "フォルダーをローカルにダウンロードし、サブディレクトリ構造を維持してください。クラウド同期はクラウドドライブ側で行います。",
+
     meta_locale: 'ja_JP', meta_title: 'Token 戦情室｜ローカル優先の AI Coding Agent Token ダッシュボード',
     brand_name: 'Token 戦情室',
     meta_description: 'ローカルログと SQLite から Token 使用量、推定費用、Session のタイムラインを分析します。',
@@ -140,6 +168,13 @@ const siteTranslations = {
     copy_denied: '自動コピーが許可されませんでした。コマンドを手動で選択してください。'
   },
   ko: {
+    source_config_title: "여러 컴퓨터의 사용량을 한곳에서",
+    source_config_desc: "<code>config.yaml</code>에서 도구별로 여러 데이터 루트를 추가하세요. 서로 다른 <code>CODEX_HOME</code>이나 클라우드 드라이브에서 로컬로 동기화한 로그를 함께 분석할 수 있습니다.",
+    source_config_sync: "기본 소스를 유지하며 시작 시와 “지금 동기화” 실행 시 추가 경로를 읽습니다. Codex 홈만 지정하면 <code>sessions</code>와 <code>archived_sessions</code>를 자동으로 찾습니다.",
+    source_config_docs: "모든 도구의 설정 방법 보기 →",
+    source_config_caption: "데이터 디렉터리의 config.yaml에 추가",
+    source_config_note: "원본 폴더를 로컬로 다운로드하고 하위 디렉터리 구조를 유지하세요. 클라우드 동기화는 클라우드 드라이브가 담당합니다.",
+
     meta_locale: 'ko_KR', meta_title: 'Token 전황실｜로컬 우선 AI Coding Agent Token 대시보드',
     brand_name: 'Token 전황실',
     meta_description: '로컬 로그와 SQLite에서 Token 사용량, 예상 비용, 완전한 Session 타임라인을 분석합니다.',
