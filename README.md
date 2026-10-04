@@ -262,7 +262,7 @@ COPILOT_APP_DIR="/path/to/copilot-app-data" token-usage-insights
 
 ## GitHub Copilot Chat（VS Code）設定
 
-**VS Code Copilot Chat 不需要安裝 Status Line、Hook 或額外收集腳本。**看板會直接讀取本機 `workspaceStorage` 內的聊天 Session，並與 Copilot CLI 合併顯示；Session 清單會以 `VS Code` 或 `CLI` 標示來源。
+**VS Code Copilot Chat 不需要安裝 Status Line、Hook 或額外收集腳本**。看板會直接讀取本機 `workspaceStorage` 內的聊天 Session，並與 Copilot CLI 合併顯示；Session 清單會以 `VS Code` 或 `CLI` 標示來源。
 
 支援 VS Code Stable 與 Insiders：
 
