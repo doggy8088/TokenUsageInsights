@@ -148,6 +148,13 @@ async fn startup_and_manual_sync_reload_extra_homes_without_losing_defaults() {
         .stderr(Stdio::from(
             fs::File::create(root.join("server.log")).unwrap(),
         ));
+    // Winsock loads its providers through SystemRoot even with isolated user data.
+    #[cfg(windows)]
+    command.env(
+        "SystemRoot",
+        std::env::var_os("SystemRoot")
+            .expect("Windows test server requires SystemRoot for Winsock"),
+    );
     for tool in [
         "antigravity",
         "copilot",
