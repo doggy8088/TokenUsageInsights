@@ -54,11 +54,10 @@ fn codex_subagent_task_name(payload: &serde_json::Value, agent_path: &str) -> Op
         return None;
     }
 
-    // Some Codex versions encrypt the assignment body. Its task path is still
-    // readable and identifies the task without pretending an inherited user
-    // message is the child's prompt.
+    // Some Codex versions encrypt the assignment body. Show only the task name
+    // from its readable agent path; the full path is used for matching above.
     let name = if prompt.trim().is_empty() {
-        agent_path
+        agent_path.rsplit('/').find(|part| !part.is_empty())?
     } else {
         prompt.trim()
     };
@@ -635,24 +634,30 @@ mod tests {
     }
 
     #[test]
-    fn parse_codex_subagent_uses_task_path_when_assigned_prompt_is_encrypted() {
+    fn parse_codex_subagent_uses_task_name_when_assigned_prompt_is_encrypted() {
         let path = temp_jsonl_path("codex-subagent-encrypted");
         let content = r##"{"type":"session_meta","payload":{"id":"child","parent_thread_id":"parent","source":{"subagent":{"thread_spawn":{"agent_path":"/root/reviewer"}}}}}
 {"type":"response_item","payload":{"type":"message","role":"user","content":"# AGENTS.md instructions"}}
 {"type":"response_item","payload":{"type":"agent_message","recipient":"/root/reviewer","content":[{"type":"input_text","text":"Message Type: NEW_TASK\nTask name: /root/reviewer\nSender: /root\nPayload:\n"},{"type":"encrypted_content","encrypted_content":"unreadable-test-data"}]}}
 {"timestamp":"2026-10-04T10:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":10,"total_tokens":110}}}}
 "##;
-        fs::write(&path, content).unwrap();
+        for (agent_path, expected_name) in [
+            ("/root/kyc250r1_auth_test_plan", "kyc250r1_auth_test_plan"),
+            ("/root/reviewer/auth_test_plan", "auth_test_plan"),
+            ("reviewer", "reviewer"),
+        ] {
+            fs::write(&path, content.replace("/root/reviewer", agent_path)).unwrap();
 
-        let parsed = parse_codex_session_file_with_diagnostics(&path).unwrap();
+            let parsed = parse_codex_session_file_with_diagnostics(&path).unwrap();
+
+            assert_eq!(parsed.malformed_lines, 0);
+            assert_eq!(parsed.entries.len(), 1);
+            assert_eq!(
+                parsed.entries[0].session_name.as_deref(),
+                Some(expected_name)
+            );
+        }
         let _ = fs::remove_file(&path);
-
-        assert_eq!(parsed.malformed_lines, 0);
-        assert_eq!(parsed.entries.len(), 1);
-        assert_eq!(
-            parsed.entries[0].session_name.as_deref(),
-            Some("/root/reviewer")
-        );
     }
 
     #[test]

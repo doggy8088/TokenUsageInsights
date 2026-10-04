@@ -158,7 +158,7 @@ pub struct UsageImportRollbackSummary {
     pub removed_records: usize,
 }
 
-const CODEX_PARSER_MIGRATION_KEY: &str = "migration:codex_session_identity_v8";
+const CODEX_PARSER_MIGRATION_KEY: &str = "migration:codex_session_identity_v9";
 const CODEX_SOURCE_KIND_MIGRATION_KEY: &str = "migration:codex_source_kind_v1";
 const CODEX_ROLLOUT_IDENTITY_MIGRATION_KEY: &str = "migration:codex_rollout_identity_v1";
 const CODEX_CLI_SOURCE_KIND: &str = "codex-cli";
@@ -10229,7 +10229,7 @@ mod tests {
             &path,
             r#"{"type":"session_meta","payload":{"id":"child","parent_thread_id":"parent","source":{"subagent":{"thread_spawn":{"agent_path":"/root/reviewer"}}}}}
 {"type":"response_item","payload":{"type":"message","role":"user","content":"主代理的提示詞"}}
-{"type":"response_item","payload":{"type":"agent_message","recipient":"/root/reviewer","content":"Message Type: NEW_TASK\nTask name: /root/reviewer\nSender: /root\nPayload:\n檢查匯入流程"}}
+{"type":"response_item","payload":{"type":"agent_message","recipient":"/root/reviewer","content":[{"type":"input_text","text":"Message Type: NEW_TASK\nTask name: /root/reviewer\nSender: /root\nPayload:\n"},{"type":"encrypted_content","encrypted_content":"unreadable-test-data"}]}}
 {"timestamp":"2026-10-04T10:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":10,"total_tokens":110}}}}
 "#,
         )
@@ -10240,9 +10240,9 @@ mod tests {
         let roots = [primary, additional];
         sync_codex_usage_logs_from(&mut conn, &roots).unwrap();
 
-        // Simulate v7 data whose transcript size and path have not changed.
+        // Simulate v8 data whose transcript size and path have not changed.
         conn.execute(
-            "UPDATE usage_entries SET session_name = '主代理的提示詞'",
+            "UPDATE usage_entries SET session_name = '/root/reviewer'",
             [],
         )
         .unwrap();
@@ -10253,7 +10253,7 @@ mod tests {
         .unwrap();
         conn.execute(
             "INSERT INTO sync_state (filename, last_synced_size, last_synced_time)
-             VALUES ('migration:codex_session_identity_v7', 1, 0),
+             VALUES ('migration:codex_session_identity_v8', 1, 0),
                     ('claude:untouched.jsonl', 123, 456)",
             [],
         )
@@ -10270,7 +10270,7 @@ mod tests {
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .unwrap();
-            assert_eq!(stored, ("檢查匯入流程".to_string(), 110, 1));
+            assert_eq!(stored, ("reviewer".to_string(), 110, 1));
         }
         let unrelated_cursor: u64 = conn
             .query_row(
