@@ -4677,7 +4677,7 @@ function renderSessionTable(sessions) {
 
     const astColumn = (currentAssistant === 'all' || currentAssistant.includes(',')) ? `<td class="session-agent-column">${assistantBadge}</td>` : '';
 
-    // 依據 depth 縮排會話名稱，並呈現└─ 符號與 subagent tag
+    // 依據 depth 縮排會話名稱，並呈現樹狀連接線與子代理標籤
     let nameCellContent = '';
     if (s.isSubagent) {
       const paddingLeft = s.depth * 16;
@@ -4689,7 +4689,7 @@ function renderSessionTable(sessions) {
       const subagentDisplayName = s.session_name || s.session_id;
       nameCellContent = `
         <div class="session-name-wrapper is-subagent" style="padding-left: ${paddingLeft}px;">
-          <span class="tree-connector" style="left: ${connectorLeft}px;">└─</span>
+          <span class="tree-connector" style="left: ${connectorLeft}px;" aria-hidden="true"></span>
           <div style="display: flex; flex-wrap: wrap; gap: 4px; align-items: center; margin-bottom: 3px;">
             <span class="badge subagent-badge" title="${escapeHtml(t('subagent_parent_label'))}: ${escapeHtml(s.parentName || '')}">${escapeHtml(t('subagent_label'))}</span>
             ${nameSourceBadge}

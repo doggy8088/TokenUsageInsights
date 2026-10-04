@@ -1,6 +1,6 @@
 @import '/static/css/variables.css?v=3';
 @import '/static/css/timeline.css?v=3';
-@import '/static/css/components.css?v=2';
+@import '/static/css/components.css?v=3';
 @import '/static/css/redesign.css?v=30';
 /* Compact native locale selector for the five supported UI languages. */
 .lang-select-label {

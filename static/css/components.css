@@ -1283,10 +1283,12 @@ input:checked + .slider-round:before {
 
 .tree-connector {
   position: absolute;
-  color: var(--text-muted);
-  font-family: monospace;
-  font-size: 13px;
-  top: 1px;
+  top: 2px;
+  /* Keep the corner inside the 16px indent, with a 4px gap before the badge. */
+  width: 8px;
+  height: 9px;
+  border-left: 1px solid var(--text-muted);
+  border-bottom: 1px solid var(--text-muted);
 }
 
 .subagent-badge {
