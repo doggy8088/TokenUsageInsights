@@ -981,6 +981,11 @@ input {
   min-width: 0;
 }
 
+.model-session-name-row .source-badge {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
 .model-session-name,
 .model-session-cwd {
   display: block;
