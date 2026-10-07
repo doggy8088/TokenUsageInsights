@@ -531,6 +531,40 @@ mod tests {
     }
 
     #[test]
+    fn claude_haiku_5_5_prompt_length_tiers_use_packaged_pricing() {
+        let rules = load_pricing_rules();
+
+        for model_name in [
+            "claude-haiku-5-5",
+            "Claude Haiku 5.5",
+            "claude-haiku-5-5-20261001",
+            "haiku-5.5",
+        ] {
+            // 90k input + 10k cache read = exactly 100k prompt tokens: short tier.
+            let short =
+                calculate_usage_cost(&rules, Some(model_name), 90_000, 10_000, 10_000, 0, 0)
+                    .unwrap_or_else(|error| {
+                        panic!("{model_name} should have a pricing rule: {error}")
+                    });
+            let short_expected = 0.09 * 0.10 + 0.01 * 0.01 + 0.01 * 0.50;
+            assert!(
+                (short - short_expected).abs() < 1e-12,
+                "unexpected Haiku 5.5 short-tier cost for {model_name}: {short}"
+            );
+
+            // A 5m cache write pushes the prompt over 100k: long tier, 1.25x input.
+            let long =
+                calculate_usage_cost(&rules, Some(model_name), 90_000, 10_000, 10_000, 1_000, 0)
+                    .unwrap();
+            let long_expected = 0.09 * 0.50 + 0.01 * 0.05 + 0.001 * 0.50 * 1.25 + 0.01 * 2.50;
+            assert!(
+                (long - long_expected).abs() < 1e-12,
+                "unexpected Haiku 5.5 long-tier cost for {model_name}: {long}"
+            );
+        }
+    }
+
+    #[test]
     fn glm_5_3_flash_uses_packaged_pricing() {
         let rules = load_pricing_rules();
 
