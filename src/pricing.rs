@@ -806,6 +806,50 @@ mod tests {
     }
 
     #[test]
+    fn gemini_4_argon_thinking_levels_use_packaged_pricing() {
+        let rules = load_pricing_rules();
+
+        for model_name in [
+            "Gemini 4 Argon",
+            "Gemini 4 Argon (Medium)",
+            "Gemini 4 Argon (High)",
+            "Gemini 4 Argon (Low)",
+            "gemini-4-argon",
+        ] {
+            let cost = calculate_usage_cost(
+                &rules,
+                Some(model_name),
+                1_000_000,
+                1_000_000,
+                1_000_000,
+                0,
+                0,
+            )
+            .unwrap();
+
+            // Standard input 4.00 + cache read 0.20 (95% off) + output 20.00 = 24.20
+            assert!(
+                (cost - 24.20).abs() < 1e-9,
+                "unexpected Gemini 4 Argon cost for {model_name}: {cost}"
+            );
+        }
+
+        // Regression test for session_id=575e5267-0e01-4a17-acb1-3174ccbe5b61 turn_no=1
+        let turn_1_cost = calculate_usage_cost(
+            &rules,
+            Some("Gemini 4 Argon (Medium)"),
+            18_389,
+            191,
+            0,
+            0,
+            0,
+        )
+        .expect("Gemini 4 Argon (Medium) turn 1 cost should calculate successfully");
+        let expected_turn_1 = (18_389.0 / 1_000_000.0) * 4.00 + (191.0 / 1_000_000.0) * 20.00;
+        assert!((turn_1_cost - expected_turn_1).abs() < 1e-9);
+    }
+
+    #[test]
     fn gemini_3_8_flash_thinking_levels_use_packaged_pricing() {
         let rules = load_pricing_rules();
 
