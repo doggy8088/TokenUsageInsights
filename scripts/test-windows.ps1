@@ -547,6 +547,8 @@ try {
         $entries = @(Get-Content -LiteralPath $jsonl.FullName | ForEach-Object { $_ | ConvertFrom-Json })
         Assert-Equal 1 $entries.Count "$($case.Name) should append the first positive delta."
         Assert-Equal 12 $entries[0].delta_tokens.total "$($case.Name) first delta is wrong."
+        Assert-Equal $true $entries[0].timestamp.EndsWith("Z") "$($case.Name) timestamp should use UTC Z format."
+        Assert-Equal ("usage-{0}.jsonl" -f $entries[0].timestamp.Substring(0, 10)) $jsonl.Name "$($case.Name) JSONL file name should match UTC date."
 
         $null = $json | & $psExe -NoProfile -ExecutionPolicy Bypass -File $case.Script
         if ($LASTEXITCODE -ne 0) { throw "$($case.Name) collector failed on repeat invocation." }

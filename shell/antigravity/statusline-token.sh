@@ -17,11 +17,10 @@ antigravity_dir="$HOME/.gemini/antigravity-cli"
 usage_dir="$antigravity_dir/usage"
 
 state_file="$antigravity_dir/statusline-state.json"
-jsonl_file="$usage_dir/usage-$(date +%Y-%m-%d).jsonl"
+now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+jsonl_file="$usage_dir/usage-${now:0:10}.jsonl"
 
 mkdir -p "$antigravity_dir" "$usage_dir"
-
-now="$(date -Iseconds)"
 
 fmt_tokens() {
   local n="$1"
@@ -56,7 +55,7 @@ cwd=$(printf '%s' "$input" | jq -r '.cwd // .workspace.current_dir // empty')
 version=$(printf '%s' "$input" | jq -r '.version // empty')
 
 if [ -z "$payload_session_id" ]; then
-  payload_session_id="$(date +%Y%m%d-%H%M%S)-$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid)"
+  payload_session_id="$(date -u +%Y%m%d-%H%M%S)-$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid)"
 fi
 
 session_id="$payload_session_id"

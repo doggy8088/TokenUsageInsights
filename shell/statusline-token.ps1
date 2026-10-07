@@ -119,9 +119,10 @@ if ($Assistant -eq "antigravity") {
 } else {
     $dataDir = Resolve-DataDirectory "COPILOT_DIR" @(".copilot")
 }
+$utcNow = [DateTime]::UtcNow
 $usageDir = Join-Path $dataDir "usage"
 $stateFile = Join-Path $dataDir "statusline-state.json"
-$jsonlFile = Join-Path $usageDir ("usage-{0}.jsonl" -f (Get-Date -Format "yyyy-MM-dd"))
+$jsonlFile = Join-Path $usageDir ("usage-{0}.jsonl" -f $utcNow.ToString("yyyy-MM-dd", [Globalization.CultureInfo]::InvariantCulture))
 New-Item -ItemType Directory -Force -Path $dataDir, $usageDir | Out-Null
 
 $inputText = [Console]::In.ReadToEnd()
@@ -139,7 +140,7 @@ $sessionPaths = if ($Assistant -eq "antigravity") {
 }
 $sessionId = Get-TextValue $payload $sessionPaths
 if ([string]::IsNullOrWhiteSpace($sessionId)) {
-    $sessionId = "{0}-{1}" -f (Get-Date -Format "yyyyMMdd-HHmmss"), [guid]::NewGuid()
+    $sessionId = "{0}-{1}" -f $utcNow.ToString("yyyyMMdd-HHmmss", [Globalization.CultureInfo]::InvariantCulture), [guid]::NewGuid()
 }
 
 $sessionName = Get-TextValue $payload @("session_name")
@@ -243,7 +244,7 @@ $turnNo = $previousTurnNo
 if ($deltaTotal -gt 0) {
     $turnNo = $previousTurnNo + 1
     $entry = [ordered]@{
-        timestamp = (Get-Date -Format "o")
+        timestamp = $utcNow.ToString("yyyy-MM-ddTHH:mm:ssZ", [Globalization.CultureInfo]::InvariantCulture)
         session_id = $sessionId
         session_name = $sessionName
         transcript_path = $transcriptPath
