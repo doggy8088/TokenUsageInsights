@@ -531,6 +531,84 @@ mod tests {
     }
 
     #[test]
+    fn claude_haiku_5_5_context_tiers_use_packaged_pricing() {
+        let rules = load_pricing_rules();
+
+        // 1. Short context (prompt tokens <= 100k): $0.10 / $0.01 / $0.50 per 1M tokens
+        for model_name in [
+            "claude-haiku-5-5",
+            "Claude Haiku 5.5",
+            "Claude Haiku 5.5 (<100k)",
+            "claude-haiku-5.5",
+        ] {
+            let cost = calculate_usage_cost(
+                &rules,
+                Some(model_name),
+                40_000,
+                10_000,
+                30_000,
+                20_000,
+                10_000,
+            )
+            .unwrap_or_else(|error| panic!("{model_name} should have a pricing rule: {error}"));
+
+            let expected = (40_000.0 / 1_000_000.0) * 0.10
+                + (30_000.0 / 1_000_000.0) * 0.01
+                + (20_000.0 / 1_000_000.0) * (0.10 * 1.25)
+                + (10_000.0 / 1_000_000.0) * (0.10 * 2.0)
+                + (10_000.0 / 1_000_000.0) * 0.50;
+            assert!(
+                (cost - expected).abs() < 1e-9,
+                "unexpected short-context cost for {model_name}: {cost}"
+            );
+        }
+
+        // 2. Long context (prompt tokens > 100k): $0.50 / $0.05 / $2.50 per 1M tokens
+        for model_name in [
+            "claude-haiku-5-5",
+            "Claude Haiku 5.5",
+            "Claude Haiku 5.5 (>100k)",
+            "claude-haiku-5.5",
+        ] {
+            let cost =
+                calculate_usage_cost(&rules, Some(model_name), 60_000, 10_000, 30_000, 10_001, 0)
+                    .unwrap_or_else(|error| {
+                        panic!("{model_name} should have a pricing rule: {error}")
+                    });
+
+            let expected = (60_000.0 / 1_000_000.0) * 0.50
+                + (30_000.0 / 1_000_000.0) * 0.05
+                + (10_001.0 / 1_000_000.0) * (0.50 * 1.25)
+                + (10_000.0 / 1_000_000.0) * 2.50;
+            assert!(
+                (cost - expected).abs() < 1e-9,
+                "unexpected long-context cost for {model_name}: {cost}"
+            );
+        }
+
+        // 3. Regression test for session_id=c3e4ba13-5d3e-43aa-b96b-16d97d7c1224
+        // Turn 1: input=2, output=5, cache_read=17,871, cache_write_5m=62,584 -> prompt=80,457 (<=100k)
+        let turn_1_cost =
+            calculate_usage_cost(&rules, Some("claude-haiku-5-5"), 2, 5, 17_871, 62_584, 0)
+                .expect("claude-haiku-5-5 turn 1 cost should calculate successfully");
+        let expected_turn_1 = (2.0 / 1_000_000.0) * 0.10
+            + (17_871.0 / 1_000_000.0) * 0.01
+            + (62_584.0 / 1_000_000.0) * 0.125
+            + (5.0 / 1_000_000.0) * 0.50;
+        assert!((turn_1_cost - expected_turn_1).abs() < 1e-9);
+
+        // Turn 6: input=2, output=8, cache_read=98,807, cache_write_5m=3,546 -> prompt=102,355 (>100k)
+        let turn_6_cost =
+            calculate_usage_cost(&rules, Some("claude-haiku-5-5"), 2, 8, 98_807, 3_546, 0)
+                .expect("claude-haiku-5-5 turn 6 cost should calculate successfully");
+        let expected_turn_6 = (2.0 / 1_000_000.0) * 0.50
+            + (98_807.0 / 1_000_000.0) * 0.05
+            + (3_546.0 / 1_000_000.0) * 0.625
+            + (8.0 / 1_000_000.0) * 2.50;
+        assert!((turn_6_cost - expected_turn_6).abs() < 1e-9);
+    }
+
+    #[test]
     fn glm_5_3_flash_uses_packaged_pricing() {
         let rules = load_pricing_rules();
 

@@ -120,6 +120,9 @@ GPT-5-mini,Global,1M Tokens,0.25,0.025,2.00,N/A
 Claude Sonnet 5,Global,1M Tokens,3.00,0.30,15.00,N/A
 Claude Sonnet 4.6,Global,1M Tokens,3.00,0.30,15.00,N/A
 Claude Sonnet 4.5,Global,1M Tokens,3.00,0.30,15.00,N/A
+Claude Haiku 5.5 (<100k),Global,1M Tokens,0.10,0.01,0.50,N/A
+Claude Haiku 5.5 (>100k),Global,1M Tokens,0.50,0.05,2.50,N/A
+Claude Haiku 5.5,Global,1M Tokens,0.10,0.01,0.50,N/A
 Claude Haiku 4.5,Global,1M Tokens,1.00,0.10,5.00,N/A
 Claude Fable 5,Global,1M Tokens,10.00,1.00,50.00,N/A
 Claude Opus 5,Global,1M Tokens,5.00,0.50,25.00,N/A
@@ -212,6 +215,7 @@ claude-4-6-sonnet,Cursor,1M Tokens,3.00,0.30,15.00,N/A
 claude-4-5-sonnet,Cursor,1M Tokens,3.00,0.30,15.00,N/A
 claude-4-sonnet,Cursor,1M Tokens,3.00,0.30,15.00,N/A
 claude-4-sonnet-1m,Cursor,1M Tokens,3.00,0.30,15.00,N/A
+claude-haiku-5-5,Cursor,1M Tokens,0.10,0.01,0.50,N/A
 claude-4-5-haiku,Cursor,1M Tokens,1.00,0.10,5.00,N/A
 claude-fable-5,Cursor,1M Tokens,10.00,1.00,50.00,N/A
 claude-opus-5,Cursor,1M Tokens,5.00,0.50,25.00,N/A
