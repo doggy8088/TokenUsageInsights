@@ -1249,6 +1249,7 @@ pub fn parse_claude_timeline(
     let mut request_turns: HashMap<String, u32> = HashMap::new();
     let mut emitted_reply_tokens: HashSet<String> = HashSet::new();
     let mut tool_calls_map: HashMap<String, usize> = HashMap::new();
+    let mut reasoning_parts: Vec<String> = Vec::new();
     let mut user_turn_no = 0u32;
 
     for line_res in reader.lines() {
@@ -1341,6 +1342,7 @@ pub fn parse_claude_timeline(
                 } else {
                     let prompt = claude_text_from_content(content);
                     if !prompt.trim().is_empty() {
+                        reasoning_parts.clear();
                         user_turn_no += 1;
                         timeline.push(TimelineItem::UserPrompt {
                             timestamp,
@@ -1391,7 +1393,6 @@ pub fn parse_claude_timeline(
 
         if let Some(content) = content {
             if let Some(items) = content.as_array() {
-                let mut reasoning_parts = Vec::new();
                 for item in items {
                     match item.get("type").and_then(|t| t.as_str()).unwrap_or("") {
                         "thinking" => {

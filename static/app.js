@@ -337,6 +337,8 @@ let currentSessionReasoningTokens = 0;
 let currentSessionCwd = '';
 let currentSessionModel = '';
 let currentSessionAssistantType = '';
+let currentSessionAgentNickname = '';
+let currentSessionAgentRole = '';
 let availableDates = [];
 let pricingRules = [];
 
@@ -4475,8 +4477,8 @@ function sortAndGetFlatSessions(sessions, sortCol, sortDir) {
     flat.push({
       ...node,
       depth,
-      isSubagent: depth > 0,
-      parentName
+      isSubagent: depth > 0 || Boolean(node.parent_session_id),
+      parentName: parentName || node.parent_session_id || null
     });
     node.children
       .sort(compare)
@@ -4689,7 +4691,7 @@ function renderSessionTable(sessions) {
       const subagentDisplayName = s.session_name || s.session_id;
       nameCellContent = `
         <div class="session-name-wrapper is-subagent" style="padding-left: ${paddingLeft}px;">
-          <span class="tree-connector" style="left: ${connectorLeft}px;" aria-hidden="true"></span>
+          ${s.depth > 0 ? `<span class="tree-connector" style="left: ${connectorLeft}px;" aria-hidden="true"></span>` : ''}
           <div style="display: flex; flex-wrap: wrap; gap: 4px; align-items: center; margin-bottom: 3px;">
             <span class="badge subagent-badge" title="${escapeHtml(t('subagent_parent_label'))}: ${escapeHtml(s.parentName || '')}">${escapeHtml(t('subagent_label'))}</span>
             ${nameSourceBadge}
@@ -4798,6 +4800,8 @@ async function openSessionTimeline(session) {
   currentSessionCwd = cwd || '';
   currentSessionModel = model || '';
   currentSessionAssistantType = assistantType || '';
+  currentSessionAgentNickname = agentNickname || '';
+  currentSessionAgentRole = agentRole || '';
 
   // 設定基礎抬頭 (截斷至 100 字元，滑鼠移過去可以看到全部)
   let displayName = sessionName || '';
@@ -4917,6 +4921,8 @@ function renderTimeline(data) {
   const finalCwd = metadata.cwd || currentSessionCwd || '-';
   const displayCwd = abbreviateHomePath(finalCwd) || '-';
   const finalModel = metadata.selected_model || currentSessionModel || '-';
+  const finalNickname = metadata.agent_nickname || currentSessionAgentNickname || '';
+  const finalRole = metadata.agent_role || currentSessionAgentRole || '';
 
   // 更新 Metadata 區塊
   document.getElementById('meta-cwd').textContent = displayCwd;
@@ -4929,15 +4935,15 @@ function renderTimeline(data) {
   const nicknameContainer = document.getElementById('drawer-meta-nickname-container');
   const roleContainer = document.getElementById('drawer-meta-role-container');
 
-  if (metadata.agent_nickname) {
-    document.getElementById('meta-nickname').textContent = metadata.agent_nickname;
+  if (finalNickname) {
+    document.getElementById('meta-nickname').textContent = finalNickname;
     if (nicknameContainer) nicknameContainer.style.display = 'flex';
   } else {
     if (nicknameContainer) nicknameContainer.style.display = 'none';
   }
 
-  if (metadata.agent_role) {
-    document.getElementById('meta-role').textContent = metadata.agent_role;
+  if (finalRole) {
+    document.getElementById('meta-role').textContent = finalRole;
     if (roleContainer) roleContainer.style.display = 'flex';
   } else {
     if (roleContainer) roleContainer.style.display = 'none';

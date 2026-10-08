@@ -4525,6 +4525,25 @@ fn sync_claude_usage_logs_from(conn: &mut Connection, claude_dir: &Path) -> Resu
         );
     }
 
+    // Re-sync existing Claude Code transcripts once so main sessions previously
+    // overwritten by subagent transcripts (which shared the parent's `sessionId`)
+    // and all subagent sessions are restored with distinct session IDs.
+    let subagent_migration_done: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = 'migration:claude_code_subagents_v2')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    if !subagent_migration_done {
+        let _ = conn.execute("DELETE FROM sync_state WHERE filename LIKE 'claude:%'", []);
+        let _ = conn.execute(
+            "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time) VALUES ('migration:claude_code_subagents_v2', 1, 0)",
+            [],
+        );
+    }
+
     let projects_dir = claude_dir.join("projects");
     if !projects_dir.exists() {
         return Ok(());
@@ -4566,6 +4585,15 @@ fn sync_claude_usage_logs_from(conn: &mut Connection, claude_dir: &Path) -> Resu
             let tx = conn
                 .transaction()
                 .map_err(|e| format!("Transaction BEGIN 失敗: {}", e))?;
+
+            let transcript_path_str = filepath.to_string_lossy().into_owned();
+            if let Err(e) = tx.execute(
+                "DELETE FROM usage_entries WHERE assistant_type = 'claude' AND transcript_path = ?",
+                params![transcript_path_str],
+            ) {
+                eprintln!("清空舊 Claude Code Transcript 資料失敗: {}", e);
+                continue;
+            }
 
             // First delete old entries for this session
             let session_ids: HashSet<String> = parsed_entries
@@ -10624,6 +10652,163 @@ mod tests {
         } else {
             std::env::remove_var("CLAUDE_DIR");
         }
+        fs::remove_dir_all(claude_dir).unwrap();
+    }
+
+    #[test]
+    fn sync_claude_usage_logs_preserves_main_session_and_subagents_and_migrates_legacy_rows() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let claude_dir = temp_jsonl_path("claude-subagent-sync").with_extension("");
+        let project_dir = claude_dir.join("projects").join("test-project");
+        let session_id = "c3e4ba13-5d3e-43aa-b96b-16d97d7c1224";
+        let subagents_dir = project_dir.join(session_id).join("subagents");
+        let wf_dir = subagents_dir.join("workflows").join("wf_01ABC");
+        fs::create_dir_all(&wf_dir).unwrap();
+
+        let main_path = project_dir.join(format!("{}.jsonl", session_id));
+        fs::write(
+            &main_path,
+            concat!(
+                "{\"type\":\"user\",\"sessionId\":\"c3e4ba13-5d3e-43aa-b96b-16d97d7c1224\",\"timestamp\":\"2026-10-08T01:00:00Z\",\"message\":{\"role\":\"user\",\"content\":\"Orchestrate workflow\"}}\n",
+                "{\"type\":\"assistant\",\"sessionId\":\"c3e4ba13-5d3e-43aa-b96b-16d97d7c1224\",\"timestamp\":\"2026-10-08T01:00:05Z\",\"uuid\":\"m1\",\"requestId\":\"req_main\",\"message\":{\"id\":\"msg_main\",\"role\":\"assistant\",\"model\":\"claude-opus-4-6\",\"content\":[{\"type\":\"text\",\"text\":\"Starting subagents\"}],\"usage\":{\"input_tokens\":100,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":20}}}\n"
+            ),
+        )
+        .unwrap();
+
+        let sub1_path = subagents_dir.join("agent-a111.jsonl");
+        let sub1_meta = subagents_dir.join("agent-a111.meta.json");
+        fs::write(
+            &sub1_meta,
+            r#"{"agentType":"general-purpose","description":"Explore repo"}"#,
+        )
+        .unwrap();
+        fs::write(
+            &sub1_path,
+            concat!(
+                "{\"type\":\"user\",\"isSidechain\":true,\"agentId\":\"a111\",\"sessionId\":\"c3e4ba13-5d3e-43aa-b96b-16d97d7c1224\",\"timestamp\":\"2026-10-08T01:01:00Z\",\"message\":{\"role\":\"user\",\"content\":\"Scan files\"}}\n",
+                "{\"type\":\"assistant\",\"isSidechain\":true,\"agentId\":\"a111\",\"sessionId\":\"c3e4ba13-5d3e-43aa-b96b-16d97d7c1224\",\"timestamp\":\"2026-10-08T01:01:05Z\",\"uuid\":\"s1\",\"requestId\":\"req_sub1\",\"message\":{\"id\":\"msg_sub1\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-6\",\"content\":[{\"type\":\"text\",\"text\":\"Scanned\"}],\"usage\":{\"input_tokens\":50,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":10}}}\n"
+            ),
+        )
+        .unwrap();
+
+        let wf_sub_path = wf_dir.join("agent-a222.jsonl");
+        let wf_sub_meta = wf_dir.join("agent-a222.meta.json");
+        fs::write(
+            &wf_sub_meta,
+            r#"{"agentType":"workflow","name":"lead","workflowPhase":"implement","description":"Implement feature"}"#,
+        )
+        .unwrap();
+        fs::write(
+            &wf_sub_path,
+            concat!(
+                "{\"type\":\"user\",\"isSidechain\":true,\"agentId\":\"a222\",\"sessionId\":\"c3e4ba13-5d3e-43aa-b96b-16d97d7c1224\",\"timestamp\":\"2026-10-08T01:02:00Z\",\"message\":{\"role\":\"user\",\"content\":\"Write code\"}}\n",
+                "{\"type\":\"assistant\",\"isSidechain\":true,\"agentId\":\"a222\",\"sessionId\":\"c3e4ba13-5d3e-43aa-b96b-16d97d7c1224\",\"timestamp\":\"2026-10-08T01:02:05Z\",\"uuid\":\"s2\",\"requestId\":\"req_sub2\",\"message\":{\"id\":\"msg_sub2\",\"role\":\"assistant\",\"model\":\"claude-opus-4-6\",\"content\":[{\"type\":\"text\",\"text\":\"Implemented\"}],\"usage\":{\"input_tokens\":80,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":30}}}\n"
+            ),
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // Simulate legacy broken state where wf_sub overwrote the parent session_id
+        conn.execute(
+            "INSERT INTO usage_entries (
+                session_id, parent_session_id, session_name, agent_nickname, agent_role,
+                assistant_type, model, timestamp, date, tokens_input, tokens_output,
+                tokens_cache_read, tokens_cache_write, tokens_reasoning, turn_no,
+                delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning,
+                transcript_path
+            ) VALUES (?1, NULL, 'Write code', NULL, NULL, 'claude', 'claude-opus-4-6', '2026-10-08T01:02:05Z', '2026-10-08', 80, 30, 0, 0, 0, 1, 80, 30, 0, 0, 0, ?2)",
+            params![session_id, wf_sub_path.to_string_lossy().to_string()],
+        )
+        .unwrap();
+        for p in [&main_path, &sub1_path, &wf_sub_path] {
+            let state_path = p
+                .strip_prefix(&claude_dir)
+                .unwrap_or(p)
+                .to_string_lossy()
+                .into_owned();
+            let state_key = source_sync_key("claude", &claude_dir, &state_path);
+            conn.execute(
+                "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time) VALUES (?, 999999, 9999999999)",
+                params![state_key],
+            )
+            .unwrap();
+        }
+
+        sync_claude_usage_logs_from(&mut conn, &claude_dir).unwrap();
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT session_id, parent_session_id, session_name, agent_nickname, agent_role, tokens_input, tokens_output
+                 FROM usage_entries
+                 WHERE assistant_type = 'claude'
+                 ORDER BY timestamp ASC",
+            )
+            .unwrap();
+        type SubagentSyncRow = (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            u64,
+            u64,
+        );
+        let rows: Vec<SubagentSyncRow> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows[0],
+            (
+                session_id.to_string(),
+                None,
+                Some("Orchestrate workflow".to_string()),
+                None,
+                None,
+                100,
+                20,
+            )
+        );
+        assert_eq!(
+            rows[1],
+            (
+                "agent-a111".to_string(),
+                Some(session_id.to_string()),
+                Some("Explore repo".to_string()),
+                None,
+                Some("general-purpose".to_string()),
+                50,
+                10,
+            )
+        );
+        assert_eq!(
+            rows[2],
+            (
+                "agent-a222".to_string(),
+                Some(session_id.to_string()),
+                Some("Implement feature".to_string()),
+                Some("lead".to_string()),
+                Some("implement".to_string()),
+                80,
+                30,
+            )
+        );
+
         fs::remove_dir_all(claude_dir).unwrap();
     }
 
