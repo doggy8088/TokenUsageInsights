@@ -7446,9 +7446,8 @@ function formatCost(cost) {
   if (cost === null || cost === undefined) return '-';
   const c = Number(cost);
   if (isNaN(c)) return '-';
-  if (c < 1000) return '$' + c.toFixed(2);
-  if (c < 10000) return '$' + c.toFixed(1);
-  return '$' + c.toFixed(0);
+  if (Number(c.toFixed(2)) < 1000) return '$' + c.toFixed(2);
+  return '$' + formatNumber(c.toFixed(0));
 }
 
 async function updateCodexRateLimit() {
