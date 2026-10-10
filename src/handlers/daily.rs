@@ -14,6 +14,7 @@ use crate::reporting::{group_sessions, latest_usage_entry};
 use crate::session_details::load_session_details;
 use crate::session_files::is_safe_session_id;
 use crate::session_search;
+use crate::statusline_command::statusline_command;
 
 #[cfg(test)]
 use crate::db::TokenStats;
@@ -245,6 +246,11 @@ pub async fn get_setup_info(Path(assistant): Path<String>) -> impl IntoResponse 
                 .join("settings.json")
                 .to_string_lossy()
                 .into_owned(),
+            statusline_command: statusline_command(
+                &anti_script.to_string_lossy(),
+                "antigravity",
+                cfg!(windows),
+            ),
         },
         copilot: AssistantSetupStatus {
             dir_path: copilot_dir.to_string_lossy().into_owned(),
@@ -256,6 +262,11 @@ pub async fn get_setup_info(Path(assistant): Path<String>) -> impl IntoResponse 
                 .join("settings.json")
                 .to_string_lossy()
                 .into_owned(),
+            statusline_command: statusline_command(
+                &copilot_script.to_string_lossy(),
+                "copilot",
+                cfg!(windows),
+            ),
         },
         copilot_app: AssistantSetupStatus {
             dir_path: copilot_app_dir.to_string_lossy().into_owned(),
@@ -264,6 +275,7 @@ pub async fn get_setup_info(Path(assistant): Path<String>) -> impl IntoResponse 
             script_path: "".to_string(),
             source_script_path: "".to_string(),
             settings_path: "".to_string(),
+            statusline_command: "".to_string(),
         },
         codex: AssistantSetupStatus {
             dir_path: codex_dir.to_string_lossy().into_owned(),
@@ -272,6 +284,7 @@ pub async fn get_setup_info(Path(assistant): Path<String>) -> impl IntoResponse 
             script_path: "".to_string(),
             source_script_path: "".to_string(),
             settings_path: "".to_string(),
+            statusline_command: "".to_string(),
         },
         claude: AssistantSetupStatus {
             dir_path: claude_dir.to_string_lossy().into_owned(),
@@ -280,6 +293,7 @@ pub async fn get_setup_info(Path(assistant): Path<String>) -> impl IntoResponse 
             script_path: "".to_string(),
             source_script_path: "".to_string(),
             settings_path: "".to_string(),
+            statusline_command: "".to_string(),
         },
         cursor: AssistantSetupStatus {
             dir_path: cursor_dir.to_string_lossy().into_owned(),
@@ -288,6 +302,7 @@ pub async fn get_setup_info(Path(assistant): Path<String>) -> impl IntoResponse 
             script_path: "".to_string(),
             source_script_path: "".to_string(),
             settings_path: "".to_string(),
+            statusline_command: "".to_string(),
         },
         grok: AssistantSetupStatus {
             dir_path: grok_dir.to_string_lossy().into_owned(),
@@ -296,6 +311,7 @@ pub async fn get_setup_info(Path(assistant): Path<String>) -> impl IntoResponse 
             script_path: "".to_string(),
             source_script_path: "".to_string(),
             settings_path: "".to_string(),
+            statusline_command: "".to_string(),
         },
         pi: AssistantSetupStatus {
             dir_path: pi_dir.to_string_lossy().into_owned(),
@@ -308,6 +324,7 @@ pub async fn get_setup_info(Path(assistant): Path<String>) -> impl IntoResponse 
             script_path: "".to_string(),
             source_script_path: "".to_string(),
             settings_path: "".to_string(),
+            statusline_command: "".to_string(),
         },
         omp: AssistantSetupStatus {
             dir_path: omp_dir.to_string_lossy().into_owned(),
@@ -320,6 +337,7 @@ pub async fn get_setup_info(Path(assistant): Path<String>) -> impl IntoResponse 
             script_path: "".to_string(),
             source_script_path: "".to_string(),
             settings_path: "".to_string(),
+            statusline_command: "".to_string(),
         },
         muse: AssistantSetupStatus {
             dir_path: muse_dir.to_string_lossy().into_owned(),
@@ -328,6 +346,7 @@ pub async fn get_setup_info(Path(assistant): Path<String>) -> impl IntoResponse 
             script_path: "".to_string(),
             source_script_path: "".to_string(),
             settings_path: "".to_string(),
+            statusline_command: "".to_string(),
         },
         mcode: AssistantSetupStatus {
             dir_path: mcode_dir.to_string_lossy().into_owned(),
@@ -336,6 +355,7 @@ pub async fn get_setup_info(Path(assistant): Path<String>) -> impl IntoResponse 
             script_path: "".to_string(),
             source_script_path: "".to_string(),
             settings_path: "".to_string(),
+            statusline_command: "".to_string(),
         },
     })
     .into_response()

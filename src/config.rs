@@ -118,13 +118,14 @@ impl SourceConfig {
 }
 
 pub(crate) fn absolute_root(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| {
+    let absolute = path.canonicalize().unwrap_or_else(|_| {
         if path.is_absolute() {
             path.to_path_buf()
         } else {
             std::env::current_dir().unwrap_or_default().join(path)
         }
-    })
+    });
+    crate::paths::strip_windows_verbatim_prefix(absolute)
 }
 
 pub(crate) fn deduplicate_roots(roots: Vec<PathBuf>) -> Vec<PathBuf> {

@@ -96,6 +96,7 @@ pub struct AssistantSetupStatus {
     pub script_path: String,
     pub source_script_path: String,
     pub settings_path: String,
+    pub statusline_command: String,
 }
 
 #[derive(Serialize, Clone)]

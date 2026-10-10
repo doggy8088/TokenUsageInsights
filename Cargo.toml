@@ -22,6 +22,7 @@ flate2 = "1.0"
 tar = "0.4"
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
 self-replace = "1.5.0"
+base64 = "0.22"
 
 [dev-dependencies]
 
