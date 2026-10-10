@@ -56,5 +56,5 @@ jobs:
         run: .\scripts\test-windows.ps1
 
       - name: Test generated statusLine command end-to-end (issue #64)
-        shell: powershell
+        shell: pwsh
         run: .\tests\windows-statusline-command.test.ps1 -Executable .\target\release\token-usage-insights.exe

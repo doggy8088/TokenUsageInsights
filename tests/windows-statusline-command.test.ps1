@@ -11,6 +11,10 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+if ($PSVersionTable.PSVersion.Major -lt 7) {
+    throw "This test requires PowerShell 7 (pwsh): ProcessStartInfo.ArgumentList is used to pass arguments exactly like a Node.js host."
+}
+
 function Assert-True {
     param([bool]$Condition, [string]$Message)
     if (-not $Condition) { throw $Message }
@@ -22,22 +26,29 @@ function Assert-Equal {
 }
 
 # 模擬 CLI 的行為：以空白切割 command，第一段為執行檔，其餘逐一作為獨立引數傳入。
+# 使用 .NET ProcessStartInfo.ArgumentList（需 PowerShell 7）逐一傳遞引數：它會像 Node.js spawn 一樣
+# 把引數內嵌的雙引號跳脫成 \"，忠實重現 issue #64 的情境；Windows PowerShell 5.1 的 & 呼叫會把
+# 內嵌引號原樣傳給子程序命令列，反而讓舊的錯誤格式意外可用，無法作為回歸防護。
 function Invoke-SplitCommand {
     param([string]$Command, [string]$StdinJson)
 
     $tokens = @($Command -split ' ' | Where-Object { $_ -ne "" })
-    $exe = $tokens[0]
-    $arguments = @()
-    if ($tokens.Length -gt 1) { $arguments = $tokens[1..($tokens.Length - 1)] }
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $tokens[0]
+    for ($i = 1; $i -lt $tokens.Length; $i++) { $startInfo.ArgumentList.Add($tokens[$i]) }
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardInput = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
 
-    $previous = $ErrorActionPreference
-    $ErrorActionPreference = "Continue"
-    try {
-        $output = $StdinJson | & $exe @arguments 2>&1
-        return @{ ExitCode = $LASTEXITCODE; Output = ($output | Out-String) }
-    } finally {
-        $ErrorActionPreference = $previous
-    }
+    $process = [System.Diagnostics.Process]::Start($startInfo)
+    $stderrTask = $process.StandardError.ReadToEndAsync()
+    $process.StandardInput.Write($StdinJson)
+    $process.StandardInput.Close()
+    $stdout = $process.StandardOutput.ReadToEnd()
+    $stderr = $stderrTask.GetAwaiter().GetResult()
+    $process.WaitForExit()
+    return @{ ExitCode = $process.ExitCode; Output = ($stdout + $stderr) }
 }
 
 # 模擬透過 shell 執行 command 的宿主（例如 Node.js spawn 搭配 shell: true 會走 cmd.exe）。
