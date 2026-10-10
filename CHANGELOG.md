@@ -4,6 +4,15 @@
 
 ## [未發行]
 
+### 新增與改善
+
+- 新增 `Claude Opus 5.5`（`claude-opus-5-5`）、`Claude Opus 5.5-fast`（`claude-opus-5-5-fast`，Fast Mode 2x 計價）與 `Claude Sonnet 5.5`（`claude-sonnet-5-5`）的 Anthropic 官方標準定價規則，含 Global 與 Cursor 清單條目；快取讀取依官方公告採輸入價格的 0.05x 計算。
+
+### 修正
+
+- 修正 `Claude Sonnet 5` / `claude-sonnet-5` 價格：官方已將上市優惠價 $2 / $10 轉為正式價格並取消原訂 2026/9/1 調漲，原本登錄的 $3 / $15 會高估估算費用。
+- 修正價格規則模糊比對：簡短模型名稱（如 `opus-5`）改以名稱長度最接近的規則為準，避免新增 `Claude Opus 5.5-fast` 等較長名稱後被誤配成 Fast Mode 價格。
+
 ## [1.2.0] - 2026-10-08
 
 ### 新增與改善

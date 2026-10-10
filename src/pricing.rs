@@ -308,7 +308,7 @@ impl PreparedPricingRules {
         contains_match: bool,
     ) -> Option<usize> {
         let mut best_rule = None;
-        let mut best_base_len = 0;
+        let mut best_distance = usize::MAX;
         let mut best_has_threshold = false;
 
         for (index, prepared) in self.parsed.iter().enumerate() {
@@ -322,14 +322,20 @@ impl PreparedPricingRules {
                 continue;
             }
 
-            let base_len = prepared.base.len();
+            // 以規則名稱與模型名稱的長度差距作為「貼近程度」：
+            // - 模型名稱包含規則名稱（例如 `claude-opus-5-1m · high` 對 `Claude Opus 5`）
+            //   時，較長的規則名稱更具體，差距也較小；
+            // - 規則名稱包含模型名稱（例如 `opus-5` 對 `Claude Opus 5`）時，
+            //   較短的規則才是正確對象，避免被 `Claude Opus 5.5-fast` 之類的
+            //   更長名稱搶走。
+            let distance = prepared.base.len().abs_diff(model_base.len());
             let has_threshold = prepared.threshold.is_some();
-            let is_more_specific = base_len > best_base_len;
-            let is_same_base_with_threshold =
-                base_len == best_base_len && has_threshold && !best_has_threshold;
-            if best_rule.is_none() || is_more_specific || is_same_base_with_threshold {
+            let is_closer = distance < best_distance;
+            let is_same_distance_with_threshold =
+                distance == best_distance && has_threshold && !best_has_threshold;
+            if best_rule.is_none() || is_closer || is_same_distance_with_threshold {
                 best_rule = Some(index);
-                best_base_len = base_len;
+                best_distance = distance;
                 best_has_threshold = has_threshold;
             }
         }
@@ -528,6 +534,102 @@ mod tests {
                 "unexpected Opus 5 cost for {model_name}: {cost}"
             );
         }
+    }
+
+    /// 針對同一組模型標籤逐一驗證：各 1M 輸入、輸出與快取讀取 Token 的總成本。
+    fn assert_packaged_cost_per_million(
+        rules: &[PricingRule],
+        model_names: &[&str],
+        expected: f64,
+        label: &str,
+    ) {
+        for model_name in model_names {
+            let cost = calculate_usage_cost(
+                rules,
+                Some(model_name),
+                1_000_000,
+                1_000_000,
+                1_000_000,
+                0,
+                0,
+            )
+            .unwrap_or_else(|err| panic!("{label} pricing missing for {model_name}: {err}"));
+
+            assert!(
+                (cost - expected).abs() < 1e-9,
+                "unexpected {label} cost for {model_name}: {cost}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_opus_5_5_variants_use_packaged_pricing() {
+        let rules = load_pricing_rules();
+
+        // 輸入 $4 + 輸出 $20 + 快取讀取 $0.20（0.05x）
+        assert_packaged_cost_per_million(
+            &rules,
+            &[
+                "claude-opus-5-5",
+                "Claude Opus 5.5",
+                "claude-opus-5-5-1m · high",
+                "opus-5-5",
+            ],
+            24.2,
+            "Opus 5.5",
+        );
+    }
+
+    #[test]
+    fn claude_opus_5_5_fast_mode_uses_doubled_pricing() {
+        let rules = load_pricing_rules();
+
+        // Fast Mode 為 2x：輸入 $8 + 輸出 $40 + 快取讀取 $0.40
+        assert_packaged_cost_per_million(
+            &rules,
+            &[
+                "claude-opus-5-5-fast",
+                "Claude Opus 5.5-fast",
+                "claude-opus-5-5-fast · high",
+            ],
+            48.4,
+            "Opus 5.5 fast",
+        );
+    }
+
+    #[test]
+    fn claude_sonnet_5_5_variants_use_packaged_pricing() {
+        let rules = load_pricing_rules();
+
+        // 輸入 $2 + 輸出 $10 + 快取讀取 $0.10（0.05x）
+        assert_packaged_cost_per_million(
+            &rules,
+            &[
+                "claude-sonnet-5-5",
+                "Claude Sonnet 5.5",
+                "claude-sonnet-5-5-1m · high",
+            ],
+            12.1,
+            "Sonnet 5.5",
+        );
+    }
+
+    #[test]
+    fn claude_sonnet_5_uses_standard_price_after_launch_pricing_became_permanent() {
+        let rules = load_pricing_rules();
+
+        // 官方已將 $2 / $10 上市價轉為正式價，快取讀取維持 0.1x 即 $0.20；
+        // 同時確認不會誤配到 Sonnet 5.5 的規則。
+        assert_packaged_cost_per_million(
+            &rules,
+            &[
+                "claude-sonnet-5",
+                "Claude Sonnet 5",
+                "claude-sonnet-5 · high",
+            ],
+            12.2,
+            "Sonnet 5",
+        );
     }
 
     #[test]
