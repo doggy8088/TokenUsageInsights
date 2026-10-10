@@ -7,6 +7,7 @@
 ### 新增與改善
 
 - 新增 `Claude Opus 5.5`（`claude-opus-5-5`）、`Claude Opus 5.5-fast`（`claude-opus-5-5-fast`，Fast Mode 2x 計價）與 `Claude Sonnet 5.5`（`claude-sonnet-5-5`）的 Anthropic 官方標準定價規則，含 Global 與 Cursor 清單條目；快取讀取依官方公告採輸入價格的 0.05x 計算。
+- Claude Code 會話解析現會讀取 `usage.speed`，Fast Mode 回合的模型名稱自動加上 `-fast` 後綴（例如 `claude-opus-5-5-fast`），以套用 Fast Mode 2x 計價，避免費用被低估一半。
 
 ### 修正
 
