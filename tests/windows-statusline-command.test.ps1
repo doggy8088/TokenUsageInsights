@@ -96,8 +96,13 @@ $sourceScript = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..\shell\st
 
 # 根目錄刻意包含空白，antigravity 資料目錄另含空白與 cmd.exe 的 `&` 中繼字元；copilot 資料目錄只含安全字元，兩種路徑型態都要通過。
 $root = Join-Path ([IO.Path]::GetTempPath()) ("Token Usage Insights Statusline-{0}" -f [guid]::NewGuid())
+# copilot 需驗證可讀的 -File 形式，因此放在不含空白與特殊字元的另一個暫存根目錄下。
+$plainRoot = Join-Path ([IO.Path]::GetTempPath()) ("tui-statusline-{0}" -f [guid]::NewGuid())
+if ($plainRoot -match '[^A-Za-z0-9\\/:._~-]') {
+    throw "Temp path '$plainRoot' contains characters outside the simple-token set; the -File case cannot be validated here."
+}
 $antigravityDir = Join-Path $root "antigravity & data"
-$copilotDir = Join-Path $root "copilot"
+$copilotDir = Join-Path $plainRoot "copilot"
 $insightsDir = Join-Path $root "insights"
 $workspaceDir = Join-Path $root "workspace"
 foreach ($dir in @($antigravityDir, $copilotDir, $insightsDir, $workspaceDir)) {
@@ -219,7 +224,9 @@ try {
     foreach ($name in $previousEnv.Keys) {
         [Environment]::SetEnvironmentVariable($name, $previousEnv[$name])
     }
-    if (Test-Path -LiteralPath $root) {
-        Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+    foreach ($dir in @($root, $plainRoot)) {
+        if (Test-Path -LiteralPath $dir) {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
 }
