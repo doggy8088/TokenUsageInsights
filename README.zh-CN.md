@@ -997,6 +997,14 @@ Status Line 脚本依赖 `jq` 解析 CLI 传入的 JSON。
 Write-Output '{}' | powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.gemini\antigravity-cli\statusline-token.ps1" -Assistant antigravity
 ```
 
+Windows 的 `settings.json` 请直接使用看板设置向导生成的 `command`：路径改用 `/`、且不要加任何引号，例如：
+
+```json
+"command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:/Users/YOUR_NAME/.gemini/antigravity-cli/statusline-token.ps1 -Assistant antigravity"
+```
+
+Antigravity CLI 与 Copilot CLI 会把 `command` 按空白切割后直接执行，不会经过 shell；若用 `\"...\"` 包住路径或保留 `\\` 反斜杠，`powershell.exe -File` 会收到含引号的路径而找不到脚本。若脚本路径含空白，看板会改为生成 `-Command . 'C:/Users/Your Name/.../statusline-token.ps1' -Assistant antigravity` 的形式。
+
 ### 配置文件 JSON 格式错误
 
 ```bash

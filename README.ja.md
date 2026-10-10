@@ -997,6 +997,14 @@ Status Line スクリプトは CLI から渡される JSON の解析に `jq` を
 Write-Output '{}' | powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.gemini\antigravity-cli\statusline-token.ps1" -Assistant antigravity
 ```
 
+Windows の `settings.json` にはダッシュボードのセットアップ画面が生成した `command` をそのまま使ってください。パスは `/` 区切りで、引用符は付けません。例：
+
+```json
+"command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:/Users/YOUR_NAME/.gemini/antigravity-cli/statusline-token.ps1 -Assistant antigravity"
+```
+
+Antigravity CLI と Copilot CLI は `command` を空白で分割してシェルを介さず直接実行します。パスを `\"...\"` で囲んだり `\\` を残したりすると、`powershell.exe -File` に引用符付きのパスが渡されスクリプトが見つかりません。スクリプトのパスに空白が含まれる場合、ダッシュボードは `-Command . 'C:/Users/Your Name/.../statusline-token.ps1' -Assistant antigravity` 形式を生成します。
+
 ### 設定ファイルの JSON 形式が不正
 
 ```bash

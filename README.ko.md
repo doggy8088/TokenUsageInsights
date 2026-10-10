@@ -997,6 +997,14 @@ Status Line 스크립트는 CLI가 전달한 JSON을 분석하기 위해 `jq`에
 Write-Output '{}' | powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.gemini\antigravity-cli\statusline-token.ps1" -Assistant antigravity
 ```
 
+Windows의 `settings.json`에는 대시보드 설정 마법사가 생성한 `command`를 그대로 사용하세요. 경로는 `/`로 구분하고 따옴표는 붙이지 않습니다. 예:
+
+```json
+"command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:/Users/YOUR_NAME/.gemini/antigravity-cli/statusline-token.ps1 -Assistant antigravity"
+```
+
+Antigravity CLI와 Copilot CLI는 `command`를 공백으로 나눈 뒤 셸을 거치지 않고 직접 실행합니다. 경로를 `\"...\"`로 감싸거나 `\\` 역슬래시를 남기면 `powershell.exe -File`이 따옴표가 포함된 경로를 받아 스크립트를 찾지 못합니다. 스크립트 경로에 공백이 있으면 대시보드는 `-Command . 'C:/Users/Your Name/.../statusline-token.ps1' -Assistant antigravity` 형식을 생성합니다.
+
 ### 설정 파일 JSON 형식 오류
 
 ```bash

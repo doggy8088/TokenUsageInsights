@@ -1,0 +1,60 @@
+name: Validate Windows status line command
+
+on:
+  pull_request:
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "static/app.js"
+      - "shell/**/*.ps1"
+      - "scripts/test-windows.ps1"
+      - "tests/windows-statusline-command.test.ps1"
+      - ".github/workflows/windows-statusline.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "static/app.js"
+      - "shell/**/*.ps1"
+      - "scripts/test-windows.ps1"
+      - "tests/windows-statusline-command.test.ps1"
+      - ".github/workflows/windows-statusline.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test Windows collectors and generated settings command
+    runs-on: windows-latest
+    env:
+      # Enforce the zero-warnings build policy documented in AGENTS.md.
+      RUSTFLAGS: "-D warnings"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run Rust tests
+        run: cargo test --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Test native Windows collectors
+        shell: powershell
+        run: .\scripts\test-windows.ps1
+
+      - name: Test generated statusLine command end-to-end (issue #64)
+        shell: powershell
+        run: .\tests\windows-statusline-command.test.ps1 -Executable .\target\release\token-usage-insights.exe

@@ -29,6 +29,7 @@ mod session_details;
 mod session_files;
 mod session_identity;
 mod session_search;
+mod statusline_command;
 mod timeline;
 mod updater;
 mod vscode;

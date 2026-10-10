@@ -4,6 +4,14 @@
 
 ## [未發行]
 
+### 修正
+
+- 修正 Windows 設定精靈產生的 `statusLine.command`：Antigravity CLI / Copilot CLI 會以空白切割命令後直接執行，原本以 `\"...\"` 包住的腳本路徑會讓 `powershell.exe -File` 找不到檔案。現改為不加引號並以 `/` 分隔路徑；腳本路徑含空白時改用 `-Command . '<path>' -Assistant <name>` 形式。命令字串改由後端 `/api/<assistant>/setup-info` 的 `statusline_command` 欄位提供（#64）。
+
+### 新增與改善
+
+- 新增 GitHub Actions 工作流程 `windows-statusline.yml`，於 Windows 執行 Rust 測試、原生 collector 測試，並以空白切割與 `cmd.exe` 兩種方式實際執行看板產生的 `statusLine.command` 進行端對端驗證。
+
 ## [1.2.0] - 2026-10-08
 
 ### 新增與改善
