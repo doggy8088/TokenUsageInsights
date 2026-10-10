@@ -87,6 +87,17 @@ async fn records(client: &reqwest::Client, server: &TestServer, assistant: &str)
         .clone()
 }
 
+/// setup-info 回傳給使用者看的路徑：已 canonicalize，但在 Windows 會去除 `\\?\` verbatim 前綴
+/// （避免寫入 `settings.json` 的 statusLine 命令出現 `//?/C:/...`，見 issue #64）。
+fn displayed_root(path: &std::path::Path) -> PathBuf {
+    let canonical = path.canonicalize().unwrap();
+    let raw = canonical.to_string_lossy();
+    match raw.strip_prefix(r"\\?\") {
+        Some(rest) => PathBuf::from(rest),
+        None => canonical,
+    }
+}
+
 #[tokio::test]
 async fn startup_and_manual_sync_reload_extra_homes_without_losing_defaults() {
     let root = std::env::temp_dir().join(format!(
@@ -272,7 +283,7 @@ async fn startup_and_manual_sync_reload_extra_homes_without_losing_defaults() {
     assert_eq!(setup["claude"]["exists"], true);
     assert_eq!(
         PathBuf::from(setup["claude"]["dir_path"].as_str().unwrap()),
-        remote.join("claude").canonicalize().unwrap()
+        displayed_root(&remote.join("claude"))
     );
     assert_eq!(records(&client, &server, "claude").await.len(), 1);
 

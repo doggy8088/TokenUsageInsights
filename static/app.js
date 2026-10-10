@@ -7092,9 +7092,9 @@ async function loadSetupInfo(assistant = currentAssistant) {
       const targetScriptPath = assistantSetup.script_path || '';
       const sourceScriptPath = assistantSetup.source_script_path || '';
       const settingsPath = assistantSetup.settings_path || '';
-      const targetScriptCommand = isWindows
-        ? `powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${targetScriptPath}" -Assistant ${resolvedAssistant}`
-        : targetScriptPath;
+      // 命令字串由後端依平台產生（見 src/statusline_command.rs）：Windows 不可用雙引號包住路徑，
+      // 否則 Antigravity CLI / Copilot CLI 會把引號原樣傳給 powershell.exe -File 而找不到檔案（issue #64）。
+      const targetScriptCommand = assistantSetup.statusline_command || targetScriptPath;
 
       const settingsJson = JSON.stringify({
         "statusLine": {

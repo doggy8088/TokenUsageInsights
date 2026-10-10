@@ -1033,6 +1033,14 @@ Status Line 腳本依賴 `jq` 解析 CLI 傳入的 JSON。
 Write-Output '{}' | powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.gemini\antigravity-cli\statusline-token.ps1" -Assistant antigravity
 ```
 
+Windows 的 `settings.json` 請直接使用看板設定精靈產生的 `command`：路徑改用 `/`、且不要加任何引號，例如：
+
+```json
+"command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:/Users/YOUR_NAME/.gemini/antigravity-cli/statusline-token.ps1 -Assistant antigravity"
+```
+
+Antigravity CLI 與 Copilot CLI 會把 `command` 以空白切割後直接執行，不會經過 shell；若用 `\"...\"` 包住路徑或保留 `\\` 反斜線，`powershell.exe -File` 會收到含引號的路徑而找不到腳本。若腳本路徑含空白、`&`、非 ASCII 等任何可能被切割或被 `cmd.exe` 解讀的字元，看板會改產生 `-EncodedCommand <Base64>` 形式（內容為 `& '<path>' -Assistant antigravity` 的 UTF-16LE Base64），對任何宿主都是單一安全的 token。
+
 ### 設定檔 JSON 格式錯誤
 
 ```bash
