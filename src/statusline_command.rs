@@ -182,6 +182,21 @@ mod tests {
     }
 
     #[test]
+    fn windows_repeated_whitespace_is_preserved_inside_encoded_command() {
+        // 宿主以空白切割後不會還原連續空白，因此這類路徑必須走 Base64 以原樣保留。
+        let command = statusline_command(
+            r"C:\Status  Lines\.copilot\statusline-token.ps1",
+            "copilot",
+            true,
+        );
+        assert!(command.contains("-EncodedCommand "));
+        assert_eq!(
+            decode_encoded_command(&command),
+            "& 'C:/Status  Lines/.copilot/statusline-token.ps1' -Assistant copilot"
+        );
+    }
+
+    #[test]
     fn windows_non_ascii_path_uses_encoded_command() {
         let command = statusline_command(
             r"C:\Users\王小明\.gemini\antigravity-cli\statusline-token.ps1",
