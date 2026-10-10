@@ -1003,7 +1003,7 @@ Windows의 `settings.json`에는 대시보드 설정 마법사가 생성한 `com
 "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:/Users/YOUR_NAME/.gemini/antigravity-cli/statusline-token.ps1 -Assistant antigravity"
 ```
 
-Antigravity CLI와 Copilot CLI는 `command`를 공백으로 나눈 뒤 셸을 거치지 않고 직접 실행합니다. 경로를 `\"...\"`로 감싸거나 `\\` 역슬래시를 남기면 `powershell.exe -File`이 따옴표가 포함된 경로를 받아 스크립트를 찾지 못합니다. 스크립트 경로에 공백이 있으면 대시보드는 `-Command . 'C:/Users/Your Name/.../statusline-token.ps1' -Assistant antigravity` 형식을 생성합니다.
+Antigravity CLI와 Copilot CLI는 `command`를 공백으로 나눈 뒤 셸을 거치지 않고 직접 실행합니다. 경로를 `\"...\"`로 감싸거나 `\\` 역슬래시를 남기면 `powershell.exe -File`이 따옴표가 포함된 경로를 받아 스크립트를 찾지 못합니다. 스크립트 경로에 공백, `&`, 비 ASCII 문자 등 분할되거나 `cmd.exe`가 해석할 수 있는 문자가 있으면 대시보드는 `-EncodedCommand <Base64>` 형식(`& '<path>' -Assistant antigravity`의 UTF-16LE Base64)을 생성합니다. 이는 어떤 호스트에서도 단일한 안전한 토큰입니다.
 
 ### 설정 파일 JSON 형식 오류
 

@@ -14,6 +14,19 @@ pub fn env_path(name: &str) -> Option<PathBuf> {
     Some(expand_common_prefix(PathBuf::from(value)))
 }
 
+/// 去除 Windows `canonicalize` 產生的 verbatim 前綴（`\\?\C:\...` 與 `\\?\UNC\server\share`），
+/// 讓顯示給使用者、寫進 `settings.json` 的路徑維持一般形式。非 Windows 路徑原樣回傳。
+pub(crate) fn strip_windows_verbatim_prefix(path: PathBuf) -> PathBuf {
+    let raw = path.to_string_lossy();
+    if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = raw.strip_prefix(r"\\?\") {
+        return PathBuf::from(rest);
+    }
+    path
+}
+
 pub(crate) fn expand_common_prefix(path: PathBuf) -> PathBuf {
     let raw = path.to_string_lossy();
     let home = dirs::home_dir();
@@ -116,6 +129,34 @@ mod tests {
     // warning (which is a hard error under `-D warnings`) on other platforms.
     #[cfg(windows)]
     use super::*;
+
+    #[test]
+    fn verbatim_drive_prefix_is_stripped() {
+        let stripped = super::strip_windows_verbatim_prefix(std::path::PathBuf::from(
+            r"\\?\C:\Users\YOUR_NAME\.copilot",
+        ));
+        assert_eq!(stripped.to_string_lossy(), r"C:\Users\YOUR_NAME\.copilot");
+    }
+
+    #[test]
+    fn verbatim_unc_prefix_is_rewritten_to_plain_unc() {
+        let stripped = super::strip_windows_verbatim_prefix(std::path::PathBuf::from(
+            r"\\?\UNC\server\share\.copilot",
+        ));
+        assert_eq!(stripped.to_string_lossy(), r"\\server\share\.copilot");
+    }
+
+    #[test]
+    fn plain_paths_are_left_untouched() {
+        for raw in [
+            r"C:\Users\YOUR_NAME",
+            "/home/user/.copilot",
+            r"\\server\share",
+        ] {
+            let stripped = super::strip_windows_verbatim_prefix(std::path::PathBuf::from(raw));
+            assert_eq!(stripped.to_string_lossy(), raw);
+        }
+    }
 
     #[cfg(windows)]
     #[test]

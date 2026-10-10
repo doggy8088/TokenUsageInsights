@@ -2,7 +2,7 @@
 #
 # 這兩個 CLI 不會透過 shell 解析 command，而是以空白切割後直接傳給子程序；
 # 因此這裡以「空白切割後直接呼叫」與「交給 cmd.exe 執行」兩種方式實際執行後端回傳的命令，
-# 並確認資料目錄含空白時也能正常寫入 usage JSONL。
+# 並確認資料目錄含空白或 `&` 等 cmd.exe 中繼字元時也能正常寫入 usage JSONL。
 [CmdletBinding()]
 param(
     [string]$Executable = (Join-Path $PSScriptRoot "..\target\release\token-usage-insights.exe"),
@@ -83,9 +83,9 @@ function New-Payload {
 $Executable = (Resolve-Path -LiteralPath $Executable).Path
 $sourceScript = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..\shell\statusline-token.ps1")).Path
 
-# 根目錄刻意包含空白，antigravity 資料目錄也含空白；copilot 資料目錄不含空白，兩種路徑型態都要通過。
+# 根目錄刻意包含空白，antigravity 資料目錄另含空白與 cmd.exe 的 `&` 中繼字元；copilot 資料目錄只含安全字元，兩種路徑型態都要通過。
 $root = Join-Path ([IO.Path]::GetTempPath()) ("Token Usage Insights Statusline-{0}" -f [guid]::NewGuid())
-$antigravityDir = Join-Path $root "antigravity data"
+$antigravityDir = Join-Path $root "antigravity & data"
 $copilotDir = Join-Path $root "copilot"
 $insightsDir = Join-Path $root "insights"
 $workspaceDir = Join-Path $root "workspace"
@@ -138,7 +138,7 @@ try {
             Name = "antigravity"
             DataDir = $antigravityDir
             SessionProperty = "conversation_id"
-            ExpectedForm = "-Command . '"
+            ExpectedForm = "-EncodedCommand "
         },
         @{
             Name = "copilot"
@@ -161,16 +161,24 @@ try {
         Assert-True (-not $command.Contains('"')) "[$name] command must not contain double quotes (issue #64)."
         Assert-True (-not $command.Contains('\')) "[$name] command must use forward slashes only (issue #64)."
         Assert-True ($command.Contains($case.ExpectedForm)) "[$name] command should use the '$($case.ExpectedForm)' form for this path."
-        Assert-True ($command.EndsWith(" -Assistant $name")) "[$name] command should end with -Assistant $name."
         $expectedScript = (Join-Path $case.DataDir "statusline-token.ps1").Replace('\', '/')
-        Assert-True ($command.Contains($expectedScript)) "[$name] command should reference $expectedScript."
+        if ($case.ExpectedForm -eq "-EncodedCommand ") {
+            # 路徑含空白 / 中繼字元時整個命令必須是純 ASCII 且不含空白以外的分隔風險；解碼後需指向正確腳本。
+            $encoded = $command.Substring($command.IndexOf("-EncodedCommand ") + "-EncodedCommand ".Length)
+            Assert-True ($encoded -notmatch '[^A-Za-z0-9+/=]') "[$name] encoded payload must be plain Base64."
+            $decoded = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($encoded))
+            Write-Host "[$name] decoded command: $decoded"
+            Assert-Equal ("& '{0}' -Assistant {1}" -f $expectedScript, $name) $decoded "[$name] decoded command should call the script with -Assistant."
+        } else {
+            Assert-True ($command.EndsWith(" -File $expectedScript -Assistant $name")) "[$name] command should pass $expectedScript to -File and end with -Assistant $name."
+        }
 
         # 1. 模擬 CLI 以空白切割後直接執行
         $result = Invoke-SplitCommand -Command $command -StdinJson (New-Payload $case.SessionProperty 12)
         Write-Host "[$name] split-argv output: $($result.Output.Trim())"
         Assert-Equal 0 $result.ExitCode "[$name] command failed when executed with whitespace-split argv."
         Assert-True ($result.Output.Trim().Length -gt 0) "[$name] command should print a status line."
-        $entries = Get-UsageEntries -DataDir $case.DataDir
+        $entries = @(Get-UsageEntries -DataDir $case.DataDir)
         Assert-Equal 1 $entries.Count "[$name] first invocation should append one usage entry."
         Assert-Equal 12 $entries[0].delta_tokens.total "[$name] first delta is wrong."
 
@@ -178,7 +186,7 @@ try {
         $result = Invoke-CmdShellCommand -Command $command -StdinJson (New-Payload $case.SessionProperty 30)
         Write-Host "[$name] cmd.exe output: $($result.Output.Trim())"
         Assert-Equal 0 $result.ExitCode "[$name] command failed when executed through cmd.exe."
-        $entries = Get-UsageEntries -DataDir $case.DataDir
+        $entries = @(Get-UsageEntries -DataDir $case.DataDir)
         Assert-Equal 2 $entries.Count "[$name] second invocation should append a second usage entry."
         Assert-Equal 18 $entries[1].delta_tokens.total "[$name] second delta is wrong."
 
@@ -187,7 +195,7 @@ try {
         $legacy = Invoke-SplitCommand -Command $legacyCommand -StdinJson (New-Payload $case.SessionProperty 50)
         Write-Host "[$name] legacy quoted form exit code: $($legacy.ExitCode)"
         Assert-True ($legacy.ExitCode -ne 0) "[$name] legacy quoted command unexpectedly succeeded; the regression harness no longer reproduces issue #64."
-        $entries = Get-UsageEntries -DataDir $case.DataDir
+        $entries = @(Get-UsageEntries -DataDir $case.DataDir)
         Assert-Equal 2 $entries.Count "[$name] legacy quoted command should not have written usage."
     }
 

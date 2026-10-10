@@ -1003,7 +1003,7 @@ Windows の `settings.json` にはダッシュボードのセットアップ画�
 "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:/Users/YOUR_NAME/.gemini/antigravity-cli/statusline-token.ps1 -Assistant antigravity"
 ```
 
-Antigravity CLI と Copilot CLI は `command` を空白で分割してシェルを介さず直接実行します。パスを `\"...\"` で囲んだり `\\` を残したりすると、`powershell.exe -File` に引用符付きのパスが渡されスクリプトが見つかりません。スクリプトのパスに空白が含まれる場合、ダッシュボードは `-Command . 'C:/Users/Your Name/.../statusline-token.ps1' -Assistant antigravity` 形式を生成します。
+Antigravity CLI と Copilot CLI は `command` を空白で分割してシェルを介さず直接実行します。パスを `\"...\"` で囲んだり `\\` を残したりすると、`powershell.exe -File` に引用符付きのパスが渡されスクリプトが見つかりません。スクリプトのパスに空白、`&`、非 ASCII 文字など、分割されたり `cmd.exe` に解釈されたりする可能性のある文字が含まれる場合、ダッシュボードは `-EncodedCommand <Base64>` 形式（`& '<path>' -Assistant antigravity` の UTF-16LE Base64）を生成します。これはどのホストでも単一の安全なトークンになります。
 
 ### 設定ファイルの JSON 形式が不正
 

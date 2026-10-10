@@ -6,7 +6,7 @@
 
 ### 修正
 
-- 修正 Windows 設定精靈產生的 `statusLine.command`：Antigravity CLI / Copilot CLI 會以空白切割命令後直接執行，原本以 `\"...\"` 包住的腳本路徑會讓 `powershell.exe -File` 找不到檔案。現改為不加引號並以 `/` 分隔路徑；腳本路徑含空白時改用 `-Command . '<path>' -Assistant <name>` 形式。命令字串改由後端 `/api/<assistant>/setup-info` 的 `statusline_command` 欄位提供（#64）。
+- 修正 Windows 設定精靈產生的 `statusLine.command`：Antigravity CLI / Copilot CLI 會以空白切割命令後直接執行，原本以 `\"...\"` 包住的腳本路徑會讓 `powershell.exe -File` 找不到檔案。現改為不加引號並以 `/` 分隔路徑；腳本路徑含空白、`&`、非 ASCII 等非安全字元時改用 `-EncodedCommand <Base64>` 形式，避免被空白切割或被 `cmd.exe` 解讀。另修正 Windows 設定精靈顯示的資料目錄與腳本路徑帶有 `\\?\` verbatim 前綴的問題。命令字串改由後端 `/api/<assistant>/setup-info` 的 `statusline_command` 欄位提供（#64）。
 
 ### 新增與改善
 

@@ -1003,7 +1003,7 @@ Windows 的 `settings.json` 请直接使用看板设置向导生成的 `command`
 "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:/Users/YOUR_NAME/.gemini/antigravity-cli/statusline-token.ps1 -Assistant antigravity"
 ```
 
-Antigravity CLI 与 Copilot CLI 会把 `command` 按空白切割后直接执行，不会经过 shell；若用 `\"...\"` 包住路径或保留 `\\` 反斜杠，`powershell.exe -File` 会收到含引号的路径而找不到脚本。若脚本路径含空白，看板会改为生成 `-Command . 'C:/Users/Your Name/.../statusline-token.ps1' -Assistant antigravity` 的形式。
+Antigravity CLI 与 Copilot CLI 会把 `command` 按空白切割后直接执行，不会经过 shell；若用 `\"...\"` 包住路径或保留 `\\` 反斜杠，`powershell.exe -File` 会收到含引号的路径而找不到脚本。若脚本路径含空白、`&`、非 ASCII 等任何可能被切割或被 `cmd.exe` 解读的字符，看板会改为生成 `-EncodedCommand <Base64>` 形式（内容为 `& '<path>' -Assistant antigravity` 的 UTF-16LE Base64），对任何宿主都是单一安全的 token。
 
 ### 配置文件 JSON 格式错误
 
