@@ -4,13 +4,17 @@
 
 ## [未發行]
 
-### 修正
-
-- 修正 Windows 設定精靈產生的 `statusLine.command`：Antigravity CLI / Copilot CLI 會以空白切割命令後直接執行，原本以 `\"...\"` 包住的腳本路徑會讓 `powershell.exe -File` 找不到檔案。現改為不加引號並以 `/` 分隔路徑；腳本路徑含空白、`&`、非 ASCII 等非安全字元時改用 `-EncodedCommand <Base64>` 形式，避免被空白切割或被 `cmd.exe` 解讀。另修正 Windows 設定精靈顯示的資料目錄與腳本路徑帶有 `\\?\` verbatim 前綴的問題。命令字串改由後端 `/api/<assistant>/setup-info` 的 `statusline_command` 欄位提供（#64）。
-
 ### 新增與改善
 
+- 新增 `Claude Opus 5.5`（`claude-opus-5-5`）、`Claude Opus 5.5-fast`（`claude-opus-5-5-fast`，Fast Mode 2x 計價）與 `Claude Sonnet 5.5`（`claude-sonnet-5-5`）的 Anthropic 官方標準定價規則，含 Global 與 Cursor 清單條目；快取讀取依官方公告採輸入價格的 0.05x 計算。
+- Claude Code 會話解析現會讀取 `usage.speed`，Fast Mode 回合的模型名稱自動加上 `-fast` 後綴（例如 `claude-opus-5-5-fast`），以套用 Fast Mode 2x 計價，避免費用被低估一半。
 - 新增 GitHub Actions 工作流程 `windows-statusline.yml`，於 Windows 執行 Rust 測試、原生 collector 測試，並以空白切割與 `cmd.exe` 兩種方式實際執行看板產生的 `statusLine.command` 進行端對端驗證。
+
+### 修正
+
+- 修正 `Claude Sonnet 5` / `claude-sonnet-5` 價格：官方已將上市優惠價 $2 / $10 轉為正式價格並取消原訂 2026/9/1 調漲，原本登錄的 $3 / $15 會高估估算費用。
+- 修正價格規則模糊比對：簡短模型名稱（如 `opus-5`）改以名稱長度最接近的規則為準，避免新增 `Claude Opus 5.5-fast` 等較長名稱後被誤配成 Fast Mode 價格。
+- 修正 Windows 設定精靈產生的 `statusLine.command`：Antigravity CLI / Copilot CLI 會以空白切割命令後直接執行，原本以 `\"...\"` 包住的腳本路徑會讓 `powershell.exe -File` 找不到檔案。現改為不加引號並以 `/` 分隔路徑；腳本路徑含空白、`&`、非 ASCII 等非安全字元時改用 `-EncodedCommand <Base64>` 形式，避免被空白切割或被 `cmd.exe` 解讀。另修正 Windows 設定精靈顯示的資料目錄與腳本路徑帶有 `\\?\` verbatim 前綴的問題。命令字串改由後端 `/api/<assistant>/setup-info` 的 `statusline_command` 欄位提供（#64）。
 
 ## [1.2.0] - 2026-10-08
 

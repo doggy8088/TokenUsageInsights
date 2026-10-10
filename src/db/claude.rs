@@ -12,6 +12,10 @@ struct ClaudeUsage {
     output_tokens: u64,
     #[serde(default)]
     cache_creation: ClaudeCacheCreation,
+    /// Anthropic API 於 usage 回報的推論速度（`standard` / `fast`）；
+    /// Fast Mode 的模型名稱與標準模式相同，計價卻為 2x，必須另外辨識。
+    #[serde(default)]
+    speed: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -160,6 +164,25 @@ fn extract_claude_user_prompt_for_session_name(raw_text: &str) -> Option<String>
     Some(trimmed.to_string())
 }
 
+/// Fast Mode 回合在 `message.model` 仍是標準模型名稱（例如 `claude-opus-5-5`），
+/// 僅由 `usage.speed == "fast"` 區分；此處補上 `-fast` 後綴，讓價格規則能對應到
+/// `Claude Opus 5.5-fast` 這類 2x 計價條目。
+fn apply_claude_speed_suffix(model: Option<String>, speed: Option<&str>) -> Option<String> {
+    let is_fast = speed
+        .map(str::trim)
+        .is_some_and(|speed| speed.eq_ignore_ascii_case("fast"));
+    if !is_fast {
+        return model;
+    }
+    model.map(|model| {
+        if model.to_ascii_lowercase().ends_with("-fast") {
+            model
+        } else {
+            format!("{model}-fast")
+        }
+    })
+}
+
 pub(super) fn parse_claude_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String> {
     let file = File::open(filepath).map_err(|e| format!("無法開啟檔案: {}", e))?;
     let reader = BufReader::new(file);
@@ -293,10 +316,13 @@ pub(super) fn parse_claude_session_file(filepath: &Path) -> Result<Vec<UsageEntr
             total,
         };
 
-        let model = message
-            .get("model")
-            .and_then(|model| model.as_str())
-            .map(|model| model.to_string());
+        let model = apply_claude_speed_suffix(
+            message
+                .get("model")
+                .and_then(|model| model.as_str())
+                .map(|model| model.to_string()),
+            usage.speed.as_deref(),
+        );
 
         if let Some(&existing_idx) = seen_response_indices.get(response_key) {
             if let Some(existing) = results.get_mut(existing_idx) {
@@ -509,6 +535,52 @@ mod tests {
         assert_eq!(tokens.cache_write_5m, Some(3));
         assert_eq!(tokens.cache_write_1h, Some(0));
         assert_eq!(tokens.total, 25);
+    }
+
+    #[test]
+    fn apply_claude_speed_suffix_only_marks_fast_mode() {
+        assert_eq!(
+            apply_claude_speed_suffix(Some("claude-opus-5-5".to_string()), Some("fast")),
+            Some("claude-opus-5-5-fast".to_string())
+        );
+        assert_eq!(
+            apply_claude_speed_suffix(Some("claude-opus-5-5".to_string()), Some(" FAST ")),
+            Some("claude-opus-5-5-fast".to_string())
+        );
+        assert_eq!(
+            apply_claude_speed_suffix(Some("claude-opus-5-5-fast".to_string()), Some("fast")),
+            Some("claude-opus-5-5-fast".to_string())
+        );
+        assert_eq!(
+            apply_claude_speed_suffix(Some("claude-opus-5-5".to_string()), Some("standard")),
+            Some("claude-opus-5-5".to_string())
+        );
+        assert_eq!(
+            apply_claude_speed_suffix(Some("claude-opus-5-5".to_string()), None),
+            Some("claude-opus-5-5".to_string())
+        );
+        assert_eq!(apply_claude_speed_suffix(None, Some("fast")), None);
+    }
+
+    #[test]
+    fn parse_claude_session_file_marks_fast_mode_turns_for_pricing() {
+        let path = temp_jsonl_path("claude-fast-mode");
+        let content = r#"{"type":"assistant","sessionId":"session-fast","timestamp":"2026-10-10T01:00:00.000Z","uuid":"a1","requestId":"req_fast","message":{"id":"msg_fast","role":"assistant","model":"claude-opus-5-5","content":[{"type":"text","text":"Fast"}],"usage":{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":5,"speed":"fast"}}}
+{"type":"assistant","sessionId":"session-fast","timestamp":"2026-10-10T01:00:01.000Z","uuid":"a2","requestId":"req_standard","message":{"id":"msg_standard","role":"assistant","model":"claude-opus-5-5","content":[{"type":"text","text":"Standard"}],"usage":{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":5,"speed":"standard"}}}
+{"type":"assistant","sessionId":"session-fast","timestamp":"2026-10-10T01:00:02.000Z","uuid":"a3","requestId":"req_legacy","message":{"id":"msg_legacy","role":"assistant","model":"claude-opus-5-5","content":[{"type":"text","text":"Legacy"}],"usage":{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":5}}}
+"#;
+
+        fs::write(&path, content).unwrap();
+        let entries = parse_claude_session_file(&path).unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].model.as_deref(), Some("claude-opus-5-5-fast"));
+        assert_eq!(entries[0].model_id.as_deref(), Some("claude-opus-5-5-fast"));
+        assert_eq!(entries[1].model.as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(entries[1].model_id.as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(entries[2].model.as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(entries[2].model_id.as_deref(), Some("claude-opus-5-5"));
     }
 
     #[test]
