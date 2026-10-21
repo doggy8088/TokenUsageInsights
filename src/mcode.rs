@@ -256,7 +256,7 @@ pub(crate) fn assistant_usage(message: &Value) -> Option<TokenStats> {
 
 /// A reported cost of `0` means the provider did not bill the call (MiniMax
 /// Code's own ledger records `cost.total == 0` for custom providers), so it is
-/// dropped and `pricing.csv` estimation is used instead.
+/// dropped and pricing estimation is used instead.
 fn reported_cost_usd(usage: &Value) -> Option<f64> {
     crate::pi::parse_reported_cost(usage).filter(|value| *value > 0.0)
 }
@@ -554,7 +554,7 @@ mod tests {
         assert_eq!(tokens.total, 18_776);
         assert!(
             entry.cost.is_none(),
-            "cost.total == 0 must fall back to pricing.csv estimation"
+            "cost.total == 0 must fall back to pricing estimation"
         );
         assert_eq!(entry.delta_tokens.as_ref().unwrap().total, 18_776);
     }

@@ -425,6 +425,7 @@ function Restore-ServiceBackup {
             "token-usage-insights",
             "token-usage-insights.exe",
             "static",
+            "model_prices_and_context_window.json",
             "pricing.csv",
             "shell",
             "scripts",

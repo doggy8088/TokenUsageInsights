@@ -29,7 +29,7 @@ function Invoke-GetScriptInstallCapture {
     $capturePath = Join-Path $tempRoot "install-args.json"
     New-Item -ItemType Directory -Force -Path (Join-Path $releaseDir "static") | Out-Null
 
-    Set-Content -LiteralPath (Join-Path $releaseDir "pricing.csv") -Value "model,input,output"
+    Set-Content -LiteralPath (Join-Path $releaseDir "model_prices_and_context_window.json") -Value "model,input,output"
     $fakeInstallScript = @'
 param(
     [string]$InstallDir,
@@ -128,7 +128,7 @@ function Invoke-InstallServiceTest {
     New-Item -ItemType Directory -Force -Path $scriptDir | Out-Null
 
     Set-Content -LiteralPath (Join-Path $releaseDir "token-usage-insights.exe") -Value "binary"
-    Set-Content -LiteralPath (Join-Path $releaseDir "pricing.csv") -Value "model,input,output"
+    Set-Content -LiteralPath (Join-Path $releaseDir "model_prices_and_context_window.json") -Value "model,input,output"
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot "install.ps1") -Destination (Join-Path $scriptDir "install.ps1")
     Set-Content -LiteralPath (Join-Path $scriptDir "run-service.ps1") -Value "Write-Host 'runner'"
     if ($SeedStartupShortcut) {
@@ -927,9 +927,9 @@ if (Restore-ServiceBackup -InstallDir '$traversalInstallDir') { exit 2 } else { 
     $truncatedBackupDir = Join-Path $truncatedInstallDir ".backup"
     New-Item -ItemType Directory -Force -Path $truncatedBackupDir | Out-Null
     Set-Content -LiteralPath (Join-Path $truncatedInstallDir "VERSION") -Value "v0.9.6"
-    Set-Content -LiteralPath (Join-Path $truncatedInstallDir "pricing.csv") -Value "new pricing"
+    Set-Content -LiteralPath (Join-Path $truncatedInstallDir "model_prices_and_context_window.json") -Value "new pricing"
     Set-Content -LiteralPath (Join-Path $truncatedBackupDir "VERSION") -Value "v0.9.5"
-    Set-Content -LiteralPath (Join-Path $truncatedBackupDir ".manifest") -Value "VERSION`npricing.csv"
+    Set-Content -LiteralPath (Join-Path $truncatedBackupDir ".manifest") -Value "VERSION`nmodel_prices_and_context_window.json"
 
     $truncatedTestScript = @"
 `$ErrorActionPreference = 'SilentlyContinue'
@@ -939,7 +939,7 @@ if (Restore-ServiceBackup -InstallDir '$truncatedInstallDir') { exit 2 } else { 
     $truncatedExit = Invoke-ScopedScript -ScriptText $truncatedTestScript -Name "manifest-truncated"
     Assert-Equal 0 $truncatedExit "Restore-ServiceBackup should fail closed when a manifest entry is missing from the backup."
     Assert-Equal "v0.9.6" ((Get-Content -LiteralPath (Join-Path $truncatedInstallDir "VERSION") -Raw).Trim()) "Restore-ServiceBackup must not partially restore a truncated backup."
-    Assert-Equal "new pricing" ((Get-Content -LiteralPath (Join-Path $truncatedInstallDir "pricing.csv") -Raw).Trim()) "Restore-ServiceBackup must not touch the install directory when the backup is truncated."
+    Assert-Equal "new pricing" ((Get-Content -LiteralPath (Join-Path $truncatedInstallDir "model_prices_and_context_window.json") -Raw).Trim()) "Restore-ServiceBackup must not touch the install directory when the backup is truncated."
 
     # 5c-2. Restore-ServiceBackup 必須拒絕缺少基準項目（執行檔／static）的截斷清單
     $baselineRoot = Join-Path $Root "manifest-baseline-tests"

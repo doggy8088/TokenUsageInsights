@@ -77,7 +77,7 @@ test('finds and copies the complete dashboard release payload', () => {
     mkdirSync(join(release, 'static'), { recursive: true });
     mkdirSync(join(release, 'shell'), { recursive: true });
     writeFileSync(join(release, 'token-usage-insights'), 'binary');
-    writeFileSync(join(release, 'pricing.csv'), 'model,price');
+    writeFileSync(join(release, 'model_prices_and_context_window.json'), '{}');
     writeFileSync(join(release, 'static', 'index.html'), '<main></main>');
     writeFileSync(join(release, 'shell', 'statusline-token.sh'), '#!/bin/sh');
 
@@ -209,7 +209,7 @@ test('Windows zip fallback script extracts archives and rejects unsafe entries',
     mkdirSync(join(source, 'static'), { recursive: true });
     writeFileSync(join(source, 'token-usage-insights.exe'), 'bin');
     writeFileSync(join(source, 'static', 'app.css'), 'css');
-    writeFileSync(join(source, 'pricing.csv'), 'pricing');
+    writeFileSync(join(source, 'model_prices_and_context_window.json'), '{}');
     const archive = join(directory, 'release.zip');
     const zip = spawnSync(
       'pwsh',

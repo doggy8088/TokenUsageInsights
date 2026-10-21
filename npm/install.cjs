@@ -176,7 +176,7 @@ function isReleaseRoot(directory, executableName = EXECUTABLE_NAME) {
   return (
     existsSync(join(directory, executableName)) &&
     existsSync(join(directory, 'static')) &&
-    existsSync(join(directory, 'pricing.csv'))
+    existsSync(join(directory, 'model_prices_and_context_window.json'))
   );
 }
 
@@ -187,7 +187,7 @@ function findReleaseRoot(directory, executableName = EXECUTABLE_NAME) {
     const candidate = join(directory, entry.name);
     if (isReleaseRoot(candidate, executableName)) return candidate;
   }
-  throw new Error('GitHub Release 壓縮包缺少執行檔、static 或 pricing.csv');
+  throw new Error('GitHub Release 壓縮包缺少執行檔、static 或 model_prices_and_context_window.json');
 }
 
 function copyReleaseContents(source, destination, executableName = EXECUTABLE_NAME) {
@@ -210,7 +210,7 @@ function installFromLocalBuild() {
   mkdirSync(INSTALL_DIR, { recursive: true });
   copyFileSync(localBinary, join(INSTALL_DIR, EXECUTABLE_NAME));
   chmodSync(join(INSTALL_DIR, EXECUTABLE_NAME), 0o755);
-  for (const item of ['static', 'shell', 'scripts', 'pricing.csv', 'README.md', 'LICENSE']) {
+  for (const item of ['static', 'shell', 'scripts', 'model_prices_and_context_window.json', 'README.md', 'LICENSE']) {
     const source = join(PACKAGE_ROOT, item);
     if (existsSync(source)) {
       cpSync(source, join(INSTALL_DIR, item), { recursive: true, force: true });

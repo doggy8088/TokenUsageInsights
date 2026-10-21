@@ -1364,8 +1364,11 @@ pub(crate) fn detect_environment_with_path(exe_path: &Path) -> EnvironmentKind {
     }
 
     // 5. 兼容舊版既有自訂安裝（在引入 .install_marker 之前建立的安裝目錄）：
-    // 若目錄包含完整必要資產（pricing.csv, VERSION, static/index.html）
-    let has_installed_assets = exe_dir.join("pricing.csv").is_file()
+    // 若目錄包含完整必要資產（pricing 檔案, VERSION, static/index.html）
+    let has_installed_assets = (exe_dir
+        .join("model_prices_and_context_window.json")
+        .is_file()
+        || exe_dir.join("pricing.csv").is_file())
         && exe_dir.join("VERSION").is_file()
         && exe_dir.join("static").join("index.html").is_file();
 
@@ -2259,6 +2262,7 @@ const MANAGED_ITEMS: &[&str] = &[
     #[cfg(windows)]
     "token-usage-insights.exe",
     "static",
+    "model_prices_and_context_window.json",
     "pricing.csv",
     "shell",
     "scripts",
@@ -3100,7 +3104,7 @@ pub(crate) async fn run_update_in_dir(
             let required_items = [
                 exec_name.as_str(),
                 "static",
-                "pricing.csv",
+                "model_prices_and_context_window.json",
                 "VERSION",
                 "scripts",
                 "shell",
@@ -4161,7 +4165,7 @@ if ($startupSuccess) {
     if ($backupSafe -and (Test-Path -LiteralPath $manifestPath)) {
         try {
             $originalItems = @(Get-Content -LiteralPath $manifestPath | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-            $managedItems = @('token-usage-insights', 'token-usage-insights.exe', 'static', 'pricing.csv', 'shell', 'scripts', 'install.sh', 'install.ps1', 'VERSION', 'README.md', 'LICENSE', '.install_marker', '.service.env')
+            $managedItems = @('token-usage-insights', 'token-usage-insights.exe', 'static', 'model_prices_and_context_window.json', 'pricing.csv', 'shell', 'scripts', 'install.sh', 'install.ps1', 'VERSION', 'README.md', 'LICENSE', '.install_marker', '.service.env')
             # 驗證備份清單僅包含受管理項目，防範遭竄改的清單以相對或絕對路徑跳出安裝目錄
             foreach ($rel in $originalItems) {
                 if ($managedItems -notcontains $rel) {
@@ -7832,7 +7836,7 @@ update_check_interval: 5 # check every 5 days
         let prefix = format!("{APP_NAME}-v{version}-{target}");
         let mut files: Vec<(&str, &[u8], u32)> = vec![
             ("VERSION", version.as_bytes(), 0o644),
-            ("pricing.csv", b"model,input,output\ntest,1,2\n", 0o644),
+            ("model_prices_and_context_window.json", b"{}\n", 0o644),
             ("README.md", b"# Updated", 0o644),
             ("LICENSE", b"MIT", 0o644),
             ("static/index.html", b"<h1>Dashboard</h1>", 0o644),
@@ -7942,8 +7946,8 @@ update_check_interval: 5 # check every 5 days
         )
         .unwrap();
         fs::write(
-            install_dir.join("pricing.csv"),
-            "model,input,output\nold,1,2\n",
+            install_dir.join("model_prices_and_context_window.json"),
+            "{}",
         )
         .unwrap();
 
@@ -7991,7 +7995,9 @@ update_check_interval: 5 # check every 5 days
         let updated_version = fs::read_to_string(install_dir.join("VERSION")).unwrap();
         assert_eq!(updated_version.trim(), new_version);
         assert!(install_dir.join("static").join("index.html").exists());
-        assert!(install_dir.join("pricing.csv").exists());
+        assert!(install_dir
+            .join("model_prices_and_context_window.json")
+            .exists());
         assert!(install_dir.join(".install_marker").exists());
         assert!(
             !install_dir.join(".backup").exists(),
@@ -8016,8 +8022,8 @@ update_check_interval: 5 # check every 5 days
         )
         .unwrap();
         fs::write(
-            install_dir.join("pricing.csv"),
-            "model,input,output\noriginal,1,2\n",
+            install_dir.join("model_prices_and_context_window.json"),
+            "original",
         )
         .unwrap();
 
@@ -8064,7 +8070,8 @@ update_check_interval: 5 # check every 5 days
         // 驗證原版本檔案完好如初
         let current_version = fs::read_to_string(install_dir.join("VERSION")).unwrap();
         assert_eq!(current_version.trim(), "0.9.0");
-        let pricing = fs::read_to_string(install_dir.join("pricing.csv")).unwrap();
+        let pricing =
+            fs::read_to_string(install_dir.join("model_prices_and_context_window.json")).unwrap();
         assert!(pricing.contains("original"));
 
         let _ = fs::remove_dir_all(&temp);
@@ -8117,6 +8124,11 @@ update_check_interval: 5 # check every 5 days
         fs::write(
             install_dir.join(".install_marker"),
             "token-usage-insights:installed",
+        )
+        .unwrap();
+        fs::write(
+            install_dir.join("model_prices_and_context_window.json"),
+            "{}",
         )
         .unwrap();
 

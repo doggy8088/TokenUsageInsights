@@ -402,7 +402,7 @@ if (!(Test-Path $BinarySrc)) {
     throw "Missing executable: $BinarySrc. Run this installer from an extracted Token 戰情室 release package."
 }
 
-foreach ($RequiredItem in @("static", "pricing.csv")) {
+foreach ($RequiredItem in @("static", "model_prices_and_context_window.json")) {
     if (!(Test-Path (Join-Path $ReleaseDir $RequiredItem))) {
         throw "Incomplete release package: missing $RequiredItem in $ReleaseDir"
     }
@@ -564,7 +564,7 @@ if ($PSCmdlet.ShouldProcess($InstallDir, "Install Token Usage Insights")) {
         }
     }
 
-    foreach ($File in @("pricing.csv", "README.md", "LICENSE", "VERSION")) {
+    foreach ($File in @("model_prices_and_context_window.json", "README.md", "LICENSE", "VERSION")) {
         $Source = Join-Path $ReleaseDir $File
         if (Test-Path $Source) {
             Copy-Item -Force $Source (Join-Path $InstallDir $File)

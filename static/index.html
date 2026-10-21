@@ -1372,7 +1372,7 @@ cd TokenUsageInsights</code></pre>
 
         <div class="modal-section">
           <h3 data-i18n="gemini_setup_step_3"><span>03</span> 3. 了解計費資料來源</h3>
-          <p class="modal-text" data-i18n="gemini_setup_step_3_desc">本看板會依 session 記錄的 Token 與快取用量，對照 <code>pricing.csv</code> 的 Google AI 模型單價即時估算費用；並自動解析思考（Reasoning）Token 與工具呼叫時間軸。</p>
+          <p class="modal-text" data-i18n="gemini_setup_step_3_desc">本看板會依 session 記錄的 Token 與快取用量，對照 開源 LiteLLM 模型價格資料庫 的 Google AI 模型單價即時估算費用；並自動解析思考（Reasoning）Token 與工具呼叫時間軸。</p>
         </div>
       </div>
 
@@ -1460,7 +1460,7 @@ cd TokenUsageInsights</code></pre>
 
         <div class="modal-section">
           <h3 data-i18n="mcode_setup_step_3"><span>03</span> 3. 了解計費資料來源</h3>
-          <p class="modal-text" data-i18n="mcode_setup_step_3_desc">MiniMax Code 的本地日誌未提供費用欄位，本看板會依 session 回報的 Token 數量，對照 <code>pricing.csv</code> 的模型單價估算費用；工作目錄與 Session 名稱則取自 MiniMax Code 的 runtime 資料庫。</p>
+          <p class="modal-text" data-i18n="mcode_setup_step_3_desc">MiniMax Code 的本地日誌未提供費用欄位，本看板會依 session 回報的 Token 數量，對照 開源 LiteLLM 模型價格資料庫 的模型單價估算費用；工作目錄與 Session 名稱則取自 MiniMax Code 的 runtime 資料庫。</p>
         </div>
       </div>
     </div>
@@ -1477,7 +1477,7 @@ cd TokenUsageInsights</code></pre>
       </div>
       <div class="modal-body">
         <p class="modal-text" style="margin-bottom: 16px;" data-i18n="pricing_intro">
-          此費用為本地估算，單價依據 <code>pricing.csv</code> 載入。單位為 1M Tokens (每百萬個 Token) 的美金價格。<br><strong style="color: var(--neon-gold, #fbbf24);">註：此為預估試算僅供參考。</strong>
+          此費用為本地估算，單價依據 開源 LiteLLM 模型價格資料庫 載入。單位為 1M Tokens (每百萬個 Token) 的美金價格。<br><strong style="color: var(--neon-gold, #fbbf24);">註：此為預估試算僅供參考。</strong>
         </p>
         <div class="table-wrapper">
           <table class="premium-table">

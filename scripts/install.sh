@@ -70,7 +70,7 @@ for item in static shell scripts; do
   fi
 done
 
-for file in pricing.csv README.md LICENSE VERSION; do
+for file in model_prices_and_context_window.json README.md LICENSE VERSION; do
   if [[ -f "${release_dir}/${file}" ]]; then
     cp "${release_dir}/${file}" "${install_dir}/${file}"
   fi

@@ -96,7 +96,7 @@ Windows 預設使用下列原生路徑：
 - 每日、月度、年度 Token 統計
 - 「全部 Agent」合併檢視：彙總整台電腦所有 Coding Agent 的 Token 用量與估算費用，並列出各 Agent 佔比與依 Agent 堆疊的每日／每月趨勢
 - 輸入、輸出、快取讀取、快取寫入、推理 Token 分拆
-- 依 `pricing.csv` 進行本地估算費用
+- 依開源 LiteLLM 資料庫（`model_prices_and_context_window.json`）進行本地費用估算，支援自動更新
 - Session 數、請求次數與 API 耗時統計
 - 模型使用量排名
 - Cursor 可由本機 `state.vscdb` 的 `agentKv` 記錄歸因至具體模型；無法唯一比對時保留為 `Unknown Model`
@@ -340,7 +340,7 @@ Cursor 會將對話與 Agent transcript 保存於專案目錄下。看板也會�
 3. 在左側選擇 Cursor。
 4. 按右上角同步按鈕，或等待背景同步。
 
-Cursor 本機資料不包含精確 Token 或官方帳務明細，因此 Token 依文字內容估算；只有在 `pricing.csv` 存在對應模型時才會估算費用，結果不等同官方帳單。非預設資料位置可使用 `CURSOR_DIR` 與 `CURSOR_STATE_DB` 指定。
+Cursor 本機資料不包含精確 Token 或官方帳務明細，因此 Token 依文字內容估算；只有在模型價格表（LiteLLM 開源資料庫）存在對應模型時才會估算費用，結果不等同官方帳單。非預設資料位置可使用 `CURSOR_DIR` 與 `CURSOR_STATE_DB` 指定。
 
 * * *
 
@@ -361,7 +361,7 @@ Gemini CLI 會將各專案的 Session 儲存在 `~/.gemini/tmp` 下的專案目�
 3. 在左側選擇 Gemini CLI。
 4. 按右上角同步按鈕，或等待背景同步。
 
-本看板會依 session 記錄的 Token 與快取用量，對照 `pricing.csv` 的 Google AI 模型單價即時估算費用；非預設資料位置可使用 `GEMINI_DIR` 指定包含 `tmp` 的根目錄。
+本看板會依 session 記錄的 Token 與快取用量，對照 LiteLLM 開源資料庫的 Google AI 模型單價即時估算費用；非預設資料位置可使用 `GEMINI_DIR` 指定包含 `tmp` 的根目錄。
 
 * * *
 
@@ -384,7 +384,7 @@ Gemini CLI 會將各專案的 Session 儲存在 `~/.gemini/tmp` 下的專案目�
 3. 在左側選擇 Grok Build。
 4. 按右上角同步按鈕，或等待背景同步。
 
-Grok Build Session 可能只提供 context token snapshot，也可能包含 provider usage 與成本。看板會優先使用 provider usage/cost；只有 context snapshot 時，費用會依 `pricing.csv` 的 xAI API 價格估算，並在 Session 清單標示 `Context`，不代表 SuperGrok 或其他訂閱方案的週配額。
+Grok Build Session 可能只提供 context token snapshot，也可能包含 provider usage 與成本。看板會優先使用 provider usage/cost；只有 context snapshot 時，費用會依 LiteLLM 開源資料庫的 xAI API 價格估算，並在 Session 清單標示 `Context`，不代表 SuperGrok 或其他訂閱方案的週配額。
 
 * * *
 
@@ -447,7 +447,7 @@ Muse Code 會將 Session 依日期與 Session ID 分層保存為 `session.jsonl`
 3. 在左側選擇 Muse Code。
 4. 按右上角同步按鈕，或等待背景同步。
 
-Muse Code 的費用會依 Session 回報的模型與 `pricing.csv` 估算。若資料不在預設位置，可設定 `MUSE_DIR` 指向包含 `sessions` 的 Muse Code 資料目錄。
+Muse Code 的費用會依 Session 回報的模型與 LiteLLM 開源資料庫估算。若資料不在預設位置，可設定 `MUSE_DIR` 指向包含 `sessions` 的 Muse Code 資料目錄。
 
 * * *
 
@@ -468,7 +468,7 @@ MiniMax Code 會將每個 Session 依年份、月份與日期分層保存，並�
 3. 在左側選擇 MiniMax Code。
 4. 按右上角同步按鈕，或等待背景同步。
 
-MiniMax Code 的本地日誌不提供費用欄位，因此本看板會依 Session 回報的 Token 數量，對照 `pricing.csv` 的模型單價估算費用。工作目錄與 Session 名稱會以唯讀方式讀取 MiniMax Code 執行期的 `runtime-state.sqlite` 取得，本專案不會寫入或修改該資料庫。若資料不在預設位置，可設定 `MCODE_DIR` 指向包含 `sessions` 的 MiniMax Code 資料目錄。
+MiniMax Code 的本地日誌不提供費用欄位，因此本看板會依 Session 回報的 Token 數量，對照 LiteLLM 開源資料庫的模型單價估算費用。工作目錄與 Session 名稱會以唯讀方式讀取 MiniMax Code 執行期的 `runtime-state.sqlite` 取得，本專案不會寫入或修改該資料庫。若資料不在預設位置，可設定 `MCODE_DIR` 指向包含 `sessions` 的 MiniMax Code 資料目錄。
 
 * * *
 
@@ -888,6 +888,9 @@ token-usage-insights update --check
 token-usage-insights update
 token-usage-insights update --force
 token-usage-insights update --target-version v1.6.7
+
+# 從 LiteLLM 開源儲存庫下載並更新最新模型價格資料庫
+token-usage-insights pricing update
 ```
 
 環境變數可控制版本與安裝路徑（皆為選用）：
@@ -911,7 +914,7 @@ Invoke-WebRequest -Uri https://raw.githubusercontent.com/doggy8088/TokenUsageIns
 
 - 單一平台可執行檔
 - `static/` 前端資產
-- `pricing.csv` 模型費用表
+- `model_prices_and_context_window.json` 模型費用表（來自 LiteLLM 開源資料庫）
 - `shell/` 目錄下的 Status Line 與服務腳本
 - `scripts/` 目錄（含 `install.sh`、`install.ps1`、`get.sh`、`get.ps1`、`run-service.ps1`）
 - README、LICENSE 與 VERSION
@@ -955,7 +958,7 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1 -Service
 `Release` workflow 在 PR、`main` 推送與版本標籤推送時執行相同的四平台驗證，涵蓋 Linux x86_64、Intel macOS、Apple Silicon macOS 與 Windows x86_64。除了 Rust 測試與零警告 release 建置，也會實際執行對應的安裝腳本（`install.sh` / `install.ps1`），安裝後啟動可執行檔並確認：
 
 - 服務會在指定埠號回應 `/api/<assistant>/pricing`
-- 回應內容確實載入了套件內的 `pricing.csv`
+- 回應內容確實載入了套件內的模型定價資料
 - 全新的 `INSIGHTS_DIR` 會被建立並產生 SQLite 資料庫
 
 `get.sh` 與 `get.ps1` 也會在每次建置時先做語法檢查（`bash -n` 與 PowerShell AST 剖析），確保推送到 Release 的版本可以正常執行。
@@ -1127,7 +1130,7 @@ src/                 Rust 後端、API、SQLite 同步、價格與時間軸解�
 static/              前端 HTML、JavaScript、CSS 與圖片資產
 shell/               Bash/PowerShell Status Line collector 與 systemd 服務範本
 scripts/             Linux/macOS、Windows 安裝與 Windows smoke test
-pricing.csv          模型價格表，本地估算費用依此檔案載入
+model_prices_and_context_window.json  LiteLLM 開源模型價格表，本地估算費用依此檔案載入並支援自動更新
 ```
 
 * * *

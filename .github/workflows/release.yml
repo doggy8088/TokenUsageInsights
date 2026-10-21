@@ -150,7 +150,7 @@ jobs:
           cp scripts/install.ps1 "$stage/install.ps1"
           chmod +x "$stage/install.sh"
 
-          for file in pricing.csv README.md LICENSE; do
+          for file in model_prices_and_context_window.json README.md LICENSE; do
             if [[ -f "$file" ]]; then
               cp "$file" "$stage/$file"
             fi
@@ -217,7 +217,7 @@ jobs:
 
           entry_count="$(printf '%s' "$response" | grep -o '"model_name"' | wc -l | tr -d ' ')"
           if [[ "$entry_count" -le 4 ]]; then
-            echo "Installed release did not load the packaged pricing.csv (got ${entry_count} entries)." >&2
+            echo "Installed release did not load the packaged pricing data (got ${entry_count} entries)." >&2
             exit 1
           fi
 
@@ -261,7 +261,7 @@ jobs:
                 throw 'Installed Windows release did not serve the pricing API.'
               }
               if (@(($response.Content | ConvertFrom-Json)).Count -le 4) {
-                throw 'Installed Windows release did not load the packaged pricing.csv.'
+                throw 'Installed Windows release did not load the packaged pricing data.'
               }
               if (!(Test-Path (Join-Path $env:INSIGHTS_DIR 'token_usage_insights.db'))) {
                 throw 'Installed Windows release did not create a fresh INSIGHTS_DIR.'
@@ -326,7 +326,7 @@ jobs:
 
           - 單一平台可執行檔
           - \`static/\` 前端資產
-          - \`pricing.csv\` 模型費用表
+          - \`model_prices_and_context_window.json\` 模型費用表（來自 LiteLLM 開源資料庫）
           - \`shell/\` 目錄下的 Status Line 與服務腳本
           - \`install.sh\` 與 \`install.ps1\` 安裝腳本
           - README、LICENSE 與 VERSION

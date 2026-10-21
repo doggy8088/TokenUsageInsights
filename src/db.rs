@@ -19815,7 +19815,7 @@ mod tests {
         assert_eq!(cache_read, 1_000);
         assert_eq!(
             reported_cost, None,
-            "cost.total == 0 must fall back to pricing.csv estimation"
+            "cost.total == 0 must fall back to pricing estimation"
         );
 
         let _ = fs::remove_dir_all(root);

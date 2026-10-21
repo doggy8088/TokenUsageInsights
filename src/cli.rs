@@ -18,9 +18,16 @@ const HELP_TEXT: &str = r#"Token 戰情室：看板、使用量匯入 / 匯出�
 
 用途:
   update      更新 Token 戰情室至最新版本（亦可使用 --update 或 -u）
+  pricing     更新或管理模型定價表（從 LiteLLM 開源資料庫下載最新價格）
   export      匯出指定日、月或年的資料為 JSON（可重複匯入且支援重複資料去重）
   export-all  一次匯出資料庫中所有 Agent、所有日期的使用量記錄
   import      匯入 JSON 檔內的所有資料（每筆資料依 timestamp 決定日期）
+
+定價更新:
+  token-usage-insights pricing update [--url <URL>]
+  例如:
+  token-usage-insights pricing update
+
 
 更新:
   token-usage-insights update [參數]
@@ -214,6 +221,7 @@ pub(crate) async fn run(args: &[String]) -> Option<i32> {
         "export-all" => run_export_all(&subcmd_args[1..]).await,
         "import" => run_import(&subcmd_args[1..]).await,
         "update" | "--update" | "-u" => run_update_cli(&subcmd_args[1..]).await,
+        "pricing" => run_pricing_cli(&subcmd_args[1..]).await,
         "-V" | "--version" | "version" => {
             println!("token-usage-insights {}", env!("CARGO_PKG_VERSION"));
             0
@@ -891,6 +899,62 @@ fn print_import_help() {
 
 fn has_help(args: &[String]) -> bool {
     args.iter().any(|arg| arg == "--help" || arg == "-h")
+}
+
+async fn run_pricing_cli(args: &[String]) -> i32 {
+    if args.is_empty() || args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        println!(
+            "Token 戰情室模型定價管理\n\n\
+            用法:\n  \
+            token-usage-insights pricing update [--url <URL>]\n\n\
+            說明:\n  \
+            update   從開源 LiteLLM 儲存庫下載並更新最新的模型價格清單 (model_prices_and_context_window.json)。\n  \
+            --url    自訂價格 JSON 下載網址（省略時預設使用官方 raw.githubusercontent.com 連結）。"
+        );
+        return 0;
+    }
+
+    match args[0].as_str() {
+        "update" => {
+            let mut custom_url = None;
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--url" => {
+                        if i + 1 < args.len() {
+                            custom_url = Some(args[i + 1].clone());
+                            i += 2;
+                        } else {
+                            eprintln!("--url 需要指定網址");
+                            return 1;
+                        }
+                    }
+                    other => {
+                        eprintln!("未知參數：{}", other);
+                        return 1;
+                    }
+                }
+            }
+
+            println!("正在從網路下載最新模型定價表...");
+            match crate::pricing::download_and_update_pricing(custom_url.as_deref()).await {
+                Ok(result) => {
+                    println!("✓ {}", result.message);
+                    println!("儲存路徑: {}", result.file_path);
+                    0
+                }
+                Err(err) => {
+                    eprintln!("✗ 更新定價表失敗: {}", err);
+                    1
+                }
+            }
+        }
+        other => {
+            eprintln!("未知的 pricing 子命令：{}", other);
+            eprintln!("請使用 `token-usage-insights pricing update` 進行更新。");
+            2
+        }
+    }
 }
 
 #[cfg(test)]

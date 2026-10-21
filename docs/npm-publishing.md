@@ -6,7 +6,7 @@
 npx --yes token-usage-insights
 ```
 
-npm 套件本身只包含 JavaScript 啟動器。第一次執行時會從同版本的 GitHub Release 下載目前平台的完整壓縮包，讀取 `SHA256SUMS` 驗證檔案，再安裝原生執行檔、`static`、`shell`、`scripts` 與 `pricing.csv`。後續執行會重用 npm 快取內已驗證的檔案。
+npm 套件本身只包含 JavaScript 啟動器。第一次執行時會從同版本的 GitHub Release 下載目前平台的完整壓縮包，讀取 `SHA256SUMS` 驗證檔案，再安裝原生執行檔、`static`、`shell`、`scripts` 與 `model_prices_and_context_window.json`。後續執行會重用 npm 快取內已驗證的檔案。
 
 此流程不使用 `postinstall`。npm 12 預設不執行相依套件的安裝生命週期腳本，但一般使用者仍可直接執行 `npx --yes token-usage-insights`，不需加入 `--allow-scripts`。
 

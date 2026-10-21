@@ -49,7 +49,7 @@ pub struct UsageDayImportRequest {
     pub records: Vec<UsageDayExportRecord>,
 }
 
-/// API 7: 獲取模型價格清單 ( pricing.csv 資訊)
+/// API 7: 獲取模型價格清單 (LiteLLM 開源模型價格資訊)
 pub async fn get_pricing(Path(assistant): Path<String>) -> impl IntoResponse {
     let assistant = normalize_assistant_name(&assistant);
     if !is_supported_assistant_scope(&assistant) {

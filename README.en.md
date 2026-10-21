@@ -845,7 +845,7 @@ If you do not want to execute a remote script directly, download the archive for
 
 - A single-platform executable
 - Frontend assets in `static/`
-- The model pricing table `pricing.csv`
+- The model pricing table `model_prices_and_context_window.json` (from open-source LiteLLM)
 - Status Line and service scripts in `shell/`
 - The `scripts/` directory (including `install.sh`, `install.ps1`, `get.sh`, `get.ps1`, and `run-service.ps1`)
 - README, LICENSE, and VERSION
@@ -889,7 +889,7 @@ Custom Windows installation location and port:
 The `Release` workflow runs the corresponding installation script (`install.sh` / `install.ps1`) on Linux, macOS, and Windows for every build, then starts the executable and verifies that:
 
 - The service responds to `/api/<assistant>/pricing` on the specified port
-- The response actually loads the `pricing.csv` packaged with the application
+- The response actually loads the model pricing data packaged with the application
 - A new `INSIGHTS_DIR` is created and an SQLite database is generated
 
 `get.sh` and `get.ps1` also undergo syntax checks (`bash -n` and PowerShell AST parsing) before every build, ensuring the version published to the Release can run correctly.
@@ -1049,7 +1049,7 @@ src/                 Rust 後端、API、SQLite 同步、價格與時間軸解�
 static/              前端 HTML、JavaScript、CSS 與圖片資產
 shell/               Bash/PowerShell Status Line collector 與 systemd 服務範本
 scripts/             Linux/macOS、Windows 安裝與 Windows smoke test
-pricing.csv          模型價格表，本地估算費用依此檔案載入
+model_prices_and_context_window.json  Model pricing table from LiteLLM, locally used for cost estimation with auto-update support
 ```
 
 * * *

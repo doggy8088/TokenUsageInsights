@@ -1,7 +1,16 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::BufReader;
 use std::path::PathBuf;
+
+pub const LITELLM_PRICING_FILENAME: &str = "model_prices_and_context_window.json";
+pub const LITELLM_REMOTE_URL: &str =
+    "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
+
+/// 內建 LiteLLM 模型定價 JSON 資料，確保在獨立執行檔或未攜帶外部資原始檔的情況下
+/// 依然具備完整 4,200+ 模型之官方價格規則（包含 gemini-3.8-flash 等）。
+pub const PACKAGED_LITELLM_JSON: &str = include_str!("../model_prices_and_context_window.json");
 
 #[derive(Debug, Clone)]
 pub struct PricingRule {
@@ -11,7 +20,7 @@ pub struct PricingRule {
     pub output_price: f64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PricingEntry {
     pub model_name: String,
     pub deployment_type: String,
@@ -22,8 +31,121 @@ pub struct PricingEntry {
     pub batch_api_price: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct PricingUpdateResult {
+    pub success: bool,
+    pub models_count: usize,
+    pub file_path: String,
+    pub message: String,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct LiteLlmModelEntry {
+    #[serde(default)]
+    pub litellm_provider: Option<String>,
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub input_cost_per_token: Option<f64>,
+    #[serde(default)]
+    pub output_cost_per_token: Option<f64>,
+    #[serde(default)]
+    pub cache_read_input_token_cost: Option<f64>,
+    #[serde(default)]
+    pub cache_creation_input_token_cost: Option<f64>,
+    #[serde(default)]
+    pub output_cost_per_reasoning_token: Option<f64>,
+
+    // Tiered pricing fields
+    #[serde(default)]
+    pub input_cost_per_token_above_100k_tokens: Option<f64>,
+    #[serde(default)]
+    pub input_cost_per_token_above_128k_tokens: Option<f64>,
+    #[serde(default)]
+    pub input_cost_per_token_above_200k_tokens: Option<f64>,
+    #[serde(default)]
+    pub input_cost_per_token_above_272k_tokens: Option<f64>,
+
+    #[serde(default)]
+    pub output_cost_per_token_above_100k_tokens: Option<f64>,
+    #[serde(default)]
+    pub output_cost_per_token_above_128k_tokens: Option<f64>,
+    #[serde(default)]
+    pub output_cost_per_token_above_200k_tokens: Option<f64>,
+    #[serde(default)]
+    pub output_cost_per_token_above_272k_tokens: Option<f64>,
+
+    #[serde(default)]
+    pub cache_read_input_token_cost_above_100k_tokens: Option<f64>,
+    #[serde(default)]
+    pub cache_read_input_token_cost_above_200k_tokens: Option<f64>,
+    #[serde(default)]
+    pub cache_read_input_token_cost_above_272k_tokens: Option<f64>,
+
+    // Batch pricing
+    #[serde(default)]
+    pub input_cost_per_token_batches: Option<f64>,
+    #[serde(default)]
+    pub output_cost_per_token_batches: Option<f64>,
+}
+
 fn fallback_pricing_entries() -> Vec<PricingEntry> {
     vec![
+        PricingEntry {
+            model_name: "Gemini 3.8 Flash".to_string(),
+            deployment_type: "Google AI".to_string(),
+            unit: "1M Tokens".to_string(),
+            input_price: 0.75,
+            cache_input_price: 0.075,
+            output_price: 3.75,
+            batch_api_price: "0.38/1.88".to_string(),
+        },
+        PricingEntry {
+            model_name: "gemini-3.8-flash".to_string(),
+            deployment_type: "Google AI".to_string(),
+            unit: "1M Tokens".to_string(),
+            input_price: 0.75,
+            cache_input_price: 0.075,
+            output_price: 3.75,
+            batch_api_price: "0.38/1.88".to_string(),
+        },
+        PricingEntry {
+            model_name: "Gemini 3.7 Flash".to_string(),
+            deployment_type: "Google AI".to_string(),
+            unit: "1M Tokens".to_string(),
+            input_price: 0.75,
+            cache_input_price: 0.075,
+            output_price: 3.75,
+            batch_api_price: "0.38/1.88".to_string(),
+        },
+        PricingEntry {
+            model_name: "gemini-3.7-flash".to_string(),
+            deployment_type: "Google AI".to_string(),
+            unit: "1M Tokens".to_string(),
+            input_price: 0.75,
+            cache_input_price: 0.075,
+            output_price: 3.75,
+            batch_api_price: "0.38/1.88".to_string(),
+        },
+        PricingEntry {
+            model_name: "Gemini 4 Argon".to_string(),
+            deployment_type: "Google AI".to_string(),
+            unit: "1M Tokens".to_string(),
+            input_price: 2.00,
+            cache_input_price: 0.10,
+            output_price: 10.00,
+            batch_api_price: "N/A".to_string(),
+        },
+        PricingEntry {
+            model_name: "gemini-4-argon".to_string(),
+            deployment_type: "Google AI".to_string(),
+            unit: "1M Tokens".to_string(),
+            input_price: 2.00,
+            cache_input_price: 0.10,
+            output_price: 10.00,
+            batch_api_price: "N/A".to_string(),
+        },
         PricingEntry {
             model_name: "Gemini 3.5 Flash".to_string(),
             deployment_type: "Google AI".to_string(),
@@ -63,38 +185,607 @@ fn fallback_pricing_entries() -> Vec<PricingEntry> {
     ]
 }
 
-pub fn load_pricing_entries() -> Vec<PricingEntry> {
-    let mut entries = Vec::new();
-    let file_path =
-        crate::paths::find_resource("pricing.csv").unwrap_or_else(|| PathBuf::from("pricing.csv"));
-    if let Ok(file) = File::open(&file_path) {
-        let reader = BufReader::new(file);
-        let mut lines = reader.lines();
-        if let Some(Ok(_header)) = lines.next() {
-            for line in lines.map_while(Result::ok) {
-                let parts: Vec<&str> = line.split(',').collect();
-                if parts.len() >= 6 {
-                    let input_price = parts[3].trim().parse::<f64>().unwrap_or(0.0);
-                    let cache_input_price = parts[4].trim().parse::<f64>().unwrap_or(0.0);
-                    let output_price = parts[5].trim().parse::<f64>().unwrap_or(0.0);
-                    entries.push(PricingEntry {
-                        model_name: parts[0].trim().to_string(),
-                        deployment_type: parts[1].trim().to_string(),
-                        unit: parts[2].trim().to_string(),
+fn supplemental_pricing_entries() -> Vec<PricingEntry> {
+    vec![
+        PricingEntry {
+            model_name: "composer-2.5".to_string(),
+            deployment_type: "Cursor".to_string(),
+            unit: "1M Tokens".to_string(),
+            input_price: 0.50,
+            cache_input_price: 0.20,
+            output_price: 2.50,
+            batch_api_price: "N/A".to_string(),
+        },
+        PricingEntry {
+            model_name: "composer-2.5-fast".to_string(),
+            deployment_type: "Cursor".to_string(),
+            unit: "1M Tokens".to_string(),
+            input_price: 3.00,
+            cache_input_price: 0.50,
+            output_price: 15.00,
+            batch_api_price: "N/A".to_string(),
+        },
+        PricingEntry {
+            model_name: "cursor-small".to_string(),
+            deployment_type: "Cursor".to_string(),
+            unit: "1M Tokens".to_string(),
+            input_price: 0.10,
+            cache_input_price: 0.0,
+            output_price: 0.10,
+            batch_api_price: "N/A".to_string(),
+        },
+        PricingEntry {
+            model_name: "Cursor Agent".to_string(),
+            deployment_type: "Cursor".to_string(),
+            unit: "1M Tokens".to_string(),
+            input_price: 3.00,
+            cache_input_price: 0.30,
+            output_price: 15.00,
+            batch_api_price: "N/A".to_string(),
+        },
+        PricingEntry {
+            model_name: "Codex Auto Review".to_string(),
+            deployment_type: "Global".to_string(),
+            unit: "1M Tokens".to_string(),
+            input_price: 0.10,
+            cache_input_price: 0.0,
+            output_price: 0.10,
+            batch_api_price: "N/A".to_string(),
+        },
+        PricingEntry {
+            model_name: "Claude Opus 5.5-fast".to_string(),
+            deployment_type: "Global".to_string(),
+            unit: "1M Tokens".to_string(),
+            input_price: 8.00,
+            cache_input_price: 0.40,
+            output_price: 40.00,
+            batch_api_price: "N/A".to_string(),
+        },
+        PricingEntry {
+            model_name: "Claude Opus 4.8-fast".to_string(),
+            deployment_type: "Global".to_string(),
+            unit: "1M Tokens".to_string(),
+            input_price: 10.00,
+            cache_input_price: 1.00,
+            output_price: 50.00,
+            batch_api_price: "N/A".to_string(),
+        },
+        PricingEntry {
+            model_name: "Claude Opus 4.7-fast".to_string(),
+            deployment_type: "Global".to_string(),
+            unit: "1M Tokens".to_string(),
+            input_price: 10.00,
+            cache_input_price: 1.00,
+            output_price: 50.00,
+            batch_api_price: "N/A".to_string(),
+        },
+        PricingEntry {
+            model_name: "Claude Sonnet 4.6 (Thinking)".to_string(),
+            deployment_type: "Global".to_string(),
+            unit: "1M Tokens".to_string(),
+            input_price: 3.00,
+            cache_input_price: 0.30,
+            output_price: 15.00,
+            batch_api_price: "N/A".to_string(),
+        },
+        PricingEntry {
+            model_name: "Claude Opus 4.6 (Thinking)".to_string(),
+            deployment_type: "Global".to_string(),
+            unit: "1M Tokens".to_string(),
+            input_price: 5.00,
+            cache_input_price: 0.50,
+            output_price: 25.00,
+            batch_api_price: "N/A".to_string(),
+        },
+        PricingEntry {
+            model_name: "Claude Opus 4.6 (Thinking) (<200k)".to_string(),
+            deployment_type: "Global".to_string(),
+            unit: "1M Tokens".to_string(),
+            input_price: 5.00,
+            cache_input_price: 0.50,
+            output_price: 25.00,
+            batch_api_price: "N/A".to_string(),
+        },
+        PricingEntry {
+            model_name: "Claude Opus 4.6 (Thinking) (>200k)".to_string(),
+            deployment_type: "Global".to_string(),
+            unit: "1M Tokens".to_string(),
+            input_price: 10.00,
+            cache_input_price: 1.00,
+            output_price: 37.50,
+            batch_api_price: "N/A".to_string(),
+        },
+        PricingEntry {
+            model_name: "GPT-OSS 120B (Medium)".to_string(),
+            deployment_type: "Local/OSS".to_string(),
+            unit: "1M Tokens".to_string(),
+            input_price: 0.0,
+            cache_input_price: 0.0,
+            output_price: 0.0,
+            batch_api_price: "N/A".to_string(),
+        },
+        PricingEntry {
+            model_name: "MAI-Code-1-Flash".to_string(),
+            deployment_type: "Global".to_string(),
+            unit: "1M Tokens".to_string(),
+            input_price: 0.75,
+            cache_input_price: 0.075,
+            output_price: 4.50,
+            batch_api_price: "N/A".to_string(),
+        },
+        PricingEntry {
+            model_name: "MAI-Code-1.1-Flash".to_string(),
+            deployment_type: "Global".to_string(),
+            unit: "1M Tokens".to_string(),
+            input_price: 0.75,
+            cache_input_price: 0.075,
+            output_price: 4.50,
+            batch_api_price: "N/A".to_string(),
+        },
+        PricingEntry {
+            model_name: "kimi-k3.1-pro".to_string(),
+            deployment_type: "Global".to_string(),
+            unit: "1M Tokens".to_string(),
+            input_price: 2.00,
+            cache_input_price: 0.20,
+            output_price: 10.00,
+            batch_api_price: "N/A".to_string(),
+        },
+        PricingEntry {
+            model_name: "Kimi K3.1 Pro".to_string(),
+            deployment_type: "Global".to_string(),
+            unit: "1M Tokens".to_string(),
+            input_price: 2.00,
+            cache_input_price: 0.20,
+            output_price: 10.00,
+            batch_api_price: "N/A".to_string(),
+        },
+        PricingEntry {
+            model_name: "Gemini 4 Hydrogen".to_string(),
+            deployment_type: "Google AI".to_string(),
+            unit: "1M Tokens".to_string(),
+            input_price: 1.50,
+            cache_input_price: 0.075,
+            output_price: 7.50,
+            batch_api_price: "0.75/0.0375/3.75".to_string(),
+        },
+        PricingEntry {
+            model_name: "Gemini 4 Hydrogen (Low)".to_string(),
+            deployment_type: "Google AI".to_string(),
+            unit: "1M Tokens".to_string(),
+            input_price: 1.50,
+            cache_input_price: 0.075,
+            output_price: 7.50,
+            batch_api_price: "0.75/0.0375/3.75".to_string(),
+        },
+        PricingEntry {
+            model_name: "Gemini 4 Hydrogen (Medium)".to_string(),
+            deployment_type: "Google AI".to_string(),
+            unit: "1M Tokens".to_string(),
+            input_price: 1.50,
+            cache_input_price: 0.075,
+            output_price: 7.50,
+            batch_api_price: "0.75/0.0375/3.75".to_string(),
+        },
+        PricingEntry {
+            model_name: "Gemini 4 Hydrogen (High)".to_string(),
+            deployment_type: "Google AI".to_string(),
+            unit: "1M Tokens".to_string(),
+            input_price: 1.50,
+            cache_input_price: 0.075,
+            output_price: 7.50,
+            batch_api_price: "0.75/0.0375/3.75".to_string(),
+        },
+        PricingEntry {
+            model_name: "Gemini 4 Hydrogen (Extra)".to_string(),
+            deployment_type: "Google AI".to_string(),
+            unit: "1M Tokens".to_string(),
+            input_price: 1.50,
+            cache_input_price: 0.075,
+            output_price: 7.50,
+            batch_api_price: "0.75/0.0375/3.75".to_string(),
+        },
+        PricingEntry {
+            model_name: "Gemini 4 Carbon".to_string(),
+            deployment_type: "Google AI".to_string(),
+            unit: "1M Tokens".to_string(),
+            input_price: 4.00,
+            cache_input_price: 0.20,
+            output_price: 20.00,
+            batch_api_price: "2.00/0.10/10.00".to_string(),
+        },
+        PricingEntry {
+            model_name: "Gemini 4 Carbon (Medium)".to_string(),
+            deployment_type: "Google AI".to_string(),
+            unit: "1M Tokens".to_string(),
+            input_price: 4.00,
+            cache_input_price: 0.20,
+            output_price: 20.00,
+            batch_api_price: "2.00/0.10/10.00".to_string(),
+        },
+        PricingEntry {
+            model_name: "Gemini 4 Carbon (High)".to_string(),
+            deployment_type: "Google AI".to_string(),
+            unit: "1M Tokens".to_string(),
+            input_price: 4.00,
+            cache_input_price: 0.20,
+            output_price: 20.00,
+            batch_api_price: "2.00/0.10/10.00".to_string(),
+        },
+        PricingEntry {
+            model_name: "Gemini 4 Carbon (Low)".to_string(),
+            deployment_type: "Google AI".to_string(),
+            unit: "1M Tokens".to_string(),
+            input_price: 4.00,
+            cache_input_price: 0.20,
+            output_price: 20.00,
+            batch_api_price: "2.00/0.10/10.00".to_string(),
+        },
+    ]
+}
+
+pub fn resolve_pricing_file_path() -> PathBuf {
+    let user_cache = crate::db::get_insights_dir().join(LITELLM_PRICING_FILENAME);
+    if user_cache.is_file() {
+        return user_cache;
+    }
+
+    if let Some(resource) = crate::paths::find_resource(LITELLM_PRICING_FILENAME) {
+        return resource;
+    }
+
+    user_cache
+}
+
+fn is_native_provider_for_model(model_name: &str, provider: &str) -> bool {
+    let lower_model = model_name.to_lowercase();
+    let lower_provider = provider.to_lowercase();
+
+    if lower_model.contains("grok") {
+        return lower_provider == "xai";
+    }
+    if lower_model.contains("claude") {
+        return lower_provider == "anthropic";
+    }
+    if lower_model.contains("gemini") {
+        return lower_provider == "gemini"
+            || lower_provider == "google"
+            || lower_provider.starts_with("vertex_ai");
+    }
+    if lower_model.contains("gpt") || lower_model.starts_with("o1") || lower_model.starts_with("o3")
+    {
+        return lower_provider == "openai" || lower_provider == "chatgpt";
+    }
+    if lower_model.contains("kimi") {
+        return lower_provider == "moonshot";
+    }
+    if lower_model.contains("glm") {
+        return lower_provider == "zai" || lower_provider == "zhipu";
+    }
+    if lower_model.contains("deepseek") {
+        return lower_provider == "deepseek" || lower_provider == "deepseek-ai";
+    }
+    if lower_model.contains("muse") {
+        return lower_provider == "meta";
+    }
+    if lower_model.contains("minimax") || lower_model.contains("m2.") || lower_model.contains("m3")
+    {
+        return lower_provider == "minimax";
+    }
+    if lower_model.contains("mai-code") {
+        return lower_provider == "github_copilot";
+    }
+    if lower_model.contains("mimo") {
+        return lower_provider == "xiaomi_mimo" || lower_provider == "xiaomi";
+    }
+
+    false
+}
+
+fn calculate_provider_priority(model_name: &str, provider: &str) -> u8 {
+    if is_native_provider_for_model(model_name, provider) {
+        return 4;
+    }
+    match provider.to_lowercase().as_str() {
+        "anthropic"
+        | "openai"
+        | "chatgpt"
+        | "google"
+        | "gemini"
+        | "vertex_ai"
+        | "vertex_ai-language-models"
+        | "xai"
+        | "moonshot"
+        | "minimax"
+        | "meta"
+        | "deepseek"
+        | "github_copilot"
+        | "xiaomi_mimo"
+        | "xiaomi" => 3,
+        "cursor" | "global" | "local/oss" => 2,
+        _ => 1,
+    }
+}
+
+pub fn parse_litellm_json<R: std::io::Read>(reader: R) -> Result<Vec<PricingEntry>, String> {
+    let raw_map: HashMap<String, LiteLlmModelEntry> =
+        serde_json::from_reader(reader).map_err(|e| e.to_string())?;
+
+    let mut direct_entries = Vec::with_capacity(raw_map.len());
+    let mut alias_map: HashMap<String, (u8, PricingEntry)> = HashMap::new();
+
+    // 排序 keys 以保證跨平台與測試的確定性
+    let mut sorted_keys: Vec<_> = raw_map.keys().collect();
+    sorted_keys.sort();
+
+    for key in sorted_keys {
+        if key == "sample_spec" || key == "fallback_generalizations" {
+            continue;
+        }
+
+        let entry = &raw_map[key];
+        if entry.input_cost_per_token.is_none() && entry.output_cost_per_token.is_none() {
+            continue;
+        }
+
+        let provider = entry
+            .litellm_provider
+            .clone()
+            .unwrap_or_else(|| "Unknown".to_string());
+        let priority = calculate_provider_priority(key, &provider);
+
+        let input_price = entry.input_cost_per_token.unwrap_or(0.0) * 1_000_000.0;
+        let cache_price = entry.cache_read_input_token_cost.unwrap_or(0.0) * 1_000_000.0;
+        let output_price = entry.output_cost_per_token.unwrap_or(0.0) * 1_000_000.0;
+
+        let batch_price = match (
+            entry.input_cost_per_token_batches,
+            entry.output_cost_per_token_batches,
+        ) {
+            (Some(in_b), Some(out_b)) => format!("{:.2}/{:.2}", in_b * 1e6, out_b * 1e6),
+            _ => "N/A".to_string(),
+        };
+
+        let pe = PricingEntry {
+            model_name: key.clone(),
+            deployment_type: provider.clone(),
+            unit: "1M Tokens".to_string(),
+            input_price,
+            cache_input_price: cache_price,
+            output_price,
+            batch_api_price: batch_price.clone(),
+        };
+
+        direct_entries.push(pe);
+
+        if key == "gpt-5.6-luna" {
+            alias_map.insert(
+                "gpt-reserve".to_string(),
+                (
+                    priority,
+                    PricingEntry {
+                        model_name: "gpt-reserve".to_string(),
+                        deployment_type: provider.clone(),
+                        unit: "1M Tokens".to_string(),
                         input_price,
-                        cache_input_price,
+                        cache_input_price: cache_price,
                         output_price,
-                        batch_api_price: parts
-                            .get(6)
-                            .map_or_else(|| "N/A".to_string(), |value| value.trim().to_string()),
-                    });
+                        batch_api_price: batch_price.clone(),
+                    },
+                ),
+            );
+        }
+
+        // 階梯價格支援
+        let tiers = [
+            (
+                "100k",
+                entry.input_cost_per_token_above_100k_tokens,
+                entry.cache_read_input_token_cost_above_100k_tokens,
+                entry.output_cost_per_token_above_100k_tokens,
+            ),
+            (
+                "128k",
+                entry.input_cost_per_token_above_128k_tokens,
+                None,
+                entry.output_cost_per_token_above_128k_tokens,
+            ),
+            (
+                "200k",
+                entry.input_cost_per_token_above_200k_tokens,
+                entry.cache_read_input_token_cost_above_200k_tokens,
+                entry.output_cost_per_token_above_200k_tokens,
+            ),
+            (
+                "272k",
+                entry.input_cost_per_token_above_272k_tokens,
+                entry.cache_read_input_token_cost_above_272k_tokens,
+                entry.output_cost_per_token_above_272k_tokens,
+            ),
+        ];
+
+        for (tier_name, in_above, cache_above, out_above) in tiers {
+            if in_above.is_some() || out_above.is_some() || cache_above.is_some() {
+                let tiered_in = in_above.map(|v| v * 1e6).unwrap_or(input_price);
+                let tiered_cache = cache_above.map(|v| v * 1e6).unwrap_or(cache_price);
+                let tiered_out = out_above.map(|v| v * 1e6).unwrap_or(output_price);
+
+                direct_entries.push(PricingEntry {
+                    model_name: format!("{key} (<{tier_name})"),
+                    deployment_type: provider.clone(),
+                    unit: "1M Tokens".to_string(),
+                    input_price,
+                    cache_input_price: cache_price,
+                    output_price,
+                    batch_api_price: batch_price.clone(),
+                });
+
+                direct_entries.push(PricingEntry {
+                    model_name: format!("{key} (>{tier_name})"),
+                    deployment_type: provider.clone(),
+                    unit: "1M Tokens".to_string(),
+                    input_price: tiered_in,
+                    cache_input_price: tiered_cache,
+                    output_price: tiered_out,
+                    batch_api_price: batch_price.clone(),
+                });
+
+                if key == "gpt-5.6-luna" {
+                    alias_map.insert(
+                        format!("gpt-reserve (<{tier_name})"),
+                        (
+                            priority,
+                            PricingEntry {
+                                model_name: format!("gpt-reserve (<{tier_name})"),
+                                deployment_type: provider.clone(),
+                                unit: "1M Tokens".to_string(),
+                                input_price,
+                                cache_input_price: cache_price,
+                                output_price,
+                                batch_api_price: batch_price.clone(),
+                            },
+                        ),
+                    );
+
+                    alias_map.insert(
+                        format!("gpt-reserve (>{tier_name})"),
+                        (
+                            priority,
+                            PricingEntry {
+                                model_name: format!("gpt-reserve (>{tier_name})"),
+                                deployment_type: provider.clone(),
+                                unit: "1M Tokens".to_string(),
+                                input_price: tiered_in,
+                                cache_input_price: tiered_cache,
+                                output_price: tiered_out,
+                                batch_api_price: batch_price.clone(),
+                            },
+                        ),
+                    );
+                }
+            }
+        }
+
+        // 短別名登記：僅允許原廠 Provider（priority >= 3，如 "xai/grok-4.7" 或 "meta/muse-spark-1.3" 或 "moonshot/kimi-k3"）登記別名
+        if priority >= 3 {
+            if let Some((prefix, short_name)) = key.split_once('/') {
+                if !short_name.is_empty() {
+                    let lower_short = short_name.to_lowercase();
+                    let should_insert = match alias_map.get(&lower_short) {
+                        None => true,
+                        Some((old_prio, _)) => priority > *old_prio,
+                    };
+
+                    if should_insert {
+                        alias_map.insert(
+                            lower_short.clone(),
+                            (
+                                priority,
+                                PricingEntry {
+                                    model_name: short_name.to_string(),
+                                    deployment_type: provider.clone(),
+                                    unit: "1M Tokens".to_string(),
+                                    input_price,
+                                    cache_input_price: cache_price,
+                                    output_price,
+                                    batch_api_price: batch_price.clone(),
+                                },
+                            ),
+                        );
+
+                        if prefix == "xiaomi_mimo" {
+                            alias_map.insert(
+                                format!("xiaomi/{lower_short}"),
+                                (
+                                    priority,
+                                    PricingEntry {
+                                        model_name: format!("xiaomi/{short_name}"),
+                                        deployment_type: provider.clone(),
+                                        unit: "1M Tokens".to_string(),
+                                        input_price,
+                                        cache_input_price: cache_price,
+                                        output_price,
+                                        batch_api_price: batch_price.clone(),
+                                    },
+                                ),
+                            );
+                        }
+
+                        for (tier_name, in_above, cache_above, out_above) in tiers {
+                            if in_above.is_some() || out_above.is_some() || cache_above.is_some() {
+                                let tiered_in = in_above.map(|v| v * 1e6).unwrap_or(input_price);
+                                let tiered_cache =
+                                    cache_above.map(|v| v * 1e6).unwrap_or(cache_price);
+                                let tiered_out = out_above.map(|v| v * 1e6).unwrap_or(output_price);
+
+                                alias_map.insert(
+                                    format!("{lower_short} (<{tier_name})"),
+                                    (
+                                        priority,
+                                        PricingEntry {
+                                            model_name: format!("{short_name} (<{tier_name})"),
+                                            deployment_type: provider.clone(),
+                                            unit: "1M Tokens".to_string(),
+                                            input_price,
+                                            cache_input_price: cache_price,
+                                            output_price,
+                                            batch_api_price: batch_price.clone(),
+                                        },
+                                    ),
+                                );
+
+                                alias_map.insert(
+                                    format!("{lower_short} (>{tier_name})"),
+                                    (
+                                        priority,
+                                        PricingEntry {
+                                            model_name: format!("{short_name} (>{tier_name})"),
+                                            deployment_type: provider.clone(),
+                                            unit: "1M Tokens".to_string(),
+                                            input_price: tiered_in,
+                                            cache_input_price: tiered_cache,
+                                            output_price: tiered_out,
+                                            batch_api_price: batch_price.clone(),
+                                        },
+                                    ),
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
     }
-    if entries.is_empty() {
-        return fallback_pricing_entries();
+
+    // 依優先度由高到低加入別名，確保原廠排在最前面
+    let mut alias_list: Vec<_> = alias_map.into_values().collect();
+    alias_list.sort_by(|(p1, _), (p2, _)| p2.cmp(p1));
+    for (_prio, pe) in alias_list {
+        direct_entries.push(pe);
     }
+
+    Ok(direct_entries)
+}
+
+pub fn load_pricing_entries() -> Vec<PricingEntry> {
+    let file_path = resolve_pricing_file_path();
+    let mut entries = if let Ok(file) = File::open(&file_path) {
+        let reader = BufReader::new(file);
+        parse_litellm_json(reader).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    if entries.is_empty() {
+        entries = parse_litellm_json(std::io::Cursor::new(PACKAGED_LITELLM_JSON.as_bytes()))
+            .unwrap_or_default();
+    }
+
+    if entries.is_empty() {
+        entries = fallback_pricing_entries();
+    }
+
+    entries.extend(supplemental_pricing_entries());
     entries
 }
 
@@ -110,6 +801,69 @@ pub fn load_pricing_rules() -> Vec<PricingRule> {
         .collect()
 }
 
+pub async fn download_and_update_pricing(
+    custom_url: Option<&str>,
+) -> Result<PricingUpdateResult, String> {
+    let url = custom_url.unwrap_or(LITELLM_REMOTE_URL);
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("無法建立 HTTP 客戶端: {e}"))?;
+
+    let response = client
+        .get(url)
+        .header("User-Agent", "TokenUsageInsights")
+        .send()
+        .await
+        .map_err(|e| format!("無法下載價格資訊 ({url}): {e}"))?;
+
+    if !response.status().is_success() {
+        return Err(format!("下載失敗，HTTP 狀態碼: {}", response.status()));
+    }
+
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| format!("讀取回應內容失敗: {e}"))?;
+
+    let parsed: HashMap<String, serde_json::Value> =
+        serde_json::from_slice(&bytes).map_err(|e| format!("下載內容非合法 LiteLLM JSON: {e}"))?;
+
+    let models_count = parsed
+        .keys()
+        .filter(|k| *k != "sample_spec" && *k != "fallback_generalizations")
+        .count();
+    if models_count < 10 {
+        return Err(format!("下載之價格清單模型數量異常不足 ({models_count})"));
+    }
+
+    let target_dir = crate::db::get_insights_dir();
+    if !target_dir.exists() {
+        std::fs::create_dir_all(&target_dir)
+            .map_err(|e| format!("無法建立目錄 {}: {e}", target_dir.display()))?;
+    }
+
+    let target_file = target_dir.join(LITELLM_PRICING_FILENAME);
+    let temp_file = target_dir.join(format!(
+        "{LITELLM_PRICING_FILENAME}.tmp.{}",
+        std::process::id()
+    ));
+
+    std::fs::write(&temp_file, &bytes)
+        .map_err(|e| format!("無法寫入暫存檔 {}: {e}", temp_file.display()))?;
+
+    std::fs::rename(&temp_file, &target_file)
+        .map_err(|e| format!("無法替換目標檔案 {}: {e}", target_file.display()))?;
+
+    Ok(PricingUpdateResult {
+        success: true,
+        models_count,
+        file_path: target_file.to_string_lossy().to_string(),
+        message: format!("已成功更新 LiteLLM 模型價格表，共載入 {models_count} 個模型。"),
+    })
+}
+
 /// 載入價格規則並完成一次性的標籤解析，供大量聚合的 API 重複使用。
 pub fn load_prepared_pricing_rules() -> PreparedPricingRules {
     PreparedPricingRules::from_rules(load_pricing_rules())
@@ -120,6 +874,26 @@ pub fn load_prepared_pricing_rules() -> PreparedPricingRules {
 struct ThresholdRule {
     is_greater: bool,
     threshold_tokens: u64,
+}
+
+fn strip_reasoning_labels(name: &str) -> String {
+    let mut s = name.to_lowercase();
+    for pattern in [
+        "(extra high)",
+        "(high)",
+        "(medium)",
+        "(low)",
+        "(thinking)",
+        " · high",
+        " · medium",
+        " · low",
+        " · thinking",
+        "-picker",
+        ":cloud",
+    ] {
+        s = s.replace(pattern, "");
+    }
+    s
 }
 
 /// Parse a model/rule label into a normalized base name and optional threshold.
@@ -389,21 +1163,52 @@ impl PreparedPricingRules {
             .saturating_add(priced_cache_write_5m)
             .saturating_add(priced_cache_write_1h);
 
+        let stripped = strip_reasoning_labels(model_name);
+        let (s_base, _) = parse_threshold_rule(&stripped);
+
         // 1. Exact base name match (threshold-aware)
         let matched_index = self
             .find_rule_index(&m_base, prompt_tokens, false)
-            // 2. Fallback: contains base name match
-            .or_else(|| self.find_rule_index(&m_base, prompt_tokens, true));
+            // 2. Exact match on stripped reasoning name (e.g. "Gemini 3.8 Flash (High)" -> "Gemini 3.8 Flash")
+            .or_else(|| {
+                if s_base != m_base {
+                    self.find_rule_index(&s_base, prompt_tokens, false)
+                } else {
+                    None
+                }
+            })
+            // 3. Fallback: contains base name match
+            .or_else(|| self.find_rule_index(&m_base, prompt_tokens, true))
+            .or_else(|| {
+                if s_base != m_base {
+                    self.find_rule_index(&s_base, prompt_tokens, true)
+                } else {
+                    None
+                }
+            });
 
         if let Some(index) = matched_index {
             let r = &self.rules[index];
-            let input_cost = (input as f64 / 1_000_000.0) * r.input_price;
-            let cache_cost = (cache_read as f64 / 1_000_000.0) * r.cache_input_price;
-            let cache_write_5m_cost =
-                (priced_cache_write_5m as f64 / 1_000_000.0) * r.input_price * 1.25;
-            let cache_write_1h_cost =
-                (priced_cache_write_1h as f64 / 1_000_000.0) * r.input_price * 2.0;
-            let output_cost = (output as f64 / 1_000_000.0) * r.output_price;
+            let is_fast_mode = model_name.to_lowercase().contains("fast");
+            let rule_is_fast = r.model_name.to_lowercase().contains("fast");
+            let fast_multiplier = if is_fast_mode && !rule_is_fast {
+                2.0
+            } else {
+                1.0
+            };
+
+            let input_cost = (input as f64 / 1_000_000.0) * r.input_price * fast_multiplier;
+            let cache_cost =
+                (cache_read as f64 / 1_000_000.0) * r.cache_input_price * fast_multiplier;
+            let cache_write_5m_cost = (priced_cache_write_5m as f64 / 1_000_000.0)
+                * r.input_price
+                * 1.25
+                * fast_multiplier;
+            let cache_write_1h_cost = (priced_cache_write_1h as f64 / 1_000_000.0)
+                * r.input_price
+                * 2.0
+                * fast_multiplier;
+            let output_cost = (output as f64 / 1_000_000.0) * r.output_price * fast_multiplier;
             Ok(input_cost + cache_cost + cache_write_5m_cost + cache_write_1h_cost + output_cost)
         } else {
             Err(format!("找不到可用的模型價格規則：{}", model_name))
@@ -746,9 +1551,8 @@ mod tests {
             )
             .unwrap_or_else(|error| panic!("{model_name} should have a pricing rule: {error}"));
 
-            // Peak input 0.30 + cache read 0.006 + output 1.20 = 1.506.
             assert!(
-                (cost - 1.506).abs() < 1e-12,
+                (cost - 0.87).abs() < 1e-12,
                 "unexpected DeepSeek V4.1-Flash cost for {model_name}: {cost}"
             );
         }
@@ -917,7 +1721,8 @@ mod tests {
     fn gpt_daybreak_blue_uses_packaged_pricing() {
         let rules = load_pricing_rules();
 
-        // Identical to gpt-5.6-sol: input 4.00, cache_read 0.40, output 20.00
+        // 1M 輸入 + 1M 輸出 + 1M 快取讀取 = 2M prompt tokens (> 272k 長上下文門檻)
+        // 8.00 + 0.80 + 30.00 = 38.80
         for model_name in [
             "gpt-daybreak-blue-latest",
             "gpt-daybreak-blue",
@@ -935,15 +1740,14 @@ mod tests {
             )
             .unwrap();
 
-            // 4.00 + 0.40 + 20.00 = 24.40
             assert!(
-                (cost - 24.4).abs() < 1e-9,
+                (cost - 38.8).abs() < 1e-9,
                 "unexpected cost for {model_name}: {cost}"
             );
         }
 
         // Regression test for session 01a06d15-a222-7bc2-9c0b-19ec24de2c80 turn 6
-        // input: 227, output: 180, cache_read: 42,886
+        // input: 227, output: 180, cache_read: 42,886 (prompt <= 272k: 4.00 / 0.40 / 20.00)
         let turn_6_cost = calculate_usage_cost(
             &rules,
             Some("gpt-daybreak-blue-latest"),
@@ -1024,9 +1828,9 @@ mod tests {
             )
             .unwrap_or_else(|error| panic!("{model_name} should have a pricing rule: {error}"));
 
-            // input 0.75 + cache read 0.075 + output 4.50 = 5.325
+            // LiteLLM github_copilot/mai-code-1.1-flash: input 0.20 + cache read 0.02 + output 1.20 = 1.42
             assert!(
-                (cost - 5.325).abs() < 1e-9,
+                (cost - 1.42).abs() < 1e-9,
                 "unexpected MAI-Code-1.1-Flash cost for {model_name}: {cost}"
             );
         }
@@ -1131,9 +1935,9 @@ mod tests {
             )
             .unwrap();
 
-            // Standard input 4.00 + cache read 0.20 (95% off) + output 20.00 = 24.20
+            // LiteLLM Google AI: input 2.00 + cache read 0.10 + output 10.00 = 12.10
             assert!(
-                (cost - 24.20).abs() < 1e-9,
+                (cost - 12.10).abs() < 1e-9,
                 "unexpected Gemini 4 Argon cost for {model_name}: {cost}"
             );
         }
@@ -1149,7 +1953,7 @@ mod tests {
             0,
         )
         .expect("Gemini 4 Argon (Medium) turn 1 cost should calculate successfully");
-        let expected_turn_1 = (18_389.0 / 1_000_000.0) * 4.00 + (191.0 / 1_000_000.0) * 20.00;
+        let expected_turn_1 = (18_389.0 / 1_000_000.0) * 2.00 + (191.0 / 1_000_000.0) * 10.00;
         assert!((turn_1_cost - expected_turn_1).abs() < 1e-9);
     }
 
@@ -1176,7 +1980,7 @@ mod tests {
             .unwrap();
 
             assert!(
-                (cost - 9.15).abs() < 1e-9,
+                (cost - 4.575).abs() < 1e-9,
                 "unexpected Gemini 3.8 Flash cost for {model_name}: {cost}"
             );
         }
@@ -1191,9 +1995,9 @@ mod tests {
             0,
         )
         .expect("Gemini 3.8 Flash (High) turn 306 cost should calculate successfully");
-        let expected = (142_420.0 / 1_000_000.0) * 1.50
-            + (129_867.0 / 1_000_000.0) * 0.15
-            + (76_059.0 / 1_000_000.0) * 7.50;
+        let expected = (142_420.0 / 1_000_000.0) * 0.75
+            + (129_867.0 / 1_000_000.0) * 0.075
+            + (76_059.0 / 1_000_000.0) * 3.75;
         assert!((turn_306_cost - expected).abs() < 1e-9);
     }
 
@@ -1214,7 +2018,7 @@ mod tests {
             .unwrap();
 
             assert!(
-                (cost - 9.15).abs() < 1e-9,
+                (cost - 4.575).abs() < 1e-9,
                 "unexpected Gemini 3.7 Flash cost for {model_name}: {cost}"
             );
         }
@@ -1237,7 +2041,7 @@ mod tests {
             .unwrap();
 
             assert!(
-                (cost - 9.15).abs() < 1e-9,
+                (cost - 4.575).abs() < 1e-9,
                 "unexpected Gemini 3.6 Flash cost for {model_name}: {cost}"
             );
         }
@@ -1679,5 +2483,96 @@ mod tests {
         )
         .expect("muse-spark-1.2-contributor should have a pricing rule");
         assert!((contributor_12 - 0.302).abs() < 1e-12);
+    }
+
+    #[test]
+    fn gemini_3_8_flash_calculates_session_turns_with_packaged_and_embedded_fallback() {
+        let rules = load_prepared_pricing_rules();
+
+        // Turn 302: session_id=0ebefcf7-dd4a-4335-baf3-16b07361a867 turn_no=302 model=gemini-3.8-flash
+        let res1 = rules
+            .calculate_usage_cost(Some("gemini-3.8-flash"), 351_731, 33, 0, 0, 0)
+            .expect("turn 302 gemini-3.8-flash cost should calculate successfully");
+        let expected_turn_302 = (351_731.0 / 1_000_000.0) * 0.75 + (33.0 / 1_000_000.0) * 3.75;
+        assert!((res1 - expected_turn_302).abs() < 1e-9);
+
+        // Turn 1: session_id=d6d8e457-39bc-4b97-a658-d6d4c1cab113 turn_no=1 model=Gemini 3.8 Flash (High)
+        let res2 = rules
+            .calculate_usage_cost(Some("Gemini 3.8 Flash (High)"), 14_528, 261, 0, 0, 0)
+            .expect("turn 1 Gemini 3.8 Flash (High) cost should calculate successfully");
+        let expected_turn_1 = (14_528.0 / 1_000_000.0) * 0.75 + (261.0 / 1_000_000.0) * 3.75;
+        assert!((res2 - expected_turn_1).abs() < 1e-9);
+
+        // 驗證內建 PACKAGED_LITELLM_JSON 可獨立解析並包含 gemini-3.8-flash
+        let embedded_entries =
+            parse_litellm_json(std::io::Cursor::new(PACKAGED_LITELLM_JSON.as_bytes()))
+                .expect("packaged LiteLLM JSON should parse cleanly");
+        assert!(
+            embedded_entries
+                .iter()
+                .any(|e| e.model_name == "gemini-3.8-flash"
+                    || e.model_name == "gemini/gemini-3.8-flash"),
+            "embedded JSON must contain gemini-3.8-flash"
+        );
+
+        // 驗證即使完全走 fallback_pricing_entries 也能計算 gemini-3.8-flash
+        let fallback_rules = PreparedPricingRules::from_rules(
+            fallback_pricing_entries()
+                .into_iter()
+                .map(|e| PricingRule {
+                    model_name: e.model_name,
+                    input_price: e.input_price,
+                    cache_input_price: e.cache_input_price,
+                    output_price: e.output_price,
+                })
+                .collect(),
+        );
+        let fb_cost1 = fallback_rules
+            .calculate_usage_cost(Some("gemini-3.8-flash"), 1_000_000, 1_000_000, 0, 0, 0)
+            .expect("fallback rules must support gemini-3.8-flash");
+        assert!((fb_cost1 - 4.50).abs() < 1e-9);
+
+        let fb_cost2 = fallback_rules
+            .calculate_usage_cost(
+                Some("Gemini 3.8 Flash (High)"),
+                1_000_000,
+                1_000_000,
+                0,
+                0,
+                0,
+            )
+            .expect("fallback rules must support Gemini 3.8 Flash (High)");
+        assert!((fb_cost2 - 4.50).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_parse_litellm_json_extracts_models_and_tiers() {
+        let sample_json = r#"{
+            "sample_spec": { "input_cost_per_token": 0.0 },
+            "custom/test-model": {
+                "litellm_provider": "custom",
+                "input_cost_per_token": 0.000001,
+                "output_cost_per_token": 0.000002,
+                "cache_read_input_token_cost": 0.0000001,
+                "input_cost_per_token_above_200k_tokens": 0.000003,
+                "output_cost_per_token_above_200k_tokens": 0.000006
+            }
+        }"#;
+
+        let entries = parse_litellm_json(sample_json.as_bytes()).expect("parse should succeed");
+        assert!(entries.iter().any(|e| e.model_name == "custom/test-model"));
+        assert!(entries
+            .iter()
+            .any(|e| e.model_name == "custom/test-model (<200k)"));
+        assert!(entries
+            .iter()
+            .any(|e| e.model_name == "custom/test-model (>200k)"));
+    }
+
+    #[tokio::test]
+    async fn test_download_pricing_rejects_invalid_content() {
+        // 驗證給予無效內容的 URL 時會拋出 Err 而非 panic
+        let result = download_and_update_pricing(Some("http://127.0.0.1:9/invalid")).await;
+        assert!(result.is_err());
     }
 }
