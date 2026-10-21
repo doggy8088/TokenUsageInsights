@@ -1,6 +1,6 @@
 # Token 战情室
 
-**Token 战情室是本地优先的 AI Coding Agent Token 使用量与会话还原看板。** 它会读取本机上的 Google Antigravity CLI、GitHub Copilot CLI、GitHub Copilot App、GitHub Copilot Chat（VS Code）、Codex Desktop、Codex CLI、Claude Code、Cursor、Grok Build、Pi Coding Agent、OMP、Muse Code 与 MiniMax Code 记录，集中呈现每日、月度、年度的 Token 消耗、缓存使用、推理 Token、估算费用、模型分布、项目目录分布与完整 Session 时间轴。
+**Token 战情室是本地优先的 AI Coding Agent Token 使用量与会话还原看板。** 它会读取本机上的 Google Antigravity CLI、GitHub Copilot CLI、GitHub Copilot App、GitHub Copilot Chat（VS Code）、Codex Desktop、Codex CLI、Claude Code、Cursor、Gemini CLI、Grok Build、Pi Coding Agent、OMP、Muse Code 与 MiniMax Code 记录，集中呈现每日、月度、年度的 Token 消耗、缓存使用、推理 Token、估算费用、模型分布、项目目录分布与完整 Session 时间轴。
 
 本项目不会代你调用 AI 供应商 API 查询数据；核心数据来源是本地日志、Status Line 收集文件与本地 SQLite。
 
@@ -53,13 +53,14 @@ http://localhost:3003
 | Codex Desktop / CLI | 不需要 | `~/.codex/sessions`、`~/.codex/archived_sessions` | 看板会直接扫描 Codex 活动中与已归档的本地 Session 记录 |
 | Claude Code | 不需要 | `~/.claude/projects` | 看板会直接扫描 Claude Code 的本地项目 Session 记录 |
 | Cursor | 不需要 | `~/.cursor/projects` | 看板会直接扫描 Cursor 本地 transcript，并以只读方式获取可归因的模型信息 |
+| Gemini CLI | 不需要 | `~/.gemini/tmp` | 看板会直接扫描 Gemini CLI 自动保存的项目会话 JSONL 文件，并自动解析工作目录与 Token 用量 |
 | Grok Build | 不需要 | `~/.grok/sessions` | 看板会直接扫描 Grok Build 自动保存的 `updates.jsonl` Session stream |
 | Pi Coding Agent | 不需要 | `~/.pi/agent/sessions` | 看板会直接扫描 Pi Coding Agent 自动保存的本地 Session JSONL 文件 |
 | OMP | 不需要 | `~/.omp/agent/sessions` | 看板会直接扫描 OMP 自动保存的本地 Session JSONL 文件 |
 | Muse Code | 不需要 | `~/.local/share/muse/sessions` | 看板会直接扫描 Muse Code 自动保存的本地 Session JSONL 文件 |
 | MiniMax Code | 不需要 | `~/.minimax/v2/sessions` | 看板会直接扫描 MiniMax Code 自动保存的本地 Session JSONL 文件，并以只读方式取得工作目录与 Session 名称 |
 
-**只使用 Copilot App、VS Code Copilot、Codex Desktop、Codex CLI、Claude Code、Cursor、Grok Build、Pi Coding Agent、OMP、Muse Code 或 MiniMax Code 时，执行一行安装命令并打开看板即可。**
+**只使用 Copilot App、VS Code Copilot、Codex Desktop、Codex CLI、Claude Code、Cursor、Gemini CLI、Grok Build、Pi Coding Agent、OMP、Muse Code 或 MiniMax Code 时，执行一行安装命令并打开看板即可。**
 
 ### Windows 原生使用
 
@@ -75,6 +76,7 @@ Windows 默认使用以下原生路径：
 | Codex | `%USERPROFILE%\.codex` |
 | Claude Code | `%USERPROFILE%\.claude` |
 | Cursor | `%USERPROFILE%\.cursor` |
+| Gemini CLI | `%USERPROFILE%\.gemini` |
 | Grok Build | `%USERPROFILE%\.grok` |
 | Pi Coding Agent | `%USERPROFILE%\.pi` |
 | OMP | `%USERPROFILE%\.omp` |
@@ -340,6 +342,27 @@ Cursor 本地数据不包含精确 Token 或官方账单明细，因此 Token �
 
 * * *
 
+## Gemini CLI 设置
+
+**Google Gemini CLI (`@google/gemini-cli`) 不需要安装 Hook、Status Line 或额外收集脚本。** 看板会直接扫描：
+
+```text
+~/.gemini/tmp/<project_hash>/chats/session-*.jsonl
+```
+
+Gemini CLI 会将各项目的 Session 保存在 `~/.gemini/tmp` 下的项目目录中。看板会自动读取 `.project_root` 还原工作目录，并解析提示词、模型思考过程（Thoughts / Reasoning）、工具调用（Tool Calls）与每轮 Token 使用量。
+
+使用方式：
+
+1. 先在终端机中使用 Gemini CLI（`gemini`）创建至少一个 Session。
+2. 启动或刷新本项目看板。
+3. 在左侧选择 Gemini CLI。
+4. 按右上角同步按钮，或等待后台同步。
+
+本看板会根据 session 记录的 Token 与缓存用量，对照 `pricing.csv` 的 Google AI 模型单价即时估算费用；非默认数据位置可使用 `GEMINI_DIR` 指定包含 `tmp` 的根目录。
+
+* * *
+
 ## Grok Build 设置
 
 **Grok Build 不需要安装 Hook、Status Line 或额外收集脚本。** 看板会直接扫描：
@@ -471,7 +494,7 @@ GET /api/:assistant/sync
 
 从 v0.9.0 起，看板与 CLI 已整合为同一个 `token-usage-insights` 可执行文件。不带参数会启动看板，使用 `export`、`export-all`、`import` 子命令可操作数据；主命令与各子命令均支持 `--help`、`-h`。旧版需要更新或从源代码构建。
 
-`--agent` 用于指定助理（`antigravity` / `copilot` / `codex` / `claude` / `cursor` / `grok` / `pi` / `omp` / `muse`）。
+`--agent` 用于指定助理（`antigravity` / `copilot` / `codex` / `claude` / `cursor` / `gemini` / `grok` / `pi` / `omp` / `muse` / `mcode`）。
 
 ### 从源代码使用 CLI
 
@@ -535,6 +558,7 @@ cargo build --release --bin token-usage-insights
 | `CLAUDE_DIR` | `~/.claude` | Claude Code 数据目录 |
 | `CURSOR_DIR` | `~/.cursor` | Cursor 数据目录 |
 | `CURSOR_STATE_DB` | 按平台自动检测 | Cursor `User/globalStorage/state.vscdb` 路径，用于只读获取 `agentKv` 模型信息 |
+| `GEMINI_DIR` | `~/.gemini` | Google Gemini CLI 数据目录，应包含 `tmp` 目录 |
 | `GROK_DIR` | `~/.grok` | Grok Build 数据目录 |
 | `PI_DIR` | `~/.pi` | Pi Coding Agent 数据目录 |
 | `OMP_DIR` | `~/.omp` | OMP 数据目录 |
@@ -571,6 +595,7 @@ additional_sources:
   copilot: ['~/Cloud Drive/laptop/.copilot']
   copilot_app: ['~/Cloud Drive/desktop/.copilot']
   cursor: ['~/Cloud Drive/laptop/.cursor']
+  gemini: ['~/Cloud Drive/laptop/.gemini']
   antigravity: ['~/Cloud Drive/laptop/antigravity-cli']
   grok: ['~/Cloud Drive/laptop/.grok']
   pi: ['~/Cloud Drive/laptop/.pi']
@@ -593,6 +618,7 @@ additional_sources:
 | `claude`、`cursor` | `projects/` |
 | `copilot` | `usage/`、`session-state/`、`session-store.db`；同目录的 App 数据也会导入 |
 | `copilot_app` | 独立 App 目录内的 `data.db`、`session-store.db`、`session-state/` |
+| `gemini` | `tmp/` 或直接包含 `chats/` 的项目目录 |
 | `antigravity` | `brain/` 与 `conversations/` 原生记录；也支持旧版 `usage/` |
 | `grok`、`muse` | `sessions/` |
 | `pi`、`omp` | `agent/sessions/` |

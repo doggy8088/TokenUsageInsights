@@ -98,23 +98,30 @@ fn pi_session(root: &Path, session: &str, input: u64) {
     );
 }
 
-async fn records(client: &reqwest::Client, server: &TestServer, assistant: &str) -> Vec<Value> {
-    client
+async fn try_records(
+    client: &reqwest::Client,
+    server: &TestServer,
+    assistant: &str,
+) -> Option<Vec<Value>> {
+    let response = client
         .get(format!(
             "{}/api/{assistant}/usage/2026-09-11/export",
             server.url
         ))
         .send()
         .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json::<Value>()
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let body = response.json::<Value>().await.ok()?;
+    body["records"].as_array().cloned()
+}
+
+async fn records(client: &reqwest::Client, server: &TestServer, assistant: &str) -> Vec<Value> {
+    try_records(client, server, assistant)
         .await
-        .unwrap()["records"]
-        .as_array()
-        .unwrap()
-        .clone()
+        .expect("records should succeed once server is ready")
 }
 
 /// setup-info 回傳給使用者看的路徑：已 canonicalize，但在 Windows 會去除 `\\?\` verbatim 前綴
@@ -203,6 +210,7 @@ async fn startup_and_manual_sync_reload_extra_homes_without_losing_defaults() {
         "codex",
         "claude",
         "cursor",
+        "gemini",
         "grok",
         "pi",
         "omp",
@@ -234,7 +242,9 @@ async fn startup_and_manual_sync_reload_extra_homes_without_losing_defaults() {
                 if dates["dates"]
                     .as_array()
                     .is_some_and(|dates| !dates.is_empty())
-                    && records(&client, &server, "pi").await.len() == 2
+                    && try_records(&client, &server, "pi")
+                        .await
+                        .is_some_and(|records| records.len() == 2)
                 {
                     break;
                 }

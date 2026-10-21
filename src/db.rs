@@ -608,6 +608,17 @@ pub fn get_cursor_state_db_path() -> PathBuf {
         .unwrap_or_else(|| get_cursor_dir().join("state.vscdb"))
 }
 
+pub fn get_gemini_dir() -> PathBuf {
+    if let Some(path) =
+        crate::paths::env_path("GEMINI_DIR").or_else(|| crate::paths::env_path("GEMINI_CLI_DIR"))
+    {
+        return path;
+    }
+    dirs::home_dir()
+        .map(|home| home.join(".gemini"))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
 pub fn get_grok_dir() -> PathBuf {
     if let Some(path) = crate::paths::env_path("GROK_DIR") {
         return path;
@@ -2341,6 +2352,7 @@ fn source_sync_key(assistant: &str, root: &Path, relative_path: &str) -> String 
         "copilot" => get_copilot_dir(),
         "claude" => get_claude_dir(),
         "cursor" => get_cursor_dir(),
+        "gemini" => get_gemini_dir(),
         "grok" => get_grok_dir(),
         "pi" => get_pi_dir(),
         "omp" => get_omp_dir(),
@@ -5400,6 +5412,31 @@ pub(crate) fn sync_muse_usage_logs_with_cancel(
     )
 }
 
+#[cfg(test)]
+pub(crate) fn sync_gemini_usage_logs(
+    conn: &mut Connection,
+    gemini_dir: &Path,
+) -> Result<(), String> {
+    sync_gemini_usage_logs_with_cancel(conn, gemini_dir, &|| false)
+}
+
+pub(crate) fn sync_gemini_usage_logs_with_cancel(
+    conn: &mut Connection,
+    gemini_dir: &Path,
+    should_cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<(), String> {
+    let session_files = crate::gemini::find_session_files(gemini_dir);
+    sync_pi_family_usage_logs(
+        conn,
+        "gemini",
+        "Gemini CLI",
+        session_files,
+        gemini_dir,
+        crate::gemini::parse_session_usage_file,
+        should_cancel,
+    )
+}
+
 /// Working directory and title of one MiniMax Code runtime session. Both are
 /// read from MiniMax Code's own runtime ledger instead of being guessed from
 /// prompt text.
@@ -5637,6 +5674,7 @@ fn sync_configured_sources_with_cancel(
         Harness::CopilotApp,
         Harness::Codex,
         Harness::Claude,
+        Harness::Gemini,
         Harness::Grok,
         Harness::Pi,
         Harness::Omp,
@@ -5693,6 +5731,7 @@ fn sync_configured_sources_with_cancel(
                 Harness::Claude => {
                     sync_claude_usage_logs_from_with_cancel(conn, root, should_cancel)
                 }
+                Harness::Gemini => sync_gemini_usage_logs_with_cancel(conn, root, should_cancel),
                 Harness::Grok => sync_grok_usage_logs_with_cancel(conn, root, should_cancel),
                 Harness::Pi => sync_pi_usage_logs_with_cancel(conn, root, should_cancel),
                 Harness::Omp => sync_omp_usage_logs_with_cancel(conn, root, should_cancel),

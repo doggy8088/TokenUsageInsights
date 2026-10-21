@@ -38,9 +38,8 @@ const HELP_TEXT: &str = r#"Token 戰情室：看板、使用量匯入 / 匯出�
   -v, --target-version <TAG>  指定安裝特定版本標籤（例如 v1.0.0）
 
 共用參數:
-  --agent <name>      助理名稱: antigravity / copilot / codex / claude / cursor / grok / pi / omp / muse / mcode
-                     亦可使用 claude-code / claude_code / claudecode（會正規化為 claude），
-                     或以 minimax-code / minimax_code / mcode 指定 MiniMax Code
+  --agent <name>      助理名稱: antigravity / copilot / codex / claude / cursor / gemini / grok / pi / omp / muse / mcode
+                     亦可使用 gemini-cli / claude-code / grok-build / minimax-code 等別名，
 
 匯出:
   token-usage-insights export --agent <name> --date YYYY[-MM[-DD]] --out <path>
@@ -765,6 +764,7 @@ fn normalize_assistant_name(assistant: &str) -> String {
     match normalized.as_str() {
         "claude-code" | "claude_code" | "claudecode" => "claude".to_string(),
         "cursor" => "cursor".to_string(),
+        "gemini" | "gemini-cli" | "gemini_cli" | "geminicli" => "gemini".to_string(),
         "grok-build" | "grok_build" | "grokbuild" => "grok".to_string(),
         "pi-coding-agent" | "pi_coding_agent" | "picodingagent" => "pi".to_string(),
         "oh-my-pi" | "oh_my_pi" | "ohmypi" => "omp".to_string(),
@@ -801,6 +801,7 @@ fn is_supported_assistant(assistant: &str) -> bool {
             | "codex"
             | "claude"
             | "cursor"
+            | "gemini"
             | "grok"
             | "pi"
             | "omp"
@@ -1025,6 +1026,10 @@ mod tests {
         assert_eq!(
             validate_import_source_assistant("claude", Some("claude-code")).unwrap(),
             Some("claude".to_string())
+        );
+        assert_eq!(
+            validate_import_source_assistant("gemini", Some("gemini-cli")).unwrap(),
+            Some("gemini".to_string())
         );
         assert_eq!(
             validate_import_source_assistant("codex", None).unwrap(),

@@ -79,6 +79,10 @@
             <img class="assistant-logo" src="/static/cursor-logo.svg" alt="Cursor" />
             <span class="agent-name-tooltip">Cursor</span>
           </button>
+          <button class="assistant-badge-btn" data-value="gemini" title="Gemini CLI" aria-label="Gemini CLI">
+            <img class="assistant-logo" src="/static/gemini-logo.svg" alt="Gemini CLI" />
+            <span class="agent-name-tooltip">Gemini CLI</span>
+          </button>
           <button class="assistant-badge-btn" data-value="grok" title="Grok Build" aria-label="Grok Build">
             <img class="assistant-logo" src="/static/grok-logo.svg" alt="Grok Build" />
             <span class="agent-name-tooltip">Grok Build</span>
@@ -1350,6 +1354,28 @@ cd TokenUsageInsights</code></pre>
         </div>
       </div>
 
+      <!-- Gemini CLI Setup Content -->
+      <div class="modal-body" id="setup-body-gemini" style="display: none;">
+        <div class="modal-text">
+          <p data-i18n="gemini_setup_modal_intro">本看板會讀取 Google Gemini CLI 自動保存的本地 session 日誌。Gemini CLI 不需要額外安裝狀態列腳本。</p>
+        </div>
+
+        <div class="modal-section">
+          <h3 data-i18n="gemini_setup_step_1"><span>01</span> 1. 確認 Gemini CLI 已在使用</h3>
+          <p class="modal-text" data-i18n="gemini_setup_step_1_desc">在終端機中使用過 Gemini CLI 後，session 會自動保存至 <code>~/.gemini/tmp/&lt;project&gt;/chats</code>。</p>
+        </div>
+
+        <div class="modal-section">
+          <h3 data-i18n="gemini_setup_step_2"><span>02</span> 2. 偵測本機資料路徑</h3>
+          <p class="modal-text" data-i18n="gemini_setup_step_2_desc">目前偵測到的 Gemini CLI 目錄為：<code id="lbl-detected-home-gemini">~/.gemini/tmp</code>。</p>
+        </div>
+
+        <div class="modal-section">
+          <h3 data-i18n="gemini_setup_step_3"><span>03</span> 3. 了解計費資料來源</h3>
+          <p class="modal-text" data-i18n="gemini_setup_step_3_desc">本看板會依 session 記錄的 Token 與快取用量，對照 <code>pricing.csv</code> 的 Google AI 模型單價即時估算費用；並自動解析思考（Reasoning）Token 與工具呼叫時間軸。</p>
+        </div>
+      </div>
+
       <!-- Grok Build Setup Content -->
       <div class="modal-body" id="setup-body-grok" style="display: none;">
         <div class="modal-text">
@@ -1514,9 +1540,11 @@ cd TokenUsageInsights</code></pre>
             <option value="codex">Codex</option>
             <option value="claude">Claude Code</option>
             <option value="cursor">Cursor</option>
+            <option value="gemini">Gemini CLI</option>
             <option value="grok">Grok Build</option>
             <option value="pi">Pi Coding Agent</option>
             <option value="omp">OMP</option>
+            <option value="muse">Muse</option>
             <option value="mcode">MiniMax Code</option>
           </select>
         </label>

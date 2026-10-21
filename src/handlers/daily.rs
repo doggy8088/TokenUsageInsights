@@ -232,6 +232,9 @@ pub async fn get_setup_info(Path(assistant): Path<String>) -> impl IntoResponse 
     let copilot_app_session_db = copilot_app_dir.join("session-store.db");
     let copilot_app_exists = copilot_app_data_db.exists() || copilot_app_session_db.exists();
 
+    let gemini_dir = source_root(Harness::Gemini, &["tmp"]);
+    let gemini_exists = gemini_dir.join("tmp").exists() || gemini_dir.join("chats").exists();
+
     let grok_dir = source_root(Harness::Grok, &["sessions"]);
     let grok_exists = grok_dir.join("sessions").exists();
 
@@ -314,6 +317,15 @@ pub async fn get_setup_info(Path(assistant): Path<String>) -> impl IntoResponse 
             dir_path: cursor_dir.to_string_lossy().into_owned(),
             data_path: cursor_dir.join("projects").to_string_lossy().into_owned(),
             exists: cursor_exists,
+            script_path: "".to_string(),
+            source_script_path: "".to_string(),
+            settings_path: "".to_string(),
+            statusline_command: "".to_string(),
+        },
+        gemini: AssistantSetupStatus {
+            dir_path: gemini_dir.to_string_lossy().into_owned(),
+            data_path: gemini_dir.join("tmp").to_string_lossy().into_owned(),
+            exists: gemini_exists,
             script_path: "".to_string(),
             source_script_path: "".to_string(),
             settings_path: "".to_string(),

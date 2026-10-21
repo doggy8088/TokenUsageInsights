@@ -10,9 +10,9 @@ use crate::{
     },
     timeline::{
         parse_antigravity_timeline, parse_claude_timeline, parse_codex_timeline,
-        parse_copilot_timeline_filtered, parse_cursor_timeline, parse_grok_timeline,
-        parse_mcode_timeline, parse_muse_timeline, parse_omp_timeline, parse_pi_timeline,
-        parse_vscode_timeline, TimelineItem,
+        parse_copilot_timeline_filtered, parse_cursor_timeline, parse_gemini_timeline,
+        parse_grok_timeline, parse_mcode_timeline, parse_muse_timeline, parse_omp_timeline,
+        parse_pi_timeline, parse_vscode_timeline, TimelineItem,
     },
 };
 
@@ -114,6 +114,7 @@ pub(crate) fn parse_session_timeline_file(
         "codex" => parse_codex_timeline(reader, db_entries, &mut timeline, &mut metadata),
         "claude" => parse_claude_timeline(reader, db_entries, &mut timeline, &mut metadata),
         "cursor" => parse_cursor_timeline(reader, db_entries, &mut timeline, &mut metadata),
+        "gemini" => parse_gemini_timeline(reader, db_entries, &mut timeline, &mut metadata),
         "grok" => parse_grok_timeline(reader, db_entries, &mut timeline, &mut metadata),
         "pi" => parse_pi_timeline(reader, db_entries, &mut timeline, &mut metadata),
         "omp" => parse_omp_timeline(reader, db_entries, &mut timeline, &mut metadata),

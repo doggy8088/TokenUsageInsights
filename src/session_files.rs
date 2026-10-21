@@ -181,6 +181,20 @@ fn resolve_cursor_transcript_path(
     )
 }
 
+fn resolve_gemini_transcript_path(
+    gemini_dir: &StdPath,
+    transcript_path_db: &str,
+) -> Result<PathBuf, String> {
+    resolve_transcript_path(
+        gemini_dir,
+        transcript_path_db,
+        TranscriptPathPolicy {
+            assistant_label: "Gemini CLI",
+            validation: TranscriptValidation::Jsonl,
+        },
+    )
+}
+
 fn resolve_grok_transcript_path(
     grok_dir: &StdPath,
     session_id: &str,
@@ -652,6 +666,18 @@ pub(crate) fn resolve_session_file_path(
             })?;
             resolve_configured_transcript(Harness::Cursor, |root| {
                 resolve_cursor_transcript_path(root, session_id, path)
+            })
+            .map_err(|error| SessionFileError::new(StatusCode::BAD_REQUEST, error))
+        }
+        "gemini" => {
+            let path = transcript_path_db.ok_or_else(|| {
+                SessionFileError::new(
+                    StatusCode::NOT_FOUND,
+                    "找不到 Gemini CLI 會話日誌檔案路徑。".to_string(),
+                )
+            })?;
+            resolve_configured_transcript(Harness::Gemini, |root| {
+                resolve_gemini_transcript_path(root, path)
             })
             .map_err(|error| SessionFileError::new(StatusCode::BAD_REQUEST, error))
         }

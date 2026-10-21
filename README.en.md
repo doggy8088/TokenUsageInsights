@@ -1,6 +1,6 @@
 # Token War Room
 
-**Token War Room is a local-first dashboard for AI coding-agent token usage and session reconstruction.** It reads local records from Google Antigravity CLI, GitHub Copilot CLI, GitHub Copilot App, GitHub Copilot Chat (VS Code), Codex Desktop, Codex CLI, Claude Code, Cursor, Grok Build, Pi Coding Agent, OMP, Muse Code, and MiniMax Code, presenting daily, monthly, and yearly token consumption, cache usage, reasoning tokens, estimated costs, model distribution, project-directory distribution, and complete session timelines in one place.
+**Token War Room is a local-first dashboard for AI coding-agent token usage and session reconstruction.** It reads local records from Google Antigravity CLI, GitHub Copilot CLI, GitHub Copilot App, GitHub Copilot Chat (VS Code), Codex Desktop, Codex CLI, Claude Code, Cursor, Gemini CLI, Grok Build, Pi Coding Agent, OMP, Muse Code, and MiniMax Code, presenting daily, monthly, and yearly token consumption, cache usage, reasoning tokens, estimated costs, model distribution, project-directory distribution, and complete session timelines in one place.
 
 This project does not call AI provider APIs on your behalf. Its core data sources are local logs, Status Line collector files, and local SQLite.
 
@@ -53,13 +53,14 @@ http://localhost:3003
 | Codex Desktop / CLI | Not required | `~/.codex/sessions`, `~/.codex/archived_sessions` | The dashboard scans active and archived local Codex sessions directly |
 | Claude Code | Not required | `~/.claude/projects` | The dashboard scans local Claude Code project sessions directly |
 | Cursor | Not required | `~/.cursor/projects` | The dashboard scans local Cursor transcripts and reads attributable model metadata in read-only mode |
+| Gemini CLI | Not required | `~/.gemini/tmp` | The dashboard scans local Gemini CLI project chat JSONL files and automatically resolves working directory and token usage |
 | Grok Build | Not required | `~/.grok/sessions` | The dashboard scans the `updates.jsonl` session streams saved automatically by Grok Build |
 | Pi Coding Agent | Not required | `~/.pi/agent/sessions` | The dashboard scans the local session JSONL files saved automatically by Pi Coding Agent |
 | OMP | Not required | `~/.omp/agent/sessions` | The dashboard scans the local session JSONL files saved automatically by OMP |
 | Muse Code | Not required | `~/.local/share/muse/sessions` | The dashboard scans the local session JSONL files saved automatically by Muse Code |
 | MiniMax Code | Not required | `~/.minimax/v2/sessions` | The dashboard scans the local session JSONL files saved automatically by MiniMax Code, and read-only resolves the working directory and session name |
 
-**If you only use Copilot App, VS Code Copilot, Codex Desktop, Codex CLI, Claude Code, Cursor, Grok Build, Pi Coding Agent, OMP, Muse Code, or MiniMax Code, run the one-line installation command and open the dashboard.**
+**If you only use Copilot App, VS Code Copilot, Codex Desktop, Codex CLI, Claude Code, Cursor, Gemini CLI, Grok Build, Pi Coding Agent, OMP, Muse Code, or MiniMax Code, run the one-line installation command and open the dashboard.**
 
 ### Native Windows usage
 
@@ -75,6 +76,7 @@ Windows uses the following native paths by default:
 | Codex | `%USERPROFILE%\.codex` |
 | Claude Code | `%USERPROFILE%\.claude` |
 | Cursor | `%USERPROFILE%\.cursor` |
+| Gemini CLI | `%USERPROFILE%\.gemini` |
 | Grok Build | `%USERPROFILE%\.grok` |
 | Pi Coding Agent | `%USERPROFILE%\.pi` |
 | OMP | `%USERPROFILE%\.omp` |
@@ -340,6 +342,27 @@ Cursor's local data does not contain exact token counts or official billing deta
 
 * * *
 
+## Gemini CLI setup
+
+**Google Gemini CLI (`@google/gemini-cli`) requires no hooks, a Status Line, or an additional collector script.** The dashboard scans this directory directly:
+
+```text
+~/.gemini/tmp/<project_hash>/chats/session-*.jsonl
+```
+
+Gemini CLI stores sessions under project directories inside `~/.gemini/tmp`. The dashboard automatically reads `.project_root` to restore the working directory, and parses user prompts, model thoughts (reasoning), tool calls, and per-turn token usage.
+
+Usage:
+
+1. Use Gemini CLI (`gemini`) in your terminal to create at least one session.
+2. Start or refresh the dashboard.
+3. Select Gemini CLI on the left.
+4. Click the sync button in the upper-right corner, or wait for background sync.
+
+The dashboard estimates costs in real time from the tokens and cache reported by each session against Google AI model pricing in `pricing.csv`. For non-default data locations, set `GEMINI_DIR` to the directory containing `tmp`.
+
+* * *
+
 ## Grok Build setup
 
 **Grok Build requires no hooks, a Status Line, or an additional collector script.** The dashboard scans this directory directly:
@@ -471,7 +494,7 @@ This triggers a full incremental sync of local logs.
 
 Starting with v0.9.0, the dashboard and CLI share the `token-usage-insights` executable. Run it without arguments to start the dashboard, or use `export`, `export-all`, or `import`. The main command and subcommands support `--help` and `-h`; older installations need an update or a source build.
 
-`--agent` specifies the assistant (`antigravity` / `copilot` / `codex` / `claude` / `cursor` / `grok` / `pi` / `omp` / `muse`).
+`--agent` specifies the assistant (`antigravity` / `copilot` / `codex` / `claude` / `cursor` / `gemini` / `grok` / `pi` / `omp` / `muse` / `mcode`）。
 
 ### Use the CLI from source
 
@@ -535,6 +558,7 @@ Paths specified by environment variables are authoritative and do not need to be
 | `CLAUDE_DIR` | `~/.claude` | Claude Code data directory |
 | `CURSOR_DIR` | `~/.cursor` | Cursor data directory |
 | `CURSOR_STATE_DB` | Auto-detected by platform | Cursor `User/globalStorage/state.vscdb` path, used to read `agentKv` model information in read-only mode |
+| `GEMINI_DIR` | `~/.gemini` | Google Gemini CLI data directory; should contain `tmp` |
 | `GROK_DIR` | `~/.grok` | Grok Build data directory |
 | `PI_DIR` | `~/.pi` | Pi Coding Agent data directory |
 | `OMP_DIR` | `~/.omp` | OMP data directory |
@@ -571,6 +595,7 @@ additional_sources:
   copilot: ['~/Cloud Drive/laptop/.copilot']
   copilot_app: ['~/Cloud Drive/desktop/.copilot']
   cursor: ['~/Cloud Drive/laptop/.cursor']
+  gemini: ['~/Cloud Drive/laptop/.gemini']
   antigravity: ['~/Cloud Drive/laptop/antigravity-cli']
   grok: ['~/Cloud Drive/laptop/.grok']
   pi: ['~/Cloud Drive/laptop/.pi']
@@ -593,6 +618,7 @@ additional_sources:
 | `claude`, `cursor` | `projects/` |
 | `copilot` | `usage/`, `session-state/`, `session-store.db`; App data in the same home is also imported |
 | `copilot_app` | `data.db`, `session-store.db`, `session-state/` in a separate App home |
+| `gemini` | `tmp/` or project directory directly containing `chats/` |
 | `antigravity` | Native `brain/` and `conversations/` records; also supports legacy `usage/` |
 | `grok`, `muse` | `sessions/` |
 | `pi`, `omp` | `agent/sessions/` |

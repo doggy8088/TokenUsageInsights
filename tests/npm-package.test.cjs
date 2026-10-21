@@ -134,6 +134,35 @@ test('keeps the release label visible at the bottom of the sidebar', () => {
   assert.match(versionRule[1], /flex:\s*0 0 auto/);
 });
 
+test('sidebar assistant selector and import target selector include all supported agents', () => {
+  const indexHtml = readFileSync(join(__dirname, '..', 'static', 'index.html'), 'utf8');
+  const expectedAgents = [
+    'antigravity',
+    'copilot',
+    'codex',
+    'claude',
+    'cursor',
+    'gemini',
+    'grok',
+    'pi',
+    'omp',
+    'muse',
+    'mcode',
+  ];
+  for (const agent of expectedAgents) {
+    assert.match(
+      indexHtml,
+      new RegExp(`class="assistant-badge-btn[^"]*"\\s+data-value="${agent}"`),
+      `sidebar badges should include ${agent}`,
+    );
+    assert.match(
+      indexHtml,
+      new RegExp(`<option\\s+value="${agent}">`),
+      `import target select should include ${agent}`,
+    );
+  }
+});
+
 test('release asset verification reports all failed URLs', async () => {
   const error = await verifyReleaseAssets({
     version: '1.2.3',

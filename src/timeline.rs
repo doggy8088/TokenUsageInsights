@@ -3027,6 +3027,212 @@ pub fn parse_muse_timeline(
     metadata.insert("cwd".to_string(), serde_json::Value::String(String::new()));
 }
 
+/// Reconstructs the conversation timeline of a Gemini CLI session.
+/// Turns are matched with `db_entries` to display per-turn token usage and costs.
+pub fn parse_gemini_timeline(
+    reader: BufReader<File>,
+    db_entries: &HashMap<u32, (TokenStats, String)>,
+    timeline: &mut Vec<TimelineItem>,
+    metadata: &mut HashMap<String, serde_json::Value>,
+) {
+    let mut turn_no = 0u32;
+    let mut current_model = UNKNOWN_MODEL.to_string();
+
+    let mut ordered_message_ids = Vec::new();
+    let mut messages_by_id: HashMap<String, Value> = HashMap::new();
+    let mut header_opt: Option<Value> = None;
+
+    for line in reader.lines().map_while(Result::ok) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(obj) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+
+        if header_opt.is_none() && obj.get("sessionId").is_some() {
+            header_opt = Some(obj.clone());
+        }
+
+        let mut handle_msg = |msg: &Value| {
+            if let Some(id) = msg.get("id").and_then(Value::as_str) {
+                if !messages_by_id.contains_key(id) {
+                    ordered_message_ids.push(id.to_string());
+                }
+                messages_by_id.insert(id.to_string(), msg.clone());
+            }
+        };
+
+        if let Some(set_obj) = obj.get("$set") {
+            if let Some(messages) = set_obj.get("messages").and_then(Value::as_array) {
+                for msg in messages {
+                    handle_msg(msg);
+                }
+            }
+        }
+        handle_msg(&obj);
+    }
+
+    if let Some(header) = header_opt {
+        let timestamp = header
+            .get("startTime")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        timeline.push(TimelineItem::SystemStatus {
+            timestamp,
+            status_type: "session_start".to_string(),
+            message: "Gemini CLI session started".to_string(),
+        });
+    }
+
+    for id in ordered_message_ids {
+        let Some(msg) = messages_by_id.remove(&id) else {
+            continue;
+        };
+        let msg_type = msg.get("type").and_then(Value::as_str).unwrap_or("");
+        let timestamp = msg
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+
+        if msg_type == "user" {
+            let content = msg.get("content");
+            if let Some(arr) = content.and_then(Value::as_array) {
+                let is_func_response = arr
+                    .iter()
+                    .any(|item| item.get("functionResponse").is_some());
+                if is_func_response {
+                    continue;
+                }
+            }
+
+            if let Some(prompt) = content.and_then(crate::gemini::extract_prompt_from_content) {
+                turn_no += 1;
+                timeline.push(TimelineItem::UserPrompt {
+                    timestamp,
+                    prompt,
+                    context: None,
+                    turn_no,
+                });
+            }
+        } else if msg_type == "gemini" {
+            if let Some(model) = msg.get("model").and_then(Value::as_str) {
+                current_model = model.to_string();
+            }
+
+            let reasoning = msg
+                .get("thoughts")
+                .and_then(Value::as_array)
+                .and_then(|thoughts| {
+                    let items: Vec<String> = thoughts
+                        .iter()
+                        .filter_map(|th| {
+                            let subject = th.get("subject").and_then(Value::as_str).unwrap_or("");
+                            let desc = th.get("description").and_then(Value::as_str).unwrap_or("");
+                            if subject.is_empty() && desc.is_empty() {
+                                None
+                            } else if subject.is_empty() {
+                                Some(desc.to_string())
+                            } else if desc.is_empty() {
+                                Some(subject.to_string())
+                            } else {
+                                Some(format!("**{subject}**\n{desc}"))
+                            }
+                        })
+                        .collect();
+                    if items.is_empty() {
+                        None
+                    } else {
+                        Some(items.join("\n\n"))
+                    }
+                });
+
+            if let Some(tool_calls) = msg.get("toolCalls").and_then(Value::as_array) {
+                for tc in tool_calls {
+                    let tool_name = tc
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let arguments = tc.get("args").cloned().unwrap_or(Value::Null);
+                    let call_id = tc.get("id").and_then(Value::as_str).map(str::to_string);
+                    let status = tc
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("success")
+                        .to_string();
+
+                    let stdout = tc
+                        .get("resultDisplay")
+                        .map(|rd| {
+                            if let Some(s) = rd.as_str() {
+                                s.to_string()
+                            } else {
+                                rd.to_string()
+                            }
+                        })
+                        .or_else(|| {
+                            tc.get("result")
+                                .and_then(Value::as_array)
+                                .and_then(|arr| arr.first())
+                                .and_then(|r| r.get("functionResponse"))
+                                .and_then(|fr| fr.get("response"))
+                                .and_then(|resp| resp.get("output"))
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                        })
+                        .unwrap_or_default();
+
+                    let tool_ts = tc
+                        .get("timestamp")
+                        .and_then(Value::as_str)
+                        .unwrap_or(&timestamp)
+                        .to_string();
+
+                    timeline.push(TimelineItem::ToolStep {
+                        timestamp: tool_ts,
+                        tool_name,
+                        arguments,
+                        env: None,
+                        exit_code: None,
+                        stdout,
+                        stderr: String::new(),
+                        tool_call_id: call_id,
+                        status,
+                    });
+                }
+            }
+
+            let reply = msg
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+
+            let tokens = db_entries.get(&turn_no).map(|(s, _)| s.clone());
+
+            timeline.push(TimelineItem::AgentReply {
+                timestamp,
+                reply,
+                reasoning,
+                turn_no,
+                model: current_model.clone(),
+                tokens,
+                duration_ms: None,
+                reasoning_effort: None,
+            });
+        }
+    }
+
+    metadata.insert(
+        "selected_model".to_string(),
+        serde_json::Value::String(current_model),
+    );
+}
+
 /// Reconstructs the conversation timeline of one MiniMax Code session. Unlike
 /// the other assistants a single session spans several JSONL files
 /// (`messages.jsonl` plus `snapshots/*.jsonl`), so the session directory is
@@ -3404,12 +3610,17 @@ mod antigravity_tests {
 mod pi_family_tests {
     use super::*;
     use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static TEST_FILE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
     fn make_reader(lines: &[&str]) -> BufReader<File> {
+        let count = TEST_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "token-usage-insights-pi-timeline-test-{}-{}",
+            "token-usage-insights-pi-timeline-test-{}-{}-{}",
             std::process::id(),
-            lines.len()
+            lines.len(),
+            count
         ));
         let mut file = File::create(&path).unwrap();
         for line in lines {
@@ -3495,6 +3706,53 @@ mod pi_family_tests {
                 if status_type == "model_change" && message.contains("ollama/glm-5.3-flash:cloud"))
         });
         assert!(has_model_change);
+    }
+
+    #[test]
+    fn parse_gemini_timeline_reconstructs_prompt_reply_and_tool_call() {
+        let reader = make_reader(&[
+            r#"{"sessionId":"gemini-test-123","startTime":"2026-10-13T07:49:00.000Z"}"#,
+            r#"{"id":"ctx","type":"user","content":[{"text":"<session_context>info</session_context>"}]}"#,
+            r#"{"id":"u1","timestamp":"2026-10-13T07:49:01.000Z","type":"user","content":[{"text":"測試提問"}]}"#,
+            r#"{"id":"g1","timestamp":"2026-10-13T07:49:05.000Z","type":"gemini","model":"gemini-3.8-flash","content":"這是回覆","thoughts":[{"subject":"思考主題","description":"思考細節"}],"toolCalls":[{"id":"call_1","name":"read_file","args":{"path":"test.txt"},"status":"success","resultDisplay":"file content"}]}"#,
+        ]);
+        let db_entries = HashMap::new();
+        let mut timeline = Vec::new();
+        let mut metadata = HashMap::new();
+
+        parse_gemini_timeline(reader, &db_entries, &mut timeline, &mut metadata);
+
+        assert_eq!(
+            metadata.get("selected_model").and_then(|v| v.as_str()),
+            Some("gemini-3.8-flash")
+        );
+
+        // Verify session_start
+        assert!(timeline.iter().any(|item| matches!(
+            item,
+            TimelineItem::SystemStatus { status_type, .. } if status_type == "session_start"
+        )));
+
+        // Verify user prompt
+        assert!(timeline.iter().any(|item| matches!(
+            item,
+            TimelineItem::UserPrompt { prompt, turn_no: 1, .. } if prompt == "測試提問"
+        )));
+
+        // Verify tool step
+        assert!(timeline.iter().any(|item| matches!(
+            item,
+            TimelineItem::ToolStep { tool_name, stdout, .. } if tool_name == "read_file" && stdout == "file content"
+        )));
+
+        // Verify agent reply
+        assert!(timeline.iter().any(|item| matches!(
+            item,
+            TimelineItem::AgentReply { reply, model, reasoning, .. }
+                if reply == "這是回覆"
+                    && model == "gemini-3.8-flash"
+                    && reasoning.as_deref() == Some("**思考主題**\n思考細節")
+        )));
     }
 }
 

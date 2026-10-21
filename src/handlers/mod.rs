@@ -23,6 +23,7 @@ pub fn normalize_assistant_name(assistant: &str) -> String {
     match normalized.as_str() {
         "claude-code" | "claude_code" | "claudecode" => "claude".to_string(),
         "cursor" => "cursor".to_string(),
+        "gemini" | "gemini-cli" | "gemini_cli" | "geminicli" => "gemini".to_string(),
         "grok-build" | "grok_build" | "grokbuild" | "grok" => "grok".to_string(),
         "pi-coding-agent" | "pi_coding_agent" | "picodingagent" | "pi" => "pi".to_string(),
         "omp" | "oh-my-pi" | "oh_my_pi" | "ohmypi" => "omp".to_string(),
@@ -52,6 +53,7 @@ pub fn is_supported_assistant(assistant: &str) -> bool {
             | "codex"
             | "claude"
             | "cursor"
+            | "gemini"
             | "grok"
             | "pi"
             | "omp"
@@ -81,6 +83,7 @@ pub struct SetupInfoResponse {
     pub codex: AssistantSetupStatus,
     pub claude: AssistantSetupStatus,
     pub cursor: AssistantSetupStatus,
+    pub gemini: AssistantSetupStatus,
     pub grok: AssistantSetupStatus,
     pub pi: AssistantSetupStatus,
     pub omp: AssistantSetupStatus,

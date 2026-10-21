@@ -1,6 +1,6 @@
 # Token 戦情室
 
-**Token 戦情室は、ローカル優先の AI Coding Agent の Token 使用量とセッション復元ダッシュボードです。** Google Antigravity CLI、GitHub Copilot CLI、GitHub Copilot App、GitHub Copilot Chat（VS Code）、Codex Desktop、Codex CLI、Claude Code、Cursor、Grok Build、Pi Coding Agent、OMP、Muse Code、MiniMax Code のローカル記録を読み取り、日別・月別・年別の Token 消費量、キャッシュ使用量、推論 Token、推定コスト、モデル分布、プロジェクトディレクトリ分布、完全な Session タイムラインをまとめて表示します。
+**Token 戦情室は、ローカル優先の AI Coding Agent の Token 使用量とセッション復元ダッシュボードです。** Google Antigravity CLI、GitHub Copilot CLI、GitHub Copilot App、GitHub Copilot Chat（VS Code）、Codex Desktop、Codex CLI、Claude Code、Cursor、Gemini CLI、Grok Build、Pi Coding Agent、OMP、Muse Code、MiniMax Code のローカル記録を読み取り、日別・月別・年別の Token 消費量、キャッシュ使用量、推論 Token、推定コスト、モデル分布、プロジェクトディレクトリ分布、完全な Session タイムラインをまとめて表示します。
 
 このプロジェクトが AI プロバイダー API を代わりに呼び出してデータを取得することはありません。主なデータソースはローカルログ、Status Line コレクターファイル、ローカル SQLite です。
 
@@ -53,13 +53,14 @@ http://localhost:3003
 | Codex Desktop / CLI | 不要 | `~/.codex/sessions`、`~/.codex/archived_sessions` | Codex のアクティブおよびアーカイブ済みローカル Session を直接スキャン |
 | Claude Code | 不要 | `~/.claude/projects` | Claude Code のローカルプロジェクト Session を直接スキャン |
 | Cursor | 不要 | `~/.cursor/projects` | Cursor のローカル transcript をスキャンし、帰属可能なモデル情報を読み取り専用で取得 |
+| Gemini CLI | 不要 | `~/.gemini/tmp` | Gemini CLI が自動保存するプロジェクトチャット JSONL ファイルを直接スキャンし、作業ディレクトリと Token 用量を自動解析 |
 | Grok Build | 不要 | `~/.grok/sessions` | Grok Build が自動保存する `updates.jsonl` Session stream を直接スキャン |
 | Pi Coding Agent | 不要 | `~/.pi/agent/sessions` | Pi Coding Agent が自動保存するローカル Session JSONL ファイルを直接スキャン |
 | OMP | 不要 | `~/.omp/agent/sessions` | OMP が自動保存するローカル Session JSONL ファイルを直接スキャン |
 | Muse Code | 不要 | `~/.local/share/muse/sessions` | Muse Code が自動保存するローカル Session JSONL ファイルを直接スキャン |
 | MiniMax Code | 不要 | `~/.minimax/v2/sessions` | MiniMax Code が自動保存するローカル Session JSONL ファイルを直接スキャンし、作業ディレクトリと Session 名を読み取り専用で取得 |
 
-**Copilot App、VS Code Copilot、Codex Desktop、Codex CLI、Claude Code、Cursor、Grok Build、Pi Coding Agent、OMP、Muse Code、MiniMax Code だけを使用する場合は、1 行のインストールコマンドを実行してダッシュボードを開くだけで利用できます。**
+**Copilot App、VS Code Copilot、Codex Desktop、Codex CLI、Claude Code、Cursor、Gemini CLI、Grok Build、Pi Coding Agent、OMP、Muse Code、MiniMax Code だけを使用する場合は、1 行のインストールコマンドを実行してダッシュボードを開くだけで利用できます。**
 
 ### Windows ネイティブでの利用
 
@@ -75,6 +76,7 @@ Windows ではデフォルトで次のネイティブパスを使用します：
 | Codex | `%USERPROFILE%\.codex` |
 | Claude Code | `%USERPROFILE%\.claude` |
 | Cursor | `%USERPROFILE%\.cursor` |
+| Gemini CLI | `%USERPROFILE%\.gemini` |
 | Grok Build | `%USERPROFILE%\.grok` |
 | Pi Coding Agent | `%USERPROFILE%\.pi` |
 | OMP | `%USERPROFILE%\.omp` |
@@ -340,6 +342,27 @@ Cursor のローカルデータには正確な Token 数や公式の請求明細
 
 * * *
 
+## Gemini CLI の設定
+
+**Google Gemini CLI (`@google/gemini-cli`) に Hook、Status Line、追加の収集スクリプトは必要ありません。** ダッシュボードは次のディレクトリを直接スキャンします：
+
+```text
+~/.gemini/tmp/<project_hash>/chats/session-*.jsonl
+```
+
+Gemini CLI は各プロジェクトの Session を `~/.gemini/tmp` 配下のプロジェクトディレクトリに保存します。ダッシュボードは自動的に `.project_root` を読み取って作業ディレクトリを復元し、プロンプト、思考プロセス（Thoughts / Reasoning）、ツール呼び出し（Tool Calls）、各ターンの Token 使用量を解析します。
+
+使用方法：
+
+1. ターミナルで Gemini CLI（`gemini`）を使い、少なくとも 1 つの Session を作成します。
+2. ダッシュボードを起動または再読み込みします。
+3. 左側で Gemini CLI を選択します。
+4. 右上の同期ボタンをクリックするか、バックグラウンド同期を待ちます。
+
+本ダッシュボードは Session が報告する Token とキャッシュ使用量をもとに、`pricing.csv` の Google AI モデル単価からリアルタイムに費用を試算します。デフォルト以外の場所は `GEMINI_DIR` で指定できます。
+
+* * *
+
 ## Grok Build の設定
 
 **Grok Build に Hook、Status Line、追加の収集スクリプトは必要ありません。** ダッシュボードは次のディレクトリを直接スキャンします：
@@ -471,7 +494,7 @@ GET /api/:assistant/sync
 
 v0.9.0 以降、ダッシュボードと CLI は `token-usage-insights` に統合されています。引数なしでダッシュボードを起動し、`export`、`export-all`、`import` でデータを操作できます。各コマンドは `--help` と `-h` に対応します。旧版では更新またはソースからのビルドが必要です。
 
-`--agent` はアシスタント（`antigravity` / `copilot` / `codex` / `claude` / `cursor` / `grok` / `pi` / `omp` / `muse`）を指定します。
+`--agent` はアシスタント（`antigravity` / `copilot` / `codex` / `claude` / `cursor` / `gemini` / `grok` / `pi` / `omp` / `muse` / `mcode`）を指定します。
 
 ### ソースから CLI を使用
 
@@ -535,6 +558,7 @@ cargo build --release --bin token-usage-insights
 | `CLAUDE_DIR` | `~/.claude` | Claude Code データディレクトリ |
 | `CURSOR_DIR` | `~/.cursor` | Cursor データディレクトリ |
 | `CURSOR_STATE_DB` | プラットフォームにより自動検出 | Cursor `User/globalStorage/state.vscdb` のパス。読み取り専用で `agentKv` モデル情報を取得するために使用 |
+| `GEMINI_DIR` | `~/.gemini` | Google Gemini CLI データディレクトリ。`tmp` を含む必要があります |
 | `GROK_DIR` | `~/.grok` | Grok Build データディレクトリ |
 | `PI_DIR` | `~/.pi` | Pi Coding Agent データディレクトリ |
 | `OMP_DIR` | `~/.omp` | OMP データディレクトリ |
@@ -571,6 +595,7 @@ additional_sources:
   copilot: ['~/Cloud Drive/laptop/.copilot']
   copilot_app: ['~/Cloud Drive/desktop/.copilot']
   cursor: ['~/Cloud Drive/laptop/.cursor']
+  gemini: ['~/Cloud Drive/laptop/.gemini']
   antigravity: ['~/Cloud Drive/laptop/antigravity-cli']
   grok: ['~/Cloud Drive/laptop/.grok']
   pi: ['~/Cloud Drive/laptop/.pi']
@@ -593,6 +618,7 @@ additional_sources:
 | `claude`, `cursor` | `projects/` |
 | `copilot` | `usage/`, `session-state/`, `session-store.db`。同じホームの App データも取り込み |
 | `copilot_app` | 独立した App ホームの `data.db`, `session-store.db`, `session-state/` |
+| `gemini` | `tmp/` または直接 `chats/` を含むプロジェクトディレクトリ |
 | `antigravity` | ネイティブの `brain/` と `conversations/`。従来の `usage/` にも対応 |
 | `grok`, `muse` | `sessions/` |
 | `pi`, `omp` | `agent/sessions/` |

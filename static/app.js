@@ -83,6 +83,9 @@ function getCookie(name) {
 }
 
 const assistantAliasMap = {
+  'gemini-cli': 'gemini',
+  'gemini_cli': 'gemini',
+  'geminicli': 'gemini',
   'claude-code': 'claude',
   'claude_code': 'claude',
   'claudecode': 'claude',
@@ -157,6 +160,16 @@ const assistantMeta = {
     senderName: 'CURSOR AGENT',
     highlightColor: '#a78bfa',
     nameHighlights: ['Cursor'],
+  },
+  gemini: {
+    logo: '/static/gemini-logo.svg',
+    label: 'Gemini CLI',
+    shortLabel: 'Gemini',
+    alt: 'Gemini CLI',
+    badgeStyle: 'background: rgba(66, 133, 244, 0.15); color: #4285f4; border: 1px solid rgba(66, 133, 244, 0.3); display: inline-flex; align-items: center;',
+    senderName: 'GEMINI AGENT',
+    highlightColor: '#4285f4',
+    nameHighlights: ['Gemini CLI'],
   },
   grok: {
     logo: '/static/grok-logo.svg',
@@ -646,6 +659,7 @@ const setupModalTitleKeys = {
   codex: 'codex_setup_modal_title',
   claude: 'claude_setup_modal_title',
   cursor: 'cursor_setup_modal_title',
+  gemini: 'gemini_setup_modal_title',
   grok: 'grok_setup_modal_title',
   pi: 'pi_setup_modal_title',
   omp: 'omp_setup_modal_title',
@@ -673,6 +687,7 @@ function setSetupModalBody(assistant) {
     codex: 'setup-body-codex',
     claude: 'setup-body-claude',
     cursor: 'setup-body-cursor',
+    gemini: 'setup-body-gemini',
     grok: 'setup-body-grok',
     pi: 'setup-body-pi',
     omp: 'setup-body-omp',
@@ -7552,6 +7567,9 @@ async function loadSetupInfo(assistant = currentAssistant) {
     } else if (resolvedAssistant === 'cursor') {
       const homeLabelCursor = document.getElementById('lbl-detected-home-cursor');
       if (homeLabelCursor) homeLabelCursor.textContent = abbreviateHomePath(data.cursor?.data_path || '');
+    } else if (resolvedAssistant === 'gemini') {
+      const homeLabelGemini = document.getElementById('lbl-detected-home-gemini');
+      if (homeLabelGemini) homeLabelGemini.textContent = abbreviateHomePath(data.gemini?.data_path || '');
     } else if (resolvedAssistant === 'grok') {
       const homeLabelGrok = document.getElementById('lbl-detected-home-grok');
       if (homeLabelGrok) homeLabelGrok.textContent = abbreviateHomePath(data.grok?.data_path || '');

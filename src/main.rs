@@ -20,6 +20,7 @@ mod cli;
 mod config;
 mod copilot;
 mod db;
+mod gemini;
 mod grok;
 mod handlers;
 mod mcode;
