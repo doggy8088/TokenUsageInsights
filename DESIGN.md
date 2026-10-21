@@ -25,31 +25,31 @@ colors:
   light-text-secondary: "#475569"
 typography:
   display:
-    fontFamily: "Inter, Outfit, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif"
+    fontFamily: "'IBM Plex Sans', Inter, Outfit, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif"
     fontSize: "1.35rem"
     fontWeight: 750
     lineHeight: 1.2
     letterSpacing: "0"
   title:
-    fontFamily: "Inter, Outfit, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif"
+    fontFamily: "'IBM Plex Sans', Inter, Outfit, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif"
     fontSize: "0.96rem"
     fontWeight: 700
     lineHeight: 1.2
     letterSpacing: "0.3px"
   body:
-    fontFamily: "Inter, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif"
+    fontFamily: "'IBM Plex Sans', Inter, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif"
     fontSize: "0.875rem"
     fontWeight: 500
     lineHeight: 1.6
     letterSpacing: "0"
   label:
-    fontFamily: "Inter, Outfit, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif"
+    fontFamily: "'IBM Plex Sans', Inter, Outfit, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif"
     fontSize: "0.75rem"
     fontWeight: 600
     lineHeight: 1.2
     letterSpacing: "0.5px"
   data:
-    fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace"
+    fontFamily: "'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace"
     fontSize: "13px"
     fontWeight: 600
     lineHeight: 1.4

@@ -1146,6 +1146,12 @@ input {
   color: var(--text-primary);
 }
 
+.agent-selector-section .assistant-badge-btn:focus-visible {
+  outline: 2px solid var(--accent-cyan);
+  outline-offset: 2px;
+  background: color-mix(in srgb, var(--accent-cyan) 16%, transparent);
+}
+
 .agent-selector-section .assistant-badge-btn:hover .assistant-logo {
   transform: none;
 }
