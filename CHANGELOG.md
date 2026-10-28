@@ -4,6 +4,10 @@
 
 ## [未發行]
 
+### 修正
+
+- 依官方定價文件校正 `pricing.csv`：`gpt-5.6-sol`（含別名 `gpt-daybreak-blue`、`gpt-daybreak-blue-latest`）為 4.00／0.40／20.00，`gpt-5.6-terra` 為 2.00／0.20／12.00，`gpt-5.6-luna`（含別名 `gpt-reserve`）為 0.20／0.02／1.20，`GPT-5.4-mini` 快取輸入為 0.075，`gemini-3-flash-preview` 快取輸入為 0.05。這會改變上述模型的成本估算（issue #79）。
+
 ### 新增與改善
 
 - 新增每日定價檢查 workflow（`.github/workflows/pricing-check.yml`）與 `scripts/pricing-check.mjs`：直接解析 Anthropic、OpenAI、Google Gemini、xAI 的官方定價文件，與 `pricing.csv` 比對，回報價格差異、促銷價到期提醒與尚未收錄的新模型；官方頁面抓取失敗或格式改版（解析不到價格）時視為錯誤。有異動時自動建立或更新 `pricing-drift` issue（#71）。僅產生報告，不會自動改寫 `pricing.csv`。
