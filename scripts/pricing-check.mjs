@@ -45,7 +45,7 @@ export function normalizeName(name) {
 
 // CSV 的推理強度／Thinking 後綴與官方基礎模型共用同一組價格。
 export function csvKey(name) {
-  return normalizeName(name.replace(/\s*\((?:low|medium|high|xhigh|minimal|thinking|non-thinking|reasoning)\)/gi, ''));
+  return normalizeName(name.replace(/\s*\((?:low|medium|high|xhigh|extra high|minimal|thinking|non-thinking|reasoning)\)/gi, ''));
 }
 
 // 去除 Markdown 連結與 HTML 標籤（反覆處理直到穩定，最後移除殘留的角括號），僅用於比對與顯示名稱。
@@ -172,8 +172,9 @@ export function parseProvider(provider, md) {
   return provider.parser === 'gemini' ? parseGeminiProvider(md) : parseTableProvider(md, provider.sectionHeading);
 }
 
-const matchesPrice = (local, p) =>
-  Math.abs(local - p.now) <= EPSILON || (p.after != null && Math.abs(local - p.after) <= EPSILON);
+// pricing.csv 依慣例記錄標準牌價：有促銷時以促銷後價格（after）為準，促銷價僅作報告提醒。
+const standardPrice = (p) => (p.after != null ? p.after : p.now);
+const matchesPrice = (local, p) => Math.abs(local - standardPrice(p)) <= EPSILON;
 
 export function compareProvider(csvRows, official, ignoreModels = []) {
   const ignored = new Set(ignoreModels.map(officialKey));
@@ -193,8 +194,8 @@ export function compareProvider(csvRows, official, ignoreModels = []) {
     ]) {
       if (local == null || !price) continue;
       if (!matchesPrice(local, price)) {
-        diffs.push(`${label}：CSV ${local} → 官方 ${price.now}${price.after != null ? `（${price.until} 後 ${price.after}）` : ''}`);
-      } else if (price.after != null && Math.abs(local - price.now) > EPSILON) {
+        diffs.push(`${label}：CSV ${local} → 官方標準價 ${standardPrice(price)}${price.after != null ? `（目前促銷價 ${price.now}，至 ${price.until}）` : ''}`);
+      } else if (price.after != null) {
         promos.push(`${csvKey(row.model)} ${label}：官方目前促銷價 ${price.now}，${price.until} 後為 ${price.after}（CSV 已採後者）`);
       }
     }

@@ -110,3 +110,17 @@ test('stripMarkup 不會殘留巢狀標籤', async () => {
   assert.equal(stripMarkup('Claude <sup>1</sup> [x](http://a)'), 'Claude 1 x');
   assert.ok(!stripMarkup('<scr<script>ipt>').includes('<'));
 });
+
+test('csvKey 正規化 Extra High 變體', async () => {
+  const { csvKey } = await import('../scripts/pricing-check.mjs');
+  assert.equal(csvKey('Grok 4.7 (Extra High)'), csvKey('Grok 4.7'));
+});
+
+test('CSV 誤填促銷價時視為差異', () => {
+  const promoCsv = parseCsv(`h,h,h,h,h,h,h
+Gemini 3.8 Flash,Google AI,1M Tokens,0.75,0.075,3.75,N/A
+`);
+  const result = compareProvider(promoCsv, parseGeminiProvider(geminiMd));
+  assert.equal(result.mismatches.length, 1);
+  assert.match(result.mismatches[0].diffs[0], /標準價/);
+});
