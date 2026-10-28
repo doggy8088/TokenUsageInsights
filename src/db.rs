@@ -2450,10 +2450,14 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
 
 /// Rebuild registered App sessions from complete per-call sources, independently
 /// of the legacy SQLite cursor. Failed reads leave both rows and state intact.
-fn sync_copilot_app_transcripts(conn: &mut Connection, root: &Path) -> Result<(), String> {
-    let root = crate::config::absolute_root(root);
-    let registry = load_copilot_app_session_registry(&root.join("data.db"))?;
-    let key = encode_hex(root.as_os_str().as_encoded_bytes());
+fn sync_copilot_app_transcripts(
+    conn: &mut Connection,
+    root: &Path,
+    key: &str,
+    registry: &HashSet<String>,
+    data_db: &Connection,
+    should_cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<(), String> {
     let store_path = root.join("session-store.db");
     let store = if store_path.exists() {
         let store = Connection::open_with_flags(&store_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
@@ -2477,17 +2481,22 @@ fn sync_copilot_app_transcripts(conn: &mut Connection, root: &Path) -> Result<()
         None
     };
     let states = load_sync_state_for_prefix(conn, "copilot-app-transcript");
-    for sid in registry {
-        if !crate::session_files::is_safe_session_id(&sid) {
+    let mut sessions: Vec<_> = registry.iter().collect();
+    sessions.sort();
+    for sid in sessions {
+        if should_cancel() {
+            break;
+        }
+        if !crate::session_files::is_safe_session_id(sid) {
             continue;
         }
-        let path = root.join("session-state").join(&sid).join("events.jsonl");
+        let path = root.join("session-state").join(sid).join("events.jsonl");
         if !path.exists() {
             continue;
         }
         let result = (|| -> Result<(), String> {
             let before = copilot_cli_transcript_fingerprint(&path)?;
-            let native = read_copilot_cli_native_calls(store.as_ref(), &sid)?;
+            let native = read_copilot_cli_native_calls(store.as_ref(), sid)?;
             let state_key = format!("copilot-app-transcript:{key}:{sid}");
             // Native rows can arrive without any transcript growth. Include
             // their complete ordered contents, not the global SQLite cursor.
@@ -2497,34 +2506,32 @@ fn sync_copilot_app_transcripts(conn: &mut Connection, root: &Path) -> Result<()
             format!("{native:?}").hash(&mut hash);
             let cwd = store
                 .as_ref()
-                .and_then(|s| resolve_session_store_cwd(s, &sid));
+                .and_then(|s| resolve_session_store_cwd(s, sid));
             cwd.hash(&mut hash);
-            let title =
-                Connection::open_with_flags(root.join("data.db"), OpenFlags::SQLITE_OPEN_READ_ONLY)
-                    .ok()
-                    .and_then(|c| {
-                        c.query_row("SELECT title FROM sessions WHERE id=?", [&sid], |r| {
-                            r.get::<_, Option<String>>(0)
-                        })
-                        .ok()
-                        .flatten()
-                    });
+            let title = data_db
+                .query_row("SELECT title FROM sessions WHERE id=?", [sid], |r| {
+                    r.get::<_, Option<String>>(0)
+                })
+                .ok()
+                .flatten();
+            2u32.hash(&mut hash); // App reconciliation/accounting revision.
             title.hash(&mut hash);
             let fingerprint = (before.0, (hash.finish() & i64::MAX as u64) as i64);
             if states.get(&state_key) == Some(&fingerprint) {
                 return Ok(());
             }
-            let calls = crate::copilot::read_calls(&path, &sid, &|| false)?;
-            let calls = crate::copilot::merge_calls(calls, native)?;
+            let calls = crate::copilot::read_calls(&path, sid, should_cancel)?;
+            let calls = crate::copilot::merge_calls(calls, native.clone())?;
             if before != copilot_cli_transcript_fingerprint(&path)? {
                 return Err("Copilot App 事件檔在讀取時變更".into());
             }
             let rows: Vec<_> = calls
                 .into_iter()
                 .map(|r| CopilotCliUsageRow {
-                    session_id: sid.clone(),
+                    session_id: sid.to_string(),
                     call_identity: r.identity,
-                    turn_no: r.turn_no,
+                    turn_no: r.turn_no.unwrap_or(1),
+                    native_identity: r.native_identity,
                     reasoning_effort: r.reasoning_effort,
                     ts: r
                         .timestamp
@@ -2541,23 +2548,48 @@ fn sync_copilot_app_transcripts(conn: &mut Connection, root: &Path) -> Result<()
                     duration_ms: r.metrics.duration_ms,
                 })
                 .collect();
+            if should_cancel() {
+                return Err("Copilot App 同步已取消".into());
+            }
             let tx = conn.transaction().map_err(|e| e.to_string())?;
-            replace_copilot_call_rows(&tx, &root, &key, &sid, &rows, true)?;
+            let context = AppCallContext {
+                native: &native,
+                title,
+            };
+            replace_copilot_call_rows(&tx, root, key, sid, &rows, Some(&context))?;
             tx.execute(
                 "INSERT OR REPLACE INTO sync_state VALUES (?, ?, ?)",
                 params![state_key, fingerprint.0, fingerprint.1],
             )
             .map_err(|e| e.to_string())?;
+            if should_cancel() {
+                return Err("Copilot App 同步已取消".into());
+            }
             tx.commit().map_err(|e| e.to_string())
         })();
         if let Err(error) = result {
             eprintln!("⚠️ Copilot App 用量尚待重試: {error}");
         }
     }
+    if let Some(store) = store {
+        store.execute_batch("ROLLBACK").map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
+#[cfg(test)]
 fn sync_copilot_app_usage_logs_from(conn: &mut Connection, app_dir: &Path) -> Result<(), String> {
+    sync_copilot_app_usage_logs_from_with_cancel(conn, app_dir, &|| false)
+}
+
+fn sync_copilot_app_usage_logs_from_with_cancel(
+    conn: &mut Connection,
+    app_dir: &Path,
+    should_cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<(), String> {
+    if should_cancel() {
+        return Ok(());
+    }
     let session_store_path = app_dir.join("session-store.db");
 
     // Canonicalize the source directory so the cursor is stable across trailing
@@ -2648,9 +2680,28 @@ fn sync_copilot_app_usage_logs_from(conn: &mut Connection, app_dir: &Path) -> Re
         }
     };
 
-    if let Err(error) = sync_copilot_app_transcripts(conn, app_dir) {
+    if let Err(error) = sync_copilot_app_transcripts(
+        conn,
+        &canonical_app_dir,
+        &source_key,
+        &app_session_ids,
+        &data_db,
+        should_cancel,
+    ) {
         eprintln!("⚠️ Copilot App 事件檔同步尚待重試: {error}");
     }
+    if should_cancel() {
+        return Ok(());
+    }
+    // Repair only derived App totals from already stored breakdowns. No source
+    // data is deleted, and a missing source cannot block correcting double counts.
+    conn.execute("UPDATE usage_entries SET
+        tokens_total=COALESCE(tokens_input,0)+COALESCE(tokens_cache_read,0)+COALESCE(tokens_output,0),
+        delta_total=COALESCE(delta_input,0)+COALESCE(delta_cache_read,0)+COALESCE(delta_output,0)
+        WHERE source_kind='copilot-app' AND source_dir_key=?1 AND import_batch_id IS NULL
+          AND (tokens_total != COALESCE(tokens_input,0)+COALESCE(tokens_cache_read,0)+COALESCE(tokens_output,0)
+            OR delta_total != COALESCE(delta_input,0)+COALESCE(delta_cache_read,0)+COALESCE(delta_output,0))", [&source_key])
+        .map_err(|e| e.to_string())?;
     let authoritative_registry = app_session_ids.clone();
     let managed = load_sync_state_for_prefix(conn, "copilot-app-transcript");
     let app_session_ids: HashSet<String> = app_session_ids
@@ -2773,6 +2824,9 @@ fn sync_copilot_app_usage_logs_from(conn: &mut Connection, app_dir: &Path) -> Re
     let mut max_event_cursor: Option<(String, i64)> = None;
     let mut scan_failed = false;
     for row_res in touched_iter {
+        if should_cancel() {
+            return Ok(());
+        }
         match row_res {
             Ok((session_id, turn_index, created_at, id)) => {
                 max_event_cursor = Some((created_at, id));
@@ -2848,6 +2902,9 @@ fn sync_copilot_app_usage_logs_from(conn: &mut Connection, app_dir: &Path) -> Re
                 legacy_timestamp,
                 max_id.unwrap_or(0),
             )?;
+            if should_cancel() {
+                return Ok(());
+            }
             tx.commit()
                 .map_err(|e| format!("Copilot App cursor migration COMMIT 失敗: {}", e))?;
         }
@@ -2875,8 +2932,8 @@ fn sync_copilot_app_usage_logs_from(conn: &mut Connection, app_dir: &Path) -> Re
     // the net non-cached input as `tokens_input = SUM(input_tokens) -
     // SUM(cache_read_tokens)`, mirroring the Copilot CLI normalization
     // (`separate_copilot_cli_cached_input`). `tokens_cache_read` keeps the
-    // raw cache-read total; `tokens_total` sums net input + output +
-    // cache_read + cache_write + reasoning, so cache read is counted once.
+    // raw cache-read total. Total is net input + cache read + output;
+    // cache write and reasoning are already represented in source input/output.
     let aggregate_query = "SELECT MIN(created_at) AS ts,
                 SUM(input_tokens), SUM(output_tokens),
                 SUM(cache_read_tokens), SUM(cache_write_tokens),
@@ -2892,6 +2949,9 @@ fn sync_copilot_app_usage_logs_from(conn: &mut Connection, app_dir: &Path) -> Re
 
     let mut turn_rows: Vec<CopilotAppTurnRow> = Vec::new();
     for (session_id, turn_index) in &touched_turns {
+        if should_cancel() {
+            return Ok(());
+        }
         let rows_res = agg_stmt
             .query_map(params![session_id, turn_index], |row| {
                 let raw_input: i64 = row.get::<_, Option<i64>>(1)?.unwrap_or(0).max(0);
@@ -2987,6 +3047,9 @@ fn sync_copilot_app_usage_logs_from(conn: &mut Connection, app_dir: &Path) -> Re
     }
 
     for row in turn_rows {
+        if should_cancel() {
+            return Ok(());
+        }
         // Resolve session metadata (title + cwd) from the original session.
         let meta = session_meta_cache
             .entry(row.session_id.clone())
@@ -3003,8 +3066,7 @@ fn sync_copilot_app_usage_logs_from(conn: &mut Connection, app_dir: &Path) -> Re
 
         // tokens_total counts cache_read once (as its own component), since
         // tokens_input has already been normalized to the non-cached portion.
-        let total =
-            row.input_tokens + row.output_tokens + row.cache_read + row.cache_write + row.reasoning;
+        let total = row.input_tokens + row.output_tokens + row.cache_read;
 
         // Delta tokens: the source records per-API-call usage (not cumulative
         // session totals), so the per-turn SUM already represents the delta for
@@ -3175,6 +3237,9 @@ fn sync_copilot_app_usage_logs_from(conn: &mut Connection, app_dir: &Path) -> Re
         }
     }
 
+    if should_cancel() {
+        return Ok(());
+    }
     tx.commit()
         .map_err(|e| format!("Copilot App transaction COMMIT 失敗: {}", e))?;
 
@@ -3220,7 +3285,7 @@ fn query_copilot_app_session_ids(
 ) -> Result<HashSet<String>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT DISTINCT session_id
+            "SELECT DISTINCT COALESCE(parent_session_id, session_id)
              FROM usage_entries
              WHERE assistant_type = 'copilot'
                AND source_kind = ?
@@ -3235,12 +3300,7 @@ fn query_copilot_app_session_ids(
     let mut ids = HashSet::new();
     for row in rows {
         let raw = row.map_err(|e| format!("讀取 Copilot App session 失敗: {}", e))?;
-        // Subagent rows use a synthetic `<session_id>__<agent_id>` id. Strip
-        // the agent suffix so reconciliation compares the original session id
-        // against `data.db.sessions`, otherwise subagent rows would always be
-        // classified as stale and deleted on every sync.
-        let base = raw.split("__").next().unwrap_or(&raw).to_string();
-        ids.insert(base);
+        ids.insert(raw);
     }
     Ok(ids)
 }
@@ -3252,22 +3312,16 @@ fn delete_stale_copilot_app_rows(
 ) -> Result<usize, String> {
     let mut deleted = 0usize;
     for session_id in session_ids {
-        // Delete the main session row plus any subagent synthetic rows
-        // (`<session_id>__<agent_id>`). Use a prefix match (`session_id` + '__')
-        // so stale subagent rows are removed together with their parent.
+        // Only an explicit parent establishes App ownership. An independently
+        // registered session may legitimately contain the `__` separator.
         deleted += tx
             .execute(
                 "DELETE FROM usage_entries
                  WHERE assistant_type = 'copilot'
                    AND source_kind = ?
                    AND source_dir_key = ?
-                   AND (session_id = ? OR session_id LIKE ? ESCAPE '\\')",
-                params![
-                    COPILOT_APP_SOURCE_KIND,
-                    source_key,
-                    session_id,
-                    format!("{}\\__%", session_id)
-                ],
+                   AND ((session_id = ?3 AND parent_session_id IS NULL) OR parent_session_id = ?3)",
+                params![COPILOT_APP_SOURCE_KIND, source_key, session_id],
             )
             .map_err(|e| format!("刪除錯誤 Copilot App 資料失敗: {}", e))?;
         tx.execute(
@@ -3429,6 +3483,7 @@ fn encode_hex(bytes: &[u8]) -> String {
 struct CopilotCliUsageRow {
     session_id: String,
     call_identity: String,
+    native_identity: Option<String>,
     turn_no: u32,
     reasoning_effort: Option<String>,
     /// Original call timestamp in UTC, including fractional seconds.
@@ -3674,7 +3729,8 @@ fn sync_copilot_cli_agent_usage_logs_with_cancel(
                 .map(|r| CopilotCliUsageRow {
                     session_id: sid.clone(),
                     call_identity: r.identity,
-                    turn_no: r.turn_no,
+                    turn_no: r.turn_no.unwrap_or(1),
+                    native_identity: r.native_identity,
                     reasoning_effort: None,
                     ts: r
                         .timestamp
@@ -3773,11 +3829,16 @@ fn read_copilot_cli_native_calls(
         };
         calls.push(crate::copilot::Call {
             turn_no: row
-                .get::<_, Option<u32>>(12)
+                .get::<_, Option<i64>>(12)
                 .map_err(|e| e.to_string())?
-                .unwrap_or(0)
-                .checked_add(1)
-                .ok_or("Copilot SQLite 回合數超出範圍")?,
+                .map(|turn| {
+                    u32::try_from(turn.max(0))
+                        .ok()
+                        .and_then(|turn| turn.checked_add(1))
+                        .ok_or("Copilot SQLite 回合數超出範圍")
+                })
+                .transpose()?,
+            native_identity: None,
             reasoning_effort: row.get(11).map_err(|e| e.to_string())?,
             identity: format!(
                 "sqlite:{}",
@@ -3812,7 +3873,12 @@ fn replace_copilot_cli_call_rows(
     session_id: &str,
     agent_rows: &[CopilotCliUsageRow],
 ) -> Result<(), String> {
-    replace_copilot_call_rows(tx, copilot_dir, source_key, session_id, agent_rows, false)
+    replace_copilot_call_rows(tx, copilot_dir, source_key, session_id, agent_rows, None)
+}
+
+struct AppCallContext<'a> {
+    native: &'a [crate::copilot::Call],
+    title: Option<String>,
 }
 
 fn replace_copilot_call_rows(
@@ -3821,8 +3887,9 @@ fn replace_copilot_call_rows(
     source_key: &str,
     session_id: &str,
     agent_rows: &[CopilotCliUsageRow],
-    app: bool,
+    app_context: Option<&AppCallContext<'_>>,
 ) -> Result<(), String> {
+    let app = app_context.is_some();
     let kind = if app {
         COPILOT_APP_SOURCE_KIND
     } else {
@@ -3842,13 +3909,13 @@ fn replace_copilot_call_rows(
             "SELECT id, source_dir_key, transcript_path, import_source_id,
                 delta_total, tokens_total FROM usage_entries
          WHERE assistant_type='copilot' AND source_kind=?2
-           AND (session_id=?1 OR parent_session_id=?1
-                OR substr(session_id,1,length(?1)+2)=?1 || '__')
+           AND ((session_id=?1 AND (?3=0 OR parent_session_id IS NULL)) OR parent_session_id=?1
+                OR (?3=0 AND substr(session_id,1,length(?1)+2)=?1 || '__'))
            AND import_batch_id IS NULL",
         )
         .map_err(|e| e.to_string())?;
     let mut records = stmt
-        .query(params![session_id, kind])
+        .query(params![session_id, kind, app])
         .map_err(|e| e.to_string())?;
     let mut owned_ids = Vec::new();
     let mut hook_sum = None;
@@ -3937,6 +4004,39 @@ fn replace_copilot_call_rows(
                     .ok_or("Copilot App 歷史用量超出範圍")?;
             }
         }
+        // Legacy collectors place a whole turn on MIN(created_at). Validate
+        // against the original complete native calls before redistributing their
+        // matched transcript timestamps across UTC dates (including clock jitter).
+        if let Some(context) = app_context {
+            type NativeBucket = (u32, String, Option<String>);
+            let mut native_buckets: BTreeMap<NativeBucket, (String, [u64; 5])> = BTreeMap::new();
+            for call in context.native {
+                let sid = call
+                    .agent_id
+                    .as_ref()
+                    .map(|agent| format!("{session_id}__{agent}"))
+                    .unwrap_or_else(|| session_id.to_owned());
+                let day = call.timestamp.format("%Y-%m-%d").to_string();
+                let bucket = native_buckets
+                    .entry((call.turn_no.unwrap_or(1), sid, call.model.clone()))
+                    .or_insert_with(|| (day.clone(), [0; 5]));
+                bucket.0 = bucket.0.clone().min(day);
+                for (sum, value) in bucket.1.iter_mut().zip([
+                    call.metrics.input.saturating_sub(call.metrics.cache_read),
+                    call.metrics.output,
+                    call.metrics.cache_read,
+                    call.metrics.cache_write,
+                    call.metrics.reasoning,
+                ]) {
+                    *sum = sum
+                        .checked_add(value)
+                        .ok_or("Copilot App 原生回合用量超出範圍")?;
+                }
+            }
+            for ((turn, sid, model), (day, values)) in native_buckets {
+                buckets.insert((day, turn, sid, model), values);
+            }
+        }
         let mut legacy = tx
             .prepare(
                 "SELECT date, turn_no, session_id, model,
@@ -3944,7 +4044,7 @@ fn replace_copilot_call_rows(
             SUM(COALESCE(tokens_cache_read,0)), SUM(COALESCE(tokens_cache_write,0)),
             SUM(COALESCE(tokens_reasoning,0)) FROM usage_entries
             WHERE source_kind=?1 AND source_dir_key=?2
-              AND (session_id=?3 OR parent_session_id=?3)
+              AND ((session_id=?3 AND parent_session_id IS NULL) OR parent_session_id=?3)
               AND (import_source_id IS NULL OR import_source_id NOT LIKE '%:call:%')
               AND import_batch_id IS NULL GROUP BY date, turn_no, session_id, model",
             )
@@ -3970,96 +4070,71 @@ fn replace_copilot_call_rows(
                 return Err("Copilot App 來源未涵蓋既有回合用量，保留原資料待重試".into());
             }
         }
-        // Do not replace a previously imported call merely because unrelated
-        // new calls make the session total larger. Every known call must still
-        // have a unique counterpart in the current complete source snapshot.
+        // Event identities are authoritative. Only a native SQLite identity
+        // retained by merge_calls may prove a SQLite -> transcript transition;
+        // an unrelated equal-valued event must never stand in for a lost call.
         let mut stmt = tx
             .prepare(
-                "SELECT timestamp, model, agent_nickname,
+                "SELECT import_source_id, timestamp, model, agent_nickname,
             tokens_input, tokens_output, tokens_cache_read, tokens_cache_write,
             tokens_reasoning, duration_ms FROM usage_entries
             WHERE source_kind=?1 AND source_dir_key=?2
-              AND (session_id=?3 OR parent_session_id=?3)
+              AND ((session_id=?3 AND parent_session_id IS NULL) OR parent_session_id=?3)
               AND import_source_id LIKE '%:call:%' AND import_batch_id IS NULL",
             )
             .map_err(|e| e.to_string())?;
-        let previous = stmt
-            .query_map(params![kind, source_key, session_id], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, Option<String>>(1)?,
-                    r.get::<_, Option<String>>(2)?,
-                    (3..9)
-                        .map(|i| r.get::<_, Option<u64>>(i).map(|n| n.unwrap_or(0)))
-                        .collect::<rusqlite::Result<Vec<_>>>()?,
-                ))
-            })
-            .map_err(|e| e.to_string())?
-            .collect::<rusqlite::Result<Vec<_>>>()
+        let mut previous = stmt
+            .query(params![kind, source_key, session_id])
             .map_err(|e| e.to_string())?;
-        let previous = previous
-            .into_iter()
-            .map(|(ts, model, agent_id, m)| {
-                Ok(crate::copilot::Call {
-                    identity: String::new(),
-                    turn_no: 1,
-                    timestamp: crate::copilot::parse_timestamp(&ts)?,
-                    model,
-                    agent_id,
-                    initiator: None,
-                    reasoning_effort: None,
-                    metrics: crate::copilot::Metrics {
-                        input: m[0] + m[2],
-                        output: m[1],
-                        cache_read: m[2],
-                        cache_write: m[3],
-                        reasoning: m[4],
-                        duration_ms: m[5],
-                    },
-                })
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        let current = agent_rows
-            .iter()
-            .map(|r| {
-                Ok(crate::copilot::Call {
-                    identity: r.call_identity.clone(),
-                    turn_no: r.turn_no,
-                    timestamp: crate::copilot::parse_timestamp(&r.ts)?,
-                    model: r.model.clone(),
-                    agent_id: r.agent_id.clone(),
-                    initiator: r.initiator.clone(),
-                    reasoning_effort: r.reasoning_effort.clone(),
-                    metrics: crate::copilot::Metrics {
-                        input: r.input_tokens + r.cache_read,
-                        output: r.output_tokens,
-                        cache_read: r.cache_read,
-                        cache_write: r.cache_write,
-                        reasoning: r.reasoning,
-                        duration_ms: r.duration_ms,
-                    },
-                })
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        if crate::copilot::merge_calls(current, previous)?.len() != agent_rows.len() {
-            return Err("Copilot App 來源缺少已匯入呼叫，保留原資料待重試".into());
+        while let Some(old) = previous.next().map_err(|e| e.to_string())? {
+            let import: String = old.get(0).map_err(|e| e.to_string())?;
+            let hash = import
+                .rsplit(':')
+                .next()
+                .ok_or("Copilot App 呼叫身分遺失")?;
+            let old_ts: String = old.get(1).map_err(|e| e.to_string())?;
+            let old_model: Option<String> = old.get(2).map_err(|e| e.to_string())?;
+            let old_agent: Option<String> = old.get(3).map_err(|e| e.to_string())?;
+            let metrics = (4..10)
+                .map(|i| old.get::<_, Option<u64>>(i).map(|v| v.unwrap_or(0)))
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|e| e.to_string())?;
+            let covered = agent_rows.iter().any(|row| {
+                let same_id = hex::encode(Sha256::digest(row.call_identity.as_bytes())) == hash;
+                let native_transition = row
+                    .native_identity
+                    .as_ref()
+                    .is_some_and(|id| hex::encode(Sha256::digest(id.as_bytes())) == hash);
+                (same_id || native_transition)
+                    && row.model == old_model
+                    && row.agent_id == old_agent
+                    && (native_transition || row.ts == old_ts)
+                    && [
+                        row.input_tokens,
+                        row.output_tokens,
+                        row.cache_read,
+                        row.cache_write,
+                        row.reasoning,
+                        row.duration_ms,
+                    ]
+                    .as_slice()
+                        == metrics
+            });
+            if !covered {
+                return Err("Copilot App 來源缺少已匯入呼叫身分，保留原資料待重試".into());
+            }
         }
     }
     let new_total = agent_rows
         .iter()
         .try_fold(0u64, |sum, r| {
-            sum.checked_add(if app {
-                r.cache_write.checked_add(r.reasoning)?
-            } else {
-                0
-            })?
-            .checked_add(r.input_tokens)?
-            .checked_add(r.cache_read)?
-            .checked_add(r.output_tokens)
+            sum.checked_add(r.input_tokens)?
+                .checked_add(r.cache_read)?
+                .checked_add(r.output_tokens)
         })
         .and_then(|n| i64::try_from(n).ok())
         .ok_or("Copilot session 總量超出範圍")?;
-    if hook_total.max(previous_total) > new_total {
+    if !app && hook_total.max(previous_total) > new_total {
         return Err(format!(
             "來源用量尚未補齊（已知={}，重建={new_total}）",
             hook_total.max(previous_total)
@@ -4073,19 +4148,8 @@ fn replace_copilot_call_rows(
     }
     drop(delete);
     register_usage_source_directory(tx, "copilot", kind, source_key, copilot_dir)?;
-    let session_name = if app {
-        Connection::open_with_flags(
-            copilot_dir.join("data.db"),
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .ok()
-        .and_then(|c| {
-            c.query_row("SELECT title FROM sessions WHERE id=?", [session_id], |r| {
-                r.get::<_, Option<String>>(0)
-            })
-            .ok()
-            .flatten()
-        })
+    let session_name = if let Some(context) = app_context {
+        context.title.clone()
     } else {
         get_copilot_session_name(copilot_dir, session_id)
     };
@@ -4111,18 +4175,10 @@ fn replace_copilot_call_rows(
     for row in agent_rows {
         let timestamp = &row.ts;
         let date_str = timestamp.get(..10).unwrap_or(&row.ts).to_string();
-        // CLI accounting mirrors the hook: raw input + output. Since
-        // `input_tokens` was normalized to exclude cache reads, add
-        // `cache_read` back once. Reasoning and cache write remain separate
-        // breakdowns and are not added to tokens_total.
-        let total = row.input_tokens
-            + row.cache_read
-            + row.output_tokens
-            + if app {
-                row.cache_write + row.reasoning
-            } else {
-                0
-            };
+        // Copilot's raw input already includes cached input; output includes
+        // reasoning. App and CLI count raw input + output exactly once. Cache
+        // read/write and reasoning remain separate breakdowns, never additions.
+        let total = row.input_tokens + row.cache_read + row.output_tokens;
 
         let (row_session_id, parent_session_id, agent_nickname, agent_role) = match &row.agent_id {
             Some(agent) if !agent.is_empty() => {
@@ -5981,7 +6037,9 @@ fn sync_configured_sources_with_cancel(
                 Harness::Copilot => {
                     sync_hook_usage_logs_with_cancel(conn, "copilot", root, should_cancel)
                 }
-                Harness::CopilotApp => sync_copilot_app_usage_logs_from(conn, root),
+                Harness::CopilotApp => {
+                    sync_copilot_app_usage_logs_from_with_cancel(conn, root, should_cancel)
+                }
                 Harness::Claude => {
                     sync_claude_usage_logs_from_with_cancel(conn, root, should_cancel)
                 }
@@ -13200,10 +13258,10 @@ mod tests {
         );
         assert_eq!(row.2, 1_370, "tokens_output");
         assert_eq!(row.3, 384, "tokens_reasoning");
-        // total = net_input + cache_read + output + reasoning = 42_530 + 401_024 + 1_370 + 384
-        assert_eq!(row.4, 445_308, "tokens_total counts cache_read once");
+        // Reasoning is included in output: total = net input + cache read + output.
+        assert_eq!(row.4, 444_924, "tokens_total counts cache_read once");
         assert_eq!(row.5, 42_530, "delta_input must also exclude cache_read");
-        assert_eq!(row.6, 445_308, "delta_total must match tokens_total");
+        assert_eq!(row.6, 444_924, "delta_total must match tokens_total");
 
         if let Some(value) = old_app_dir {
             std::env::set_var("COPILOT_APP_DIR", value);
@@ -13677,7 +13735,7 @@ mod tests {
             "main agent agent_role must be NULL (initiator is NULL)"
         );
         // DP4F events: input 100000+1261894=1361894, output 800+17622=18422, reasoning 1500+88=1588
-        let dp4f_total = 1361894 + 18422 + 1588;
+        let dp4f_total = 1361894 + 18422;
         assert_eq!(
             main_row.0, dp4f_total,
             "main agent total must match DP4F event sum"
@@ -13728,7 +13786,7 @@ mod tests {
             "subagent agent_role must be 'sub-agent' when initiator is 'sub-agent'"
         );
         // K2.7 events: input 2000000+1156615=3156615, output 20000+8069=28069, reasoning 100+97=197
-        let k27_total = 3156615 + 28069 + 197;
+        let k27_total = 3156615 + 28069;
         assert_eq!(
             sub_row.0, k27_total,
             "subagent total must match K2.7 event sum"
@@ -15553,169 +15611,567 @@ mod tests {
         .collect()
     }
 
+    /// Source handles are dropped before fixture cleanup on every platform.
+    struct AppReviewFixture {
+        root: PathBuf,
+        conn: Connection,
+        store: Option<Connection>,
+    }
+
+    impl AppReviewFixture {
+        fn new(ids: &[&str]) -> Self {
+            let root = temp_jsonl_path("app-review").with_extension("");
+            fs::create_dir_all(&root).unwrap();
+            let store = build_cli_reconciler_fixture(&root, ids, &[]);
+            let conn = Connection::open_in_memory().unwrap();
+            init_db(&conn).unwrap();
+            Self {
+                root,
+                conn,
+                store: Some(store),
+            }
+        }
+        fn write(&self, sid: &str, events: &[serde_json::Value]) {
+            write_cli_usage_fixture(&self.root, sid, events);
+        }
+        fn sync(&mut self) {
+            sync_copilot_app_usage_logs_from(&mut self.conn, &self.root).unwrap();
+        }
+        fn native(
+            &self,
+            id: i64,
+            sid: &str,
+            timestamp: &str,
+            turn: Option<i64>,
+            agent: Option<&str>,
+        ) {
+            let store = self.store.as_ref().unwrap();
+            insert_cli_event(
+                store,
+                CliEventIdentity {
+                    id,
+                    session_id: sid,
+                    model: "B",
+                    agent_id: agent,
+                    initiator: None,
+                },
+                CliEventTokens {
+                    input: 100,
+                    output: 10,
+                    cache_read: 80,
+                    cache_write: 0,
+                    reasoning: 0,
+                    duration_ms: 50,
+                },
+                timestamp,
+            );
+            store
+                .execute(
+                    "UPDATE assistant_usage_events SET turn_index=? WHERE id=?",
+                    params![turn, id],
+                )
+                .unwrap();
+        }
+        fn rows(&self, sid: &str) -> Vec<(i64, String, u32, u64)> {
+            self.conn.prepare("SELECT id,import_source_id,turn_no,delta_total FROM usage_entries WHERE session_id=? AND parent_session_id IS NULL ORDER BY import_source_id")
+                .unwrap().query_map([sid], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap().map(Result::unwrap).collect()
+        }
+        fn replies(&self, sid: &str, agent: Option<&str>) -> Vec<(u32, u64)> {
+            let entries = self.conn.prepare("SELECT turn_no,SUM(delta_total) FROM usage_entries WHERE session_id=? GROUP BY turn_no")
+                .unwrap().query_map([sid], |r|Ok((r.get::<_,u32>(0)?,r.get::<_,u64>(1)?))).unwrap()
+                .map(|r| { let (turn,total)=r.unwrap(); (turn,(TokenStats { total,input:0,output:0,cache_read:None,cache_write:None,cache_write_5m:None,cache_write_1h:None,reasoning:None }, "B".into())) }).collect();
+            let mut timeline = Vec::new();
+            crate::timeline::parse_copilot_timeline_filtered(
+                BufReader::new(
+                    File::open(self.root.join("session-state/app/events.jsonl")).unwrap(),
+                ),
+                &entries,
+                &mut timeline,
+                &mut HashMap::new(),
+                agent,
+                None,
+            );
+            timeline
+                .into_iter()
+                .filter_map(|item| match item {
+                    crate::timeline::TimelineItem::AgentReply {
+                        turn_no,
+                        tokens: Some(tokens),
+                        ..
+                    } => Some((turn_no, tokens.total)),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+    impl Drop for AppReviewFixture {
+        fn drop(&mut self) {
+            drop(self.store.take());
+            if !std::thread::panicking() {
+                fs::remove_dir_all(&self.root).unwrap();
+            }
+        }
+    }
+    fn app_text(kind: &str) -> serde_json::Value {
+        serde_json::json!({"type":kind,"data":{"content":"fixture"}})
+    }
+
     #[test]
-    fn app_transcripts_reconcile_legacy_overlap_append_and_retry() {
-        let base = temp_jsonl_path("app-transcript-reconcile").with_extension("");
-        fs::create_dir_all(&base).unwrap();
-        let store = build_cli_reconciler_fixture(&base, &["app"], &["cli"]);
-        insert_cli_event(
-            &store,
-            CliEventIdentity {
-                id: 1,
-                session_id: "app",
-                model: "B",
-                agent_id: None,
-                initiator: None,
-            },
-            CliEventTokens {
-                input: 100,
-                output: 10,
-                cache_read: 80,
-                cache_write: 0,
-                reasoning: 0,
-                duration_ms: 50,
-            },
-            "2026-07-23T12:00:00Z",
+    fn app_review_preserves_canonical_source_key_in_rows_and_state() {
+        let mut f = AppReviewFixture::new(&["app"]);
+        let root = f.root.canonicalize().unwrap();
+        #[cfg(windows)]
+        assert!(root.to_string_lossy().starts_with(r"\\?\"));
+        let key = encode_hex(root.as_os_str().as_encoded_bytes());
+        f.native(1, "app", "2026-07-23T12:00:00Z", Some(0), None);
+        f.sync();
+        f.write("app", &[cli_usage_fixture(1, "2026-07-23T12:00:00Z")]);
+        f.sync();
+        assert_eq!(f.rows("app").len(), 1);
+        let actual: String = f
+            .conn
+            .query_row("SELECT source_dir_key FROM usage_entries", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(actual, key);
+        assert!(
+            load_sync_state_for_prefix(&f.conn, "copilot-app-transcript")
+                .contains_key(&format!("copilot-app-transcript:{key}:app"))
         );
-        let mut conn = Connection::open_in_memory().unwrap();
-        init_db(&conn).unwrap();
-        sync_copilot_app_usage_logs_from(&mut conn, &base).unwrap();
-        assert_eq!(cli_daily_totals(&conn, "app")[0].1, 110);
-        // First takeover must leave legacy rows intact if the transcript is partial.
-        write_cli_usage_fixture(&base, "app", &[]);
-        let path = base.join("session-state/app/events.jsonl");
-        fs::write(&path, "{").unwrap();
-        sync_copilot_app_usage_logs_from(&mut conn, &base).unwrap();
-        assert_eq!(cli_daily_totals(&conn, "app")[0].1, 110);
-        let ambiguous = [
-            cli_usage_fixture(10, "2026-07-23T11:59:59.500Z"),
-            cli_usage_fixture(11, "2026-07-23T12:00:00.500Z"),
-        ];
-        write_cli_usage_fixture(&base, "app", &ambiguous);
-        sync_copilot_app_usage_logs_from(&mut conn, &base).unwrap();
-        assert_eq!(cli_daily_totals(&conn, "app")[0].1, 110);
-        let native_path = base.join("session-store.db");
-        let hidden_path = base.join("hidden-store.db");
-        fs::rename(&native_path, &hidden_path).unwrap();
-        let mut unrelated_legacy = cli_usage_fixture(50, "2026-07-24T12:00:00Z");
-        unrelated_legacy["data"]["usage"]["outputTokens"] = serde_json::json!(10000);
-        write_cli_usage_fixture(&base, "app", &[unrelated_legacy]);
-        sync_copilot_app_usage_logs_from(&mut conn, &base).unwrap();
+        let changes = f
+            .conn
+            .query_row::<i64, _, _>("SELECT total_changes()", [], |r| r.get(0))
+            .unwrap();
+        f.sync();
         assert_eq!(
-            cli_daily_totals(&conn, "app"),
-            vec![("2026-07-23".into(), 110)]
+            f.conn
+                .query_row::<i64, _, _>("SELECT total_changes()", [], |r| r.get(0))
+                .unwrap(),
+            changes
         );
-        fs::rename(&hidden_path, &native_path).unwrap();
+    }
+
+    #[test]
+    fn app_review_independent_double_underscore_session_survives_rebuild_and_cleanup() {
+        let mut f = AppReviewFixture::new(&["a", "a__b"]);
+        let first = cli_usage_fixture(1, "2026-07-23T12:00:00Z");
+        f.write("a", std::slice::from_ref(&first));
+        f.write("a__b", &[cli_usage_fixture(2, "2026-07-23T12:01:00Z")]);
+        f.sync();
+        let independent = f.rows("a__b");
+        f.write("a", &[first, cli_usage_fixture(3, "2026-07-23T12:02:00Z")]);
+        f.sync();
+        assert_eq!(f.rows("a__b"), independent);
+        Connection::open(f.root.join("data.db"))
+            .unwrap()
+            .execute("DELETE FROM sessions WHERE id='a'", [])
+            .unwrap();
+        f.sync();
+        assert!(f.rows("a").is_empty());
+        assert_eq!(f.rows("a__b"), independent);
+        let key = encode_hex(
+            f.root
+                .canonicalize()
+                .unwrap()
+                .as_os_str()
+                .as_encoded_bytes(),
+        );
+        assert_eq!(
+            query_copilot_app_session_ids(&f.conn, &key).unwrap(),
+            HashSet::from(["a__b".to_owned()])
+        );
+    }
+
+    #[test]
+    fn app_review_registered_id_cannot_claim_another_sessions_child_with_same_display_id() {
+        let mut f = AppReviewFixture::new(&["a", "a__b"]);
+        let mut child = cli_usage_fixture(1, "2026-07-23T12:00:00Z");
+        child["agentId"] = serde_json::json!("b");
+        f.write("a", &[child]);
+        let independent = cli_usage_fixture(2, "2026-07-23T12:01:00Z");
+        f.write("a__b", std::slice::from_ref(&independent));
+        f.sync();
+        let child_id: i64 = f
+            .conn
+            .query_row(
+                "SELECT id FROM usage_entries WHERE parent_session_id='a'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        f.write(
+            "a__b",
+            &[independent, cli_usage_fixture(3, "2026-07-23T12:02:00Z")],
+        );
+        f.sync();
+        let still_child: i64 = f
+            .conn
+            .query_row(
+                "SELECT id FROM usage_entries WHERE parent_session_id='a'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(still_child, child_id);
+        assert_eq!(f.rows("a__b").len(), 2);
+    }
+
+    #[test]
+    fn app_review_equal_metrics_cannot_replace_a_persisted_event_identity() {
+        let mut f = AppReviewFixture::new(&["app"]);
+        f.write("app", &[cli_usage_fixture(1, "2026-07-23T12:00:00Z")]);
+        f.sync();
+        let before = f.rows("app");
+        f.write("app", &[cli_usage_fixture(222, "2026-07-23T12:00:00Z")]);
+        f.sync();
+        assert_eq!(f.rows("app"), before);
+    }
+
+    #[test]
+    fn app_review_verified_sqlite_identity_can_transition_to_transcript() {
+        let mut f = AppReviewFixture::new(&["app"]);
+        f.native(1, "app", "2026-07-23T12:00:00Z", Some(0), None);
+        f.write("app", &[]);
+        f.sync();
+        let before = f.rows("app");
+        f.write("app", &[cli_usage_fixture(1, "2026-07-23T12:00:00.500Z")]);
+        f.sync();
+        let after = f.rows("app");
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].3, 110);
+        assert_ne!(before[0].1, after[0].1);
+        let changes = f
+            .conn
+            .query_row::<i64, _, _>("SELECT total_changes()", [], |r| r.get(0))
+            .unwrap();
+        f.sync();
+        assert_eq!(
+            f.conn
+                .query_row::<i64, _, _>("SELECT total_changes()", [], |r| r.get(0))
+                .unwrap(),
+            changes
+        );
+    }
+
+    #[test]
+    fn app_review_native_null_turn_does_not_override_inferred_later_turn() {
+        let mut f = AppReviewFixture::new(&["app"]);
+        f.native(2, "app", "2026-07-23T12:01:00Z", None, None);
+        f.write(
+            "app",
+            &[
+                app_text("user.message"),
+                cli_usage_fixture(1, "2026-07-23T12:00:00Z"),
+                app_text("assistant.message"),
+                app_text("user.message"),
+                cli_usage_fixture(2, "2026-07-23T12:01:00Z"),
+                app_text("assistant.message"),
+            ],
+        );
+        f.sync();
+        assert_eq!(f.replies("app", None), vec![(1, 110), (2, 110)]);
+    }
+
+    #[test]
+    fn app_review_negative_native_turn_index_clamps_to_first_turn() {
+        let mut f = AppReviewFixture::new(&["app"]);
+        f.native(1, "app", "2026-07-23T12:00:00Z", Some(-1), None);
+        f.write("app", &[cli_usage_fixture(1, "2026-07-23T12:00:00Z")]);
+        f.sync();
+        assert_eq!(f.rows("app")[0].2, 1);
+    }
+
+    #[test]
+    fn app_review_consecutive_prompts_and_late_child_match_filtered_timeline() {
+        let mut f = AppReviewFixture::new(&["app"]);
+        let mut child = cli_usage_fixture(3, "2026-07-23T12:02:00Z");
+        child["agentId"] = serde_json::json!("child");
+        let mut reply = app_text("assistant.message");
+        reply["agentId"] = serde_json::json!("child");
+        f.native(3, "app", "2026-07-23T12:02:00Z", Some(2), Some("child"));
+        f.write(
+            "app",
+            &[
+                app_text("user.message"),
+                app_text("user.message"),
+                cli_usage_fixture(1, "2026-07-23T12:00:00Z"),
+                app_text("assistant.message"),
+                app_text("user.message"),
+                cli_usage_fixture(2, "2026-07-23T12:01:00Z"),
+                app_text("assistant.message"),
+                app_text("user.message"),
+                child,
+                reply,
+            ],
+        );
+        f.sync();
+        assert_eq!(f.replies("app", None), vec![(1, 110), (2, 110)]);
+        assert_eq!(f.replies("app__child", Some("child")), vec![(1, 110)]);
+    }
+
+    #[test]
+    fn app_review_intermediate_text_reply_advances_usage_with_timeline() {
+        let mut f = AppReviewFixture::new(&["app"]);
+        f.write(
+            "app",
+            &[
+                app_text("user.message"),
+                cli_usage_fixture(1, "2026-07-23T12:00:00Z"),
+                app_text("assistant.message"),
+                cli_usage_fixture(2, "2026-07-23T12:01:00Z"),
+                app_text("assistant.message"),
+            ],
+        );
+        f.sync();
+        assert_eq!(f.replies("app", None), vec![(1, 110), (2, 110)]);
+    }
+
+    #[test]
+    fn app_review_legacy_midnight_turn_and_jitter_migrate_to_actual_call_dates() {
+        let mut f = AppReviewFixture::new(&["app"]);
+        f.native(1, "app", "2026-07-23T23:59:59.900Z", Some(0), None);
+        f.native(2, "app", "2026-07-24T00:00:01Z", Some(0), None);
+        f.sync();
+        assert_eq!(
+            cli_daily_totals(&f.conn, "app"),
+            vec![("2026-07-23".into(), 220)]
+        );
+        f.write(
+            "app",
+            &[
+                cli_usage_fixture(1, "2026-07-24T00:00:00.100Z"),
+                cli_usage_fixture(2, "2026-07-24T00:00:01Z"),
+                cli_usage_fixture(3, "2026-07-24T00:01:00Z"),
+            ],
+        );
+        f.sync();
+        assert_eq!(
+            cli_daily_totals(&f.conn, "app"),
+            vec![("2026-07-24".into(), 330)]
+        );
+        assert_eq!(f.rows("app").len(), 3);
+    }
+
+    #[test]
+    fn app_review_cancellation_during_read_leaves_session_uncommitted() {
+        use std::sync::atomic::AtomicUsize;
+        let mut f = AppReviewFixture::new(&["app"]);
+        f.write(
+            "app",
+            &[
+                cli_usage_fixture(1, "2026-07-23T12:00:00Z"),
+                cli_usage_fixture(2, "2026-07-23T12:01:00Z"),
+            ],
+        );
+        let checks = AtomicUsize::new(0);
+        sync_copilot_app_usage_logs_from_with_cancel(&mut f.conn, &f.root, &|| {
+            checks.fetch_add(1, Ordering::SeqCst) >= 3
+        })
+        .unwrap();
+        assert!(f.rows("app").is_empty());
+        assert!(load_sync_state_for_prefix(&f.conn, "copilot-app-transcript").is_empty());
+        f.sync();
+        assert_eq!(f.rows("app").len(), 2);
+    }
+
+    #[test]
+    fn app_review_cancellation_before_commit_rolls_back_current_session() {
+        use std::sync::atomic::AtomicUsize;
+        let mut f = AppReviewFixture::new(&["app"]);
+        f.write("app", &[cli_usage_fixture(1, "2026-07-23T12:00:00Z")]);
+        let checks = AtomicUsize::new(0);
+        sync_copilot_app_usage_logs_from_with_cancel(&mut f.conn, &f.root, &|| {
+            checks.fetch_add(1, Ordering::SeqCst) >= 5
+        })
+        .unwrap();
+        assert!(f.rows("app").is_empty());
+        assert!(load_sync_state_for_prefix(&f.conn, "copilot-app-transcript").is_empty());
+        f.sync();
+        assert_eq!(f.rows("app").len(), 1);
+    }
+
+    #[test]
+    fn app_review_corrects_double_counted_totals_without_losing_breakdowns_or_calls() {
+        let mut f = AppReviewFixture::new(&["app"]);
+        let mut event = cli_usage_fixture(1, "2026-07-23T12:00:00Z");
+        event["data"]["usage"]["cacheWriteTokens"] = serde_json::json!(4);
+        event["data"]["usage"]["reasoningTokens"] = serde_json::json!(5);
+        f.write("app", &[event]);
+        f.sync();
+        f.conn
+            .execute(
+                "UPDATE usage_entries SET tokens_total=119,delta_total=119",
+                [],
+            )
+            .unwrap();
+        f.sync();
+        let totals:(u64,u64,u64,u64)=f.conn.query_row("SELECT tokens_total,delta_total,tokens_cache_write,tokens_reasoning FROM usage_entries",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+        assert_eq!(totals, (110, 110, 4, 5));
+        assert_eq!(f.rows("app").len(), 1);
+    }
+
+    #[test]
+    fn app_transcript_first_takeover_retries_invalid_partial_and_missing_native_source() {
+        let mut f = AppReviewFixture::new(&["app"]);
+        f.native(1, "app", "2026-07-23T12:00:00Z", Some(0), None);
+        f.sync();
+        let original = f.rows("app");
+        f.write("app", &[]);
+        let path = f.root.join("session-state/app/events.jsonl");
+        for invalid in ["{", "{invalid}\n"] {
+            fs::write(&path, invalid).unwrap();
+            f.sync();
+            assert_eq!(f.rows("app"), original);
+        }
+        drop(f.store.take());
+        let native = f.root.join("session-store.db");
+        let hidden = f.root.join("hidden-store.db");
+        fs::rename(&native, &hidden).unwrap();
+        let mut unrelated = cli_usage_fixture(50, "2026-07-24T12:00:00Z");
+        unrelated["data"]["usage"]["outputTokens"] = serde_json::json!(10000);
+        f.write("app", &[unrelated]);
+        f.sync();
+        assert_eq!(f.rows("app"), original);
+        fs::rename(&hidden, &native).unwrap();
+        f.store = Some(Connection::open(native).unwrap());
+        f.write("app", &[cli_usage_fixture(1, "2026-07-23T12:00:00Z")]);
+        f.sync();
+        assert_eq!(f.rows("app").len(), 1);
+        assert_eq!(f.rows("app")[0].3, 110);
+    }
+
+    #[test]
+    fn app_transcript_append_backfills_past_cursor_and_ignores_checkpoint() {
+        let mut f = AppReviewFixture::new(&["app"]);
+        f.native(1, "app", "2026-07-23T12:00:00Z", Some(0), None);
+        f.sync();
         let first = cli_usage_fixture(1, "2026-07-23T12:00:00Z");
         let second = cli_usage_fixture(2, "2026-07-23T12:01:00Z");
-        write_cli_usage_fixture(&base, "app", &[first.clone(), second.clone()]);
-        for _ in 0..2 {
-            sync_copilot_app_usage_logs_from(&mut conn, &base).unwrap();
-        }
-        assert_eq!(cli_daily_totals(&conn, "app")[0].1, 220);
-        let changes: i64 = conn
-            .query_row("SELECT total_changes()", [], |r| r.get(0))
-            .unwrap();
-        let ids: Vec<i64> = conn
-            .prepare("SELECT id FROM usage_entries ORDER BY id")
-            .unwrap()
-            .query_map([], |r| r.get(0))
-            .unwrap()
-            .map(Result::unwrap)
-            .collect();
-        sync_copilot_app_usage_logs_from(&mut conn, &base).unwrap();
+        let mut child = cli_usage_fixture(3, "2026-07-23T12:02:00Z");
+        child["agentId"] = serde_json::json!("child");
+        child["data"]["usage"]["initiator"] = serde_json::json!("sub-agent");
+        child["data"]["usage"]["reasoningEffort"] = serde_json::json!("high");
+        child["data"]["usage"]["cacheWriteTokens"] = serde_json::json!(4);
+        child["data"]["usage"]["reasoningTokens"] = serde_json::json!(5);
+        let mut events = vec![
+            first,
+            second,
+            child,
+            serde_json::json!({"type":"session.usage_checkpoint","data":{"usage":{"inputTokens":999999}}}),
+        ];
+        f.write("app", &events);
+        f.sync();
+        f.sync();
         assert_eq!(
-            conn.query_row::<i64, _, _>("SELECT total_changes()", [], |r| r.get(0))
-                .unwrap(),
-            changes,
-            "unchanged sources must perform no writes"
+            cli_daily_totals(&f.conn, "app"),
+            vec![("2026-07-23".into(), 330)]
         );
-        let unchanged: Vec<i64> = conn
-            .prepare("SELECT id FROM usage_entries ORDER BY id")
-            .unwrap()
-            .query_map([], |r| r.get(0))
-            .unwrap()
-            .map(Result::unwrap)
+        let metadata:(String,String)=f.conn.query_row("SELECT agent_role,reasoning_effort FROM usage_entries WHERE parent_session_id='app'",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!(metadata, ("sub-agent".into(), "high".into()));
+        events.push(cli_usage_fixture(4, "2026-07-23T12:03:00Z"));
+        f.write("app", &events);
+        f.sync();
+        assert_eq!(cli_daily_totals(&f.conn, "app")[0].1, 440);
+    }
+
+    #[test]
+    fn app_transcript_missing_or_shrinking_file_retains_imported_call_identities() {
+        let mut f = AppReviewFixture::new(&["app"]);
+        let events = vec![
+            cli_usage_fixture(1, "2026-07-23T12:00:00Z"),
+            cli_usage_fixture(2, "2026-07-23T12:01:00Z"),
+        ];
+        f.write("app", &events);
+        f.sync();
+        let original = f.rows("app");
+        f.write("app", &events[..1]);
+        f.sync();
+        assert_eq!(f.rows("app"), original);
+        fs::remove_file(f.root.join("session-state/app/events.jsonl")).unwrap();
+        f.sync();
+        assert_eq!(f.rows("app"), original);
+        f.write("app", &events);
+        f.sync();
+        let restored: Vec<_> = f
+            .rows("app")
+            .into_iter()
+            .map(|(_, identity, turn, total)| (identity, turn, total))
             .collect();
-        assert_eq!(ids, unchanged);
-        let mut third = cli_usage_fixture(3, "2026-07-23T12:02:00Z");
-        third["agentId"] = serde_json::json!("child");
-        third["data"]["usage"]["initiator"] = serde_json::json!("sub-agent");
-        third["data"]["usage"]["reasoningEffort"] = serde_json::json!("high");
-        third["data"]["usage"]["cacheWriteTokens"] = serde_json::json!(4);
-        third["data"]["usage"]["reasoningTokens"] = serde_json::json!(5);
-        let checkpoint = serde_json::json!({"type":"session.usage_checkpoint","data":{"usage":{"inputTokens":999999}}});
-        let all = vec![first.clone(), second.clone(), third.clone(), checkpoint];
-        write_cli_usage_fixture(&base, "app", &all);
-        sync_copilot_app_usage_logs_from(&mut conn, &base).unwrap();
-        assert_eq!(cli_daily_totals(&conn, "app")[0].1, 339);
-        let child: (String, String) = conn.query_row("SELECT agent_role, reasoning_effort FROM usage_entries WHERE session_id='app__child'", [], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
-        assert_eq!(child, ("sub-agent".into(), "high".into()));
-        let mut unrelated = cli_usage_fixture(99, "2026-07-23T12:04:00Z");
-        unrelated["data"]["usage"]["outputTokens"] = serde_json::json!(10000);
-        write_cli_usage_fixture(&base, "app", &[first.clone(), third.clone(), unrelated]);
-        sync_copilot_app_usage_logs_from(&mut conn, &base).unwrap();
-        assert_eq!(
-            cli_daily_totals(&conn, "app")[0].1,
-            339,
-            "larger unrelated usage cannot mask a missing known call"
-        );
-        // A shrinking or invalid source cannot replace already imported calls.
-        write_cli_usage_fixture(&base, "app", &[first]);
-        sync_copilot_app_usage_logs_from(&mut conn, &base).unwrap();
-        assert_eq!(cli_daily_totals(&conn, "app")[0].1, 339);
-        fs::write(&path, "{invalid}\n").unwrap();
-        sync_copilot_app_usage_logs_from(&mut conn, &base).unwrap();
-        assert_eq!(cli_daily_totals(&conn, "app")[0].1, 339);
-        fs::remove_file(&path).unwrap();
-        sync_copilot_app_usage_logs_from(&mut conn, &base).unwrap();
-        assert_eq!(cli_daily_totals(&conn, "app")[0].1, 339);
-        write_cli_usage_fixture(&base, "app", &all);
-        sync_copilot_app_usage_logs_from(&mut conn, &base).unwrap();
-        assert_eq!(cli_daily_totals(&conn, "app")[0].1, 339);
-        // CLI transcript remains classified separately.
-        write_cli_usage_fixture(&base, "cli", &[second, third]);
-        sync_copilot_cli_agent_usage_logs_from(&mut conn, &base).unwrap();
-        assert_eq!(cli_daily_totals(&conn, "app")[0].1, 339);
-        let app_cli_rows: i64 = conn.query_row("SELECT COUNT(*) FROM usage_entries WHERE session_id='app' AND source_kind='copilot-cli'", [], |r| r.get(0)).unwrap();
-        assert_eq!(app_cli_rows, 0);
-        // SQLite-only additions must invalidate the state even with an unchanged transcript.
-        insert_cli_event(
-            &store,
-            CliEventIdentity {
-                id: 2,
-                session_id: "app",
-                model: "B",
-                agent_id: None,
-                initiator: None,
-            },
-            CliEventTokens {
-                input: 100,
-                output: 10,
-                cache_read: 80,
-                cache_write: 0,
-                reasoning: 0,
-                duration_ms: 50,
-            },
-            "2026-07-23T12:03:00Z",
-        );
-        sync_copilot_app_usage_logs_from(&mut conn, &base).unwrap();
-        assert_eq!(cli_daily_totals(&conn, "app")[0].1, 449);
-        sync_copilot_app_usage_logs_from(&mut conn, &base).unwrap();
-        assert_eq!(cli_daily_totals(&conn, "app")[0].1, 449);
-        Connection::open(base.join("data.db"))
-            .unwrap()
+        let expected: Vec<_> = original
+            .into_iter()
+            .map(|(_, identity, turn, total)| (identity, turn, total))
+            .collect();
+        assert_eq!(restored, expected);
+    }
+
+    #[test]
+    fn app_transcript_registry_readd_restores_unchanged_source() {
+        let mut f = AppReviewFixture::new(&["app"]);
+        f.write("app", &[cli_usage_fixture(1, "2026-07-23T12:00:00Z")]);
+        f.sync();
+        let registry = Connection::open(f.root.join("data.db")).unwrap();
+        registry
             .execute("DELETE FROM sessions WHERE id='app'", [])
             .unwrap();
-        sync_copilot_app_usage_logs_from(&mut conn, &base).unwrap();
-        assert!(cli_daily_totals(&conn, "app").is_empty());
-        Connection::open(base.join("data.db"))
-            .unwrap()
+        f.sync();
+        assert!(f.rows("app").is_empty());
+        registry
             .execute("INSERT INTO sessions (id) VALUES ('app')", [])
             .unwrap();
-        sync_copilot_app_usage_logs_from(&mut conn, &base).unwrap();
-        assert_eq!(cli_daily_totals(&conn, "app")[0].1, 449);
-        fs::remove_dir_all(base).unwrap();
+        f.sync();
+        assert_eq!(f.rows("app").len(), 1);
+        drop(registry);
+    }
+
+    #[test]
+    fn app_transcript_does_not_reclassify_cli_sessions() {
+        let mut f = AppReviewFixture::new(&["app"]);
+        let event = cli_usage_fixture(1, "2026-07-23T12:00:00Z");
+        f.write("app", std::slice::from_ref(&event));
+        f.write("cli", &[event]);
+        f.sync();
+        sync_copilot_cli_agent_usage_logs_from(&mut f.conn, &f.root).unwrap();
+        let kinds: Vec<(String, String)> = f
+            .conn
+            .prepare("SELECT session_id,source_kind FROM usage_entries ORDER BY session_id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ("app".into(), "copilot-app".into()),
+                ("cli".into(), "copilot-cli".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn app_review_total_repair_is_source_scoped_and_handles_legacy_without_new_events() {
+        let mut f = AppReviewFixture::new(&["app"]);
+        f.native(1, "app", "2026-07-23T12:00:00Z", Some(0), None);
+        f.sync();
+        f.conn
+            .execute(
+                "UPDATE usage_entries SET tokens_total=119,delta_total=119",
+                [],
+            )
+            .unwrap();
+        f.conn.execute("INSERT INTO usage_entries (assistant_type,source_kind,source_dir_key,session_id,timestamp,date,turn_no,tokens_input,tokens_output,tokens_total,delta_total) VALUES ('copilot','copilot-app','foreign','foreign','2026-07-23T12:00:00Z','2026-07-23',1,100,10,119,119)",[]).unwrap();
+        seed_cli_hook_row(&f.conn, "cli", 119);
+        f.sync();
+        assert_eq!(f.rows("app")[0].3, 110);
+        let foreign: i64 = f
+            .conn
+            .query_row(
+                "SELECT delta_total FROM usage_entries WHERE session_id='foreign'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(foreign, 119);
+        assert_eq!(cli_daily_totals(&f.conn, "cli")[0].1, 119);
     }
 
     #[test]
@@ -15836,6 +16292,7 @@ mod tests {
             })
             .collect();
         assert_eq!(replies, vec![(1, 110), (2, 220)]);
+        drop(store);
         fs::remove_dir_all(base).unwrap();
     }
 

@@ -1,4 +1,4 @@
-//! Read and reconcile Copilot CLI's per-call usage without counting snapshots.
+//! Read and reconcile Copilot per-call usage without counting snapshots.
 use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::Deserialize;
 use serde_json::Value;
@@ -47,7 +47,9 @@ pub(crate) struct Call {
     /// Stable within the source directory and parent session; independent of time/model.
     pub identity: String,
     pub reasoning_effort: Option<String>,
-    pub turn_no: u32,
+    pub turn_no: Option<u32>,
+    /// SQLite identity retained only after a verified cross-source match.
+    pub native_identity: Option<String>,
     pub timestamp: DateTime<Utc>,
     pub model: Option<String>,
     pub agent_id: Option<String>,
@@ -71,6 +73,66 @@ pub(crate) fn parse_timestamp(raw: &str) -> Result<DateTime<Utc>, String> {
 #[derive(Deserialize, Default)]
 struct Data {
     usage: Option<Value>,
+    #[serde(default, deserialize_with = "nonempty_content")]
+    content: bool,
+}
+
+// Inspect only whether a reply has text; never retain conversation content.
+fn nonempty_content<'de, D: serde::Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+    struct Content;
+    impl<'de> serde::de::Visitor<'de> for Content {
+        type Value = bool;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("reply text or null")
+        }
+        fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<bool, E> {
+            Ok(!value.is_empty())
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<bool, A::Error> {
+            while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+            Ok(false)
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<bool, A::Error> {
+            while map
+                .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+                .is_some()
+            {}
+            Ok(false)
+        }
+        fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<bool, E> {
+            Ok(false)
+        }
+        fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<bool, E> {
+            Ok(false)
+        }
+        fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<bool, E> {
+            Ok(false)
+        }
+        fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<bool, E> {
+            Ok(false)
+        }
+        fn visit_none<E: serde::de::Error>(self) -> Result<bool, E> {
+            Ok(false)
+        }
+        fn visit_unit<E: serde::de::Error>(self) -> Result<bool, E> {
+            Ok(false)
+        }
+    }
+    d.deserialize_any(Content)
+}
+
+// Mirror the filtered timeline: consecutive prompts share a turn; the first
+// nonempty reply after a prompt advances the next reply. Each agent starts its
+// own filtered counter at one, even if first invoked on a later parent turn.
+#[derive(Clone)]
+struct TurnState {
+    next: u32,
+    pending: bool,
+}
+impl TurnState {
+    fn new(pending: bool) -> Self {
+        Self { next: 1, pending }
+    }
 }
 
 // Unknown fields are skipped by serde rather than retaining conversations,
@@ -81,6 +143,7 @@ struct Event {
     kind: String,
     #[serde(default)]
     data: Data,
+    payload: Option<Data>,
     timestamp: Option<String>,
     id: Option<String>,
     #[serde(rename = "agentId")]
@@ -97,7 +160,8 @@ pub(crate) fn read_calls(
     let mut line = String::new();
     let mut calls = Vec::new();
     let mut identities: HashMap<(String, Option<String>, String), Call> = HashMap::new();
-    let mut turn_no = 0u32;
+    let mut turns = HashMap::new();
+    let mut seen_prompt = false;
     loop {
         if should_cancel() {
             return Err("Copilot 同步已取消".into());
@@ -118,7 +182,21 @@ pub(crate) fn read_calls(
             serde_json::from_str(&line).map_err(|_| "Copilot 事件檔包含無效 JSON".to_string())?;
         if matches!(event.kind.as_str(), "user.message" | "USER_PROMPT") && event.agent_id.is_none()
         {
-            turn_no = turn_no.checked_add(1).ok_or("Copilot 回合數超出範圍")?;
+            seen_prompt = true;
+            for state in turns.values_mut() {
+                let state: &mut TurnState = state;
+                state.pending = true;
+            }
+        }
+        let state = turns
+            .entry(event.agent_id.clone().filter(|id| !id.is_empty()))
+            .or_insert_with(|| TurnState::new(seen_prompt));
+        if matches!(event.kind.as_str(), "assistant.message" | "ASSISTANT_REPLY")
+            && event.payload.as_ref().unwrap_or(&event.data).content
+            && state.pending
+        {
+            state.next = state.next.checked_add(1).ok_or("Copilot 回合數超出範圍")?;
+            state.pending = false;
         }
         if event.kind != "session.usage_record" {
             continue;
@@ -161,7 +239,8 @@ pub(crate) fn read_calls(
         validate.add(&metrics)?;
         let key = (source_session.to_owned(), agent_id.clone(), identity);
         let call = Call {
-            turn_no: turn_no.max(1),
+            turn_no: Some(state.next),
+            native_identity: None,
             reasoning_effort: usage["reasoningEffort"].as_str().map(str::to_owned),
             identity: format!(
                 "event:{}",
@@ -181,6 +260,7 @@ pub(crate) fn read_calls(
         if let Some(previous) = identities.get(&key) {
             let mut comparable: Call = previous.clone();
             comparable.turn_no = call.turn_no;
+            comparable.native_identity = call.native_identity.clone();
             comparable.reasoning_effort = call.reasoning_effort.clone();
             if comparable != call {
                 return Err("Copilot 相同用量識別碼的內容不一致".into());
@@ -226,15 +306,24 @@ pub(crate) fn merge_calls(
     // Exact timestamp matches have priority over the proximity fallback.
     for call in native {
         let indices = candidates.get(&Signature::from(&call));
-        let exact = indices.and_then(|indices| {
-            indices
-                .iter()
-                .copied()
-                .find(|i| !matched[*i] && transcript[*i].timestamp == call.timestamp)
-        });
-        if let Some(i) = exact {
+        let exact: Vec<_> = indices
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|i| !matched[*i] && transcript[*i].timestamp == call.timestamp)
+            .collect();
+        if exact.len() > 1 {
+            return Err("Copilot 相同時間用量無法唯一配對".into());
+        }
+        if let Some(&i) = exact.first() {
             matched[i] = true;
-            transcript[i].turn_no = call.turn_no;
+            transcript[i].native_identity = Some(call.identity.clone());
+            if call.agent_id.is_none() && call.turn_no.is_some() {
+                transcript[i].turn_no = call.turn_no;
+            }
+            if transcript[i].initiator.is_none() {
+                transcript[i].initiator = call.initiator.clone();
+            }
             if transcript[i].reasoning_effort.is_none() {
                 transcript[i].reasoning_effort = call.reasoning_effort.clone();
             }
@@ -266,7 +355,13 @@ pub(crate) fn merge_calls(
         match nearby.as_slice() {
             [] => transcript.push(call),
             [i] if degree[*i] == 1 => {
-                transcript[*i].turn_no = call.turn_no;
+                transcript[*i].native_identity = Some(call.identity.clone());
+                if call.agent_id.is_none() && call.turn_no.is_some() {
+                    transcript[*i].turn_no = call.turn_no;
+                }
+                if transcript[*i].initiator.is_none() {
+                    transcript[*i].initiator = call.initiator.clone();
+                }
                 if transcript[*i].reasoning_effort.is_none() {
                     transcript[*i].reasoning_effort = call.reasoning_effort;
                 }
@@ -306,6 +401,44 @@ mod tests {
 
     fn call(time: &str) -> Call {
         read(&[event("a", time)], "", false).unwrap().remove(0)
+    }
+
+    #[test]
+    fn native_metadata_fills_missing_initiator_without_erasing_unknown_turns() {
+        for native_time in ["2026-07-22T10:00:00Z", "2026-07-22T10:00:00.500Z"] {
+            let mut transcript = call("2026-07-22T10:00:00Z");
+            transcript.agent_id = Some("child".into());
+            transcript.turn_no = Some(2);
+            let mut native = transcript.clone();
+            native.identity = "sqlite:1".into();
+            native.timestamp = parse_timestamp(native_time).unwrap();
+            native.turn_no = None;
+            native.initiator = Some("sub-agent".into());
+            let merged = merge_calls(vec![transcript], vec![native]).unwrap();
+            assert_eq!(merged[0].initiator.as_deref(), Some("sub-agent"));
+            assert_eq!(merged[0].turn_no, Some(2));
+            assert_eq!(merged[0].native_identity.as_deref(), Some("sqlite:1"));
+        }
+    }
+
+    #[test]
+    fn ambiguous_exact_matches_do_not_assign_native_turn_to_arbitrary_event() {
+        let a = call("2026-07-22T10:00:00Z");
+        let mut b = a.clone();
+        b.identity = "event:other".into();
+        b.turn_no = Some(2);
+        let mut native = b.clone();
+        native.identity = "sqlite:1".into();
+        assert!(merge_calls(vec![a, b], vec![native]).is_err());
+    }
+
+    #[test]
+    fn unrelated_structured_content_is_ignored_without_retaining_it() {
+        let events = [
+            json!({"type":"system.message","data":{"content":[{"text":"fixture"}]}}),
+            event("a", "2026-07-22T10:00:00Z"),
+        ];
+        assert_eq!(read(&events, "", false).unwrap().len(), 1);
     }
 
     #[test]
