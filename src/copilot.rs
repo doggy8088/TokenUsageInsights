@@ -46,6 +46,8 @@ impl Metrics {
 pub(crate) struct Call {
     /// Stable within the source directory and parent session; independent of time/model.
     pub identity: String,
+    pub reasoning_effort: Option<String>,
+    pub turn_no: u32,
     pub timestamp: DateTime<Utc>,
     pub model: Option<String>,
     pub agent_id: Option<String>,
@@ -94,7 +96,8 @@ pub(crate) fn read_calls(
     let mut reader = BufReader::new(file);
     let mut line = String::new();
     let mut calls = Vec::new();
-    let mut identities = HashMap::new();
+    let mut identities: HashMap<(String, Option<String>, String), Call> = HashMap::new();
+    let mut turn_no = 0u32;
     loop {
         if should_cancel() {
             return Err("Copilot 同步已取消".into());
@@ -113,6 +116,10 @@ pub(crate) fn read_calls(
         }
         let event: Event =
             serde_json::from_str(&line).map_err(|_| "Copilot 事件檔包含無效 JSON".to_string())?;
+        if matches!(event.kind.as_str(), "user.message" | "USER_PROMPT") && event.agent_id.is_none()
+        {
+            turn_no = turn_no.checked_add(1).ok_or("Copilot 回合數超出範圍")?;
+        }
         if event.kind != "session.usage_record" {
             continue;
         }
@@ -154,6 +161,8 @@ pub(crate) fn read_calls(
         validate.add(&metrics)?;
         let key = (source_session.to_owned(), agent_id.clone(), identity);
         let call = Call {
+            turn_no: turn_no.max(1),
+            reasoning_effort: usage["reasoningEffort"].as_str().map(str::to_owned),
             identity: format!(
                 "event:{}",
                 serde_json::to_string(&key).map_err(|e| e.to_string())?
@@ -170,7 +179,10 @@ pub(crate) fn read_calls(
         // Agent sequences restart independently. Stable API identities are
         // scoped to the agent, never to sequence or the selected model.
         if let Some(previous) = identities.get(&key) {
-            if previous != &call {
+            let mut comparable: Call = previous.clone();
+            comparable.turn_no = call.turn_no;
+            comparable.reasoning_effort = call.reasoning_effort.clone();
+            if comparable != call {
                 return Err("Copilot 相同用量識別碼的內容不一致".into());
             }
             continue;
@@ -222,6 +234,10 @@ pub(crate) fn merge_calls(
         });
         if let Some(i) = exact {
             matched[i] = true;
+            transcript[i].turn_no = call.turn_no;
+            if transcript[i].reasoning_effort.is_none() {
+                transcript[i].reasoning_effort = call.reasoning_effort.clone();
+            }
         } else {
             remaining.push(call);
         }
@@ -249,7 +265,12 @@ pub(crate) fn merge_calls(
     for (call, nearby) in remaining.into_iter().zip(edges) {
         match nearby.as_slice() {
             [] => transcript.push(call),
-            [i] if degree[*i] == 1 => {}
+            [i] if degree[*i] == 1 => {
+                transcript[*i].turn_no = call.turn_no;
+                if transcript[*i].reasoning_effort.is_none() {
+                    transcript[*i].reasoning_effort = call.reasoning_effort;
+                }
+            }
             _ => return Err("Copilot 事件檔與 SQLite 用量無法唯一配對，保留原資料待重試".into()),
         }
     }
