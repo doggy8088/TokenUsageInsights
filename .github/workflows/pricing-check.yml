@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: '17 1 * * *'
   workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/pricing-check.yml'
+      - 'scripts/pricing-*'
+      - 'tests/pricing-check.test.mjs'
 
 permissions:
   contents: read
@@ -27,14 +32,14 @@ jobs:
         id: check
         run: node scripts/pricing-check.mjs --report pricing-report.md
       - name: Open or update pricing drift issue
-        if: steps.check.outputs.drift != '0' || steps.check.outputs.errors != '0'
+        if: github.event_name != 'pull_request' && (steps.check.outputs.drift != '0' || steps.check.outputs.added != '0' || steps.check.outputs.errors != '0')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          title="定價檢查：偵測到與官方來源索引的差異"
+          title="定價檢查：偵測到與官方定價文件的差異、新模型或解析錯誤"
           number=$(gh issue list --state open --label pricing-drift --json number --jq '.[0].number // empty')
           if [ -n "$number" ]; then
-            gh issue comment "$number" --body-file pricing-report.md
+            gh issue edit "$number" --body-file pricing-report.md
           else
             gh label create pricing-drift --description "Automated pricing drift report" --color FBCA04 2>/dev/null || true
             gh issue create --title "$title" --label pricing-drift --body-file pricing-report.md
