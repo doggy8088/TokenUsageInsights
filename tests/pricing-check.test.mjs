@@ -104,3 +104,9 @@ test('compareProvider 偵測差異、促銷價與新模型', () => {
   assert.ok(google.promos.length >= 1);
   assert.deepEqual(google.missing, []); // TTS 屬非文字模型，略過
 });
+
+test('stripMarkup 不會殘留巢狀標籤', async () => {
+  const { stripMarkup } = await import('../scripts/pricing-check.mjs');
+  assert.equal(stripMarkup('Claude <sup>1</sup> [x](http://a)'), 'Claude 1 x');
+  assert.ok(!stripMarkup('<scr<script>ipt>').includes('<'));
+});

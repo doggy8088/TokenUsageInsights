@@ -48,14 +48,19 @@ export function csvKey(name) {
   return normalizeName(name.replace(/\s*\((?:low|medium|high|xhigh|minimal|thinking|non-thinking|reasoning)\)/gi, ''));
 }
 
+// 去除 Markdown 連結與 HTML 標籤（反覆處理直到穩定，最後移除殘留的角括號），僅用於比對與顯示名稱。
+export function stripMarkup(text) {
+  let out = text.replace(/\[([^\]]*)\]\([^)]*\)/g, '$1');
+  let prev;
+  do {
+    prev = out;
+    out = out.replace(/<[^<>]*>/g, '');
+  } while (out !== prev);
+  return out.replace(/[<>]/g, '');
+}
+
 export function officialKey(name) {
-  return normalizeName(
-    name
-      .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
-      .replace(/<[^>]+>/g, '')
-      .replace(/\([^)]*\)/g, '')
-      .replace(/[^\x20-\x7E]/g, ''),
-  );
+  return normalizeName(stripMarkup(name).replace(/\([^)]*\)/g, '').replace(/[^\x20-\x7E]/g, ''));
 }
 
 // 取出價格文字中的第一個金額；若為促銷格式（"$0.75 through Dec 31, 2026. $1.50 starting ..."）一併回傳促銷後價格。
@@ -114,7 +119,7 @@ export function parseTableProvider(md, heading) {
     const output = parsePrice(cells[cols.output]);
     if (!input || !output) continue;
     entries.set(key, {
-      name: cells[0].replace(/\[([^\]]*)\]\([^)]*\)/g, '$1').replace(/<[^>]+>/g, '').replace(/\s*\(.*$/, '').trim(),
+      name: stripMarkup(cells[0]).replace(/\s*\(.*$/, '').trim(),
       input,
       output,
       cached: cols.cached >= 0 ? parsePrice(cells[cols.cached]) : null,
