@@ -16,8 +16,7 @@
       "name": "OpenAI",
       "modelsDevProvider": "openai",
       "officialUrls": [
-        "https://platform.openai.com/docs/pricing",
-        "https://openai.com/api/pricing/"
+        "https://platform.openai.com/docs/pricing"
       ],
       "deployments": [
         "Global"
