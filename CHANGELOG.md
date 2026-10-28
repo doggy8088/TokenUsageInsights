@@ -4,6 +4,10 @@
 
 ## [未發行]
 
+### 新增與改善
+
+- 新增每日定價檢查 workflow（`.github/workflows/pricing-check.yml`）與 `scripts/pricing-check.mjs`：以 `scripts/pricing-sources.json` 登錄的官方定價文件為權威來源，並以 models.dev 作為機器可讀索引比對 `pricing.csv`，偵測到價格差異時自動建立或更新 `pricing-drift` issue（#71）。僅產生報告，不會自動改寫 `pricing.csv`。
+
 ## [1.6.1] - 2026-10-29
 
 本次 patch release 新增 Docker 隔離式用量看板與管理腳本，並修正 Windows 透過 `npx` 安裝時 GNU tar 顯示誤導錯誤訊息的問題。

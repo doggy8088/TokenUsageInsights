@@ -1,0 +1,35 @@
+{
+  "_comment": "官方定價文件為唯一權威來源；modelsDevProvider 僅作為機器可讀索引，用來比對差異，不可取代官方文件。",
+  "providers": [
+    {
+      "name": "Anthropic",
+      "modelsDevProvider": "anthropic",
+      "officialUrls": [
+        "https://docs.anthropic.com/en/docs/about-claude/pricing",
+        "https://www.anthropic.com/pricing"
+      ]
+    },
+    {
+      "name": "OpenAI",
+      "modelsDevProvider": "openai",
+      "officialUrls": [
+        "https://platform.openai.com/docs/pricing",
+        "https://openai.com/api/pricing/"
+      ]
+    },
+    {
+      "name": "Google Gemini",
+      "modelsDevProvider": "google",
+      "officialUrls": [
+        "https://ai.google.dev/gemini-api/docs/pricing"
+      ]
+    },
+    {
+      "name": "xAI",
+      "modelsDevProvider": "xai",
+      "officialUrls": [
+        "https://docs.x.ai/docs/models"
+      ]
+    }
+  ]
+}
