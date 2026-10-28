@@ -7,6 +7,9 @@
       "officialUrls": [
         "https://docs.anthropic.com/en/docs/about-claude/pricing",
         "https://www.anthropic.com/pricing"
+      ],
+      "deployments": [
+        "Global"
       ]
     },
     {
@@ -15,6 +18,9 @@
       "officialUrls": [
         "https://platform.openai.com/docs/pricing",
         "https://openai.com/api/pricing/"
+      ],
+      "deployments": [
+        "Global"
       ]
     },
     {
@@ -22,6 +28,9 @@
       "modelsDevProvider": "google",
       "officialUrls": [
         "https://ai.google.dev/gemini-api/docs/pricing"
+      ],
+      "deployments": [
+        "Google AI"
       ]
     },
     {
@@ -29,6 +38,9 @@
       "modelsDevProvider": "xai",
       "officialUrls": [
         "https://docs.x.ai/docs/models"
+      ],
+      "deployments": [
+        "xAI API"
       ]
     }
   ]

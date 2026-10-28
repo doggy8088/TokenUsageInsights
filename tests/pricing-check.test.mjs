@@ -28,3 +28,7 @@ test('compareProvider 偵測差異與新模型', () => {
   assert.match(result.mismatches[0].diffs[0], /快取輸入/);
   assert.deepEqual(result.missing, ['Gemini 9 Nova']);
 });
+
+test('parseCsv 保留部署類型供篩選', () => {
+  assert.equal(parseCsv(csv)[0].deployment, 'Google AI');
+});

@@ -87,6 +87,7 @@ export async function run({ csvPath = path.join(root, 'pricing.csv'), reportPath
     const res = await fetchWithTimeout(MODELS_DEV_URL);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     api = await res.json();
+    if (api === null || typeof api !== 'object' || Array.isArray(api)) throw new Error('回應格式不符（預期為物件）');
   } catch (err) {
     errors++;
     lines.push(`> ⚠️ 無法取得 models.dev 索引：${err.message}。本次略過比對（保留現有 pricing.csv）。`, '');
@@ -98,8 +99,10 @@ export async function run({ csvPath = path.join(root, 'pricing.csv'), reportPath
       let status;
       try {
         const res = await fetchWithTimeout(url, { method: 'GET' });
+        if (!res.ok) errors++;
         status = res.ok ? '可連線' : `HTTP ${res.status}（可能為防爬蟲，請人工開啟）`;
       } catch (err) {
+        errors++;
         status = `無法連線：${err.message}`;
       }
       lines.push(`- <${url}> — ${status}`);
@@ -110,7 +113,10 @@ export async function run({ csvPath = path.join(root, 'pricing.csv'), reportPath
       if (api) { errors++; lines.push(`> ⚠️ models.dev 缺少 provider \`${p.modelsDevProvider}\`。`, ''); }
       continue;
     }
-    const { mismatches, missing } = compareProvider(csvRows, models);
+    const { mismatches, missing } = compareProvider(
+      csvRows.filter((r) => p.deployments.includes(r.deployment)),
+      models,
+    );
     drift += mismatches.length; // 新模型僅列入報告，不單獨觸發 issue（含大量非文字模型）
     if (mismatches.length) {
       lines.push('### 價格差異（USD / 1M tokens）', '');
