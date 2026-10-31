@@ -9067,6 +9067,7 @@ pub fn get_usage_entries_by_range(
             entry: row.record.entry,
             assistant_type: row.assistant_type,
             date: row.date,
+            import_source_id: row.record.import_source_id,
         })
         .collect())
 }
