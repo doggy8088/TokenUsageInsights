@@ -303,6 +303,15 @@ pub(crate) fn merge_calls(
     }
     let mut matched = vec![false; transcript.len()];
     let mut remaining = Vec::new();
+    // Native calls sharing a signature and timestamp are indistinguishable.
+    // Pre-count them so an exact hit is consumed only when the pairing is 1:1;
+    // otherwise keep both sides untouched and let the caller retry later.
+    let mut native_classes: HashMap<(Signature, DateTime<Utc>), usize> = HashMap::new();
+    for call in &native {
+        *native_classes
+            .entry((Signature::from(call), call.timestamp))
+            .or_default() += 1;
+    }
     // Exact timestamp matches have priority over the proximity fallback.
     for call in native {
         let indices = candidates.get(&Signature::from(&call));
@@ -316,11 +325,14 @@ pub(crate) fn merge_calls(
             return Err("Copilot 相同時間用量無法唯一配對".into());
         }
         if let Some(&i) = exact.first() {
+            if native_classes
+                .get(&(Signature::from(&call), call.timestamp))
+                .is_some_and(|count| *count > 1)
+            {
+                return Err("Copilot 相同時間用量無法唯一配對".into());
+            }
             matched[i] = true;
             transcript[i].native_identity = Some(call.identity.clone());
-            if call.agent_id.is_none() && call.turn_no.is_some() {
-                transcript[i].turn_no = call.turn_no;
-            }
             if transcript[i].initiator.is_none() {
                 transcript[i].initiator = call.initiator.clone();
             }
@@ -356,9 +368,6 @@ pub(crate) fn merge_calls(
             [] => transcript.push(call),
             [i] if degree[*i] == 1 => {
                 transcript[*i].native_identity = Some(call.identity.clone());
-                if call.agent_id.is_none() && call.turn_no.is_some() {
-                    transcript[*i].turn_no = call.turn_no;
-                }
                 if transcript[*i].initiator.is_none() {
                     transcript[*i].initiator = call.initiator.clone();
                 }
@@ -430,6 +439,34 @@ mod tests {
         let mut native = b.clone();
         native.identity = "sqlite:1".into();
         assert!(merge_calls(vec![a, b], vec![native]).is_err());
+    }
+
+    #[test]
+    fn ambiguous_native_exact_pair_keeps_both_sides_for_retry() {
+        let mut transcript = call("2026-07-22T10:00:00Z");
+        transcript.turn_no = Some(2);
+        let mut first = transcript.clone();
+        first.identity = "sqlite:1".into();
+        first.turn_no = Some(1);
+        let mut second = transcript.clone();
+        second.identity = "sqlite:2".into();
+        second.turn_no = Some(1);
+        assert!(merge_calls(vec![transcript], vec![first, second]).is_err());
+    }
+
+    #[test]
+    fn paired_calls_keep_the_event_derived_turn() {
+        for native_time in ["2026-07-22T10:00:00Z", "2026-07-22T10:00:00.500Z"] {
+            let mut transcript = call("2026-07-22T10:00:00Z");
+            transcript.turn_no = Some(2);
+            let mut native = transcript.clone();
+            native.identity = "sqlite:1".into();
+            native.timestamp = parse_timestamp(native_time).unwrap();
+            native.turn_no = Some(1);
+            native.agent_id = None;
+            let merged = merge_calls(vec![transcript], vec![native]).unwrap();
+            assert_eq!(merged[0].turn_no, Some(2), "native_time={native_time}");
+        }
     }
 
     #[test]
