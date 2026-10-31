@@ -14,7 +14,6 @@ use crate::reporting::{
     group_sessions, latest_usage_entry, session_durations_by_identity, summarize_models_by_mode,
 };
 use crate::session_details::load_session_details;
-use crate::session_files::is_safe_session_id;
 use crate::session_search;
 use crate::statusline_command::statusline_command;
 
@@ -525,13 +524,6 @@ pub async fn get_session_details(
         )
             .into_response();
     }
-    if !is_safe_session_id(&session_id) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "非法的 session_id 格式。" })),
-        )
-            .into_response();
-    }
 
     let source_kind = query
         .source_kind
@@ -558,21 +550,15 @@ pub async fn get_session_details(
             .into_response();
     }
 
+    // 正規化但不做檔名檢查（PRRT_kwDOTOgsec6yUXNl）：匯入／解析端接受的
+    // 父層 id（如 `vendor:parent`）不在 is_safe_session_id 的檔名字元集內，
+    // handler 攔截會造成「清單看得到、詳情 400」。檔案系統安全由
+    // `session_files` 解析器的 is_safe_session_id＋containment 把關。
     let parent_session_id = query
         .parent_session_id
         .as_deref()
         .map(str::trim)
         .map(str::to_string);
-    if parent_session_id
-        .as_deref()
-        .is_some_and(|parent| !parent.is_empty() && !is_safe_session_id(parent))
-    {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "非法的 parent_session_id 格式。" })),
-        )
-            .into_response();
-    }
 
     match tokio::task::spawn_blocking(move || {
         load_session_details(
@@ -1315,5 +1301,192 @@ mod tests {
             .unwrap();
         assert_eq!(cumulative["duration_ms"].as_u64(), Some(3500));
         assert_eq!(body["summary"]["total_duration_ms"].as_u64(), Some(3700));
+    }
+
+    /// 回歸測試（thread PRRT_kwDOTOgsec6yUXNl）：匯入／解析端接受的父層 id
+    /// （如 `vendor:parent`）不在 is_safe_session_id 的檔名字元集內，
+    /// `get_session_details` 的 handler 層檢查以 400 拒絕，但同一列在每日
+    /// 清單看得到——「清單看得到、詳情 400」。同源的 session_id 檔名檢查同樣
+    /// 誤殺匯入端接受的 id。handler 不得做檔名檢查；真正的安全界線是
+    /// `session_files` 解析器的 `is_safe_session_id`＋路徑 containment（見
+    /// `copilot_app_events_resolver_rejects_unsafe_session_ids`）。
+    #[test]
+    fn get_session_details_accepts_imported_parent_outside_filename_charset() {
+        if crate::reporting::is_isolated_insights_test_child() {
+            crate::reporting::handler_test_runtime()
+                .block_on(session_details_imported_parent_body());
+            return;
+        }
+        let temp_dir = std::env::temp_dir().join(format!(
+            "tui-session-details-parent-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let output = crate::reporting::spawn_isolated_insights_test(
+            "handlers::daily::tests::get_session_details_accepts_imported_parent_outside_filename_charset",
+            &temp_dir,
+        );
+        assert!(
+            output.status.success(),
+            "子行程 handler 測試失敗:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    async fn session_details_imported_parent_body() {
+        // 先建立資料庫檔案，避免 get_db_conn 將舊位置的資料庫搬進測試目錄。
+        let conn = Connection::open(crate::db::get_insights_dir().join("token_usage_insights.db"))
+            .unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let codex_root = crate::db::get_insights_dir().join("codex-root");
+        let rollout_dir = codex_root
+            .join("sessions")
+            .join("2026")
+            .join("10")
+            .join("04");
+        fs::create_dir_all(&rollout_dir).unwrap();
+        let rollout = rollout_dir.join("rollout-2026-10-04T10-00-00.jsonl");
+        fs::write(
+            &rollout,
+            r##"{"timestamp":"2026-10-04T10:00:00.000Z","type":"session_meta","payload":{"id":"child","parent_thread_id":"vendor:parent","cwd":"/tmp/project","cli_version":"0.142.5","model":"gpt-5"}}
+{"timestamp":"2026-10-04T10:00:01.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":10,"total_tokens":110},"last_token_usage":{"input_tokens":100,"output_tokens":10,"total_tokens":110}}}}
+"##,
+        )
+        .unwrap();
+        std::env::set_var("CODEX_DIR", &codex_root);
+        let rollout_path = rollout.to_string_lossy().into_owned();
+        for (session_id, parent) in [("child", Some("vendor:parent")), ("vendor:child", None)] {
+            conn.execute(
+                "INSERT INTO usage_entries (
+                    assistant_type, source_kind, timestamp, date, transcript_path,
+                    session_id, turn_no, session_name, model,
+                    tokens_input, tokens_output, tokens_total,
+                    delta_input, delta_output, delta_total,
+                    parent_session_id
+                ) VALUES (
+                    'codex', 'codex-cli', '2026-10-04 10:00:00', '2026-10-04', ?,
+                    ?, 1, 'Codex Thread', 'gpt-5',
+                    100, 10, 110,
+                    100, 10, 110,
+                    ?
+                )",
+                rusqlite::params![rollout_path, session_id, parent],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        // 症狀面：清單／摘要看得到 vendor:parent 的列。
+        let response =
+            super::get_usage_details(Path(("codex".to_string(), "2026-10-04".to_string())))
+                .await
+                .into_response();
+        assert_eq!(response.status().as_u16(), 200);
+        let body = response_json(response).await;
+        let child = body["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|session| session["session_id"] == "child")
+            .expect("清單必須看得到 vendor:parent 的子層列");
+        assert_eq!(child["parent_session_id"], "vendor:parent");
+
+        // 修正面：詳情查詢不得以檔名字元集 400 拒絕匯入端接受的父層 id。
+        for parent in ["vendor:parent", "  vendor:parent  "] {
+            let response = super::get_session_details(
+                Path(("codex".to_string(), "child".to_string())),
+                Query(SessionDetailsQuery {
+                    parent_session_id: Some(parent.to_string()),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .into_response();
+            assert_eq!(
+                response.status().as_u16(),
+                200,
+                "parent_session_id={parent:?} 的詳情查詢必須成功"
+            );
+            let body = response_json(response).await;
+            assert_eq!(body["metadata"]["parent_session_id"], "vendor:parent");
+        }
+
+        // 同源檢查（一併移除）：handler 也不得攔下匯入端接受的 session_id。
+        let response = super::get_session_details(
+            Path(("codex".to_string(), "vendor:child".to_string())),
+            Query(SessionDetailsQuery {
+                parent_session_id: Some("".to_string()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "session_id 帶冒號的詳情查詢不得被 handler 層 400 攔下"
+        );
+    }
+
+    /// 安全界線保留確認（thread PRRT_kwDOTOgsec6yUXNl）：handler 層檢查移除
+    /// 後，防線是 `session_files` 解析器的 `is_safe_session_id`＋路徑
+    /// containment；本 PR 不得鬆動它。
+    #[test]
+    fn copilot_app_events_resolver_rejects_unsafe_session_ids() {
+        let root = std::env::temp_dir().join(format!(
+            "copilot-app-resolver-guard-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        assert!(crate::session_files::resolve_copilot_app_events_path(
+            &root,
+            "vendor:parent",
+            None
+        )
+        .is_err());
+        assert!(crate::session_files::resolve_copilot_app_events_path(
+            &root,
+            "../escape",
+            Some("agent")
+        )
+        .is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// 同上：CLI 子層 drawer 的 parent_session_id 一樣不得被穿越路徑欺騙。
+    #[test]
+    fn cli_subagent_resolver_rejects_traversal_parent_session_id() {
+        let root = std::env::temp_dir().join(format!(
+            "copilot-cli-subagent-resolver-guard-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let session_dir = root.join("session-state").join("parent");
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(session_dir.join("events.jsonl"), "").unwrap();
+        assert!(
+            crate::session_files::resolve_copilot_cli_subagent_events_path(&root, "..").is_err()
+        );
+        assert!(
+            crate::session_files::resolve_copilot_cli_subagent_events_path(&root, "a/../../b")
+                .is_err()
+        );
+        let resolved =
+            crate::session_files::resolve_copilot_cli_subagent_events_path(&root, "parent")
+                .unwrap();
+        assert!(resolved.ends_with("session-state/parent/events.jsonl"));
+        let _ = fs::remove_dir_all(root);
     }
 }
