@@ -38,6 +38,14 @@ export function sessionIdentityKey(session) {
   ]);
 }
 
+// 搜尋結果列（後端 SessionSearchMatch）與 sessions 清單列共用同一把含
+// parent_session_id 的身分鍵：真實獨立 session `a__b` 與 session `a` 的
+// 合成子 Agent `b` 必須各自可被選取（comment 4403291365）。文字搜尋的
+// 過濾行為不變：符合文字的每一列都以自己的鍵入選，不會漏掉符合列。
+export function sessionSearchMatchKey(session) {
+  return sessionIdentityKey(session);
+}
+
 export function parentSessionIdentityKey(session, sessions) {
   if (!session?.parent_session_id) return null;
   // 父層通常是主／獨立 session（Copilot 合成 `<parent>__<agent>` 約定），

@@ -7,6 +7,7 @@ import {
   matchesSessionIdentity,
   parentSessionIdentityKey,
   sessionIdentityKey,
+  sessionSearchMatchKey,
 } from '../static/session-utils.js';
 
 const mixedTimestampSessions = [
@@ -206,4 +207,66 @@ test('raw usage filtering preserves the full session source identity', () => {
   ];
 
   assert.deepEqual(filterEntriesBySessionIdentity(entries, sessions), [entries[0]]);
+});
+
+test('search match keys keep colliding standalone and synthetic child selectable', () => {
+  // 搜尋結果列（後端 SessionSearchMatch）與 sessions 清單列必須共用同一把
+  // 身分鍵：獨立 session `a__b` 與 session `a` 的子 Agent `b` 要能各自被
+  // 選取（comment 4403291365）；兩列都符合文字時兩列都要保留（搜尋過濾
+  // 不漏掉符合列），父子關聯也不受影響。
+  const matchRows = [
+    {
+      session_id: 'a__b',
+      parent_session_id: null,
+      assistant_type: 'copilot',
+      source_kind: 'copilot-app',
+      source_dir_key: 'aa',
+    },
+    {
+      session_id: 'a__b',
+      parent_session_id: 'a',
+      assistant_type: 'copilot',
+      source_kind: 'copilot-app',
+      source_dir_key: 'aa',
+    },
+  ];
+
+  assert.notEqual(
+    sessionSearchMatchKey(matchRows[0]),
+    sessionSearchMatchKey(matchRows[1]),
+    '搜尋結果的獨立 session 與合成子 Agent 必須是兩個不同的身分鍵',
+  );
+
+  // sessions 清單列帶有額外欄位，仍必須與搜尋列算出同一把鍵，Set 比對
+  // 才能在清單中各自獨立選取。
+  const sessionRows = [
+    { ...matchRows[0], session_name: '獨立 session', total_tokens: 100 },
+    { ...matchRows[1], agent_nickname: 'b', total_tokens: 900 },
+  ];
+  for (const match of matchRows) {
+    const hitKeys = new Set([sessionSearchMatchKey(match)]);
+    const selected = sessionRows.filter(row => hitKeys.has(sessionSearchMatchKey(row)));
+    assert.equal(selected.length, 1, '單一搜尋命中只能選到自己的那一列');
+    assert.equal(selected[0].parent_session_id ?? null, match.parent_session_id ?? null);
+  }
+
+  // 兩列都符合文字時都要保留（搜尋過濾行為不漏掉符合列）。
+  const allKeys = new Set(matchRows.map(sessionSearchMatchKey));
+  assert.equal(
+    sessionRows.filter(row => allKeys.has(sessionSearchMatchKey(row))).length,
+    2,
+  );
+
+  // 子 Agent 的父子關聯不受影響。
+  const parentRow = {
+    session_id: 'a',
+    parent_session_id: null,
+    assistant_type: 'copilot',
+    source_kind: 'copilot-app',
+    source_dir_key: 'aa',
+  };
+  assert.equal(
+    parentSessionIdentityKey(matchRows[1], [parentRow]),
+    sessionIdentityKey(parentRow),
+  );
 });

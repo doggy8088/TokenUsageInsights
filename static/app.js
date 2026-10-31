@@ -6,14 +6,15 @@ import {
   calculateMovingAverageTrend,
   calculateMovingAverageViewportTrend,
   getChartDataPointX,
-} from './chart-utils.js?v=9';
+} from './chart-utils.js?v=10';
 import {
   compareSessionRows,
   filterEntriesBySessionIdentity,
   matchesSessionIdentity,
   parentSessionIdentityKey,
   sessionIdentityKey,
-} from './session-utils.js?v=4';
+  sessionSearchMatchKey,
+} from './session-utils.js?v=5';
 import { parseUsageTimestamp } from './time-utils.js?v=1';
 
 // Globals
@@ -4401,12 +4402,6 @@ function updateSessionCwdFilterOptions(sessions) {
   select.title = currentSessionCwdFilter
     ? (select.selectedOptions[0]?.textContent || t('session_cwd_filter_aria_label'))
     : t('session_cwd_filter_aria_label');
-}
-
-function sessionSearchMatchKey(session) {
-  // 搜尋後端回傳的 match 列未帶 parent_session_id，比對時忽略父層以維持
-  // 既有過濾行為（合成 id 碰撞的兩列可能同時顯示，但不會漏掉符合列）。
-  return sessionIdentityKey({ ...session, parent_session_id: null });
 }
 
 function getSearchFilteredSessions() {
