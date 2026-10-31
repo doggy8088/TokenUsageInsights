@@ -2670,7 +2670,7 @@ fn sync_copilot_app_transcripts(
                 })
                 .ok()
                 .flatten();
-            2u32.hash(&mut hash); // App reconciliation/accounting revision.
+            3u32.hash(&mut hash); // App reconciliation/accounting revision.
             title.hash(&mut hash);
             let fingerprint = (before.0, (hash.finish() & i64::MAX as u64) as i64);
             if states.get(&state_key) == Some(&fingerprint) {
