@@ -6912,7 +6912,27 @@ pub fn import_usage_day_entries(
     )
     .map_err(|e| format!("建立匯入批次失敗: {e}"))?;
 
+    // Copilot App 備份匯入以「家族代表權先到先得」避免兩種粒度的列同時宣告同一筆
+    // 呼叫（review 4403291503 的「同步先、匯入聚合後」殘留重複計量）：逐次呼叫列
+    // 是本機同步的代表格式，先處理；回合聚合後處理，兩者在逐筆寫入時檢查——
+    // R1 家族已有逐次呼叫列（本機同步或較早匯入）時，跳過後到的回合聚合；
+    // R2 家族已被回合聚合（本機 fallback 或較早匯入）認領且尚無逐次呼叫列時，
+    // 跳過後到的逐次呼叫匯入列（「匯入批次優先」，與接管側的暫緩同一不變量）。
+    // 被跳過的列不寫入批次（撤銷性不受影響），並誠實計入 skipped_duplicates。
+    let mut per_call_records = Vec::new();
+    let mut other_records = Vec::new();
     for record in records {
+        let is_per_call = assistant == "copilot"
+            && record.entry.source_kind.as_deref() == Some(COPILOT_APP_SOURCE_KIND)
+            && normalize_import_source_id(record.import_source_id.as_deref())
+                .is_some_and(|id| id.contains(":call:"));
+        if is_per_call {
+            per_call_records.push(record);
+        } else {
+            other_records.push(record);
+        }
+    }
+    for record in per_call_records.into_iter().chain(other_records) {
         let UsageDayExportRecord {
             mut entry,
             import_source_id,
@@ -6926,6 +6946,59 @@ pub fn import_usage_day_entries(
             .source_kind
             .clone()
             .unwrap_or_else(|| "legacy".to_string());
+        if assistant == "copilot" && source_kind == COPILOT_APP_SOURCE_KIND {
+            // 同一來源家族只允許一種代表粒度宣告同一筆呼叫，與接管的一對一覆蓋
+            // 是同一不變量。家族以 parent_session_id 分群（不解析合成 id），
+            // key 缺失的舊備份跨目錄比對（同 session 視為同源，寧可少計重複）。
+            let family = entry
+                .parent_session_id
+                .clone()
+                .unwrap_or_else(|| entry.session_id.clone());
+            let record_is_per_call = normalized_id
+                .as_deref()
+                .is_some_and(|id| id.contains(":call:"));
+            let has_call_rows: i64 = tx
+                .query_row(
+                    "SELECT EXISTS (
+                        SELECT 1 FROM usage_entries
+                        WHERE assistant_type='copilot' AND source_kind='copilot-app'
+                          AND (?1 IS NULL OR source_dir_key = ?1)
+                          AND ((session_id = ?2 AND parent_session_id IS NULL)
+                               OR parent_session_id = ?2)
+                          AND import_source_id LIKE '%:call:%')",
+                    params![entry.source_dir_key.as_deref(), family],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("檢查既有逐次呼叫列失敗: {e}"))?;
+            let has_aggregate_rows: i64 = tx
+                .query_row(
+                    "SELECT EXISTS (
+                        SELECT 1 FROM usage_entries
+                        WHERE assistant_type='copilot' AND source_kind='copilot-app'
+                          AND (?1 IS NULL OR source_dir_key = ?1)
+                          AND ((session_id = ?2 AND parent_session_id IS NULL)
+                               OR parent_session_id = ?2)
+                          AND (import_source_id IS NULL
+                               OR import_source_id NOT LIKE '%:call:%'))",
+                    params![entry.source_dir_key.as_deref(), family],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("檢查既有回合聚合列失敗: {e}"))?;
+            let skip = if record_is_per_call {
+                // R2：回合聚合已認領家族（匯入批次優先），後到的逐次呼叫匯入列
+                // 不得並存；聚合批次撤銷後重新匯入即可復原。
+                has_aggregate_rows != 0 && has_call_rows == 0
+            } else {
+                // R1：家族已有逐次呼叫列（本機同步或較早匯入）時，回合聚合是同
+                // 一批用量的第二份宣告。只跳過、不動任何既有列：本機列可能已無
+                // 來源可重建，而匯入列可撤銷、可重新匯入，絕不遺失資料。
+                has_call_rows != 0
+            };
+            if skip {
+                skipped_duplicates += 1;
+                continue;
+            }
+        }
         let usage_identity = exported_usage_identity
             .as_deref()
             .map(str::trim)
@@ -7261,6 +7334,11 @@ pub fn rollback_usage_import_batch(
         // calls (review 4403291263). Without this, INSERT OR IGNORE had skipped
         // the shadowed local rows while their sync fingerprint remained
         // "done", permanently losing their usage.
+        // Intentionally NOT deleted here: the reconciliation retry markers
+        // `sync:copilot_app_transcript:pending:{key}::{family}`. They are
+        // retry state, not sync progress — deleting them would lose a forced
+        // rescan, while the fingerprint invalidation below triggers a re-sync
+        // that clears the markers on success.
         let mut stmt = tx
             .prepare(
                 "SELECT DISTINCT source_dir_key, COALESCE(parent_session_id, session_id)
@@ -16566,6 +16644,211 @@ mod tests {
         assert_eq!(
             cli_daily_totals(&f.conn, "app"),
             vec![("2026-07-23".into(), 220)]
+        );
+    }
+
+    /// A backup record shaped like the turn aggregate an old release exported
+    /// for one Copilot App call (same usage as `cli_usage_fixture`).
+    fn app_aggregate_backup_record(key: &str) -> UsageDayExportRecord {
+        UsageDayExportRecord {
+            entry: UsageEntry {
+                timestamp: "2026-07-23T12:00:00Z".to_string(),
+                session_id: "app".to_string(),
+                session_name: None,
+                transcript_path: None,
+                cwd: None,
+                version: None,
+                turn_no: 1,
+                model: Some("B".to_string()),
+                model_id: Some("B".to_string()),
+                tokens: Some(TokenStats {
+                    input: 20,
+                    output: 10,
+                    cache_read: Some(80),
+                    cache_write: Some(0),
+                    cache_write_5m: None,
+                    cache_write_1h: None,
+                    reasoning: Some(0),
+                    total: 110,
+                }),
+                delta_tokens: Some(TokenStats {
+                    input: 20,
+                    output: 10,
+                    cache_read: Some(80),
+                    cache_write: Some(0),
+                    cache_write_5m: None,
+                    cache_write_1h: None,
+                    reasoning: Some(0),
+                    total: 110,
+                }),
+                context: None,
+                cost: None,
+                source_kind: Some("copilot-app".to_string()),
+                source_dir_key: Some(key.to_string()),
+                parent_session_id: None,
+                agent_nickname: None,
+                agent_role: None,
+                reasoning_effort: None,
+            },
+            import_source_id: Some(format!("copilot-app:{key}:app:0:main:42")),
+            usage_identity: Some("agent=6d61696e;model=42".to_string()),
+        }
+    }
+
+    #[test]
+    fn copilot_app_imported_aggregate_never_doubles_local_per_call_totals() {
+        let mut f = AppReviewFixture::new(&["app"]);
+        f.write("app", &[cli_usage_fixture(1, "2026-07-23T12:00:00Z")]);
+        f.sync();
+        let key = test_copilot_source_key(&f.root);
+        // Sync-only baseline: one local per-call row for the call.
+        assert_eq!(
+            cli_daily_totals(&f.conn, "app"),
+            vec![("2026-07-23".into(), 110)]
+        );
+        // A backup of the same source brings the old turn aggregate for the
+        // family that already holds the local per-call rows: the daily totals
+        // must keep counting exactly one set.
+        let summary = import_usage_day_entries(
+            &mut f.conn,
+            "copilot",
+            "2026-07-23",
+            vec![app_aggregate_backup_record(&key)],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            cli_daily_totals(&f.conn, "app"),
+            vec![("2026-07-23".into(), 110)],
+            "backup aggregates must not double the synced per-call usage"
+        );
+        assert_eq!(
+            summary.imported, 0,
+            "the duplicate aggregate must not be imported"
+        );
+        assert_eq!(
+            summary.skipped_duplicates, 1,
+            "the skipped aggregate must be reported honestly"
+        );
+        // The takeover stays live: a follow-up sync must neither defer nor
+        // duplicate once no aggregate claims the family.
+        f.sync();
+        assert_eq!(
+            cli_daily_totals(&f.conn, "app"),
+            vec![("2026-07-23".into(), 110)]
+        );
+    }
+
+    #[test]
+    fn copilot_app_aggregate_import_revocation_restores_the_sync_only_state() {
+        let mut f = AppReviewFixture::new(&["app"]);
+        f.write("app", &[cli_usage_fixture(1, "2026-07-23T12:00:00Z")]);
+        f.sync();
+        let key = test_copilot_source_key(&f.root);
+        let summary = import_usage_day_entries(
+            &mut f.conn,
+            "copilot",
+            "2026-07-23",
+            vec![app_aggregate_backup_record(&key)],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        // End-to-end: the import never doubles the synced usage…
+        assert_eq!(
+            cli_daily_totals(&f.conn, "app"),
+            vec![("2026-07-23".into(), 110)]
+        );
+        // …so revoking the batch is a no-op for the family: the report shows
+        // exactly the sync-only baseline and nothing local was lost.
+        let rollback =
+            rollback_usage_import_batch(&mut f.conn, "copilot", &summary.batch_id).unwrap();
+        assert_eq!(
+            rollback.removed_records, 0,
+            "skipped rows are not batch rows"
+        );
+        assert_eq!(
+            cli_daily_totals(&f.conn, "app"),
+            vec![("2026-07-23".into(), 110)],
+            "revocation must restore the sync-only baseline"
+        );
+        let local: i64 = f
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries WHERE import_batch_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(local, 1, "the local call row must survive revocation");
+        // A batch that never touched the family must not invalidate its sync
+        // fingerprint: the retryable-state machinery stays untouched.
+        assert!(
+            load_sync_state_for_prefix(&f.conn, "copilot-app-transcript")
+                .contains_key(&format!("copilot-app-transcript:{key}:app")),
+            "a skipped import must not invalidate the family fingerprint"
+        );
+        f.sync();
+        assert_eq!(
+            cli_daily_totals(&f.conn, "app"),
+            vec![("2026-07-23".into(), 110)]
+        );
+    }
+
+    #[test]
+    fn copilot_app_per_call_import_defers_to_an_earlier_aggregate_batch() {
+        let mut f = AppReviewFixture::new(&["app"]);
+        f.write("app", &[cli_usage_fixture(1, "2026-07-23T12:00:00Z")]);
+        f.sync();
+        let per_call_backup = export_usage_day_entries(&f.conn, "copilot", "2026-07-23").unwrap();
+        assert_eq!(per_call_backup.len(), 1);
+        let key = test_copilot_source_key(&f.root);
+        // Restore onto a fresh database: the old aggregate batch arrives first
+        // and claims the family representation.
+        f.conn.execute("DELETE FROM usage_entries", []).unwrap();
+        f.conn.execute("DELETE FROM sync_state", []).unwrap();
+        let aggregate_batch = import_usage_day_entries(
+            &mut f.conn,
+            "copilot",
+            "2026-07-23",
+            vec![app_aggregate_backup_record(&key)],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            aggregate_batch.imported, 1,
+            "the first aggregate import must claim the family"
+        );
+        // The per-call backup of the same source must not add a second set.
+        let call_batch = import_usage_day_entries(
+            &mut f.conn,
+            "copilot",
+            "2026-07-23",
+            per_call_backup.clone(),
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            cli_daily_totals(&f.conn, "app"),
+            vec![("2026-07-23".into(), 110)],
+            "imported aggregates and per-call rows must never both claim a call"
+        );
+        assert_eq!(call_batch.imported, 0);
+        assert_eq!(call_batch.skipped_duplicates, 1);
+        // Revoking the claiming batch releases the family: re-importing the
+        // per-call backup restores that representation exactly once.
+        rollback_usage_import_batch(&mut f.conn, "copilot", &aggregate_batch.batch_id).unwrap();
+        let retry = import_usage_day_entries(
+            &mut f.conn,
+            "copilot",
+            "2026-07-23",
+            per_call_backup,
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        assert_eq!(retry.imported, 1);
+        assert_eq!(
+            cli_daily_totals(&f.conn, "app"),
+            vec![("2026-07-23".into(), 110)]
         );
     }
 
