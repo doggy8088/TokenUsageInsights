@@ -6,7 +6,7 @@ import {
   calculateMovingAverageTrend,
   calculateMovingAverageViewportTrend,
   getChartDataPointX,
-} from './chart-utils.js?v=10';
+} from './chart-utils.js?v=11';
 import {
   buildSessionParentIndex,
   compareSessionRows,
