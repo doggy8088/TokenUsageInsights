@@ -18709,6 +18709,45 @@ mod tests {
     }
 
     #[test]
+    fn app_review_absent_then_present_reasoning_effort_survives_into_usage_row() {
+        // (thread PRRT_kwDOTOgsec6yUXNX) Event-only App sessions have no
+        // SQLite row to back-fill `reasoning_effort`. If the same-identity
+        // dedup keeps only the first copy, a later duplicate that supplies the
+        // metadata is lost before the writer and the badge/export silently
+        // drop it — the merge must reach the persisted row, not just the map.
+        let mut f = AppReviewFixture::new(&["app"]);
+        let mut first = cli_usage_fixture(1, "2026-07-23T12:00:00Z");
+        first["id"] = serde_json::json!("event-first");
+        let mut second = first.clone();
+        second["id"] = serde_json::json!("event-second");
+        second["data"]["usage"]["reasoningEffort"] = serde_json::json!("high");
+        f.write("app", &[first, second]);
+        f.sync();
+        let effort: Option<String> = f
+            .conn
+            .query_row(
+                "SELECT reasoning_effort FROM usage_entries WHERE session_id = 'app'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            effort.as_deref(),
+            Some("high"),
+            "後到重複份的推理強度必須回填到保留份並寫入用量列"
+        );
+        let count: i64 = f
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries WHERE session_id = 'app'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "同身分重複仍須維持單一用量列");
+    }
+
+    #[test]
     fn sqlite_only_subagent_call_with_untimestamped_reply_keeps_timeline_turn() {
         // (review comment 4436837487) The child's single reply has no
         // parseable timestamp, but `timeline::parse_copilot_timeline_filtered`

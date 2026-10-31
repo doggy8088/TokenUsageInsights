@@ -160,8 +160,8 @@ pub(crate) fn read_calls(
     let file = File::open(path).map_err(|e| format!("讀取 Copilot 事件檔失敗: {e}"))?;
     let mut reader = BufReader::new(file);
     let mut line = String::new();
-    let mut calls = Vec::new();
-    let mut identities: HashMap<(String, Option<String>, String), Call> = HashMap::new();
+    let mut calls: Vec<Call> = Vec::new();
+    let mut identities: HashMap<(String, Option<String>, String), usize> = HashMap::new();
     let mut turns = HashMap::new();
     let mut seen_prompt = false;
     loop {
@@ -271,17 +271,24 @@ pub(crate) fn read_calls(
         };
         // Agent sequences restart independently. Stable API identities are
         // scoped to the agent, never to sequence or the selected model.
-        if let Some(previous) = identities.get(&key) {
-            let mut comparable: Call = previous.clone();
+        if let Some(&idx) = identities.get(&key) {
+            let mut comparable: Call = calls[idx].clone();
             comparable.turn_no = call.turn_no;
             comparable.native_identity = call.native_identity.clone();
             comparable.reasoning_effort = call.reasoning_effort.clone();
             if comparable != call {
                 return Err("Copilot 相同用量識別碼的內容不一致".into());
             }
+            // Fill-only metadata merge into the retained call: a later
+            // duplicate may carry metadata the first copy lacks
+            // (absent-then-present). The first `Some` still wins and strict
+            // fields stay loud errors above (thread PRRT_kwDOTOgsec6yUXNX).
+            if calls[idx].reasoning_effort.is_none() {
+                calls[idx].reasoning_effort = call.reasoning_effort;
+            }
             continue;
         }
-        identities.insert(key, call.clone());
+        identities.insert(key, calls.len());
         calls.push(call);
     }
     Ok(calls)
@@ -523,6 +530,47 @@ mod tests {
         let mut conflict = a.clone();
         conflict["data"]["usage"]["inputTokens"] = json!(101);
         assert!(read(&[a, conflict], "", false).is_err());
+    }
+
+    #[test]
+    fn absent_then_present_reasoning_effort_fills_retained_call() {
+        // (thread PRRT_kwDOTOgsec6yUXNX) The retained duplicate may lack
+        // metadata a later copy supplies. Event-only sessions have no SQLite
+        // value to back-fill `reasoning_effort`, so the dedup must merge the
+        // missing metadata into the retained call instead of discarding it.
+        let mut first = event("a", "2026-07-22T10:00:00Z");
+        first["id"] = json!("event-first");
+        let mut second = first.clone();
+        second["id"] = json!("event-second");
+        second["data"]["usage"]["reasoningEffort"] = json!("high");
+        let rows = read(&[first, second], "", false).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn present_then_absent_reasoning_effort_keeps_first_value() {
+        // Fill-only semantics: the first `Some` wins over later `None`/`Some`
+        // copies and conflicting strict fields stay loud errors.
+        let mut first = event("a", "2026-07-22T10:00:00Z");
+        first["id"] = json!("event-first");
+        first["data"]["usage"]["reasoningEffort"] = json!("high");
+        let mut absent = first.clone();
+        absent["id"] = json!("event-absent");
+        absent["data"]["usage"]["reasoningEffort"] = Value::Null;
+        let rows = read(&[first.clone(), absent], "", false).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].reasoning_effort.as_deref(), Some("high"));
+        let mut low = first.clone();
+        low["id"] = json!("event-low");
+        low["data"]["usage"]["reasoningEffort"] = json!("low");
+        let rows = read(&[first, low], "", false).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].reasoning_effort.as_deref(),
+            Some("high"),
+            "後到的值不得覆寫保留份的既有推理強度"
+        );
     }
 
     #[test]
