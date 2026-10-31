@@ -284,6 +284,10 @@ pub(super) fn parse_codex_session_file_with_diagnostics(
             parent_session_id = payload
                 .get("parent_thread_id")
                 .and_then(|id| id.as_str())
+                // Empty parent ≡ no parent (mirrors the `id` extraction above):
+                // it must neither become `Some("")` nor clobber a real parent
+                // read from an earlier `session_meta` (review PRRT_kwDOTOgsec6yUKGs).
+                .filter(|id| !id.is_empty())
                 .map(|id| id.to_string())
                 .or(parent_session_id);
             agent_nickname = payload
@@ -622,6 +626,54 @@ mod tests {
             Some("parent-session")
         );
         assert_ne!(entries[0].session_id, "parent-session");
+    }
+
+    #[test]
+    fn parse_codex_session_file_normalizes_empty_parent_thread_id() {
+        // (thread PRRT_kwDOTOgsec6yUKGs) `parent_thread_id: ""` means "no
+        // parent" — the frontend identity key and the detail query's RootOnly
+        // scope both read an empty parent as absent, so the parser must store
+        // `None` instead of `Some("")`.
+        let path = temp_jsonl_path("codex-empty-parent");
+        let content = r##"{"type":"session_meta","payload":{"id":"child","parent_thread_id":"","source":{"subagent":{"thread_spawn":{"agent_path":"/root/reviewer"}}}}}
+{"timestamp":"2026-10-04T10:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":10,"total_tokens":110}}}}
+"##;
+        fs::write(&path, content).unwrap();
+        let entries = parse_codex_session_file_with_diagnostics(&path)
+            .unwrap()
+            .entries;
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].session_id, "child");
+        assert!(
+            entries[0].parent_session_id.is_none(),
+            "空的 parent_thread_id 必須正規化為無父層，而不是 Some(\"\")"
+        );
+    }
+
+    #[test]
+    fn parse_codex_session_file_empty_parent_does_not_clobber_real_parent() {
+        // A later `parent_thread_id: ""` must not overwrite a real parent read
+        // from an earlier `session_meta` (the `.or(parent_session_id)` chain
+        // only keeps the previous value when the new one is `None`).
+        let path = temp_jsonl_path("codex-empty-parent-clobber");
+        let content = r##"{"type":"session_meta","payload":{"id":"child","parent_thread_id":"parent"}}
+{"type":"session_meta","payload":{"id":"child","parent_thread_id":""}}
+{"timestamp":"2026-10-04T10:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":10,"total_tokens":110}}}}
+"##;
+        fs::write(&path, content).unwrap();
+        let entries = parse_codex_session_file_with_diagnostics(&path)
+            .unwrap()
+            .entries;
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].parent_session_id.as_deref(),
+            Some("parent"),
+            "後到的空 parent_thread_id 不得覆寫先前的真實父層"
+        );
     }
 
     #[test]

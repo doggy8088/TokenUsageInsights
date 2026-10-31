@@ -228,6 +228,8 @@ pub struct UsageImportRollbackSummary {
 const CODEX_PARSER_MIGRATION_KEY: &str = "migration:codex_session_identity_v9";
 const CODEX_SOURCE_KIND_MIGRATION_KEY: &str = "migration:codex_source_kind_v1";
 const CODEX_ROLLOUT_IDENTITY_MIGRATION_KEY: &str = "migration:codex_rollout_identity_v1";
+const PARENT_SESSION_NORMALIZATION_MIGRATION_KEY: &str =
+    "migration:parent_session_id_normalization_v1";
 const CODEX_CLI_SOURCE_KIND: &str = "codex-cli";
 const CODEX_DESKTOP_SOURCE_KIND: &str = "codex-desktop";
 const CODEX_OTHER_SOURCE_KIND: &str = "codex-other";
@@ -547,6 +549,18 @@ fn build_usage_entry_import_source_id(
         ));
     }
     format!("{:016x}", hash_fnv1a_64(&signature))
+}
+
+/// Normalize a persisted `parent_session_id` at write boundaries: an empty or
+/// blank parent means "no parent" for every consumer — the frontend
+/// `sessionIdentityKey` collapses `''` to absent and the detail page requests
+/// the parentless row-set with `parent_session_id=''` → `RootOnly` — so the
+/// `Some("")` vs `None` distinction must never reach storage or identity keys
+/// (review thread PRRT_kwDOTOgsec6yUKGs).
+pub(crate) fn normalize_parent_session_id(parent: Option<String>) -> Option<String> {
+    parent
+        .map(|parent| parent.trim().to_string())
+        .filter(|parent| !parent.is_empty())
 }
 
 /// Directory resolution helpers
@@ -2217,6 +2231,50 @@ fn run_codex_parser_migration(conn: &mut Connection) -> Result<(), String> {
             .map_err(|e| format!("Codex parser migration COMMIT 失敗: {}", e))?;
     }
     Ok(())
+}
+
+/// One-time repair for rows persisted before empty parents were normalized:
+/// `parent_session_id = ''` (Codex `parent_thread_id: ""`, imported
+/// `parent_session_id: ""`) means "no parent" everywhere else in the stack
+/// (frontend identity key, `ParentSessionScope::RootOnly`), so collapse `''` /
+/// blank parents to NULL and TRIM the rest.
+///
+/// Deliberately NOT done via the Copilot App reconciliation revision
+/// (`4u32.hash`): that fingerprint only covers App transcript rows — whose
+/// parents are always real session ids — while Codex and imported rows bypass
+/// the App reconciliation entirely, so bumping it would rescan unrelated data
+/// and leave every `''` row untouched. A `sync_state` marker (same pattern as
+/// [`run_codex_parser_migration`]) keeps this UPDATE one-shot and idempotent.
+fn run_parent_session_id_normalization_migration(conn: &mut Connection) -> Result<(), String> {
+    let migration_done: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = ?)",
+            params![PARENT_SESSION_NORMALIZATION_MIGRATION_KEY],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    if migration_done {
+        return Ok(());
+    }
+
+    let tx = conn
+        .transaction()
+        .map_err(|error| format!("父層身分正規化遷移 BEGIN 失敗: {error}"))?;
+    tx.execute(
+        "UPDATE usage_entries
+         SET parent_session_id = NULLIF(TRIM(parent_session_id), '')
+         WHERE parent_session_id IS NOT NULL",
+        [],
+    )
+    .map_err(|error| format!("修正空白父層資料失敗: {error}"))?;
+    tx.execute(
+        "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time) VALUES (?, 1, 0)",
+        params![PARENT_SESSION_NORMALIZATION_MIGRATION_KEY],
+    )
+    .map_err(|error| format!("寫入父層身分正規化遷移狀態失敗: {error}"))?;
+    tx.commit()
+        .map_err(|error| format!("父層身分正規化遷移 COMMIT 失敗: {error}"))
 }
 
 fn run_codex_source_kind_migration(conn: &mut Connection) -> Result<(), String> {
@@ -5477,6 +5535,7 @@ fn sync_codex_usage_logs_from_with_cancel(
     run_codex_parser_migration(conn)?;
     run_codex_source_kind_migration(conn)?;
     run_codex_rollout_identity_migration(conn)?;
+    run_parent_session_id_normalization_migration(conn)?;
 
     let mut transcripts = Vec::new();
     for root in roots {
@@ -7724,6 +7783,10 @@ pub fn import_usage_day_entries(
             import_source_id,
             usage_identity: exported_usage_identity,
         } = record;
+        // Empty parent ≡ no parent at the storage boundary (thread
+        // PRRT_kwDOTOgsec6yUKGs): the frontend identity key collapses `''` to
+        // absent and RootOnly lookups cannot find rows persisted with `''`.
+        entry.parent_session_id = normalize_parent_session_id(entry.parent_session_id.take());
         let normalized_id = normalize_import_source_id(import_source_id.as_deref());
         let record_date = entry_date_from_timestamp(&entry.timestamp)
             .ok_or_else(|| "無效的 timestamp 格式，無法取得日期".to_string())?
@@ -8224,7 +8287,10 @@ pub enum ParentSessionScope<'a> {
     /// `parent_session_id` predicate at all, preserving the pre-existing API
     /// behaviour exactly (main-session lookups are unaffected).
     Unfiltered,
-    /// Only main-agent / standalone rows (`parent_session_id IS NULL`).
+    /// Only main-agent / standalone rows (`parent_session_id IS NULL`, plus
+    /// legacy rows persisted with `parent_session_id = ''` before empty-parent
+    /// normalization — the frontend reads an empty parent as absent, so those
+    /// rows are roots too and must stay reachable).
     RootOnly,
     /// Only sub-agent rows of the given parent (`parent_session_id = ?`).
     ChildOf(&'a str),
@@ -8232,8 +8298,8 @@ pub enum ParentSessionScope<'a> {
 
 impl<'a> ParentSessionScope<'a> {
     /// The effective `parent_session_id` predicate: `None` means no filter
-    /// ([`Self::Unfiltered`]), `Some(None)` means `parent_session_id IS NULL`
-    /// and `Some(Some(p))` means `parent_session_id = p`.
+    /// ([`Self::Unfiltered`]), `Some(None)` selects the root row-set (see
+    /// [`push_parent_filter`]) and `Some(Some(p))` means `parent_session_id = p`.
     fn parent_filter(&self) -> Option<Option<String>> {
         match self {
             Self::Unfiltered => None,
@@ -8250,8 +8316,9 @@ impl<'a> ParentSessionScope<'a> {
     }
 }
 
-/// Appends the `parent_session_id` predicate: `None` for
-/// `parent_session_id IS NULL` and `Some(p)` for `parent_session_id = p`.
+/// Appends the `parent_session_id` predicate: `None` for the root scope
+/// (`parent_session_id IS NULL`, plus legacy `''` rows) and `Some(p)` for
+/// `parent_session_id = p`.
 fn push_parent_filter(
     sql: &mut String,
     params: &mut Vec<rusqlite::types::Value>,
@@ -8262,7 +8329,11 @@ fn push_parent_filter(
             sql.push_str(" AND parent_session_id = ?");
             params.push(rusqlite::types::Value::Text(parent.to_string()));
         }
-        None => sql.push_str(" AND parent_session_id IS NULL"),
+        // RootOnly must also match rows persisted with `''` before empty-parent
+        // normalization: the frontend sends `parent_session_id=''` for them and
+        // an `IS NULL`-only predicate made their detail page 404
+        // (review PRRT_kwDOTOgsec6yUKGs).
+        None => sql.push_str(" AND (parent_session_id IS NULL OR parent_session_id = '')"),
     }
 }
 
@@ -10105,6 +10176,50 @@ mod tests {
     }
 
     #[test]
+    fn import_usage_day_entries_normalizes_empty_parent_session_id() {
+        // (thread PRRT_kwDOTOgsec6yUKGs) The export/import serde channel keeps
+        // `parent_session_id: ""` as `Some("")`. Storage must normalize it to
+        // "no parent" at the write boundary: the frontend identity key
+        // collapses `''` to absent and the detail page requests the parentless
+        // row-set with `parent_session_id=''` → `RootOnly`, which cannot find
+        // a row persisted with `''`.
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut record = sample_import_record();
+        record.entry.parent_session_id = Some(String::new());
+
+        let summary = import_usage_day_entries(
+            &mut conn,
+            "codex",
+            "2026-07-10",
+            vec![record],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        assert_eq!(summary.imported, 1);
+
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT parent_session_id FROM usage_entries WHERE session_id = 'import-session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, None, "空父層必須以無父層（NULL）儲存");
+
+        let lookup = get_session_assistant_and_transcript_in_parent_scope(
+            &conn,
+            "codex",
+            "import-session",
+            None,
+            None,
+            ParentSessionScope::RootOnly,
+        )
+        .expect("RootOnly 詳情查詢必須查得到空父層 session（否則詳情頁 404）");
+        assert_eq!(lookup.parent_session_id, None);
+    }
+
+    #[test]
     fn import_preserves_copilot_source_directories_and_multi_model_rows() {
         let mut conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
@@ -11111,6 +11226,65 @@ mod tests {
             )
             .unwrap();
         assert_eq!(later_identity, "");
+    }
+
+    #[test]
+    fn parent_session_id_empty_string_migration_repairs_existing_rows() {
+        // One-time repair vehicle for rows persisted before empty-parent
+        // normalization (thread PRRT_kwDOTOgsec6yUKGs / audit F4). Not the
+        // Copilot App reconciliation revision (`4u32`): that fingerprint never
+        // sees Codex or imported rows, which are exactly the `''` producers.
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        for (index, parent) in [Some(""), Some("  "), Some(" p "), None]
+            .into_iter()
+            .enumerate()
+        {
+            conn.execute(
+                "INSERT INTO usage_entries (
+                    assistant_type, timestamp, date, session_id,
+                    turn_no, parent_session_id
+                 ) VALUES ('codex', '2026-09-10T16:06:50Z', '2026-09-10', ?, ?, ?)",
+                params![format!("session-{index}"), (index + 1) as i64, parent],
+            )
+            .unwrap();
+        }
+
+        run_parent_session_id_normalization_migration(&mut conn).unwrap();
+
+        let parents: Vec<Option<String>> = conn
+            .prepare("SELECT parent_session_id FROM usage_entries ORDER BY session_id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            parents,
+            vec![None, None, Some("p".to_string()), None],
+            "''／全空白父層修為 NULL、空白包夾的真實父層 trim、NULL 不動"
+        );
+
+        let marker: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = ?)",
+                params![PARENT_SESSION_NORMALIZATION_MIGRATION_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(marker, "遷移必須寫入 sync_state marker 保證只跑一次");
+
+        let changes_before = conn
+            .query_row::<i64, _, _>("SELECT total_changes()", [], |row| row.get(0))
+            .unwrap();
+        run_parent_session_id_normalization_migration(&mut conn).unwrap();
+        let changes_after = conn
+            .query_row::<i64, _, _>("SELECT total_changes()", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            changes_after, changes_before,
+            "第二次執行必須為 no-op（冪等）"
+        );
     }
 
     #[test]
@@ -24524,6 +24698,81 @@ mod tests {
                 .input,
             900,
             "子 Agent 詳細頁回合用量不得混入獨立 session 的 100 tokens"
+        );
+    }
+
+    #[test]
+    fn root_only_parent_scope_reaches_legacy_empty_parent_rows() {
+        // Rows persisted before empty-parent normalization store `''` for
+        // "no parent" (Codex `parent_thread_id: ""` / imported records). The
+        // frontend sends `parent_session_id=''` for such a session and
+        // `session_details` maps that to `RootOnly`; the scope must keep
+        // matching `''` rows (thread PRRT_kwDOTOgsec6yUKGs: clicking such a
+        // session used to 404) so they stay reachable before/without the
+        // one-time repair migration.
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, timestamp, date, session_id,
+                turn_no, parent_session_id, delta_input, delta_output, delta_total
+             ) VALUES ('codex', 'legacy', '2026-07-10T12:00:00Z', '2026-07-10',
+                'legacy-empty-parent', 1, '', 100, 0, 100)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, timestamp, date, session_id,
+                turn_no, parent_session_id, delta_input, delta_output, delta_total
+             ) VALUES ('codex', 'legacy', '2026-07-10T12:00:00Z', '2026-07-10',
+                'real-child', 1, 'real-parent', 900, 0, 900)",
+            [],
+        )
+        .unwrap();
+
+        let lookup = get_session_assistant_and_transcript_in_parent_scope(
+            &conn,
+            "codex",
+            "legacy-empty-parent",
+            Some("legacy"),
+            None,
+            ParentSessionScope::RootOnly,
+        )
+        .expect("RootOnly 必須命中以 '' 存放的既有無父層列");
+        assert_eq!(
+            lookup.parent_session_id, None,
+            "既有 '' 父層列在身分面上應呈現為無父層"
+        );
+
+        let turns = get_session_turns_token_stats_in_parent_scope(
+            &conn,
+            "codex",
+            "legacy-empty-parent",
+            Some("legacy"),
+            None,
+            ParentSessionScope::RootOnly,
+        )
+        .unwrap();
+        assert_eq!(
+            turns.get(&1).unwrap().0.input,
+            100,
+            "詳情頁回合用量必須查得到既有 '' 父層列"
+        );
+
+        // A real child must NOT leak into the root scope while the legacy
+        // `''` rows are being matched.
+        assert!(
+            get_session_assistant_and_transcript_in_parent_scope(
+                &conn,
+                "codex",
+                "real-child",
+                Some("legacy"),
+                None,
+                ParentSessionScope::RootOnly,
+            )
+            .is_err(),
+            "RootOnly 不得吞下真正的子層列"
         );
     }
 }
