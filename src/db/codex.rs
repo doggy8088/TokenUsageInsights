@@ -259,11 +259,13 @@ pub(super) fn parse_codex_session_file_with_diagnostics(
                 if let Some(id) = payload
                     .get("id")
                     .and_then(|id| id.as_str())
+                    .map(str::trim)
                     .filter(|id| !id.is_empty())
                     .or_else(|| {
                         payload
                             .get("session_id")
                             .and_then(|id| id.as_str())
+                            .map(str::trim)
                             .filter(|id| !id.is_empty())
                     })
                 {
@@ -284,9 +286,13 @@ pub(super) fn parse_codex_session_file_with_diagnostics(
             parent_session_id = payload
                 .get("parent_thread_id")
                 .and_then(|id| id.as_str())
-                // Empty parent ≡ no parent (mirrors the `id` extraction above):
-                // it must neither become `Some("")` nor clobber a real parent
-                // read from an earlier `session_meta` (review PRRT_kwDOTOgsec6yUKGs).
+                // Trim first, then the empty check (mirrors the `id`
+                // extraction above): whitespace-only parent ≡ no parent — it
+                // must neither become `Some("  ")` (which the grouping layer
+                // trims away → summary rows that 404 in details, review
+                // PRRT_kwDOTOgsec6yUXNe) nor clobber a real parent read from
+                // an earlier `session_meta` (review PRRT_kwDOTOgsec6yUKGs).
+                .map(str::trim)
                 .filter(|id| !id.is_empty())
                 .map(|id| id.to_string())
                 .or(parent_session_id);
@@ -368,7 +374,9 @@ pub(super) fn parse_codex_session_file_with_diagnostics(
 
     let session_name = subagent_task_name.or_else(|| session_name_selector.into_name());
 
-    if parent_session_id.as_deref() == Some(session_id.as_str()) {
+    // Self-parent detection compares the trimmed forms too (PRRT_kwDOTOgsec6yUXNe):
+    // `"  child  "` parent of session `child` is a self-reference, not a parent.
+    if parent_session_id.as_deref().map(str::trim) == Some(session_id.trim()) {
         parent_session_id = None;
     }
 
@@ -673,6 +681,94 @@ mod tests {
             entries[0].parent_session_id.as_deref(),
             Some("parent"),
             "後到的空 parent_thread_id 不得覆寫先前的真實父層"
+        );
+    }
+
+    #[test]
+    fn parse_codex_session_file_trims_padded_parent_thread_id() {
+        // (thread PRRT_kwDOTOgsec6yUXNe) 空白包覆的 parent_thread_id 會通過
+        // 非空 filter 卻被分組層 trim → 摘要看得到、詳情 404。解析端必須
+        // trim 之後再判空：包覆空白 → trim 後儲存，純空白 → 無父層。
+        let path = temp_jsonl_path("codex-padded-parent");
+        let content = r##"{"type":"session_meta","payload":{"id":"child","parent_thread_id":"  vendor:parent  "}}
+{"timestamp":"2026-10-04T10:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":10,"total_tokens":110}}}}
+"##;
+        fs::write(&path, content).unwrap();
+        let entries = parse_codex_session_file_with_diagnostics(&path)
+            .unwrap()
+            .entries;
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].parent_session_id.as_deref(),
+            Some("vendor:parent"),
+            "包覆空白的 parent_thread_id 必須 trim 後儲存"
+        );
+
+        let path = temp_jsonl_path("codex-whitespace-parent");
+        let content = r##"{"type":"session_meta","payload":{"id":"child","parent_thread_id":"   "}}
+{"timestamp":"2026-10-04T10:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":10,"total_tokens":110}}}}
+"##;
+        fs::write(&path, content).unwrap();
+        let entries = parse_codex_session_file_with_diagnostics(&path)
+            .unwrap()
+            .entries;
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(entries.len(), 1);
+        assert!(
+            entries[0].parent_session_id.is_none(),
+            "純空白 parent_thread_id 必須視為無父層，而不是 Some(\"   \")"
+        );
+    }
+
+    #[test]
+    fn parse_codex_session_file_whitespace_parent_does_not_clobber_real_parent() {
+        // trim→判空→or 的語意：後到的純空白 parent 是「無父層」，不得覆寫
+        // 先前讀到的真實父層（與空字串行為一致）。
+        let path = temp_jsonl_path("codex-whitespace-parent-clobber");
+        let content = r##"{"type":"session_meta","payload":{"id":"child","parent_thread_id":"parent"}}
+{"type":"session_meta","payload":{"id":"child","parent_thread_id":" "}}
+{"timestamp":"2026-10-04T10:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":10,"total_tokens":110}}}}
+"##;
+        fs::write(&path, content).unwrap();
+        let entries = parse_codex_session_file_with_diagnostics(&path)
+            .unwrap()
+            .entries;
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].parent_session_id.as_deref(),
+            Some("parent"),
+            "後到的純空白 parent_thread_id 不得覆寫先前的真實父層"
+        );
+    }
+
+    #[test]
+    fn parse_codex_session_file_trims_padded_ids_and_self_parent_check() {
+        // 同型漏洞（PRRT_kwDOTOgsec6yUXNe）：`id`/`session_id` 擷取與自指
+        // parent 判定同樣必須 trim——空白包覆的 id 會寫出無法通過
+        // is_safe_session_id 的 session_id，包覆空白的自指 parent 會漏判。
+        let path = temp_jsonl_path("codex-padded-ids");
+        let content = r##"{"type":"session_meta","payload":{"id":"  child  ","parent_thread_id":"  child  "}}
+{"timestamp":"2026-10-04T10:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":10,"total_tokens":110}}}}
+"##;
+        fs::write(&path, content).unwrap();
+        let entries = parse_codex_session_file_with_diagnostics(&path)
+            .unwrap()
+            .entries;
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].session_id, "child",
+            "包覆空白的 id 必須 trim 後成為 session_id"
+        );
+        assert!(
+            entries[0].parent_session_id.is_none(),
+            "包覆空白的自指 parent（trim 後等於 session_id）必須視為無父層"
         );
     }
 

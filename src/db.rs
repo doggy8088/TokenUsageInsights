@@ -234,6 +234,11 @@ const PARENT_SESSION_NORMALIZATION_MIGRATION_KEY: &str =
 /// sync_state key，避免兩者互相把對方的一次性修復吞掉。
 const COPILOT_PARENT_COLLISION_RECOVERY_KEY: &str =
     "migration:copilot_parent_collision_recovery_v1";
+/// 一次性父層正規化 v2（PRRT_kwDOTOgsec6yUXNe）：修復 v1（feca7c9）之後才落盤
+/// 的空白／padded 父層值。獨立於 v1 的 sync_state key——沿用 v1 的 key 會被
+/// 已消費的一次性標記擋住、永遠不跑。
+const PARENT_SESSION_NORMALIZATION_MIGRATION_V2_KEY: &str =
+    "migration:parent_session_id_normalization_v2";
 const CODEX_CLI_SOURCE_KIND: &str = "codex-cli";
 const CODEX_DESKTOP_SOURCE_KIND: &str = "codex-desktop";
 const CODEX_OTHER_SOURCE_KIND: &str = "codex-other";
@@ -1413,10 +1418,12 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
         .map_err(|error| format!("記錄 Grok Build parser migration 失敗: {error}"))?;
     }
 
-    // 一次性復原：父層碰撞修復（PRRT_kwDOTOgsec6yUXND）。掛載於 init_db 尾端
-    // （sync_state 表建立之後）：只要開庫就執行，且不與 App sync 入口的
-    // legacy cursor 升級路徑互相干擾。
+    // 一次性遷移（掛載於 init_db 尾端、sync_state 表建立之後：只要開庫就
+    // 執行，且不與 App sync 入口的 legacy cursor 升級路徑互相干擾）：
+    // - 父層碰撞復原（PRRT_kwDOTOgsec6yUXND）
+    // - 父層正規化 v2（PRRT_kwDOTOgsec6yUXNe）
     run_copilot_parent_collision_recovery_migration(conn)?;
+    run_parent_session_id_normalization_migration_v2(conn)?;
 
     Ok(())
 }
@@ -2093,7 +2100,7 @@ fn insert_vscode_usage_entry(
                 .map(|value| value as i64),
             cost.and_then(|value| value.total_premium_requests)
                 .map(|value| value as i64),
-            entry.parent_session_id.as_deref(),
+            normalize_parent_session_id(entry.parent_session_id.clone()),
             entry.agent_nickname.as_deref(),
             entry.agent_role.as_deref(),
             entry.reasoning_effort.as_deref(),
@@ -2299,6 +2306,51 @@ fn run_parent_session_id_normalization_migration(conn: &mut Connection) -> Resul
     .map_err(|error| format!("寫入父層身分正規化遷移狀態失敗: {error}"))?;
     tx.commit()
         .map_err(|error| format!("父層身分正規化遷移 COMMIT 失敗: {error}"))
+}
+
+/// 一次性父層正規化 v2（PRRT_kwDOTOgsec6yUXNe）。
+///
+/// v1 之後仍可能落盤空白／padded 父層值（codex parser 的
+/// `parent_thread_id` filter 未 trim、匯入端以外的寫入邊界未正規化）。摘要層
+/// 分組會 trim、詳情頁 `RootOnly` 只認 `IS NULL`/`''`，`'  '` 列變成「清單
+/// 看得到、詳情 404」。此遷移把既有列折成與 `SessionIdentity` 相同語意
+/// （trim＋空即無父）。SQL 謂詞用 null-safe 的 `IS NOT`：`x <> NULLIF(TRIM(x),'')`
+/// 對會折成 NULL 的列永遠是 NULL 比較、恰好漏掉最需要修的純空白列。
+/// 以獨立 sync_state 標記守門、標記最後寫入，冪等且一次性。
+fn run_parent_session_id_normalization_migration_v2(conn: &Connection) -> Result<(), String> {
+    let migration_done: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = ?)",
+            params![PARENT_SESSION_NORMALIZATION_MIGRATION_V2_KEY],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    if migration_done {
+        return Ok(());
+    }
+
+    let repaired = conn
+        .execute(
+            "UPDATE usage_entries
+             SET parent_session_id = NULLIF(TRIM(parent_session_id), '')
+             WHERE parent_session_id IS NOT NULL
+               AND parent_session_id IS NOT NULLIF(TRIM(parent_session_id), '')",
+            [],
+        )
+        .map_err(|error| format!("修正空白／padded 父層資料失敗: {error}"))?;
+    conn.execute(
+        "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time) VALUES (?, 1, 0)",
+        params![PARENT_SESSION_NORMALIZATION_MIGRATION_V2_KEY],
+    )
+    .map_err(|error| format!("寫入父層正規化 v2 遷移狀態失敗: {error}"))?;
+    if repaired > 0 {
+        println!(
+            "✅ 遷移：父層正規化 v2——修正 {} 列空白／padded 父層",
+            repaired
+        );
+    }
+    Ok(())
 }
 
 /// 一次性父層碰撞復原（PRRT_kwDOTOgsec6yUXND）。
@@ -5179,7 +5231,7 @@ fn replace_copilot_call_rows(
             row.duration_ms as i64,
             import_source_id,
             row.reasoning_effort,
-            parent_session_id,
+            normalize_parent_session_id(parent_session_id),
             agent_nickname,
             agent_role,
         ]);
@@ -5643,6 +5695,7 @@ fn sync_codex_usage_logs_from_with_cancel(
     run_codex_source_kind_migration(conn)?;
     run_codex_rollout_identity_migration(conn)?;
     run_parent_session_id_normalization_migration(conn)?;
+    run_parent_session_id_normalization_migration_v2(conn)?;
 
     let mut transcripts = Vec::new();
     for root in roots {
@@ -5919,7 +5972,7 @@ fn sync_codex_transcript(
                 delta.map(|t| t.total as i64),
                 cost.and_then(|c| c.total_api_duration_ms.map(|d| d as i64)),
                 cost.and_then(|c| c.total_premium_requests.map(|r| r as i64)),
-                entry.parent_session_id.as_deref(),
+                normalize_parent_session_id(entry.parent_session_id.clone()),
                 entry.agent_nickname.as_deref(),
                 entry.agent_role.as_deref(),
                 entry.reasoning_effort.as_deref()
@@ -6191,7 +6244,7 @@ fn sync_claude_usage_logs_from_with_cancel(
                         delta.map(|t| t.total as i64),
                         cost.and_then(|c| c.total_api_duration_ms.map(|d| d as i64)),
                         cost.and_then(|c| c.total_premium_requests.map(|r| r as i64)),
-                        entry.parent_session_id.as_deref(),
+                        normalize_parent_session_id(entry.parent_session_id.clone()),
                         entry.agent_nickname.as_deref(),
                         entry.agent_role.as_deref(),
                         entry.reasoning_effort.as_deref()
@@ -6604,7 +6657,7 @@ fn insert_usage_entries(
                 cost.and_then(|value| value.reported_cost_usd),
                 entry.reasoning_effort.as_deref(),
                 entry.source_dir_key.as_deref(),
-                entry.parent_session_id.as_deref(),
+                normalize_parent_session_id(entry.parent_session_id.clone()),
                 entry.agent_nickname.as_deref(),
                 entry.agent_role.as_deref(),
             ],
@@ -7214,7 +7267,7 @@ fn migrate_records(
                 delta_total,
                 row.get::<_, Option<i64>>(20)?,
                 row.get::<_, Option<i64>>(21)?,
-                parent_sid,
+                normalize_parent_session_id(parent_sid),
                 nickname,
                 role
             ],
@@ -25571,5 +25624,132 @@ mod tests {
             std::env::remove_var("COPILOT_APP_DIR");
         }
         let _ = fs::remove_dir_all(base_dir);
+    }
+
+    /// Claim B repair (thread PRRT_kwDOTOgsec6yUXNe): rows persisted after the
+    /// first (`feca7c9`) one-time normalization can still carry whitespace-only
+    /// or padded `parent_session_id` values. The v2 migration (NEW sync_state
+    /// key) must trim + collapse blanks exactly like `SessionIdentity`, so the
+    /// rows stop appearing in summaries yet 404-ing in details (RootOnly only
+    /// reaches `IS NULL`/`''`, never `'  '`). One-shot: rows written after the
+    /// marker survives untouched.
+    #[test]
+    fn parent_session_id_normalization_migration_v2_repairs_post_migration_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // v1 正規化遷移已跑過（模擬 feca7c9 之後才落盤的雜值）。
+        conn.execute(
+            "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES (?, 1, 0)",
+            params![PARENT_SESSION_NORMALIZATION_MIGRATION_KEY],
+        )
+        .unwrap();
+        // 還原成修復前的 sync_state：升級當下資料庫並無 v2 標記
+        // （init_db 會先寫入標記，此處模擬「修復尚未跑過」的既有庫）。
+        conn.execute(
+            "DELETE FROM sync_state WHERE filename = ?",
+            params!["migration:parent_session_id_normalization_v2"],
+        )
+        .unwrap();
+        for (session_id, parent) in [
+            ("s-pad", Some(" a ")),
+            ("s-blank", Some("  ")),
+            ("s-empty", Some("")),
+            ("s-ok", Some("ok")),
+            ("s-null", None),
+        ] {
+            conn.execute(
+                "INSERT INTO usage_entries (
+                    assistant_type, source_kind, timestamp, date, session_id,
+                    turn_no, parent_session_id, delta_input, delta_output, delta_total
+                 ) VALUES ('codex', 'codex-cli', '2026-07-10T12:00:00Z', '2026-07-10',
+                    ?, 1, ?, 100, 0, 100)",
+                params![session_id, parent],
+            )
+            .unwrap();
+        }
+
+        // Claim B 症狀：純空白父層列在 RootOnly 詳情查詢 404（清單卻看得到）。
+        assert!(
+            get_session_assistant_and_transcript_in_parent_scope(
+                &conn,
+                "codex",
+                "s-blank",
+                Some("codex-cli"),
+                None,
+                ParentSessionScope::RootOnly,
+            )
+            .is_err(),
+            "修復前：純空白父層列在 RootOnly 詳情查詢必須 404（症狀成立）"
+        );
+
+        // 升級後首次啟動：init_db 掛載的 v2 遷移修復 v1 之後落盤的雜值。
+        init_db(&conn).unwrap();
+
+        let parents: Vec<(String, Option<String>)> = conn
+            .prepare(
+                "SELECT session_id, parent_session_id FROM usage_entries
+                 WHERE session_id LIKE 's-%' ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(
+            parents,
+            vec![
+                ("s-pad".to_string(), Some("a".to_string())),
+                ("s-blank".to_string(), None),
+                ("s-empty".to_string(), None),
+                ("s-ok".to_string(), Some("ok".to_string())),
+                ("s-null".to_string(), None),
+            ],
+            "v2 遷移必須 trim 包覆空白、把純空白／空字串折成無父層"
+        );
+
+        let lookup = get_session_assistant_and_transcript_in_parent_scope(
+            &conn,
+            "codex",
+            "s-blank",
+            Some("codex-cli"),
+            None,
+            ParentSessionScope::RootOnly,
+        )
+        .expect("修復後：純空白父層列必須能被 RootOnly 詳情查詢命中");
+        assert_eq!(lookup.parent_session_id, None);
+
+        let marker: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = ?)",
+                params!["migration:parent_session_id_normalization_v2"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(marker, "v2 遷移必須寫入一次性 sync_state 標記");
+
+        // 一次性證明：標記生效後才落盤的雜值不得被再次改寫。
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, timestamp, date, session_id,
+                turn_no, parent_session_id, delta_input, delta_output, delta_total
+             ) VALUES ('codex', 'codex-cli', '2026-07-10T12:00:00Z', '2026-07-10',
+                's-late', 1, '  b  ', 100, 0, 100)",
+            [],
+        )
+        .unwrap();
+        init_db(&conn).unwrap();
+        let late_parent: Option<String> = conn
+            .query_row(
+                "SELECT parent_session_id FROM usage_entries WHERE session_id = 's-late'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            late_parent.as_deref(),
+            Some("  b  "),
+            "遷移是一次性行為：標記生效後的新列不得被改寫"
+        );
     }
 }
