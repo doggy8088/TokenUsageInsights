@@ -3,3 +3,4 @@ temp_test_insights/
 node_modules/
 npm/token-usage-insights-bin/
 token-usage-insights-*.tgz
+*.local.json
