@@ -1,6 +1,6 @@
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -186,6 +186,10 @@ pub struct UsageDayImportSummary {
     pub total: usize,
     pub imported: usize,
     pub skipped_duplicates: usize,
+    /// Records whose overlap with existing usage could not be proven either
+    /// way (for example a turn-less legacy aggregate). They are neither
+    /// imported nor counted as duplicates (review 4403291574).
+    pub skipped_conflicts: usize,
     pub batch_id: String,
 }
 
@@ -205,6 +209,7 @@ pub struct UsageImportBatch {
     pub total: usize,
     pub imported: usize,
     pub skipped_duplicates: usize,
+    pub skipped_conflicts: usize,
     pub created_at: i64,
     pub rolled_back_at: Option<i64>,
     pub removed_records: usize,
@@ -1072,6 +1077,7 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
             total_records INTEGER NOT NULL,
             imported_records INTEGER NOT NULL,
             skipped_duplicates INTEGER NOT NULL,
+            skipped_conflicts INTEGER NOT NULL DEFAULT 0,
             created_at INTEGER NOT NULL,
             rolled_back_at INTEGER,
             removed_records INTEGER NOT NULL DEFAULT 0
@@ -1079,6 +1085,13 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
         [],
     )
     .map_err(|e| format!("建立 import_batches 表失敗: {e}"))?;
+    // Tolerated-ALTER migration: databases created before the conflict bucket
+    // existed keep counting unprovable-overlap records honestly (review
+    // 4403291574). A duplicate-column error simply means it is already there.
+    let _ = conn.execute(
+        "ALTER TABLE import_batches ADD COLUMN skipped_conflicts INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_import_batches_assistant_created
          ON import_batches(assistant_type, created_at DESC)",
@@ -4365,10 +4378,15 @@ fn replace_copilot_call_rows(
         // fingerprint — until the batch is revoked. `rollback_usage_import_batch`
         // deletes the batch rows and clears the affected App fingerprints so
         // the local calls rebuild on the next sync (review 4403291263).
+        // The source key weak-matches in both directions so a key-less legacy
+        // aggregate resolves to the same source as the keyed local rows
+        // (review 4403291578); the deferral stays whole-session because a
+        // per-turn partial takeover would break the injective 1:1 coverage.
         let imported_aggregates: i64 = tx
             .query_row(
                 "SELECT COUNT(*) FROM usage_entries
-             WHERE assistant_type='copilot' AND source_kind=?2 AND source_dir_key=?3
+             WHERE assistant_type='copilot' AND source_kind=?2
+               AND (source_dir_key IS NULL OR source_dir_key=?3)
                AND ((session_id=?1 AND parent_session_id IS NULL) OR parent_session_id=?1)
                AND import_batch_id IS NOT NULL
                AND (import_source_id IS NULL OR import_source_id NOT LIKE '%:call:%')",
@@ -4488,7 +4506,8 @@ fn replace_copilot_call_rows(
             COALESCE(tokens_input,0), COALESCE(tokens_output,0),
             COALESCE(tokens_cache_read,0), COALESCE(tokens_cache_write,0),
             COALESCE(tokens_reasoning,0) FROM usage_entries
-            WHERE source_kind=?1 AND source_dir_key=?2
+            WHERE source_kind=?1
+              AND (source_dir_key IS NULL OR source_dir_key=?2)
               AND ((session_id=?3 AND parent_session_id IS NULL) OR parent_session_id=?3)
               AND (import_source_id IS NULL OR import_source_id NOT LIKE '%:call:%')
               AND import_batch_id IS NULL",
@@ -4574,7 +4593,8 @@ fn replace_copilot_call_rows(
                 "SELECT import_source_id, timestamp, model, agent_nickname,
             tokens_input, tokens_output, tokens_cache_read, tokens_cache_write,
             tokens_reasoning, duration_ms FROM usage_entries
-            WHERE source_kind=?1 AND source_dir_key=?2
+            WHERE source_kind=?1
+              AND (source_dir_key IS NULL OR source_dir_key=?2)
               AND ((session_id=?3 AND parent_session_id IS NULL) OR parent_session_id=?3)
               AND import_source_id LIKE '%:call:%' AND import_batch_id IS NULL",
             )
@@ -7146,6 +7166,212 @@ pub fn export_usage_period_entries(
     Ok(records)
 }
 
+/// Which source calls one Copilot App usage row claims to represent
+/// (review 4403291574). The claim is the unit of import deduplication: two
+/// records may only be deduped when their claimed call sets provably overlap.
+#[derive(Debug, PartialEq, Eq)]
+enum CopilotAppCoverageClaim {
+    /// One per-call row: exactly one call, identified by its call hash and
+    /// placed at `(turn, session, model)`.
+    Call {
+        hash: String,
+        turn: u32,
+        sid: String,
+        model: Option<String>,
+    },
+    /// A per-agent/model turn row (4/5-segment id): every call of its
+    /// `(turn, session, model)` bucket.
+    Split {
+        turn: u32,
+        sid: String,
+        model: Option<String>,
+    },
+    /// A legacy 3-segment main-session turn row: every call of that turn
+    /// across agents and models.
+    WholeTurn { turn: u32 },
+    /// The row cannot be placed in the family's turn space (turn missing or
+    /// 0), so its overlap with anything else is unprovable.
+    Undecidable,
+}
+
+/// Classify a row's coverage claim from its identity shape and its declared
+/// turn/session/model (never from metric sums — numbers cannot prove
+/// coverage). `family` disambiguates a whole-turn merge from a split row.
+fn classify_copilot_app_coverage_claim(
+    import_source_id: Option<&str>,
+    turn_no: u32,
+    session_id: &str,
+    family: &str,
+    model: Option<&str>,
+) -> CopilotAppCoverageClaim {
+    if turn_no == 0 {
+        return CopilotAppCoverageClaim::Undecidable;
+    }
+    let sid = session_id.to_string();
+    let model = model.map(|model| model.to_string());
+    if let Some(id) = import_source_id {
+        if id.contains(":call:") {
+            let hash = id.rsplit(':').next().unwrap_or_default().to_string();
+            return CopilotAppCoverageClaim::Call {
+                hash,
+                turn: turn_no,
+                sid,
+                model,
+            };
+        }
+        if let Some(rest) = id.strip_prefix("copilot-app:") {
+            if rest.matches(':').count() == 2 && session_id == family {
+                return CopilotAppCoverageClaim::WholeTurn { turn: turn_no };
+            }
+            return CopilotAppCoverageClaim::Split {
+                turn: turn_no,
+                sid,
+                model,
+            };
+        }
+    }
+    // Exports without a recognizable source id land at their declared row
+    // position and can only claim that `(turn, session, model)` bucket.
+    CopilotAppCoverageClaim::Split {
+        turn: turn_no,
+        sid,
+        model,
+    }
+}
+
+fn copilot_app_claims_overlap(a: &CopilotAppCoverageClaim, b: &CopilotAppCoverageClaim) -> bool {
+    use CopilotAppCoverageClaim::{Call, Split, WholeTurn};
+    match (a, b) {
+        // Two per-call rows are the same call only when their hashes match;
+        // distinct hashes are distinct calls of the same bucket.
+        (Call { hash: left, .. }, Call { hash: right, .. }) => left == right,
+        (
+            Call {
+                turn: t1,
+                sid: s1,
+                model: m1,
+                ..
+            },
+            Split {
+                turn: t2,
+                sid: s2,
+                model: m2,
+            },
+        )
+        | (
+            Split {
+                turn: t1,
+                sid: s1,
+                model: m1,
+            },
+            Call {
+                turn: t2,
+                sid: s2,
+                model: m2,
+                ..
+            },
+        )
+        | (
+            Split {
+                turn: t1,
+                sid: s1,
+                model: m1,
+            },
+            Split {
+                turn: t2,
+                sid: s2,
+                model: m2,
+            },
+        ) => t1 == t2 && s1 == s2 && m1 == m2,
+        // A whole-turn claim covers every agent/model bucket of its turn.
+        (Call { turn: t1, .. }, WholeTurn { turn: t2 })
+        | (WholeTurn { turn: t1 }, Call { turn: t2, .. })
+        | (Split { turn: t1, .. }, WholeTurn { turn: t2 })
+        | (WholeTurn { turn: t1 }, Split { turn: t2, .. })
+        | (WholeTurn { turn: t1 }, WholeTurn { turn: t2 }) => t1 == t2,
+        // Undecidable claims never reach this function.
+        _ => false,
+    }
+}
+
+enum ImportCoverageDecision {
+    Import,
+    Duplicate,
+    Conflict,
+}
+
+/// Three-way adjudication of one Copilot App import record against the
+/// family's existing claims: provable overlap keeps first-come-first-served
+/// deduplication, provable disjointness imports normally, and anything
+/// unprovable is reported as a conflict (review 4403291574). Source keys
+/// weak-match in both directions so a key-less legacy row and the keyed rows
+/// of the same session resolve to one source (review 4403291578).
+fn adjudicate_copilot_app_import_coverage(
+    conn: &Connection,
+    entry: &UsageEntry,
+    normalized_id: Option<&str>,
+    family: &str,
+) -> Result<ImportCoverageDecision, String> {
+    let claim = classify_copilot_app_coverage_claim(
+        normalized_id,
+        entry.turn_no,
+        &entry.session_id,
+        family,
+        entry.model.as_deref(),
+    );
+    if claim == CopilotAppCoverageClaim::Undecidable {
+        return Ok(ImportCoverageDecision::Conflict);
+    }
+    let mut stmt = conn
+        .prepare(
+            "SELECT import_source_id, turn_no, session_id, model
+             FROM usage_entries
+             WHERE assistant_type='copilot' AND source_kind='copilot-app'
+               AND (?1 IS NULL OR source_dir_key IS NULL OR source_dir_key = ?1)
+               AND ((session_id = ?2 AND parent_session_id IS NULL)
+                    OR parent_session_id = ?2)",
+        )
+        .map_err(|e| format!("準備覆蓋範圍裁決查詢失敗: {e}"))?;
+    let rows = stmt
+        .query_map(params![entry.source_dir_key.as_deref(), family], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, u32>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })
+        .map_err(|e| format!("執行覆蓋範圍裁決查詢失敗: {e}"))?;
+    let mut saw_overlap = false;
+    for row in rows {
+        let (import, turn, sid, model) = row.map_err(|e| format!("讀取覆蓋範圍裁決列失敗: {e}"))?;
+        let existing = classify_copilot_app_coverage_claim(
+            import.as_deref(),
+            turn,
+            &sid,
+            family,
+            model.as_deref(),
+        );
+        match existing {
+            CopilotAppCoverageClaim::Undecidable => {
+                // An existing claim that cannot be placed in the turn space
+                // may cover anything: refuse to guess and report a conflict.
+                return Ok(ImportCoverageDecision::Conflict);
+            }
+            claim_overlap if copilot_app_claims_overlap(&claim, &claim_overlap) => {
+                // Conflict verdicts must win over duplicates, so remember the
+                // overlap and keep scanning for an unplaceable claim.
+                saw_overlap = true;
+            }
+            _ => {}
+        }
+    }
+    if saw_overlap {
+        return Ok(ImportCoverageDecision::Duplicate);
+    }
+    Ok(ImportCoverageDecision::Import)
+}
+
 pub fn import_usage_day_entries(
     conn: &mut Connection,
     assistant: &str,
@@ -7164,6 +7390,7 @@ pub fn import_usage_day_entries(
     let source_file_name = normalize_import_metadata_value(metadata.source_file_name, 255);
     let mut inserted = 0usize;
     let mut skipped_duplicates = 0usize;
+    let mut skipped_conflicts = 0usize;
 
     let tx = conn
         .transaction()
@@ -7171,8 +7398,9 @@ pub fn import_usage_day_entries(
     tx.execute(
         "INSERT INTO import_batches (
             id, assistant_type, source_assistant, source_file_name, import_date,
-            total_records, imported_records, skipped_duplicates, created_at
-         ) VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?)",
+            total_records, imported_records, skipped_duplicates, skipped_conflicts,
+            created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, ?)",
         params![
             batch_id,
             assistant,
@@ -7187,11 +7415,17 @@ pub fn import_usage_day_entries(
 
     // Copilot App 備份匯入以「家族代表權先到先得」避免兩種粒度的列同時宣告同一筆
     // 呼叫（review 4403291503 的「同步先、匯入聚合後」殘留重複計量）：逐次呼叫列
-    // 是本機同步的代表格式，先處理；回合聚合後處理，兩者在逐筆寫入時檢查——
-    // R1 家族已有逐次呼叫列（本機同步或較早匯入）時，跳過後到的回合聚合；
-    // R2 家族已被回合聚合（本機 fallback 或較早匯入）認領且尚無逐次呼叫列時，
-    // 跳過後到的逐次呼叫匯入列（「匯入批次優先」，與接管側的暫緩同一不變量）。
-    // 被跳過的列不寫入批次（撤銷性不受影響），並誠實計入 skipped_duplicates。
+    // 是本機同步的代表格式，先處理；回合聚合後處理。判重以「可證明的覆蓋範圍」
+    // 為準（review 4403291574）：來源鍵雙向弱匹配（既有 NULL key 列依「同 session
+    // 視為同源」慣例匹配任意探鍵，review 4403291578），再以 (family × turn_no) 判斷
+    // 覆蓋集合是否相交——3 段式整回合聚合認領整個回合，細粒度列（逐次呼叫與 4/5
+    // 段式聚合）以 (turn, session, model) 收緊；日期不進鍵（整回合聚合掛在
+    // MIN(created_at)，跨午夜不得再誤判）；metric 加總永不用來證明覆蓋。
+    // 可證明重疊 → skipped_duplicates（先到先得，語意不變）；可證明不重疊（不同
+    // 回合鍵）→ 正常寫入；無法判定（turn 缺失／為 0、家族內既有無法對映的回合
+    // 空間）→ skipped_conflicts：不寫入、不計重複、不中斷整批交易（批次仍可撤銷）。
+    // 被跳過與衝突的列都不寫入批次（撤銷性不受影響），帳務恆為
+    // total = imported + skipped_duplicates + skipped_conflicts。
     let mut per_call_records = Vec::new();
     let mut other_records = Vec::new();
     for record in records {
@@ -7223,53 +7457,28 @@ pub fn import_usage_day_entries(
             // 同一來源家族只允許一種代表粒度宣告同一筆呼叫，與接管的一對一覆蓋
             // 是同一不變量。家族以 parent_session_id 分群（不解析合成 id），
             // key 缺失的舊備份跨目錄比對（同 session 視為同源，寧可少計重複）。
+            // 重疊判定以覆蓋集合為準（review 4403291574）：只有能證明覆蓋範圍
+            // 重疊的列才是重複；不重疊的歷史照常入庫；無法判定的列誠實回報衝突，
+            // 不得混入 skipped_duplicates。
             let family = entry
                 .parent_session_id
                 .clone()
                 .unwrap_or_else(|| entry.session_id.clone());
-            let record_is_per_call = normalized_id
-                .as_deref()
-                .is_some_and(|id| id.contains(":call:"));
-            let has_call_rows: i64 = tx
-                .query_row(
-                    "SELECT EXISTS (
-                        SELECT 1 FROM usage_entries
-                        WHERE assistant_type='copilot' AND source_kind='copilot-app'
-                          AND (?1 IS NULL OR source_dir_key = ?1)
-                          AND ((session_id = ?2 AND parent_session_id IS NULL)
-                               OR parent_session_id = ?2)
-                          AND import_source_id LIKE '%:call:%')",
-                    params![entry.source_dir_key.as_deref(), family],
-                    |row| row.get(0),
-                )
-                .map_err(|e| format!("檢查既有逐次呼叫列失敗: {e}"))?;
-            let has_aggregate_rows: i64 = tx
-                .query_row(
-                    "SELECT EXISTS (
-                        SELECT 1 FROM usage_entries
-                        WHERE assistant_type='copilot' AND source_kind='copilot-app'
-                          AND (?1 IS NULL OR source_dir_key = ?1)
-                          AND ((session_id = ?2 AND parent_session_id IS NULL)
-                               OR parent_session_id = ?2)
-                          AND (import_source_id IS NULL
-                               OR import_source_id NOT LIKE '%:call:%'))",
-                    params![entry.source_dir_key.as_deref(), family],
-                    |row| row.get(0),
-                )
-                .map_err(|e| format!("檢查既有回合聚合列失敗: {e}"))?;
-            let skip = if record_is_per_call {
-                // R2：回合聚合已認領家族（匯入批次優先），後到的逐次呼叫匯入列
-                // 不得並存；聚合批次撤銷後重新匯入即可復原。
-                has_aggregate_rows != 0 && has_call_rows == 0
-            } else {
-                // R1：家族已有逐次呼叫列（本機同步或較早匯入）時，回合聚合是同
-                // 一批用量的第二份宣告。只跳過、不動任何既有列：本機列可能已無
-                // 來源可重建，而匯入列可撤銷、可重新匯入，絕不遺失資料。
-                has_call_rows != 0
-            };
-            if skip {
-                skipped_duplicates += 1;
-                continue;
+            match adjudicate_copilot_app_import_coverage(
+                &tx,
+                &entry,
+                normalized_id.as_deref(),
+                &family,
+            )? {
+                ImportCoverageDecision::Duplicate => {
+                    skipped_duplicates += 1;
+                    continue;
+                }
+                ImportCoverageDecision::Conflict => {
+                    skipped_conflicts += 1;
+                    continue;
+                }
+                ImportCoverageDecision::Import => {}
             }
         }
         let usage_identity = exported_usage_identity
@@ -7470,9 +7679,14 @@ pub fn import_usage_day_entries(
 
     tx.execute(
         "UPDATE import_batches
-         SET imported_records = ?, skipped_duplicates = ?
+         SET imported_records = ?, skipped_duplicates = ?, skipped_conflicts = ?
          WHERE id = ?",
-        params![inserted as i64, skipped_duplicates as i64, batch_id],
+        params![
+            inserted as i64,
+            skipped_duplicates as i64,
+            skipped_conflicts as i64,
+            batch_id
+        ],
     )
     .map_err(|e| format!("更新匯入批次結果失敗: {e}"))?;
     tx.commit()
@@ -7483,6 +7697,7 @@ pub fn import_usage_day_entries(
         total,
         imported: inserted,
         skipped_duplicates,
+        skipped_conflicts,
         batch_id,
     })
 }
@@ -7496,8 +7711,8 @@ pub fn list_usage_import_batches(
     let mut stmt = conn
         .prepare(
             "SELECT id, assistant_type, source_assistant, source_file_name, import_date,
-                    total_records, imported_records, skipped_duplicates, created_at,
-                    rolled_back_at, removed_records
+                    total_records, imported_records, skipped_duplicates, skipped_conflicts,
+                    created_at, rolled_back_at, removed_records
              FROM import_batches
              WHERE assistant_type = ?
              ORDER BY created_at DESC, id DESC
@@ -7515,9 +7730,10 @@ pub fn list_usage_import_batches(
                 total: row.get::<_, i64>(5)? as usize,
                 imported: row.get::<_, i64>(6)? as usize,
                 skipped_duplicates: row.get::<_, i64>(7)? as usize,
-                created_at: row.get(8)?,
-                rolled_back_at: row.get(9)?,
-                removed_records: row.get::<_, i64>(10)? as usize,
+                skipped_conflicts: row.get::<_, i64>(8)? as usize,
+                created_at: row.get(9)?,
+                rolled_back_at: row.get(10)?,
+                removed_records: row.get::<_, i64>(11)? as usize,
             })
         })
         .map_err(|e| format!("查詢匯入批次失敗: {e}"))?;
@@ -7616,14 +7832,66 @@ pub fn rollback_usage_import_batch(
             .prepare(
                 "SELECT DISTINCT source_dir_key, COALESCE(parent_session_id, session_id)
              FROM usage_entries
-             WHERE assistant_type='copilot' AND import_batch_id=?1
-               AND source_dir_key IS NOT NULL",
+             WHERE assistant_type='copilot' AND import_batch_id=?1",
             )
             .map_err(|e| e.to_string())?;
         let mut local_sources = stmt.query(params![batch_id]).map_err(|e| e.to_string())?;
+        let mut invalidated: BTreeSet<(String, String)> = BTreeSet::new();
+        let mut keyless_families: Vec<String> = Vec::new();
         while let Some(row) = local_sources.next().map_err(|e| e.to_string())? {
-            let source_key: String = row.get(0).map_err(|e| e.to_string())?;
+            let source_key: Option<String> = row.get(0).map_err(|e| e.to_string())?;
             let family: String = row.get(1).map_err(|e| e.to_string())?;
+            match source_key {
+                Some(source_key) => {
+                    invalidated.insert((source_key, family));
+                }
+                None => keyless_families.push(family),
+            }
+        }
+        drop(local_sources);
+        drop(stmt);
+        // A key-less batch row weak-matched rows of every source key while it
+        // lived ("same session is the same source", review 4403291578), so
+        // revocation must invalidate the weak-matched real keys' fingerprints
+        // too — otherwise the shadowed local usage cannot rebuild and the
+        // as-if-never-imported guarantee breaks.
+        for family in keyless_families {
+            let mut keys: Vec<String> = Vec::new();
+            let mut stmt = tx
+                .prepare(
+                    "SELECT DISTINCT source_dir_key FROM usage_entries
+                 WHERE assistant_type='copilot' AND source_kind='copilot-app'
+                   AND source_dir_key IS NOT NULL
+                   AND ((session_id=?1 AND parent_session_id IS NULL) OR parent_session_id=?1)",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(params![family], |row| row.get::<_, String>(0))
+                .map_err(|e| e.to_string())?;
+            for key in rows {
+                keys.push(key.map_err(|e| e.to_string())?);
+            }
+            drop(stmt);
+            let mut stmt = tx
+                .prepare(
+                    "SELECT source_dir_key FROM usage_source_directories
+                 WHERE assistant_type='copilot' AND source_kind='copilot-app'",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|e| e.to_string())?;
+            for key in rows {
+                keys.push(key.map_err(|e| e.to_string())?);
+            }
+            drop(stmt);
+            keys.sort();
+            keys.dedup();
+            for source_key in keys {
+                invalidated.insert((source_key, family.clone()));
+            }
+        }
+        for (source_key, family) in invalidated {
             for key in [
                 format!("copilot-app-transcript:{source_key}:{family}"),
                 format!("copilot-cli-transcript:{source_key}:{family}"),
@@ -7633,8 +7901,6 @@ pub fn rollback_usage_import_batch(
                     .map_err(|e| e.to_string())?;
             }
         }
-        drop(local_sources);
-        drop(stmt);
     }
     let removed_records = tx
         .execute(
@@ -17733,6 +17999,454 @@ mod tests {
         f.write("app", &events);
         f.sync();
         assert_eq!(cli_daily_totals(&f.conn, "app")[0].1, 440);
+    }
+
+    /// One 110-token Copilot App backup record (net input 20 + output 10 +
+    /// cache read 80, matching `cli_usage_fixture`) at the caller's declared
+    /// source key / turn / identity, used by the coverage-adjudication tests.
+    fn coverage_backup_entry(
+        key: Option<&str>,
+        timestamp: &str,
+        turn_no: u32,
+        import_source_id: Option<&str>,
+        usage_identity: Option<&str>,
+    ) -> UsageDayExportRecord {
+        UsageDayExportRecord {
+            entry: UsageEntry {
+                timestamp: timestamp.to_string(),
+                session_id: "app".to_string(),
+                session_name: None,
+                transcript_path: None,
+                cwd: None,
+                version: None,
+                turn_no,
+                model: Some("B".to_string()),
+                model_id: Some("B".to_string()),
+                tokens: Some(TokenStats {
+                    input: 20,
+                    output: 10,
+                    cache_read: Some(80),
+                    cache_write: Some(0),
+                    cache_write_5m: None,
+                    cache_write_1h: None,
+                    reasoning: Some(0),
+                    total: 110,
+                }),
+                delta_tokens: Some(TokenStats {
+                    input: 20,
+                    output: 10,
+                    cache_read: Some(80),
+                    cache_write: Some(0),
+                    cache_write_5m: None,
+                    cache_write_1h: None,
+                    reasoning: Some(0),
+                    total: 110,
+                }),
+                context: None,
+                cost: None,
+                source_kind: Some(COPILOT_APP_SOURCE_KIND.to_string()),
+                source_dir_key: key.map(|key| key.to_string()),
+                parent_session_id: None,
+                agent_nickname: None,
+                agent_role: None,
+                reasoning_effort: None,
+            },
+            import_source_id: import_source_id.map(|id| id.to_string()),
+            usage_identity: usage_identity.map(|id| id.to_string()),
+        }
+    }
+
+    /// A turn-aggregate backup record: the 5-segment native id when the source
+    /// key is known, the legacy 3-segment id (whole-turn claim) when it is not.
+    fn coverage_agg_backup_record(
+        key: Option<&str>,
+        timestamp: &str,
+        turn_no: u32,
+    ) -> UsageDayExportRecord {
+        let import_source_id = match key {
+            Some(key) => format!("copilot-app:{key}:app:0:main:42"),
+            None => "copilot-app:legacy:app:0".to_string(),
+        };
+        coverage_backup_entry(
+            key,
+            timestamp,
+            turn_no,
+            Some(&import_source_id),
+            Some("agent=6d61696e;model=42"),
+        )
+    }
+
+    /// A per-call backup record in the local identity format.
+    fn coverage_call_backup_record(
+        key: &str,
+        timestamp: &str,
+        turn_no: u32,
+        call_seed: &str,
+    ) -> UsageDayExportRecord {
+        let hash = sha256_hex(call_seed);
+        coverage_backup_entry(
+            Some(key),
+            timestamp,
+            turn_no,
+            Some(&format!("copilot-app:{key}:app:call:{hash}")),
+            Some(&format!("source={key};call={hash}")),
+        )
+    }
+
+    #[test]
+    fn copilot_app_import_keeps_disjoint_granularity_history_in_both_orders() {
+        let key = "deadbeef";
+        let aggregates = vec![coverage_agg_backup_record(
+            Some(key),
+            "2026-07-23T12:00:00Z",
+            1,
+        )];
+        let calls = vec![
+            coverage_call_backup_record(key, "2026-07-24T09:00:00Z", 2, "api-2"),
+            coverage_call_backup_record(key, "2026-07-24T10:00:00Z", 3, "api-3"),
+        ];
+        let expected = vec![
+            ("2026-07-23".to_string(), 110),
+            ("2026-07-24".to_string(), 220),
+        ];
+        // Order 1: 7/23 turn aggregates first, 7/24 per-call history second.
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let agg_batch = import_usage_day_entries(
+            &mut conn,
+            "copilot",
+            "2026-07-23",
+            aggregates.clone(),
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        assert_eq!((agg_batch.imported, agg_batch.skipped_duplicates), (1, 0));
+        let call_batch = import_usage_day_entries(
+            &mut conn,
+            "copilot",
+            "2026-07-24",
+            calls.clone(),
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            (call_batch.imported, call_batch.skipped_duplicates),
+            (2, 0),
+            "calls from another turn are disjoint history, not duplicates"
+        );
+        assert_eq!(cli_daily_totals(&conn, "app"), expected);
+        // Order 2: per-call history first, turn aggregates second.
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let call_batch = import_usage_day_entries(
+            &mut conn,
+            "copilot",
+            "2026-07-24",
+            calls,
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        assert_eq!((call_batch.imported, call_batch.skipped_duplicates), (2, 0));
+        let agg_batch = import_usage_day_entries(
+            &mut conn,
+            "copilot",
+            "2026-07-23",
+            aggregates,
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            (agg_batch.imported, agg_batch.skipped_duplicates),
+            (1, 0),
+            "an aggregate from another turn is disjoint history, not a duplicate"
+        );
+        assert_eq!(cli_daily_totals(&conn, "app"), expected);
+    }
+
+    #[test]
+    fn copilot_app_import_still_dedupes_overlapping_turn_coverage() {
+        let key = "deadbeef";
+        let aggregates = vec![coverage_agg_backup_record(
+            Some(key),
+            "2026-07-23T12:00:00Z",
+            1,
+        )];
+        let calls = vec![coverage_call_backup_record(
+            key,
+            "2026-07-23T12:00:00Z",
+            1,
+            "api-1",
+        )];
+        for (first, second) in [(aggregates.clone(), calls.clone()), (calls, aggregates)] {
+            let mut conn = Connection::open_in_memory().unwrap();
+            init_db(&conn).unwrap();
+            import_usage_day_entries(
+                &mut conn,
+                "copilot",
+                "2026-07-23",
+                first,
+                UsageImportMetadata::default(),
+            )
+            .unwrap();
+            let summary = import_usage_day_entries(
+                &mut conn,
+                "copilot",
+                "2026-07-23",
+                second,
+                UsageImportMetadata::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                (
+                    summary.imported,
+                    summary.skipped_duplicates,
+                    summary.skipped_conflicts
+                ),
+                (0, 1, 0),
+                "two granularities covering the same turn must keep one representation"
+            );
+            assert_eq!(
+                cli_daily_totals(&conn, "app"),
+                vec![("2026-07-23".to_string(), 110)]
+            );
+        }
+    }
+
+    #[test]
+    fn copilot_app_import_reports_conflict_when_turn_is_undecidable() {
+        let key = "deadbeef";
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let call_batch = import_usage_day_entries(
+            &mut conn,
+            "copilot",
+            "2026-07-23",
+            vec![coverage_call_backup_record(
+                key,
+                "2026-07-23T12:00:00Z",
+                1,
+                "api-1",
+            )],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        assert_eq!((call_batch.imported, call_batch.skipped_duplicates), (1, 0));
+        // A legacy aggregate without a usable turn cannot be proven to overlap
+        // or to be disjoint: it must be reported as a conflict, never as a
+        // duplicate and never silently imported.
+        let conflict_batch = import_usage_day_entries(
+            &mut conn,
+            "copilot",
+            "2026-07-23",
+            vec![coverage_agg_backup_record(
+                Some(key),
+                "2026-07-23T12:00:00Z",
+                0,
+            )],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        assert_eq!(conflict_batch.imported, 0);
+        assert_eq!(
+            conflict_batch.skipped_duplicates, 0,
+            "an unprovable record is not a duplicate"
+        );
+        assert_eq!(conflict_batch.skipped_conflicts, 1);
+        assert_eq!(
+            conflict_batch.total,
+            conflict_batch.imported
+                + conflict_batch.skipped_duplicates
+                + conflict_batch.skipped_conflicts,
+            "the batch accounting must stay complete"
+        );
+        assert_eq!(
+            cli_daily_totals(&conn, "app"),
+            vec![("2026-07-23".to_string(), 110)],
+            "usage must stay exactly one copy"
+        );
+        let rollback =
+            rollback_usage_import_batch(&mut conn, "copilot", &conflict_batch.batch_id).unwrap();
+        assert_eq!(
+            rollback.removed_records, 0,
+            "conflicting records never enter the batch"
+        );
+        assert_eq!(
+            cli_daily_totals(&conn, "app"),
+            vec![("2026-07-23".to_string(), 110)],
+            "the imported copy must survive the revocation"
+        );
+        // Even when a provable overlap also exists in the family, an
+        // unplaceable claim must win: the verdict stays a conflict and the
+        // record must not be miscounted as a duplicate.
+        seed_app_row(
+            &conn,
+            &SeedAppRow {
+                source_key: key,
+                session_id: "app",
+                turn_no: 0,
+                date: "2026-07-23",
+                timestamp: "2026-07-23T12:00:00Z",
+                model: "B",
+                agent: None,
+                duration_ms: 1,
+                usage_identity: "",
+                import_source_id: "copilot-app:legacy:app:0",
+                tokens_input: 5,
+                tokens_output: 5,
+                tokens_cache_read: 5,
+                tokens_cache_write: 0,
+                tokens_reasoning: 0,
+            },
+        );
+        let mixed = import_usage_day_entries(
+            &mut conn,
+            "copilot",
+            "2026-07-23",
+            vec![coverage_call_backup_record(
+                key,
+                "2026-07-23T12:00:00Z",
+                1,
+                "api-1",
+            )],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                mixed.imported,
+                mixed.skipped_duplicates,
+                mixed.skipped_conflicts
+            ),
+            (0, 0, 1),
+            "an unplaceable family claim must beat a provable overlap"
+        );
+    }
+
+    #[test]
+    fn copilot_app_import_dedupes_keyless_aggregate_against_keyed_per_calls_in_both_orders() {
+        let key = "deadbeef";
+        let aggregates = vec![coverage_agg_backup_record(None, "2026-07-23T12:00:00Z", 1)];
+        let calls = vec![coverage_call_backup_record(
+            key,
+            "2026-07-23T12:00:00Z",
+            1,
+            "api-1",
+        )];
+        // Both orders must agree: a key-less legacy aggregate and the keyed
+        // per-call rows of the same call are the same usage (same session is
+        // the same source), so exactly one representation may be imported.
+        for (first, second) in [(aggregates.clone(), calls.clone()), (calls, aggregates)] {
+            let mut conn = Connection::open_in_memory().unwrap();
+            init_db(&conn).unwrap();
+            import_usage_day_entries(
+                &mut conn,
+                "copilot",
+                "2026-07-23",
+                first,
+                UsageImportMetadata::default(),
+            )
+            .unwrap();
+            let summary = import_usage_day_entries(
+                &mut conn,
+                "copilot",
+                "2026-07-23",
+                second,
+                UsageImportMetadata::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                (summary.imported, summary.skipped_duplicates),
+                (0, 1),
+                "the key-less representation must still dedupe the same call"
+            );
+            assert_eq!(
+                cli_daily_totals(&conn, "app"),
+                vec![("2026-07-23".to_string(), 110)]
+            );
+        }
+    }
+
+    #[test]
+    fn copilot_app_keyless_aggregate_does_not_block_disjoint_keyed_calls() {
+        let key = "deadbeef";
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // A key-less aggregate claims turn 1 only; the keyed calls live in
+        // turn 2. The weak source-key match must not degenerate into a
+        // family-wide veto over disjoint history.
+        let agg_batch = import_usage_day_entries(
+            &mut conn,
+            "copilot",
+            "2026-07-23",
+            vec![coverage_agg_backup_record(None, "2026-07-23T12:00:00Z", 1)],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        assert_eq!((agg_batch.imported, agg_batch.skipped_duplicates), (1, 0));
+        let call_batch = import_usage_day_entries(
+            &mut conn,
+            "copilot",
+            "2026-07-23",
+            vec![coverage_call_backup_record(
+                key,
+                "2026-07-23T12:05:00Z",
+                2,
+                "api-2",
+            )],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            (call_batch.imported, call_batch.skipped_duplicates),
+            (1, 0),
+            "a disjoint turn must import normally"
+        );
+        assert_eq!(
+            cli_daily_totals(&conn, "app"),
+            vec![("2026-07-23".to_string(), 220)]
+        );
+    }
+
+    #[test]
+    fn copilot_app_takeover_defers_to_keyless_imported_aggregate() {
+        let mut f = AppReviewFixture::new(&["app"]);
+        f.write("app", &[cli_usage_fixture(1, "2026-07-23T12:00:00Z")]);
+        let key = test_copilot_source_key(&f.root);
+        // A key-less legacy aggregate of the same call is still a revocable
+        // claim on the family's usage: the local per-call takeover must defer
+        // until the batch is revoked.
+        let summary = import_usage_day_entries(
+            &mut f.conn,
+            "copilot",
+            "2026-07-23",
+            vec![coverage_agg_backup_record(None, "2026-07-23T12:00:00Z", 1)],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        assert_eq!(summary.imported, 1);
+        f.sync();
+        assert_eq!(
+            cli_daily_totals(&f.conn, "app"),
+            vec![("2026-07-23".to_string(), 110)],
+            "a key-less imported aggregate must still defer the local takeover"
+        );
+        let local: i64 = f
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries WHERE import_batch_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            local, 0,
+            "the takeover must stay deferred while the batch lives"
+        );
+        assert!(
+            !load_sync_state_for_prefix(&f.conn, "copilot-app-transcript")
+                .contains_key(&format!("copilot-app-transcript:{key}:app")),
+            "the deferred takeover must not finalize a fingerprint"
+        );
     }
 
     #[test]
