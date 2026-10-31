@@ -11,6 +11,7 @@ use crate::db;
 use crate::pricing::{load_prepared_pricing_rules, PreparedPricingRules};
 use crate::reporting::{
     build_period_report, cursor_session_mode, group_sessions, latest_usage_entry,
+    session_durations_by_identity,
 };
 use crate::session_identity::SessionIdentity;
 
@@ -97,6 +98,15 @@ fn collect_model_session_details(
     requested_mode: Option<ModelSessionMode>,
     pricing_rules: &PreparedPricingRules,
 ) -> Vec<ModelSessionDetail> {
+    // 判別逐次呼叫列所需的 import_source_id 不在 UsageEntry 上，先依分組
+    // 身分預彙總顯示耗時（`:call:` 列逐次加總、其餘維持累積值語意）。
+    let session_durations = session_durations_by_identity(entries_with_type.iter().map(|record| {
+        (
+            &record.entry,
+            record.assistant_type.as_str(),
+            record.import_source_id.as_deref(),
+        )
+    }));
     let sessions_map = group_sessions(
         entries_with_type
             .iter()
@@ -142,11 +152,17 @@ fn collect_model_session_details(
             continue;
         };
         let last_entry = latest_usage_entry(&entries).unwrap_or(&first.entry);
-        let duration_ms = last_entry
-            .cost
-            .as_ref()
-            .and_then(|cost| cost.total_api_duration_ms)
-            .unwrap_or(0.0) as u64;
+        let duration_ms = session_durations
+            .get(&identity)
+            .copied()
+            .unwrap_or_else(|| {
+                // 對照保守：分組鍵查無預彙總時維持舊的「最新一筆累積耗時」語意。
+                last_entry
+                    .cost
+                    .as_ref()
+                    .and_then(|cost| cost.total_api_duration_ms)
+                    .unwrap_or(0.0) as u64
+            });
         let total_requests = last_entry
             .cost
             .as_ref()
@@ -261,6 +277,7 @@ pub async fn get_model_sessions(
                         entry: row.record.entry,
                         assistant_type: row.assistant_type,
                         date: row.date,
+                        import_source_id: row.record.import_source_id,
                     })
                     .collect()
             }
@@ -395,6 +412,8 @@ mod tests {
     use super::*;
     use crate::db::TokenStats;
     use crate::pricing::PricingRule;
+    use rusqlite::Connection;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn model_entry(
         session_id: &str,
@@ -443,6 +462,7 @@ mod tests {
             entry,
             assistant_type: assistant_type.to_string(),
             date: date.to_string(),
+            import_source_id: None,
         }
     }
 
@@ -730,5 +750,137 @@ mod tests {
                 .sum::<u64>(),
             330
         );
+    }
+
+    async fn response_json(response: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// 回歸測試（code review comment 4436837582 / thread PRRT_kwDOTOgsec6yTxjO）：
+    /// 模型明細的逐次呼叫列（`import_source_id` 含 `:call:`）每列只有單次
+    /// 呼叫耗時，同回合兩筆 100ms 必須顯示 200ms；Codex 類累積列每列都帶
+    /// 整個 session 的 3500ms，維持取最新一筆 3500ms（不可加總）。
+    ///
+    /// fixture 沿用 yearly handler 測試的暫存 `INSIGHTS_DIR` 模式並走真實
+    /// handler，但於乾淨子行程執行（見
+    /// `reporting::spawn_isolated_insights_test` 說明）。
+    #[test]
+    fn monthly_model_sessions_sum_per_call_rows_and_keep_cumulative_latest() {
+        if crate::reporting::is_isolated_insights_test_child() {
+            crate::reporting::handler_test_runtime()
+                .block_on(monthly_model_sessions_per_call_duration_body());
+            return;
+        }
+        let temp_dir = std::env::temp_dir().join(format!(
+            "tui-monthly-per-call-duration-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let output = crate::reporting::spawn_isolated_insights_test(
+            "handlers::monthly::tests::monthly_model_sessions_sum_per_call_rows_and_keep_cumulative_latest",
+            &temp_dir,
+        );
+        assert!(
+            output.status.success(),
+            "子行程 handler 測試失敗:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    async fn monthly_model_sessions_per_call_duration_body() {
+        // 先建立資料庫檔案，避免 get_db_conn 將舊位置的資料庫搬進測試目錄。
+        let conn = Connection::open(crate::db::get_insights_dir().join("token_usage_insights.db"))
+            .unwrap();
+        crate::db::init_db(&conn).unwrap();
+        for (timestamp, call_identity) in
+            [("2026-07-10 10:00:00", "h1"), ("2026-07-10 10:01:00", "h2")]
+        {
+            conn.execute(
+                "INSERT INTO usage_entries (
+                    assistant_type, source_kind, source_dir_key, timestamp, date,
+                    session_id, turn_no, session_name, model,
+                    tokens_input, tokens_output, tokens_total,
+                    delta_input, delta_output, delta_total,
+                    duration_ms, import_source_id, usage_identity
+                ) VALUES (
+                    'copilot', 'copilot-app', 'aa', ?1, '2026-07-10',
+                    'per-call-m1', 1, 'App Session', 'gpt-5',
+                    10, 5, 15,
+                    10, 5, 15,
+                    100, ?2, ?3
+                )",
+                rusqlite::params![
+                    timestamp,
+                    format!("copilot-app:aa:per-call-m1:call:{call_identity}"),
+                    format!("source=aa;call={call_identity}")
+                ],
+            )
+            .unwrap();
+        }
+        for turn_no in 1..=2u32 {
+            conn.execute(
+                "INSERT INTO usage_entries (
+                    assistant_type, timestamp, date,
+                    session_id, turn_no, session_name, model,
+                    tokens_input, tokens_output, tokens_total,
+                    delta_input, delta_output, delta_total,
+                    duration_ms
+                ) VALUES (
+                    'codex', ?1, '2026-07-10',
+                    'cumulative-m2', ?2, 'Codex Session', 'gpt-5',
+                    20, 10, 30,
+                    20, 10, 30,
+                    3500
+                )",
+                rusqlite::params![format!("2026-07-10 11:0{turn_no}:00"), turn_no],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let mut bodies = Vec::new();
+        for period in ["2026-07-10", "2026-07"] {
+            let response = super::get_model_sessions(
+                Path("all".to_string()),
+                Query(ModelSessionsQuery {
+                    period: period.to_string(),
+                    model: "gpt-5".to_string(),
+                    mode: None,
+                }),
+            )
+            .await
+            .into_response();
+            assert_eq!(response.status().as_u16(), 200, "period={period}");
+            bodies.push((period, response_json(response).await));
+        }
+
+        for (period, body) in bodies {
+            let sessions = body["sessions"].as_array().unwrap();
+            let per_call = sessions
+                .iter()
+                .find(|session| session["session_id"] == "per-call-m1")
+                .unwrap_or_else(|| panic!("period={period} 缺少 per-call-m1"));
+            assert_eq!(
+                per_call["duration_ms"].as_u64(),
+                Some(200),
+                "period={period}"
+            );
+            let cumulative = sessions
+                .iter()
+                .find(|session| session["session_id"] == "cumulative-m2")
+                .unwrap_or_else(|| panic!("period={period} 缺少 cumulative-m2"));
+            assert_eq!(
+                cumulative["duration_ms"].as_u64(),
+                Some(3500),
+                "period={period}"
+            );
+        }
     }
 }

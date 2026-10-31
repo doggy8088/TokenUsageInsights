@@ -186,6 +186,71 @@ pub(crate) fn latest_usage_entry<'a>(
     })
 }
 
+/// 逐次呼叫列（Copilot App / CLI agents 的逐呼叫對帳列）的
+/// `import_source_id` 一定帶 `:call:` 標記（見 `db::replace_copilot_call_rows`
+/// 寫入的 `…:call:{call_identity}`）。這類列的 `duration_ms` 只是單次呼叫
+/// 耗時；舊聚合列、Codex session 累積值等其他來源每列已帶整回合／整個
+/// session 的累積耗時。
+const PER_CALL_IMPORT_SOURCE_MARKER: &str = ":call:";
+
+fn entry_duration_ms(entry: &UsageEntry) -> f64 {
+    entry
+        .cost
+        .as_ref()
+        .and_then(|cost| cost.total_api_duration_ms)
+        .unwrap_or(0.0)
+}
+
+/// 計算單一 session 分組的顯示耗時（毫秒）。
+///
+/// 含 `:call:` 標記的逐次呼叫列每列只有單次呼叫耗時，同回合多次呼叫必須
+/// 全部加總才等於逐次呼叫接管前聚合列顯示的回合總耗時（review comment
+/// 4436837582）；沒有逐次呼叫列的分組（舊聚合列、Codex 每列皆為 session
+/// 累積值等）維持「取最新一筆」的累積值語意。混和分組（逐次呼叫列與
+/// 匯入聚合列並存）以逐次呼叫列的加總為準。
+pub(crate) fn session_duration_ms<'a>(
+    entries: impl IntoIterator<Item = (&'a UsageEntry, Option<&'a str>)>,
+) -> u64 {
+    let entries: Vec<(&UsageEntry, Option<&str>)> = entries.into_iter().collect();
+    let mut per_call_rows = 0usize;
+    let mut per_call_duration = 0.0;
+    for (entry, import_source_id) in &entries {
+        if import_source_id
+            .as_deref()
+            .is_some_and(|id| id.contains(PER_CALL_IMPORT_SOURCE_MARKER))
+        {
+            per_call_rows += 1;
+            per_call_duration += entry_duration_ms(entry);
+        }
+    }
+    if per_call_rows > 0 {
+        return per_call_duration as u64;
+    }
+    latest_usage_entry(entries.iter().map(|(entry, _)| *entry))
+        .map(entry_duration_ms)
+        .unwrap_or(0.0) as u64
+}
+
+/// 依 session 身分（`SessionIdentity`，含 `parent_session_id`）預先彙總各
+/// 分組的顯示耗時。判別逐次呼叫列所需的 `import_source_id` 不屬於
+/// `UsageEntry`，由呼叫端從 `UsageDayExportRecord`／`DatedUsageEntry` 一併
+/// 提供，避免顯示端再回頭全表掃描。
+pub(crate) fn session_durations_by_identity<'a>(
+    rows: impl IntoIterator<Item = (&'a UsageEntry, &'a str, Option<&'a str>)>,
+) -> HashMap<SessionIdentity, u64> {
+    let mut grouped: HashMap<SessionIdentity, Vec<(&UsageEntry, Option<&str>)>> = HashMap::new();
+    for (entry, assistant_type, import_source_id) in rows {
+        grouped
+            .entry(SessionIdentity::from_entry(assistant_type, entry))
+            .or_default()
+            .push((entry, import_source_id));
+    }
+    grouped
+        .into_iter()
+        .map(|(identity, group)| (identity, session_duration_ms(group)))
+        .collect()
+}
+
 static WARNED_PRICING_MODELS: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
@@ -589,6 +654,44 @@ pub(crate) fn build_period_report(
     }
 }
 
+/// 測試專用：在乾淨的 `INSIGHTS_DIR` 子行程中執行 handler 測試主體。
+///
+/// `INSIGHTS_DIR` 是行程全域環境變數；直接在測試行程內 `set_var` 會與
+/// handlers/mod.rs 既有 INSIGHTS_DIR 測試（持有自己的模組鎖，無法跨模組
+/// 共用）互相覆寫造成 flaky。這裡把同一支測試以 `--exact` 重跑於子行程，
+/// 並在建立子行程時就注入全新的 `INSIGHTS_DIR`，讓 fixture 與其他測試完全
+/// 隔離；子行程內不需也不可再改寫環境變數。
+#[cfg(test)]
+pub(crate) fn spawn_isolated_insights_test(
+    test_name: &str,
+    temp_dir: &std::path::Path,
+) -> std::process::Output {
+    std::fs::create_dir_all(temp_dir).unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([test_name, "--exact"])
+        .env("TUI_INSIGHTS_TEST_CHILD", "1")
+        .env("INSIGHTS_DIR", temp_dir)
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_dir_all(temp_dir);
+    output
+}
+
+/// 測試專用：判斷目前是否為 `spawn_isolated_insights_test` 建立的子行程。
+#[cfg(test)]
+pub(crate) fn is_isolated_insights_test_child() -> bool {
+    std::env::var_os("TUI_INSIGHTS_TEST_CHILD").is_some()
+}
+
+/// 測試專用：同步測試呼叫非同步 handler 所需的單執行緒 runtime。
+#[cfg(test)]
+pub(crate) fn handler_test_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -668,6 +771,121 @@ mod tests {
         }
     }
 
+    fn duration_entry(turn_no: u32, timestamp: &str, duration_ms: f64) -> UsageEntry {
+        UsageEntry {
+            timestamp: timestamp.to_string(),
+            session_id: "duration-session".to_string(),
+            session_name: None,
+            transcript_path: None,
+            cwd: None,
+            version: None,
+            turn_no,
+            model: Some("gpt-5".to_string()),
+            model_id: Some("gpt-5".to_string()),
+            tokens: None,
+            delta_tokens: None,
+            context: None,
+            cost: Some(CostStats {
+                total_api_duration_ms: Some(duration_ms),
+                total_duration_ms: None,
+                total_premium_requests: None,
+                reported_cost_usd: None,
+            }),
+            source_kind: Some("copilot-app".to_string()),
+            source_dir_key: Some("aa".to_string()),
+            parent_session_id: None,
+            agent_nickname: None,
+            agent_role: None,
+            reasoning_effort: None,
+        }
+    }
+
+    #[test]
+    fn session_duration_ms_sums_per_call_rows() {
+        // 同回合兩次呼叫各 100ms（`:call:` 列）→ 顯示 200ms（latest-only 會
+        // 錯誤顯示 100ms，review comment 4436837582）。
+        let early = duration_entry(1, "2026-07-10T10:00:00Z", 100.0);
+        let late = duration_entry(1, "2026-07-10T10:01:00Z", 100.0);
+
+        assert_eq!(
+            session_duration_ms([
+                (&early, Some("copilot-app:aa:duration-session:call:h1")),
+                (&late, Some("copilot-app:aa:duration-session:call:h2")),
+            ]),
+            200
+        );
+    }
+
+    #[test]
+    fn session_duration_ms_keeps_cumulative_rows_latest_only() {
+        // Codex 類來源每列都帶整個 session 的累積耗時 3500ms，取最新一筆即
+        // 可，絕不可加總成 10500ms。
+        let first = duration_entry(1, "2026-07-10T10:00:00Z", 3500.0);
+        let second = duration_entry(2, "2026-07-10T10:05:00Z", 3500.0);
+        let third = duration_entry(3, "2026-07-10T10:10:00Z", 3500.0);
+
+        assert_eq!(
+            session_duration_ms([
+                (&first, Some("codex:legacy:duration-session:1")),
+                (&second, Some("codex:legacy:duration-session:2")),
+                (&third, None),
+            ]),
+            3500
+        );
+    }
+
+    #[test]
+    fn session_duration_ms_mixed_group_prefers_per_call_sum() {
+        // 混和分組（逐次呼叫列 + 匯入聚合列並存）固定以逐次呼叫列加總為準。
+        let call = duration_entry(1, "2026-07-10T10:00:00Z", 100.0);
+        let aggregate = duration_entry(1, "2026-07-10T10:05:00Z", 3500.0);
+
+        assert_eq!(
+            session_duration_ms([
+                (
+                    &call,
+                    Some("copilot-cli-agents:bb:duration-session:call:h9")
+                ),
+                (&aggregate, Some("copilot-app:bb:duration-session:1")),
+            ]),
+            100
+        );
+    }
+
+    #[test]
+    fn session_durations_by_identity_separates_identities_and_sums_calls() {
+        // 同名 session 但 parent_session_id 不同（獨立 session vs 合成子
+        // Agent）必須分開加總；逐次呼叫組加總各次呼叫、累積組取最新一筆。
+        let mut child_call_a = duration_entry(1, "2026-07-10T10:00:00Z", 100.0);
+        child_call_a.session_id = "a__b".to_string();
+        child_call_a.parent_session_id = Some("a".to_string());
+        let mut child_call_b = duration_entry(1, "2026-07-10T10:01:00Z", 150.0);
+        child_call_b.session_id = "a__b".to_string();
+        child_call_b.parent_session_id = Some("a".to_string());
+        let mut standalone = duration_entry(5, "2026-07-10T11:00:00Z", 3500.0);
+        standalone.session_id = "a__b".to_string();
+
+        let durations = session_durations_by_identity([
+            (
+                &child_call_a,
+                "copilot",
+                Some("copilot-app:aa:a__b:call:h1"),
+            ),
+            (
+                &child_call_b,
+                "copilot",
+                Some("copilot-app:aa:a__b:call:h2"),
+            ),
+            (&standalone, "copilot", Some("copilot-app:aa:a__b:5")),
+        ]);
+
+        assert_eq!(durations.len(), 2);
+        let child_identity = SessionIdentity::from_entry("copilot", &child_call_a);
+        let standalone_identity = SessionIdentity::from_entry("copilot", &standalone);
+        assert_eq!(durations.get(&child_identity).copied(), Some(250));
+        assert_eq!(durations.get(&standalone_identity).copied(), Some(3500));
+    }
+
     #[test]
     fn latest_usage_entry_breaks_equal_turns_by_timestamp() {
         let mut earlier = usage_entry("aa", "earlier", 100);
@@ -689,16 +907,19 @@ mod tests {
                 entry: usage_entry("aa", "gpt-5", 100),
                 assistant_type: "copilot".to_string(),
                 date: "2026-07-10".to_string(),
+                import_source_id: None,
             },
             DatedUsageEntry {
                 entry: usage_entry("aa", "claude-sonnet-4", 200),
                 assistant_type: "copilot".to_string(),
                 date: "2026-07-10".to_string(),
+                import_source_id: None,
             },
             DatedUsageEntry {
                 entry: usage_entry("bb", "gpt-5", 300),
                 assistant_type: "copilot".to_string(),
                 date: "2026-07-10".to_string(),
+                import_source_id: None,
             },
         ];
 
@@ -728,6 +949,7 @@ mod tests {
                 entry,
                 assistant_type: assistant.to_string(),
                 date: date.to_string(),
+                import_source_id: None,
             }
         };
         // 兩個 Agent 使用相同 session_id，合併模式仍必須視為不同 Session。
@@ -808,11 +1030,13 @@ mod tests {
                 entry: first,
                 assistant_type: "copilot".to_string(),
                 date: "2026-07-31".to_string(),
+                import_source_id: None,
             },
             DatedUsageEntry {
                 entry: second,
                 assistant_type: "copilot".to_string(),
                 date: "2026-08-01".to_string(),
+                import_source_id: None,
             },
         ];
 

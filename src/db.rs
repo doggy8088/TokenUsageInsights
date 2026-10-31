@@ -156,12 +156,16 @@ pub struct UsageEntry {
 
 /// A usage entry together with the assistant and calendar date selected by a
 /// period query. Keeping these values named prevents month/year reporting from
-/// depending on positional tuple conventions.
+/// depending on positional tuple conventions. `import_source_id` is retained
+/// so reporting can tell per-call rows (`:call:` marker; each row carries only
+/// one call's duration) apart from cumulative/aggregate rows. This struct is
+/// internal-only and appears in no serialized shape.
 #[derive(Debug, Clone)]
 pub struct DatedUsageEntry {
     pub entry: UsageEntry,
     pub assistant_type: String,
     pub date: String,
+    pub import_source_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -8919,6 +8923,7 @@ pub fn get_usage_entries_by_month(
             entry: row.record.entry,
             assistant_type: row.assistant_type,
             date: row.date,
+            import_source_id: row.record.import_source_id,
         })
         .collect())
 }
@@ -8974,6 +8979,7 @@ pub fn get_usage_entries_by_year(
             entry: row.record.entry,
             assistant_type: row.assistant_type,
             date: row.date,
+            import_source_id: row.record.import_source_id,
         })
         .collect())
 }

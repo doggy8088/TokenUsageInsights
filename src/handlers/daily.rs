@@ -10,7 +10,9 @@ use std::path::PathBuf;
 use super::*;
 use crate::db;
 use crate::pricing::{load_prepared_pricing_rules, PreparedPricingRules};
-use crate::reporting::{group_sessions, latest_usage_entry, summarize_models_by_mode};
+use crate::reporting::{
+    group_sessions, latest_usage_entry, session_durations_by_identity, summarize_models_by_mode,
+};
 use crate::session_details::load_session_details;
 use crate::session_files::is_safe_session_id;
 use crate::session_search;
@@ -33,6 +35,15 @@ fn aggregate_usage_details(
     Vec<crate::reporting::MonthlyModelSummary>,
 ) {
     let mut summary = DaySummary::default();
+    // 判別逐次呼叫列所需的 import_source_id 不在 UsageEntry 上，先依分組
+    // 身分預彙總顯示耗時（`:call:` 列逐次加總、其餘維持累積值語意）。
+    let session_durations = session_durations_by_identity(entries_with_type.iter().map(|row| {
+        (
+            &row.record.entry,
+            row.assistant_type.as_str(),
+            row.record.import_source_id.as_deref(),
+        )
+    }));
     let sessions_map = group_sessions(
         entries_with_type
             .iter()
@@ -56,11 +67,14 @@ fn aggregate_usage_details(
         };
         let session_usage = summarize_session_usage(pricing_rules, s_entries);
 
-        let session_duration = last_entry
-            .cost
-            .as_ref()
-            .and_then(|c| c.total_api_duration_ms)
-            .unwrap_or(0.0) as u64;
+        let session_duration = session_durations.get(identity).copied().unwrap_or_else(|| {
+            // 對照保守：分組鍵查無預彙總時維持舊的「最新一筆累積耗時」語意。
+            last_entry
+                .cost
+                .as_ref()
+                .and_then(|c| c.total_api_duration_ms)
+                .unwrap_or(0.0) as u64
+        });
         let session_requests = last_entry
             .cost
             .as_ref()
@@ -1187,5 +1201,119 @@ mod tests {
         assert_eq!(summary.total_output_tokens, 40);
         assert_eq!(summary.total_cache_read_tokens, 20);
         assert_eq!(summary.total_reasoning_tokens, 10);
+    }
+
+    async fn response_json(response: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// 回歸測試（code review comment 4436837582 / thread PRRT_kwDOTOgsec6yTxjO）：
+    /// 逐次呼叫列（`import_source_id` 含 `:call:`）每列只有單次呼叫耗時，
+    /// 同回合兩筆 100ms 必須顯示 200ms；Codex 類累積列每列都帶整個 session
+    /// 的 3500ms，維持取最新一筆 3500ms（不可加總）。
+    ///
+    /// fixture 沿用 yearly handler 測試的暫存 `INSIGHTS_DIR` 模式並走真實
+    /// handler，但於乾淨子行程執行（見
+    /// `reporting::spawn_isolated_insights_test` 說明）。
+    #[test]
+    fn daily_usage_details_sum_per_call_rows_and_keep_cumulative_latest() {
+        if crate::reporting::is_isolated_insights_test_child() {
+            crate::reporting::handler_test_runtime()
+                .block_on(daily_usage_details_per_call_duration_body());
+            return;
+        }
+        let temp_dir = std::env::temp_dir().join(format!(
+            "tui-daily-per-call-duration-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let output = crate::reporting::spawn_isolated_insights_test(
+            "handlers::daily::tests::daily_usage_details_sum_per_call_rows_and_keep_cumulative_latest",
+            &temp_dir,
+        );
+        assert!(
+            output.status.success(),
+            "子行程 handler 測試失敗:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    async fn daily_usage_details_per_call_duration_body() {
+        // 先建立資料庫檔案，避免 get_db_conn 將舊位置的資料庫搬進測試目錄。
+        let conn = Connection::open(crate::db::get_insights_dir().join("token_usage_insights.db"))
+            .unwrap();
+        crate::db::init_db(&conn).unwrap();
+        for (timestamp, call_identity) in
+            [("2026-07-10 10:00:00", "h1"), ("2026-07-10 10:01:00", "h2")]
+        {
+            conn.execute(
+                "INSERT INTO usage_entries (
+                    assistant_type, source_kind, source_dir_key, timestamp, date,
+                    session_id, turn_no, session_name, model,
+                    tokens_input, tokens_output, tokens_total,
+                    delta_input, delta_output, delta_total,
+                    duration_ms, import_source_id, usage_identity
+                ) VALUES (
+                    'copilot', 'copilot-app', 'aa', ?1, '2026-07-10',
+                    'per-call-s1', 1, 'App Session', 'gpt-5',
+                    10, 5, 15,
+                    10, 5, 15,
+                    100, ?2, ?3
+                )",
+                rusqlite::params![
+                    timestamp,
+                    format!("copilot-app:aa:per-call-s1:call:{call_identity}"),
+                    format!("source=aa;call={call_identity}")
+                ],
+            )
+            .unwrap();
+        }
+        for turn_no in 1..=2u32 {
+            conn.execute(
+                "INSERT INTO usage_entries (
+                    assistant_type, timestamp, date,
+                    session_id, turn_no, session_name, model,
+                    tokens_input, tokens_output, tokens_total,
+                    delta_input, delta_output, delta_total,
+                    duration_ms
+                ) VALUES (
+                    'codex', ?1, '2026-07-10',
+                    'cumulative-s2', ?2, 'Codex Session', 'gpt-5',
+                    20, 10, 30,
+                    20, 10, 30,
+                    3500
+                )",
+                rusqlite::params![format!("2026-07-10 11:0{turn_no}:00"), turn_no],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let response =
+            super::get_usage_details(Path(("all".to_string(), "2026-07-10".to_string())))
+                .await
+                .into_response();
+        assert_eq!(response.status().as_u16(), 200);
+        let body = response_json(response).await;
+
+        let sessions = body["sessions"].as_array().unwrap();
+        let per_call = sessions
+            .iter()
+            .find(|session| session["session_id"] == "per-call-s1")
+            .unwrap();
+        assert_eq!(per_call["duration_ms"].as_u64(), Some(200));
+        let cumulative = sessions
+            .iter()
+            .find(|session| session["session_id"] == "cumulative-s2")
+            .unwrap();
+        assert_eq!(cumulative["duration_ms"].as_u64(), Some(3500));
+        assert_eq!(body["summary"]["total_duration_ms"].as_u64(), Some(3700));
     }
 }
