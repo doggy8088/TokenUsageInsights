@@ -230,6 +230,10 @@ const CODEX_SOURCE_KIND_MIGRATION_KEY: &str = "migration:codex_source_kind_v1";
 const CODEX_ROLLOUT_IDENTITY_MIGRATION_KEY: &str = "migration:codex_rollout_identity_v1";
 const PARENT_SESSION_NORMALIZATION_MIGRATION_KEY: &str =
     "migration:parent_session_id_normalization_v1";
+/// 一次性父層碰撞復原（PRRT_kwDOTOgsec6yUXND）：與 v1 正規化遷移分開的獨立
+/// sync_state key，避免兩者互相把對方的一次性修復吞掉。
+const COPILOT_PARENT_COLLISION_RECOVERY_KEY: &str =
+    "migration:copilot_parent_collision_recovery_v1";
 const CODEX_CLI_SOURCE_KIND: &str = "codex-cli";
 const CODEX_DESKTOP_SOURCE_KIND: &str = "codex-desktop";
 const CODEX_OTHER_SOURCE_KIND: &str = "codex-other";
@@ -979,9 +983,21 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
     // the original uniqueness because existing collectors use the default
     // empty usage_identity, while explicitly keyed collectors may retain
     // multiple independently upsertable rows for one logical turn.
+    // The NORMALIZED parent participates in uniqueness (COALESCE(NULLIF(TRIM(
+    // parent_session_id), ''), '') — not the bare nullable column, because
+    // SQLite treats NULLs as distinct and that would stop INSERT OR REPLACE
+    // from deduplicating parentless rows): a standalone session `a__main`
+    // (no parent) and session `a`'s agent `main` (synthetic `a__main`,
+    // parent `a`) share (session_id, turn_no, usage_identity) but must never
+    // clobber each other before grouping can tell the families apart.
+    // init_db DROPs + CREATEs these indexes each startup, so this key change
+    // is itself the rebuild migration.
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS uidx_assistant_source_session_turn
-         ON usage_entries(assistant_type, source_kind, session_id, turn_no, usage_identity)
+         ON usage_entries(
+            assistant_type, source_kind, session_id, turn_no, usage_identity,
+            COALESCE(NULLIF(TRIM(parent_session_id), ''), '')
+         )
          WHERE source_dir_key IS NULL",
         [],
     )
@@ -993,11 +1009,14 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
     })?;
 
     // Partial index for copilot-app rows (source_dir_key IS NOT NULL): includes
-    // source_dir_key so different COPILOT_APP_DIR values are isolated.
+    // source_dir_key so different COPILOT_APP_DIR values are isolated. Carries
+    // the same normalized-parent key as uidx_assistant_source_session_turn so
+    // the fallback rebuild's INSERT OR REPLACE keeps both parent families.
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS uidx_assistant_source_dir_session_turn
          ON usage_entries(
-            assistant_type, source_kind, source_dir_key, session_id, turn_no, usage_identity
+            assistant_type, source_kind, source_dir_key, session_id, turn_no, usage_identity,
+            COALESCE(NULLIF(TRIM(parent_session_id), ''), '')
          )
          WHERE source_dir_key IS NOT NULL",
         [],
@@ -1393,6 +1412,11 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
         )
         .map_err(|error| format!("記錄 Grok Build parser migration 失敗: {error}"))?;
     }
+
+    // 一次性復原：父層碰撞修復（PRRT_kwDOTOgsec6yUXND）。掛載於 init_db 尾端
+    // （sync_state 表建立之後）：只要開庫就執行，且不與 App sync 入口的
+    // legacy cursor 升級路徑互相干擾。
+    run_copilot_parent_collision_recovery_migration(conn)?;
 
     Ok(())
 }
@@ -2277,6 +2301,54 @@ fn run_parent_session_id_normalization_migration(conn: &mut Connection) -> Resul
         .map_err(|error| format!("父層身分正規化遷移 COMMIT 失敗: {error}"))
 }
 
+/// 一次性父層碰撞復原（PRRT_kwDOTOgsec6yUXND）。
+///
+/// 唯一索引納入「正規化父層」之前，`INSERT OR REPLACE` 會讓獨立 session
+/// `a__main`（無父層）與 session `a` 的 agent `main`（合成 `a__main`、
+/// parent = `a`）互相覆寫；資料庫中只剩最後寫入者，光看倖存列無法還原被吞
+/// 掉的列。因此清掉 fallback cursor 與 App transcript 指紋，讓下次同步把每
+/// 回合全部重聚合，在新的（含父層）唯一鍵下復原遺失列。
+///
+/// 刻意保留 pending keys（`sync:copilot_app_transcript:pending:*`、
+/// `sync:copilot_cli_agents:pending:*`）：它們承載尚未入庫的來源資料，不屬於
+/// 重聚合範圍。以 sync_state 標記做一次性閘門，標記最後寫入即具冪等性。
+fn run_copilot_parent_collision_recovery_migration(conn: &Connection) -> Result<(), String> {
+    let migration_done: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = ?)",
+            params![COPILOT_PARENT_COLLISION_RECOVERY_KEY],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    if migration_done {
+        return Ok(());
+    }
+
+    let cursor_cleared = conn
+        .execute(
+            "DELETE FROM sync_state WHERE filename LIKE 'sync:copilot_app:cursor:%'",
+            [],
+        )
+        .map_err(|error| format!("清除 Copilot App fallback cursor 失敗: {error}"))?;
+    let fingerprint_cleared = conn
+        .execute(
+            "DELETE FROM sync_state WHERE filename LIKE 'copilot-app-transcript:%'",
+            [],
+        )
+        .map_err(|error| format!("清除 Copilot App transcript 指紋失敗: {error}"))?;
+    conn.execute(
+        "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time) VALUES (?, 1, 0)",
+        params![COPILOT_PARENT_COLLISION_RECOVERY_KEY],
+    )
+    .map_err(|error| format!("寫入父層碰撞復原遷移狀態失敗: {error}"))?;
+    println!(
+        "✅ 遷移：父層碰撞復原——清除 {} 個 fallback cursor 與 {} 個 transcript 指紋，下次同步將全歷史重聚合",
+        cursor_cleared, fingerprint_cleared
+    );
+    Ok(())
+}
+
 fn run_codex_source_kind_migration(conn: &mut Connection) -> Result<(), String> {
     let migration_done: bool = conn
         .query_row(
@@ -2807,7 +2879,10 @@ fn sync_copilot_app_transcripts(
                 })
                 .ok()
                 .flatten();
-            5u32.hash(&mut hash); // App reconciliation/accounting revision.
+            // v6 (PRRT_kwDOTOgsec6yUXND): storage uniqueness now includes the
+            // normalized parent, so the App transcript takeover must replay
+            // once more to restore rows the old key had clobbered.
+            6u32.hash(&mut hash); // App reconciliation/accounting revision.
             title.hash(&mut hash);
             let fingerprint = (before.0, (hash.finish() & i64::MAX as u64) as i64);
             if states.get(&state_key) == Some(&fingerprint) {
@@ -3637,6 +3712,12 @@ fn sync_copilot_app_usage_logs_from_with_cancel(
                 _ => (row.session_id.clone(), None, None, "main".to_string(), None),
             };
 
+        // Normalize the parent once at the write boundary so the stored value
+        // agrees with the normalized-parent key of the unique indexes (a padded
+        // ` a ` and `a` must be the same family, and blank must match the
+        // parentless family).
+        let parent_session_id = normalize_parent_session_id(parent_session_id);
+
         // Build a session name for subagents that surfaces their agent id.
         let session_name = match (&row.agent_id, &meta.title) {
             (Some(agent), Some(title)) if !agent.is_empty() => {
@@ -3665,6 +3746,9 @@ fn sync_copilot_app_usage_logs_from_with_cancel(
         // may have merged several models into the default identity. Remove
         // only the matching logical agent/turn row before inserting the
         // independently keyed model rows; untouched turns remain intact.
+        // The legacy row is family-scoped by the normalized parent as well, so
+        // rebuilding the child `a__main` (parent `a`) never deletes the
+        // standalone `a__main` legacy row (parent blank) and vice versa.
         tx.execute(
             "DELETE FROM usage_entries
              WHERE assistant_type = 'copilot'
@@ -3673,12 +3757,14 @@ fn sync_copilot_app_usage_logs_from_with_cancel(
                AND session_id = ?
                AND turn_no = ?
                AND usage_identity = ''
+               AND COALESCE(NULLIF(TRIM(parent_session_id), ''), '') = ?
                AND import_batch_id IS NULL",
             params![
                 COPILOT_APP_SOURCE_KIND,
                 source_key,
                 row_session_id,
-                turn_no as i64
+                turn_no as i64,
+                parent_session_id.clone().unwrap_or_default()
             ],
         )
         .map_err(|e| format!("清除舊版 Copilot App 單列模型資料失敗: {}", e))?;
@@ -11816,13 +11902,16 @@ mod tests {
     fn import_usage_day_entries_dedupes_codex_rollouts_against_local_rows() {
         let mut conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
+        // 同一條邏輯列的 parent 元資料必須一致：唯一鍵自 PRRT_kwDOTOgsec6yUXND
+        // 起以正規化父層分家，此處與 sample_import_record 的 parent 對齊，
+        // 測試重點（source_kind 採納後同鍵 dedup）不變。
         conn.execute(
             "INSERT INTO usage_entries (
                 assistant_type, source_kind, timestamp, date, session_id, transcript_path,
-                turn_no, usage_identity
+                turn_no, usage_identity, parent_session_id
              ) VALUES ('codex', 'codex-desktop', '2026-07-10T12:34:56Z', '2026-07-10',
                 'import-session', '/codex/sessions/2026/09/11/rollout-2026-09-11T00-06-46-legacy.jsonl',
-                1, 'rollout=rollout-2026-09-11T00-06-46-legacy')",
+                1, 'rollout=rollout-2026-09-11T00-06-46-legacy', 'parent-session')",
             [],
         )
         .unwrap();
@@ -11861,13 +11950,16 @@ mod tests {
     fn import_usage_day_entries_dedupes_exports_that_carry_the_legacy_kind() {
         let mut conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
+        // 同一條邏輯列的 parent 元資料必須一致（PRRT_kwDOTOgsec6yUXND 起唯一鍵
+        // 以正規化父層分家）；對齊 sample_import_record 的 parent，測試重點
+        // （legacy kind 匯出回流後同鍵 dedup）不變。
         conn.execute(
             "INSERT INTO usage_entries (
                 assistant_type, source_kind, timestamp, date, session_id, transcript_path,
-                turn_no, usage_identity
+                turn_no, usage_identity, parent_session_id
              ) VALUES ('codex', 'codex-cli', '2026-07-10T12:34:56Z', '2026-07-10',
                 'import-session', '/codex/sessions/2026/09/11/rollout-2026-09-11T00-06-46-legacy.jsonl',
-                1, 'rollout=rollout-2026-09-11T00-06-46-legacy')",
+                1, 'rollout=rollout-2026-09-11T00-06-46-legacy', 'parent-session')",
             [],
         )
         .unwrap();
@@ -25167,5 +25259,317 @@ mod tests {
             .is_err(),
             "RootOnly 不得吞下真正的子層列"
         );
+    }
+
+    /// Regression for review thread PRRT_kwDOTOgsec6yUXND: a standalone
+    /// session literally named `a__main` and session `a`'s agent `main`
+    /// (synthetic id `a__main`, `parent_session_id = 'a'`) share
+    /// (session_id, turn_no, usage_identity) in the fallback rebuild. The
+    /// storage unique key must include the normalized parent so
+    /// `INSERT OR REPLACE` never deletes one family's row before grouping can
+    /// tell them apart.
+    #[test]
+    fn sync_copilot_app_usage_logs_keeps_dunder_main_standalone_and_subagent_rows_distinct() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let old_app_dir = std::env::var("COPILOT_APP_DIR").ok();
+
+        let base_dir = temp_jsonl_path("copilot-app-dunder-main").with_extension("");
+        let app_dir = base_dir.join("copilot-app");
+        fs::create_dir_all(&app_dir).unwrap();
+        let store = create_test_copilot_session_store(&app_dir);
+        // Session `a`'s agent `main` (synthetic `a__main`, parent = `a`).
+        store
+            .execute(
+                "INSERT INTO assistant_usage_events
+                    (id, session_id, turn_index, model, agent_id, initiator,
+                     input_tokens, output_tokens,
+                     cache_read_tokens, cache_write_tokens,
+                     reasoning_tokens, duration_ms, reasoning_effort, created_at)
+                 VALUES (1, 'a', 0, 'm', 'main', 'sub-agent',
+                         100, 0, 0, 0, 0, 100, 'medium', '2026-07-20 10:00:00')",
+                [],
+            )
+            .unwrap();
+        // Standalone session literally named `a__main` (no parent).
+        store
+            .execute(
+                "INSERT INTO assistant_usage_events
+                    (id, session_id, turn_index, model, agent_id, initiator,
+                     input_tokens, output_tokens,
+                     cache_read_tokens, cache_write_tokens,
+                     reasoning_tokens, duration_ms, reasoning_effort, created_at)
+                 VALUES (2, 'a__main', 0, 'm', NULL, NULL,
+                         200, 0, 0, 0, 0, 100, 'medium', '2026-07-20 10:01:00')",
+                [],
+            )
+            .unwrap();
+        drop(store);
+        create_copilot_app_registry_from_events(&app_dir);
+
+        std::env::set_var("COPILOT_APP_DIR", &app_dir);
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+
+        let rows: Vec<(Option<String>, i64)> = conn
+            .prepare(
+                "SELECT parent_session_id, tokens_input
+                 FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'
+                 ORDER BY tokens_input",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![(Some("a".to_string()), 100), (None, 200)],
+            "獨立 session a__main 與 session a 的 agent main 必須兩列並存（各自保留 200 / 100 tokens）"
+        );
+
+        if let Some(value) = old_app_dir {
+            std::env::set_var("COPILOT_APP_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_APP_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    /// Same collision on the import path (thread PRRT_kwDOTOgsec6yUXND): two
+    /// exported rows differing only in `parent_session_id` share the dedup
+    /// key, so `INSERT OR IGNORE` used to count the second one as a duplicate
+    /// and silently drop real usage from the batch.
+    #[test]
+    fn import_usage_day_entries_keeps_imported_parent_collision_pair() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let mut standalone = sample_import_record();
+        standalone.entry.session_id = "a__main".to_string();
+        standalone.entry.turn_no = 1;
+        standalone.entry.model = Some("m".to_string());
+        standalone.entry.model_id = Some("m".to_string());
+        standalone.entry.parent_session_id = None;
+        standalone.entry.agent_nickname = None;
+        standalone.entry.tokens = Some(TokenStats {
+            input: 200,
+            output: 0,
+            cache_read: Some(0),
+            cache_write: None,
+            cache_write_5m: None,
+            cache_write_1h: None,
+            reasoning: None,
+            total: 200,
+        });
+        standalone.import_source_id = Some("import-parent-collision-standalone".to_string());
+
+        let mut child = standalone.clone();
+        child.entry.parent_session_id = Some("a".to_string());
+        child.entry.tokens = Some(TokenStats {
+            input: 100,
+            output: 0,
+            cache_read: Some(0),
+            cache_write: None,
+            cache_write_5m: None,
+            cache_write_1h: None,
+            reasoning: None,
+            total: 100,
+        });
+        child.import_source_id = Some("import-parent-collision-child".to_string());
+
+        let summary = import_usage_day_entries(
+            &mut conn,
+            "copilot",
+            "2026-07-10",
+            vec![standalone.clone(), child.clone()],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        assert_eq!(summary.imported, 2, "兩筆真實用量都必須入庫");
+        assert_eq!(summary.skipped_duplicates, 0, "不同父層家族不得互相判重");
+
+        let rows: Vec<(Option<String>, i64)> = conn
+            .prepare(
+                "SELECT parent_session_id, tokens_input
+                 FROM usage_entries
+                 WHERE session_id = 'a__main'
+                 ORDER BY tokens_input",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![(Some("a".to_string()), 100), (None, 200)],
+            "碰撞對必須以父層分家各自保存"
+        );
+
+        // 同家族去重仍須成立（REPLACE/IGNORE 消費者審計的「同家族 dedup ✓」
+        // 不變量）：以不同 import_source_id 重匯入同一對列，兩列都落在既有
+        // 家族鍵上 → 全數判重、不得累積第二份。退化成裸 parent_session_id
+        // （SQLite NULL 互異）會讓無父列失去主鍵去重、於此轉紅。
+        let mut standalone_reimport = standalone.clone();
+        standalone_reimport.import_source_id =
+            Some("import-parent-collision-standalone-reimport".to_string());
+        let mut child_reimport = child.clone();
+        child_reimport.import_source_id =
+            Some("import-parent-collision-child-reimport".to_string());
+        let summary = import_usage_day_entries(
+            &mut conn,
+            "copilot",
+            "2026-07-10",
+            vec![standalone_reimport, child_reimport],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        assert_eq!(summary.imported, 0, "同家族重匯入必須全數判重");
+        assert_eq!(summary.skipped_duplicates, 2);
+
+        let total_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries WHERE session_id = 'a__main'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(total_rows, 2, "重匯入不得累積重複列");
+    }
+
+    /// Recovery path for already-clobbered data (thread PRRT_kwDOTOgsec6yUXND):
+    /// a pre-fix database holds only one survivor per colliding (turn, model).
+    /// The one-time recovery migration must clear the App fallback cursor (and
+    /// transcript fingerprints) at startup so the next sync re-aggregates every
+    /// turn and restores the lost rows under the fixed unique key.
+    #[test]
+    fn copilot_app_parent_collision_recovery_rescan_restores_lost_rows() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let old_app_dir = std::env::var("COPILOT_APP_DIR").ok();
+
+        let base_dir = temp_jsonl_path("copilot-app-parent-recovery").with_extension("");
+        let app_dir = base_dir.join("copilot-app");
+        fs::create_dir_all(&app_dir).unwrap();
+        let store = create_test_copilot_session_store(&app_dir);
+        for (id, session_id, turn_index, agent, input, created_at) in [
+            (1i64, "a", 0i64, Some("main"), 100i64, "2026-07-20 10:00:00"),
+            (2, "a__main", 0, None, 200, "2026-07-20 10:01:00"),
+            (3, "a__main", 1, None, 50, "2026-07-20 10:02:00"),
+            (4, "a", 1, Some("main"), 300, "2026-07-20 10:03:00"),
+        ] {
+            store
+                .execute(
+                    "INSERT INTO assistant_usage_events
+                        (id, session_id, turn_index, model, agent_id, initiator,
+                         input_tokens, output_tokens,
+                         cache_read_tokens, cache_write_tokens,
+                         reasoning_tokens, duration_ms, reasoning_effort, created_at)
+                     VALUES (?, ?, ?, 'm', ?, ?, ?, 0, 0, 0, 0, 100, 'medium', ?)",
+                    params![id, session_id, turn_index, agent, agent, input, created_at],
+                )
+                .unwrap();
+        }
+        drop(store);
+        create_copilot_app_registry_from_events(&app_dir);
+
+        std::env::set_var("COPILOT_APP_DIR", &app_dir);
+        let source_key = test_copilot_source_key(&app_dir);
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // Simulate the pre-fix damage: each colliding (turn, model) kept only
+        // its last writer — turn 1 lost the child row, turn 2 lost the
+        // standalone row — and the fallback cursor already passed every event.
+        let usage_identity = format!("agent={};model={}", encode_hex(b"main"), encode_hex(b"m"));
+        for (turn_no, parent, tokens, session_id, index_session, index_turn) in [
+            (1i64, None, 200i64, "a__main", "a__main", 0i64),
+            (2, Some("a"), 300, "a__main", "a", 1),
+        ] {
+            conn.execute(
+                "INSERT INTO usage_entries (
+                    assistant_type, source_kind, source_dir_key, usage_identity,
+                    timestamp, date, session_id, turn_no, model,
+                    tokens_input, tokens_output, tokens_cache_read, tokens_total,
+                    delta_input, delta_output, delta_cache_read, delta_total,
+                    import_source_id, parent_session_id, agent_nickname
+                 ) VALUES ('copilot', 'copilot-app', ?, ?,
+                    '2026-07-20T10:00:00Z', '2026-07-20',
+                    ?, ?, 'm', ?, 0, 0, ?, ?, 0, 0, ?, ?, ?, ?)",
+                params![
+                    source_key,
+                    usage_identity,
+                    session_id,
+                    turn_no,
+                    tokens,
+                    tokens,
+                    tokens,
+                    tokens,
+                    format!(
+                        "copilot-app:{source_key}:{index_session}:{index_turn}:main:{}",
+                        encode_hex(b"m")
+                    ),
+                    parent,
+                    parent.map(|_| "main".to_string()),
+                ],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES (?, 0, 0)",
+            params![format!(
+                "{}{}::2026-07-20 10:03:00::4",
+                COPILOT_APP_CURSOR_PREFIX, source_key
+            )],
+        )
+        .unwrap();
+        // 還原成修復前的 sync_state：升級當下資料庫並無 recovery 標記
+        // （init_db 會於空表時先寫入標記，此處模擬「修復尚未跑過」的既有庫）。
+        conn.execute(
+            "DELETE FROM sync_state WHERE filename = ?",
+            params!["migration:copilot_parent_collision_recovery_v1"],
+        )
+        .unwrap();
+
+        // 升級後首次啟動：init_db 掛載的一次性 recovery 清掉 fallback cursor
+        // 與 transcript 指紋，強制全歷史重聚合。
+        init_db(&conn).unwrap();
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+
+        let rows: Vec<(Option<String>, i64, i64)> = conn
+            .prepare(
+                "SELECT parent_session_id, turn_no, tokens_input
+                 FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'
+                 ORDER BY turn_no, tokens_input",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (Some("a".to_string()), 1, 100),
+                (None, 1, 200),
+                (None, 2, 50),
+                (Some("a".to_string()), 2, 300),
+            ],
+            "重掃必須復原被 REPLACE 吞掉的兩列（每回合兩個父層家族並存）"
+        );
+
+        if let Some(value) = old_app_dir {
+            std::env::set_var("COPILOT_APP_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_APP_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
     }
 }
