@@ -2486,12 +2486,33 @@ struct AgentFilteredTurns {
 impl AgentFilteredTurns {
     /// A call belongs to the next reply of the agent's filtered timeline — the
     /// same forward attribution `copilot::read_calls` derives from the stream.
-    fn turn_at(&self, ts: chrono::DateTime<chrono::Utc>) -> u32 {
-        self.replies
-            .iter()
-            .find(|(reply_ts, _)| reply_ts.is_some_and(|reply_ts| reply_ts >= ts))
-            .map(|(_, turn)| *turn)
-            .unwrap_or(self.end_turn)
+    /// A reply without a parseable timestamp may sit on either side of the
+    /// call, so it competes with the first reply that is definitely at or after
+    /// the call (review comment 4436837487): attribute to the earliest reply
+    /// that can follow the call, and return `None` when those candidates span
+    /// different turns so the caller keeps the source rows for retry instead of
+    /// writing a guessed turn.
+    fn turn_at(&self, ts: chrono::DateTime<chrono::Utc>) -> Option<u32> {
+        let mut candidate: Option<u32> = None;
+        for (reply_ts, turn) in &self.replies {
+            let definitely_after_call = match reply_ts {
+                // Definitely before the call: never the next reply.
+                Some(reply_ts) if *reply_ts < ts => continue,
+                Some(_) => true,
+                // Timestamp missing or unparseable: either side of the call,
+                // so it stays a candidate until a definitely-later reply ends
+                // the run.
+                None => false,
+            };
+            if candidate.is_some_and(|previous| previous != *turn) {
+                return None;
+            }
+            candidate = Some(*turn);
+            if definitely_after_call {
+                break;
+            }
+        }
+        Some(candidate.unwrap_or(self.end_turn))
     }
 }
 
@@ -2600,21 +2621,28 @@ fn is_native_only_subagent_call(call: &crate::copilot::Call) -> bool {
     call.agent_id.is_some() && call.identity.starts_with("sqlite:")
 }
 
-/// Filtered-timeline turn for a merged call that needs derivation; `None` for
-/// paired calls and main-agent calls, which keep their existing turns.
+/// Filtered-timeline turn for a merged call that needs derivation; `Ok(None)`
+/// for paired calls and main-agent calls, which keep their existing turns.
+/// `Err` (「保留原資料待重試」, mirroring the `merge_calls` ambiguity precedent)
+/// when an untimed reply makes the turn undecidable: the caller keeps the
+/// source rows intact and retries instead of persisting a guessed turn.
 fn native_only_subagent_turn(
     call: &crate::copilot::Call,
     turns: &HashMap<String, AgentFilteredTurns>,
-) -> Option<u32> {
+) -> Result<Option<u32>, String> {
     if !is_native_only_subagent_call(call) {
-        return None;
+        return Ok(None);
     }
-    let agent = call.agent_id.as_deref()?;
-    Some(match turns.get(agent) {
-        Some(boundaries) => boundaries.turn_at(call.timestamp),
+    let Some(agent) = call.agent_id.as_deref() else {
+        return Ok(None);
+    };
+    match turns.get(agent) {
         // The agent has no filtered events at all; its timeline starts at one.
-        None => 1,
-    })
+        None => Ok(Some(1)),
+        Some(boundaries) => boundaries.turn_at(call.timestamp).map(Some).ok_or_else(|| {
+            "Copilot 子 Agent 用量無法判定回覆回合歸屬，保留原資料待重試".to_string()
+        }),
+    }
 }
 
 /// Rebuild registered App sessions from complete per-call sources, independently
@@ -2707,35 +2735,38 @@ fn sync_copilot_app_transcripts(
             } else {
                 None
             };
-            let rows: Vec<_> = calls
-                .into_iter()
-                .map(|r| {
-                    let turn_no = subagent_turns
-                        .as_ref()
-                        .and_then(|turns| native_only_subagent_turn(&r, turns))
-                        .unwrap_or(r.turn_no.unwrap_or(1));
-                    CopilotCliUsageRow {
-                        session_id: sid.to_string(),
-                        call_identity: r.identity,
-                        turn_no,
-                        native_identity: r.native_identity,
-                        reasoning_effort: r.reasoning_effort,
-                        ts: r
-                            .timestamp
-                            .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
-                        model: r.model,
-                        agent_id: r.agent_id,
-                        initiator: r.initiator,
-                        cwd: cwd.clone(),
-                        input_tokens: r.metrics.input.saturating_sub(r.metrics.cache_read),
-                        output_tokens: r.metrics.output,
-                        cache_read: r.metrics.cache_read,
-                        cache_write: r.metrics.cache_write,
-                        reasoning: r.metrics.reasoning,
-                        duration_ms: r.metrics.duration_ms,
-                    }
-                })
-                .collect();
+            let mut rows = Vec::with_capacity(calls.len());
+            for r in calls {
+                let derived = match &subagent_turns {
+                    // An undecidable sub-agent turn propagates as 「保留原資料
+                    // 待重試」: no rows are replaced and no fingerprint is
+                    // stored, so the unchanged source retries like every other
+                    // reconciliation failure (review comment 4436837487).
+                    Some(turns) => native_only_subagent_turn(&r, turns)?,
+                    None => None,
+                };
+                let turn_no = derived.unwrap_or(r.turn_no.unwrap_or(1));
+                rows.push(CopilotCliUsageRow {
+                    session_id: sid.to_string(),
+                    call_identity: r.identity,
+                    turn_no,
+                    native_identity: r.native_identity,
+                    reasoning_effort: r.reasoning_effort,
+                    ts: r
+                        .timestamp
+                        .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
+                    model: r.model,
+                    agent_id: r.agent_id,
+                    initiator: r.initiator,
+                    cwd: cwd.clone(),
+                    input_tokens: r.metrics.input.saturating_sub(r.metrics.cache_read),
+                    output_tokens: r.metrics.output,
+                    cache_read: r.metrics.cache_read,
+                    cache_write: r.metrics.cache_write,
+                    reasoning: r.metrics.reasoning,
+                    duration_ms: r.metrics.duration_ms,
+                });
+            }
             if should_cancel() {
                 return Err("Copilot App 同步已取消".into());
             }
@@ -18097,6 +18128,113 @@ mod tests {
             .map(Result::unwrap)
             .collect();
         assert_eq!(child_turns, vec![1, 2]);
+    }
+
+    #[test]
+    fn sqlite_only_subagent_call_with_untimestamped_reply_keeps_timeline_turn() {
+        // (review comment 4436837487) The child's single reply has no
+        // parseable timestamp, but `timeline::parse_copilot_timeline_filtered`
+        // numbers replies purely by stream order and renders it at turn one.
+        // `AgentFilteredTurns::turn_at` must treat the untimed reply as the
+        // earliest possible boundary instead of skipping it and falling
+        // through to `end_turn`, or the SQLite-only call lands on turn two and
+        // the detail page shows no usage at all.
+        for ts in [None, Some("not-a-timestamp")] {
+            let mut f = AppReviewFixture::new(&["app"]);
+            let mut child_reply = app_text("assistant.message");
+            child_reply["agentId"] = serde_json::json!("child");
+            if let Some(ts) = ts {
+                child_reply["timestamp"] = serde_json::json!(ts);
+            }
+            // SQLite-only sub-agent call: no matching transcript usage record,
+            // so its turn is derived through the `turn_at` timestamp proxy.
+            f.native(3, "app", "2026-07-23T12:00:30Z", Some(2), Some("child"));
+            f.write(
+                "app",
+                &[
+                    app_text_at("user.message", "2026-07-23T12:00:00Z"),
+                    child_reply,
+                ],
+            );
+            f.sync();
+            let turns: Vec<i64> = f
+                .conn
+                .prepare(
+                    "SELECT turn_no FROM usage_entries
+                     WHERE session_id = 'app__child' AND parent_session_id = 'app'
+                     ORDER BY timestamp",
+                )
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert_eq!(turns, vec![1], "reply timestamp = {ts:?}");
+            assert_eq!(
+                f.replies("app__child", Some("child")),
+                vec![(1, 110)],
+                "reply timestamp = {ts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_only_subagent_turn_retries_when_reply_candidates_span_turns() {
+        use chrono::{DateTime, Utc};
+
+        fn at(raw: &str) -> DateTime<Utc> {
+            crate::copilot::parse_timestamp(raw).unwrap()
+        }
+        fn call_at(raw: &str) -> crate::copilot::Call {
+            crate::copilot::Call {
+                identity: "sqlite:3".into(),
+                reasoning_effort: None,
+                turn_no: None,
+                native_identity: Some("sqlite:3".into()),
+                timestamp: at(raw),
+                model: Some("B".into()),
+                agent_id: Some("child".into()),
+                initiator: None,
+                metrics: crate::copilot::Metrics::default(),
+            }
+        }
+        fn turns(
+            replies: Vec<(Option<DateTime<Utc>>, u32)>,
+        ) -> HashMap<String, AgentFilteredTurns> {
+            HashMap::from([(
+                "child".to_string(),
+                AgentFilteredTurns {
+                    replies,
+                    end_turn: 3,
+                },
+            )])
+        }
+
+        // The untimed reply may sit on either side of the call, so the next
+        // reply is turn one or turn two: undecidable, keep the source rows and
+        // retry (review comment 4436837487).
+        let undecidable = turns(vec![(None, 1), (Some(at("2026-07-23T12:03:00Z")), 2)]);
+        let error = native_only_subagent_turn(&call_at("2026-07-23T12:02:00Z"), &undecidable)
+            .expect_err("candidates spanning turns must retry");
+        assert!(error.contains("保留原資料待重試"), "{error}");
+        // A single untimed reply is decidable: attribute to the earliest
+        // possible reply, matching the timeline's stream-order numbering.
+        let decidable = turns(vec![(None, 1)]);
+        assert_eq!(
+            native_only_subagent_turn(&call_at("2026-07-23T12:00:30Z"), &decidable).unwrap(),
+            Some(1)
+        );
+        // Replies after the first definitely-later boundary never compete for
+        // "next reply": the guard must not fire on ordinary multi-reply streams.
+        let later = turns(vec![
+            (Some(at("2026-07-23T12:00:10Z")), 1),
+            (Some(at("2026-07-23T12:05:00Z")), 2),
+            (Some(at("2026-07-23T12:20:00Z")), 3),
+        ]);
+        assert_eq!(
+            native_only_subagent_turn(&call_at("2026-07-23T12:02:00Z"), &later).unwrap(),
+            Some(2)
+        );
     }
 
     #[test]
