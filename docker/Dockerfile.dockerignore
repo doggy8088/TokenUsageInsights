@@ -1,0 +1,9 @@
+# BuildKit 會自動套用與 docker/Dockerfile 同名的 .dockerignore。
+# 採白名單：只送出建置與執行需要的檔案，避免把 target/（可能數十 GB）、本機資料庫或匯出檔送進建置內容。
+*
+!Cargo.toml
+!Cargo.lock
+!build.rs
+!src/
+!static/
+!pricing.csv

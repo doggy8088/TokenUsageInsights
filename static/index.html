@@ -108,6 +108,7 @@
           <button class="nav-tab active" id="tab-btn-daily" data-i18n="tab_daily">每日</button>
           <button class="nav-tab" id="tab-btn-monthly" data-i18n="tab_monthly">月度</button>
           <button class="nav-tab" id="tab-btn-yearly" data-i18n="tab_yearly">年度</button>
+          <button class="nav-tab" id="tab-btn-range" data-i18n="tab_range">區間</button>
         </div>
       </div>
 
@@ -115,8 +116,8 @@
       <div class="sidebar-section" id="daily-selector-section">
         <h3 data-i18n="select_date">選擇日期</h3>
         <div class="date-selector-wrapper" style="display: flex; flex-direction: column; gap: 10px; width: 100%;">
-          <div style="display: flex; gap: 8px; width: 100%; align-items: stretch;">
-            <div class="hover-dropdown tab-hover-dropdown" style="flex: 0 0 75px; min-width: 75px;">
+          <div style="display: flex; flex-direction: column; gap: 8px; width: 100%;">
+            <div class="hover-dropdown tab-hover-dropdown range-tab-dropdown">
               <div class="hover-dropdown-trigger" style="height: 100%; display: flex; align-items: center; justify-content: space-between; border-radius: 12px; padding: 12px 10px; background: var(--bg-select); border: 1px solid var(--glass-border); color: var(--text-primary); font-family: var(--font-body); font-weight: 500;">
                 <span class="tab-dropdown-label" data-i18n="tab_daily">每日</span>
                 <span class="dropdown-caret"><span class="icon-glyph icon-chevron-down" aria-hidden="true"></span></span>
@@ -125,9 +126,10 @@
                 <div class="hover-dropdown-option" data-value="daily" data-i18n="tab_daily">每日</div>
                 <div class="hover-dropdown-option" data-value="monthly" data-i18n="tab_monthly">月度</div>
                 <div class="hover-dropdown-option" data-value="yearly" data-i18n="tab_yearly">年度</div>
+                <div class="hover-dropdown-option" data-value="range" data-i18n="tab_range">區間</div>
               </div>
             </div>
-            <input type="date" id="date-select" class="premium-date-input" style="flex: 1.5; min-width: 120px; margin: 0; box-sizing: border-box;">
+            <input type="date" id="date-select" class="premium-date-input" style="margin: 0; box-sizing: border-box; width: 100%;">
           </div>
           <div style="display: flex; gap: 8px; width: 100%;">
             <button id="btn-prev-day" class="today-btn" style="flex: 1; padding: 12px 8px;" data-i18n-title="prev_day_btn" title="前一天" aria-label="前一天"><span class="icon-glyph icon-chevron-left" aria-hidden="true"></span></button>
@@ -174,8 +176,8 @@
       <div class="sidebar-section hidden" id="monthly-selector-section">
         <h3 data-i18n="select_month">選擇月份</h3>
         <div class="date-selector-wrapper" style="display: flex; flex-direction: column; gap: 10px; width: 100%;">
-          <div style="display: flex; gap: 8px; width: 100%; align-items: stretch;">
-            <div class="hover-dropdown tab-hover-dropdown" style="flex: 0 0 75px; min-width: 75px;">
+          <div style="display: flex; flex-direction: column; gap: 8px; width: 100%;">
+            <div class="hover-dropdown tab-hover-dropdown range-tab-dropdown">
               <div class="hover-dropdown-trigger" style="height: 100%; display: flex; align-items: center; justify-content: space-between; border-radius: 12px; padding: 12px 10px; background: var(--bg-select); border: 1px solid var(--glass-border); color: var(--text-primary); font-family: var(--font-body); font-weight: 500;">
                 <span class="tab-dropdown-label" data-i18n="tab_monthly">月度</span>
                 <span class="dropdown-caret"><span class="icon-glyph icon-chevron-down" aria-hidden="true"></span></span>
@@ -184,9 +186,10 @@
                 <div class="hover-dropdown-option" data-value="daily" data-i18n="tab_daily">每日</div>
                 <div class="hover-dropdown-option" data-value="monthly" data-i18n="tab_monthly">月度</div>
                 <div class="hover-dropdown-option" data-value="yearly" data-i18n="tab_yearly">年度</div>
+                <div class="hover-dropdown-option" data-value="range" data-i18n="tab_range">區間</div>
               </div>
             </div>
-            <select id="month-select" class="premium-select" style="flex: 1.5; min-width: 120px; margin: 0; box-sizing: border-box;">
+            <select id="month-select" class="premium-select" style="margin: 0; box-sizing: border-box; width: 100%;">
               <option value="" disabled selected data-i18n="loading">載入中...</option>
             </select>
           </div>
@@ -205,8 +208,8 @@
       <div class="sidebar-section hidden" id="yearly-selector-section">
         <h3 data-i18n="select_year">選擇年份</h3>
         <div class="date-selector-wrapper" style="display: flex; flex-direction: column; gap: 10px; width: 100%;">
-          <div style="display: flex; gap: 8px; width: 100%; align-items: stretch;">
-            <div class="hover-dropdown tab-hover-dropdown" style="flex: 0 0 75px; min-width: 75px;">
+          <div style="display: flex; flex-direction: column; gap: 8px; width: 100%;">
+            <div class="hover-dropdown tab-hover-dropdown range-tab-dropdown">
               <div class="hover-dropdown-trigger" style="height: 100%; display: flex; align-items: center; justify-content: space-between; border-radius: 12px; padding: 12px 10px; background: var(--bg-select); border: 1px solid var(--glass-border); color: var(--text-primary); font-family: var(--font-body); font-weight: 500;">
                 <span class="tab-dropdown-label" data-i18n="tab_yearly">年度</span>
                 <span class="dropdown-caret"><span class="icon-glyph icon-chevron-down" aria-hidden="true"></span></span>
@@ -215,9 +218,10 @@
                 <div class="hover-dropdown-option" data-value="daily" data-i18n="tab_daily">每日</div>
                 <div class="hover-dropdown-option" data-value="monthly" data-i18n="tab_monthly">月度</div>
                 <div class="hover-dropdown-option" data-value="yearly" data-i18n="tab_yearly">年度</div>
+                <div class="hover-dropdown-option" data-value="range" data-i18n="tab_range">區間</div>
               </div>
             </div>
-            <select id="year-select" class="premium-select" style="flex: 1.5; min-width: 120px; margin: 0; box-sizing: border-box;">
+            <select id="year-select" class="premium-select" style="margin: 0; box-sizing: border-box; width: 100%;">
               <option value="" disabled selected data-i18n="loading">載入中...</option>
             </select>
           </div>
@@ -228,6 +232,45 @@
             </button>
             <button id="btn-next-year" class="today-btn" style="flex: 1; padding: 12px 8px;" data-i18n-title="next_year_btn" title="下一年" aria-label="下一年"><span class="icon-glyph icon-chevron-right" aria-hidden="true"></span></button>
             <button id="btn-reload-yearly" class="reload-btn" style="width: 45px; height: auto;" data-i18n-title="reload_data" title="重新載入數據" aria-label="重新載入數據"><span class="icon-glyph icon-refresh" aria-hidden="true"></span></button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Section 2.7: Range Selector (ISO week / custom range, hidden by default) -->
+      <div class="sidebar-section hidden" id="range-selector-section">
+        <h3 data-i18n="select_range">選擇週／自訂區間</h3>
+        <div class="date-selector-wrapper" style="display: flex; flex-direction: column; gap: 10px; width: 100%;">
+          <div class="hover-dropdown tab-hover-dropdown range-tab-dropdown">
+            <div class="hover-dropdown-trigger" style="display: flex; align-items: center; justify-content: space-between; border-radius: 12px; padding: 12px 10px; background: var(--bg-select); border: 1px solid var(--glass-border); color: var(--text-primary); font-family: var(--font-body); font-weight: 500;">
+              <span class="tab-dropdown-label" data-i18n="tab_range">區間</span>
+              <span class="dropdown-caret"><span class="icon-glyph icon-chevron-down" aria-hidden="true"></span></span>
+            </div>
+            <div class="hover-dropdown-options">
+              <div class="hover-dropdown-option" data-value="daily" data-i18n="tab_daily">每日</div>
+              <div class="hover-dropdown-option" data-value="monthly" data-i18n="tab_monthly">月度</div>
+              <div class="hover-dropdown-option" data-value="yearly" data-i18n="tab_yearly">年度</div>
+              <div class="hover-dropdown-option" data-value="range" data-i18n="tab_range">區間</div>
+            </div>
+          </div>
+          <div class="range-date-field">
+            <label for="range-start" class="range-field-label" data-i18n="range_start_label">開始日期</label>
+            <input type="date" id="range-start" class="premium-date-input" style="margin: 0; box-sizing: border-box; width: 100%;">
+          </div>
+          <div class="range-date-field">
+            <label for="range-end" class="range-field-label" data-i18n="range_end_label">結束日期（含）</label>
+            <input type="date" id="range-end" class="premium-date-input" style="margin: 0; box-sizing: border-box; width: 100%;">
+          </div>
+          <div style="display: flex; gap: 8px; width: 100%; flex-wrap: wrap;">
+            <button id="btn-range-this-week" class="today-btn" style="flex: 1 1 45%; padding: 12px 8px;" data-i18n="range_this_week_btn">本週 (ISO)</button>
+            <button id="btn-range-last-week" class="today-btn" style="flex: 1 1 45%; padding: 12px 8px;" data-i18n="range_last_week_btn">上週 (ISO)</button>
+            <button id="btn-range-last-2w" class="today-btn" style="flex: 1 1 45%; padding: 12px 8px;" data-i18n="range_last_2w_btn">最近 2 週</button>
+            <button id="btn-range-last-4w" class="today-btn" style="flex: 1 1 45%; padding: 12px 8px;" data-i18n="range_last_4w_btn">最近 4 週</button>
+          </div>
+          <div style="display: flex; gap: 8px; width: 100%;">
+            <button id="btn-range-prev" class="today-btn" style="flex: 1; padding: 12px 8px;" data-i18n-title="range_prev_btn" title="前一個區間" aria-label="前一個區間"><span class="icon-glyph icon-chevron-left" aria-hidden="true"></span></button>
+            <button id="btn-range-apply" class="today-btn" style="flex: 2; padding: 12px 8px;" data-i18n="range_apply_btn">套用區間</button>
+            <button id="btn-range-next" class="today-btn" style="flex: 1; padding: 12px 8px;" data-i18n-title="range_next_btn" title="後一個區間" aria-label="後一個區間"><span class="icon-glyph icon-chevron-right" aria-hidden="true"></span></button>
+            <button id="btn-reload-range" class="reload-btn" style="width: 45px; height: auto;" data-i18n-title="reload_data" title="重新載入數據" aria-label="重新載入數據"><span class="icon-glyph icon-refresh" aria-hidden="true"></span></button>
           </div>
         </div>
       </div>

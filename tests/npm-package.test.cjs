@@ -18,6 +18,7 @@ const {
   sha256,
   verifyChecksum,
   windowsPowerShellEnvironment,
+  windowsTarPath,
 } = require('../npm/install.cjs');
 const {
   assertVersionAlignment,
@@ -153,6 +154,13 @@ test('strips inherited PSModulePath so Windows PowerShell 5.1 uses its own modul
   assert.equal(env.TUI_ARCHIVE, 'C:\\a.zip');
   assert.equal(env.TUI_DESTINATION, 'C:\\out');
   assert.ok(!Object.keys(env).some((key) => key.toLowerCase() === 'psmodulepath'));
+});
+
+test('Windows zip extraction uses the built-in System32 bsdtar instead of tar on PATH', () => {
+  assert.equal(windowsTarPath({ SystemRoot: 'C:\\Windows' }), 'C:\\Windows\\System32\\tar.exe');
+  assert.equal(windowsTarPath({ SYSTEMROOT: 'D:\\WINNT' }), 'D:\\WINNT\\System32\\tar.exe');
+  assert.equal(windowsTarPath({ windir: 'E:\\Win' }), 'E:\\Win\\System32\\tar.exe');
+  assert.equal(windowsTarPath({}), 'C:\\Windows\\System32\\tar.exe');
 });
 
 test('Windows zip fallback script does not rely on Microsoft.PowerShell.Archive', () => {

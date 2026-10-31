@@ -22,11 +22,25 @@ pub struct ModelSessionsQuery {
     mode: Option<String>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum ModelSessionPeriod {
     Day,
     Month,
     Year,
+    Range(String, String),
+}
+
+/// 解析 `YYYY-MM-DD` 區間，開始日不得晚於結束日，且最長 366 天。
+pub(super) fn parse_date_range(start: &str, end: &str) -> Option<(String, String)> {
+    let start_date = chrono::NaiveDate::parse_from_str(start, "%Y-%m-%d").ok()?;
+    let end_date = chrono::NaiveDate::parse_from_str(end, "%Y-%m-%d").ok()?;
+    if start.len() != 10 || end.len() != 10 || start_date > end_date {
+        return None;
+    }
+    if (end_date - start_date).num_days() >= 366 {
+        return None;
+    }
+    Some((start.to_string(), end.to_string()))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -64,6 +78,9 @@ impl ModelSessionMode {
 }
 
 fn parse_model_session_period(value: &str) -> Option<ModelSessionPeriod> {
+    if let Some((start, end)) = value.split_once('~') {
+        return parse_date_range(start, end).map(|(s, e)| ModelSessionPeriod::Range(s, e));
+    }
     match value.len() {
         4 => chrono::NaiveDate::parse_from_str(&format!("{value}-01-01"), "%Y-%m-%d")
             .ok()
@@ -251,7 +268,7 @@ pub async fn get_model_sessions(
     let Some(period_kind) = parse_model_session_period(&period) else {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "期間必須是 YYYY、YYYY-MM 或 YYYY-MM-DD" })),
+            Json(serde_json::json!({ "error": "期間必須是 YYYY、YYYY-MM、YYYY-MM-DD 或 YYYY-MM-DD~YYYY-MM-DD" })),
         )
             .into_response();
     };
@@ -286,6 +303,9 @@ pub async fn get_model_sessions(
             }
             ModelSessionPeriod::Year => {
                 db::get_usage_entries_by_year(&conn, &period_for_query, &assistant_for_query)?
+            }
+            ModelSessionPeriod::Range(start, end) => {
+                db::get_usage_entries_by_range(&conn, &start, &end, &assistant_for_query)?
             }
         };
         Ok::<_, String>(collect_model_session_details(
@@ -407,6 +427,80 @@ pub async fn get_monthly_details(
     }
 }
 
+/// API 6b: 獲取自訂日期區間（含頭尾）的統計摘要數據，回應格式與月報相同
+pub async fn get_range_details(
+    Path((assistant, start, end)): Path<(String, String, String)>,
+) -> impl IntoResponse {
+    let assistant = normalize_assistant_name(&assistant);
+    if !is_supported_assistant_scope(&assistant) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "不支援的助理類型" })),
+        )
+            .into_response();
+    }
+    let Some((start, end)) = parse_date_range(&start, &end) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "日期區間必須是 YYYY-MM-DD，開始日不得晚於結束日，且最長 366 天"
+            })),
+        )
+            .into_response();
+    };
+
+    let report = tokio::task::spawn_blocking(move || {
+        let conn = db::get_db_conn()?;
+        let entries = db::get_usage_entries_by_range(&conn, &start, &end, &assistant)?;
+        if entries.is_empty() {
+            return Ok(None);
+        }
+        let pricing_rules = load_prepared_pricing_rules();
+        Ok::<_, String>(Some((
+            format!("{start}~{end}"),
+            build_period_report(&entries, str::to_string, &pricing_rules),
+        )))
+    })
+    .await
+    .unwrap_or_else(|_| Err("執行緒執行失敗".to_string()));
+
+    match report {
+        Ok(Some((period, report))) => Json(MonthlyDetailsResponse {
+            year_month: period,
+            summary: report.summary,
+            daily_breakdown: report
+                .breakdown
+                .into_iter()
+                .map(|item| MonthlyDailyBreakdown {
+                    date: item.label,
+                    total_tokens: item.usage.total_tokens,
+                    total_input_tokens: item.usage.input_tokens,
+                    total_output_tokens: item.usage.output_tokens,
+                    total_cache_read_tokens: item.usage.cache_read_tokens,
+                    total_reasoning_tokens: item.usage.reasoning_tokens,
+                    sessions_count: item.sessions_count,
+                    cost_usd: item.usage.cost_usd,
+                    agents: item.agents,
+                })
+                .collect(),
+            projects: report.projects,
+            models: report.models,
+            agent_breakdown: report.agent_breakdown,
+        })
+        .into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "找不到該日期區間的使用量資料。" })),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": error })),
+        )
+            .into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -480,6 +574,15 @@ mod tests {
             parse_model_session_period("2026-07-10"),
             Some(ModelSessionPeriod::Day)
         ));
+        assert_eq!(
+            parse_model_session_period("2026-07-06~2026-07-19"),
+            Some(ModelSessionPeriod::Range(
+                "2026-07-06".to_string(),
+                "2026-07-19".to_string()
+            ))
+        );
+        assert!(parse_model_session_period("2026-07-19~2026-07-06").is_none());
+        assert!(parse_model_session_period("2026-07-01~2027-07-02").is_none());
         assert!(parse_model_session_period("2026-13").is_none());
         assert!(parse_model_session_period("20x6").is_none());
         assert!(parse_model_session_period("2026-02-30").is_none());

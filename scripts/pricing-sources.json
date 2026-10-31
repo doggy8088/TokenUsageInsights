@@ -1,0 +1,94 @@
+{
+  "_comment": "價格一律以官方定價文件為準（各官方文件站台提供的 Markdown 版本，內容與官網頁面相同）。parser=table 解析 Markdown 表格；parser=gemini 解析 Google 以區塊呈現的 Standard 價格表。sectionHeading 用來限定只讀標準文字 API 價格段落。",
+  "providers": [
+    {
+      "name": "Anthropic",
+      "deployments": [
+        "Global"
+      ],
+      "pageUrl": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "sourceUrl": "https://platform.claude.com/docs/en/about-claude/pricing.md",
+      "parser": "table",
+      "sectionHeading": "## Model pricing",
+      "ignoreModels": [
+        "Claude Fable 5.1",
+        "Claude Mythos 5.1",
+        "Claude Mythos 5",
+        "Claude Opus 4.1",
+        "Claude Opus 4",
+        "Claude Sonnet 4",
+        "Claude Haiku 3.5"
+      ]
+    },
+    {
+      "name": "OpenAI",
+      "deployments": [
+        "Global"
+      ],
+      "pageUrl": "https://developers.openai.com/api/docs/pricing",
+      "sourceUrl": "https://developers.openai.com/api/docs/pricing.md",
+      "parser": "table",
+      "sectionHeading": "### Standard pricing data",
+      "ignoreModels": [
+        "gpt-5.5-pro",
+        "gpt-5.4-pro",
+        "gpt-5.4-nano",
+        "gpt-5.2",
+        "gpt-5.2-pro",
+        "gpt-5.1",
+        "gpt-5",
+        "gpt-5-nano",
+        "gpt-5-pro",
+        "gpt-4.1",
+        "gpt-4.1-mini",
+        "gpt-4.1-nano",
+        "gpt-4o",
+        "gpt-4o-2024-05-13",
+        "gpt-4o-mini",
+        "o1",
+        "o1-pro",
+        "o3-pro",
+        "o3",
+        "o4-mini",
+        "o3-mini",
+        "gpt-4-turbo-2024-04-09",
+        "gpt-4-0613",
+        "gpt-3.5-turbo",
+        "gpt-3.5-turbo-0125"
+      ]
+    },
+    {
+      "name": "Google Gemini",
+      "deployments": [
+        "Google AI"
+      ],
+      "pageUrl": "https://ai.google.dev/gemini-api/docs/pricing",
+      "sourceUrl": "https://ai.google.dev/gemini-api/docs/pricing.md.txt",
+      "parser": "gemini",
+      "ignoreModels": [
+        "Gemini 3.5 Flash-Lite",
+        "Gemini 3.1 Flash-Lite",
+        "Gemini 2.5 Pro",
+        "Gemini 2.5 Flash",
+        "Gemini 2.5 Flash-Lite"
+      ]
+    },
+    {
+      "name": "xAI",
+      "deployments": [
+        "xAI API"
+      ],
+      "pageUrl": "https://docs.x.ai/developers/models",
+      "sourceUrl": "https://docs.x.ai/developers/models.md",
+      "parser": "table",
+      "sectionHeading": "### Text API Pricing",
+      "ignoreModels": [
+        "grok-4.3",
+        "grok-4.20-0309-reasoning",
+        "grok-4.20-0309-non-reasoning",
+        "grok-4.20-multi-agent-0309"
+      ]
+    }
+  ],
+  "_comment2": "ignoreModels：已知且刻意不追蹤的官方模型（多為舊世代）。不在此清單也不在 pricing.csv 的官方模型會被視為新模型並觸發通知。"
+}

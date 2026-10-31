@@ -14,6 +14,7 @@ use tower_http::set_header::SetResponseHeaderLayer;
 
 mod antigravity;
 mod antigravity_metadata;
+mod blob_export;
 mod browser;
 mod cli;
 mod config;
@@ -364,6 +365,7 @@ async fn main() {
             "/api/:assistant/monthly/:year_month",
             get(get_monthly_details),
         )
+        .route("/api/:assistant/range/:start/:end", get(get_range_details))
         .route("/api/:assistant/model-sessions", get(get_model_sessions))
         .route("/api/:assistant/years", get(get_available_years))
         .route("/api/:assistant/yearly/:year", get(get_yearly_details))

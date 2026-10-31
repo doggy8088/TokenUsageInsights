@@ -1,6 +1,6 @@
 [package]
 name = "token-usage-insights"
-version = "1.5.1"
+version = "1.6.2"
 edition = "2021"
 default-run = "token-usage-insights"
 

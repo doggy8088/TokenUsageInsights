@@ -422,6 +422,21 @@ pub(crate) fn load_session_details(
                 .or_insert_with(|| serde_json::Value::String(repository));
         }
     }
+    if let Some(parent_session_id) = lookup.parent_session_id {
+        metadata
+            .entry("parent_session_id".to_string())
+            .or_insert_with(|| serde_json::Value::String(parent_session_id));
+    }
+    if let Some(agent_nickname) = lookup.agent_nickname {
+        metadata
+            .entry("agent_nickname".to_string())
+            .or_insert_with(|| serde_json::Value::String(agent_nickname));
+    }
+    if let Some(agent_role) = lookup.agent_role {
+        metadata
+            .entry("agent_role".to_string())
+            .or_insert_with(|| serde_json::Value::String(agent_role));
+    }
 
     let mut total_tokens = 0;
     let mut total_input_tokens = 0;

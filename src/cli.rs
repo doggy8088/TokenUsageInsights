@@ -1,5 +1,6 @@
+use crate::blob_export;
 use crate::db;
-use chrono::{SecondsFormat, Utc};
+use chrono::{Local, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -46,14 +47,20 @@ const HELP_TEXT: &str = r#"Token 戰情室：看板、使用量匯入 / 匯出�
   例如:
   token-usage-insights export --agent codex --date 2026-07-09 --out daily.json
   token-usage-insights export-all --out all-usage.json
+  token-usage-insights export-all --out 'https://<account>.blob.core.windows.net/<container>?<SAS>'
 
 匯入:
   token-usage-insights import --file <path> [--agent <name>]
+  token-usage-insights import --url <URL> [--agent <name>]
   例如:
   token-usage-insights import --file all-usage.json
+  token-usage-insights import --url 'https://<account>.blob.core.windows.net/<container>/<檔名>.json?<SAS>'
 
 注意:
   - 若未指定 export 的 --out，會直接輸出到 stdout
+  - export-all 的 --out 可為 Azure Blob 容器的 SAS URL（HTTPS）；未指定檔名時，
+    檔名為 yyyy-MM-dd_HH-mm-ss_<電腦名稱>.json（本機時間），SAS 需具備 create/write 權限
+  - 上傳成功後會印出可直接在另一台電腦執行的 import --url 命令（網址含 SAS，請妥善保管）
   - import 自動依檔案 assistant 判斷 Agent，完整匯出檔會匯入全部 Agent
   - --agent 僅供篩選完整匯出檔或指定舊檔 Agent；單一 Agent 檔案必須一致
   - import 會以 `assistant_type + import_source_id` 做資料去重，重複匯入只會插入一次
@@ -205,8 +212,8 @@ pub(crate) async fn run(args: &[String]) -> Option<i32> {
 
     Some(match subcmd_args[0].as_str() {
         "export" => run_export(&subcmd_args[1..]),
-        "export-all" => run_export_all(&subcmd_args[1..]),
-        "import" => run_import(&subcmd_args[1..]),
+        "export-all" => run_export_all(&subcmd_args[1..]).await,
+        "import" => run_import(&subcmd_args[1..]).await,
         "update" | "--update" | "-u" => run_update_cli(&subcmd_args[1..]).await,
         "-V" | "--version" | "version" => {
             println!("token-usage-insights {}", env!("CARGO_PKG_VERSION"));
@@ -262,9 +269,28 @@ fn collect_all_exports(conn: &rusqlite::Connection) -> Result<UsageAllExportPayl
     })
 }
 
-fn run_export_all(args: &[String]) -> i32 {
+/// `export-all --out` 的輸出目的地；在讀取資料庫前就解析完成，參數錯誤時不碰資料庫與網路。
+enum ExportAllTarget {
+    Stdout,
+    File(String),
+    Blob(reqwest::Url),
+}
+
+fn resolve_export_all_target(out: Option<String>) -> Result<ExportAllTarget, String> {
+    match out {
+        None => Ok(ExportAllTarget::Stdout),
+        Some(out) if blob_export::is_url(&out) => {
+            let file_name =
+                blob_export::export_file_name(&Local::now(), &blob_export::computer_name());
+            blob_export::build_blob_url(&out, &file_name).map(ExportAllTarget::Blob)
+        }
+        Some(out) => Ok(ExportAllTarget::File(out)),
+    }
+}
+
+async fn run_export_all(args: &[String]) -> i32 {
     if has_help(args) {
-        println!("export-all usage:\n  token-usage-insights export-all [--out <path>]\n\n匯出資料庫已收錄的所有 Agent、所有日期與完整使用量欄位。\n--out <path>  輸出 JSON 檔案；省略時輸出到 stdout。\n不接受 --agent 或 --date 篩選；不會掃描尚未同步的來源日誌。");
+        println!("export-all usage:\n  token-usage-insights export-all [--out <path|SAS URL>]\n\n匯出資料庫已收錄的所有 Agent、所有日期與完整使用量欄位。\n--out <path>     輸出 JSON 檔案；省略時輸出到 stdout。\n--out <SAS URL>  上傳到 Azure Blob Storage，例如：\n                 'https://<account>.blob.core.windows.net/<container>?<SAS>'\n                 容器 SAS 不需指定檔名，預設為 yyyy-MM-dd_HH-mm-ss_<電腦名稱>.json（本機時間）；\n                 Blob SAS（sr=b）則寫入該 SAS 指定的 Blob。SAS 需具備 create/write 權限，且必須使用 HTTPS。\n上傳成功後會印出可在另一台電腦執行的 import --url 命令（網址含 SAS，請妥善保管）。\n不接受 --agent 或 --date 篩選；不會掃描尚未同步的來源日誌。");
         return 0;
     }
     let mut out_path = None;
@@ -279,7 +305,14 @@ fn run_export_all(args: &[String]) -> i32 {
         }
         i += 1;
     }
-    let result = (|| -> Result<(), String> {
+    let target = match resolve_export_all_target(out_path) {
+        Ok(target) => target,
+        Err(err) => {
+            eprintln!("--out 參數無效: {err}");
+            return 2;
+        }
+    };
+    let result = async {
         let conn = db::get_db_conn()?;
         db::init_db(&conn)?;
         let payload = collect_all_exports(&conn)?;
@@ -289,14 +322,25 @@ fn run_export_all(args: &[String]) -> i32 {
             .map(|group| group.records.len())
             .sum();
         let json = serde_json::to_string_pretty(&payload).map_err(|err| err.to_string())?;
-        if let Some(out) = out_path {
-            fs::write(&out, json).map_err(|err| format!("寫入檔案失敗 {out}: {err}"))?;
-            println!("已匯出 {count} 筆到 {out}");
-        } else {
-            println!("{json}");
+        match target {
+            ExportAllTarget::File(out) => {
+                fs::write(&out, json).map_err(|err| format!("寫入檔案失敗 {out}: {err}"))?;
+                println!("已匯出 {count} 筆到 {out}");
+            }
+            ExportAllTarget::Blob(url) => {
+                blob_export::upload_json(&url, json).await?;
+                println!("{}", blob_export::export_success_message(count, &url));
+                if let Some(permissions) = blob_export::sas_without_read_permission(&url) {
+                    eprintln!(
+                        "警告：此 SAS 的權限為 sp={permissions}，不含讀取（r），另一台電腦將無法用上述網址匯入"
+                    );
+                }
+            }
+            ExportAllTarget::Stdout => println!("{json}"),
         }
-        Ok(())
-    })();
+        Ok::<(), String>(())
+    }
+    .await;
     match result {
         Ok(()) => 0,
         Err(err) => {
@@ -420,7 +464,13 @@ fn run_export(args: &[String]) -> i32 {
     0
 }
 
-fn run_import(args: &[String]) -> i32 {
+/// `import` 的輸入來源；在讀取資料庫前就解析完成，參數錯誤時不碰資料庫與網路。
+enum ImportSource {
+    File(PathBuf),
+    Url(reqwest::Url),
+}
+
+async fn run_import(args: &[String]) -> i32 {
     if has_help(args) {
         print_import_help();
         return 0;
@@ -429,6 +479,7 @@ fn run_import(args: &[String]) -> i32 {
     let mut assistant = None::<String>;
     let mut date = None::<String>;
     let mut file_path = None::<String>;
+    let mut url = None::<String>;
 
     let mut i = 0usize;
     while i < args.len() {
@@ -442,6 +493,9 @@ fn run_import(args: &[String]) -> i32 {
             "--file" => {
                 file_path = Some(next_flag_value(args, &mut i, "file"));
             }
+            "--url" => {
+                url = Some(next_flag_value(args, &mut i, "url"));
+            }
             arg => {
                 eprintln!("未知參數: {arg}");
                 return 2;
@@ -450,24 +504,54 @@ fn run_import(args: &[String]) -> i32 {
         i += 1;
     }
 
-    let file_path = match file_path {
-        Some(v) => PathBuf::from(v),
-        None => {
-            eprintln!("缺少 --file");
+    let source = match (file_path, url) {
+        (Some(_), Some(_)) => {
+            eprintln!("--file 與 --url 不可同時指定");
+            return 2;
+        }
+        (Some(path), None) => ImportSource::File(PathBuf::from(path)),
+        (None, Some(url)) => match blob_export::parse_download_url(&url) {
+            Ok(url) => ImportSource::Url(url),
+            Err(err) => {
+                eprintln!("--url 參數無效: {err}");
+                return 2;
+            }
+        },
+        (None, None) => {
+            eprintln!("缺少 --file 或 --url");
             return 2;
         }
     };
 
-    if !file_path.exists() {
-        eprintln!("找不到檔案: {:?}", file_path);
-        return 1;
-    }
-
-    let input = match fs::read_to_string(&file_path) {
-        Ok(v) => v,
-        Err(err) => {
-            eprintln!("讀取匯入檔案失敗: {err}");
-            return 1;
+    let (input, source_file_name) = match source {
+        ImportSource::File(file_path) => {
+            if !file_path.exists() {
+                eprintln!("找不到檔案: {:?}", file_path);
+                return 1;
+            }
+            let input = match fs::read_to_string(&file_path) {
+                Ok(v) => v,
+                Err(err) => {
+                    eprintln!("讀取匯入檔案失敗: {err}");
+                    return 1;
+                }
+            };
+            let name = file_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_string);
+            (input, name)
+        }
+        ImportSource::Url(url) => {
+            let input =
+                match blob_export::download_json(&url, blob_export::MAX_DOWNLOAD_BYTES).await {
+                    Ok(v) => v,
+                    Err(err) => {
+                        eprintln!("{err}");
+                        return 1;
+                    }
+                };
+            (input, blob_export::blob_file_name(&url))
         }
     };
 
@@ -519,10 +603,7 @@ fn run_import(args: &[String]) -> i32 {
             payload.records,
             db::UsageImportMetadata {
                 source_assistant: Some(assistant.to_string()),
-                source_file_name: file_path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .map(str::to_string),
+                source_file_name: source_file_name.clone(),
             },
         ) {
             Ok(v) => v,
@@ -790,13 +871,17 @@ fn print_import_help() {
     println!(
         r#"import usage:
   token-usage-insights import --file <path> [--agent <name>]
+  token-usage-insights import --url <URL> [--agent <name>]
 
 參數:
   --agent <name>      選填：篩選 Agent 或指定缺少 assistant 的舊檔案
-  --file <path>       匯入檔案
+  --file <path>       匯入本機檔案
+  --url <URL>         從 HTTPS 網址下載並匯入（可直接貼上 export-all 上傳後印出的網址；
+                      Azure Blob 網址需含 SAS 且具備讀取權限）；與 --file 擇一
   --date <label>       相容舊版，僅作為匯入紀錄標籤，不影響資料日期
   --help, -h          顯示此說明
 
+匯入網址含 SAS 簽章，錯誤訊息不會顯示它；下載內容上限 200 MB，且不跟隨重新導向。
 預設依檔案 assistant 自動判斷；完整匯出檔一次匯入所有 Agent。
 各 Agent 分別建立匯入批次；中途失敗時，已完成的批次會保留，重試會自動去重。
 "#

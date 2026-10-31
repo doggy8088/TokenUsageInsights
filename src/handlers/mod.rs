@@ -463,6 +463,32 @@ mod tests {
             2
         );
 
+        let range = |start: &str, end: &str| {
+            super::get_range_details(Path((
+                "all".to_string(),
+                start.to_string(),
+                end.to_string(),
+            )))
+        };
+        let (status, ranged) =
+            response_json(range("2026-07-01", "2026-07-31").await.into_response()).await;
+        assert_eq!(status, 200);
+        assert_eq!(ranged["year_month"], "2026-07-01~2026-07-31");
+        assert_eq!(
+            ranged["summary"]["total_tokens"],
+            monthly["summary"]["total_tokens"]
+        );
+        assert_eq!(ranged["daily_breakdown"], monthly["daily_breakdown"]);
+        let (status, _) =
+            response_json(range("2026-07-31", "2026-07-01").await.into_response()).await;
+        assert_eq!(status, 400);
+        let (status, _) =
+            response_json(range("2026-01-01", "2027-12-31").await.into_response()).await;
+        assert_eq!(status, 400);
+        let (status, _) =
+            response_json(range("2030-01-01", "2030-01-07").await.into_response()).await;
+        assert_eq!(status, 404);
+
         let (status, dates) = response_json(
             super::get_available_dates(Path("all".to_string()))
                 .await

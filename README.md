@@ -491,11 +491,30 @@ cargo build --release --bin token-usage-insights
 # 一次匯出所有 Agent、所有日期的使用量記錄
 ./target/release/token-usage-insights export-all --out all-usage.json
 
+# 直接上傳到 Azure Blob Storage 容器（SAS URL），檔名自動產生
+./target/release/token-usage-insights export-all --out 'https://<account>.blob.core.windows.net/<container>?<SAS>'
+
 # 自動判斷 Agent，匯入完整匯出檔的全部 Agent 與日期
 ./target/release/token-usage-insights import --file all-usage.json
+
+# 在另一台電腦直接從網址匯入（貼上 export-all 上傳後印出的命令即可）
+./target/release/token-usage-insights import --url 'https://<account>.blob.core.windows.net/<container>/<檔名>.json?<SAS>'
 ```
 
 `export-all` 不需指定 Agent 或日期；省略 `--out` 時輸出 JSON 到 stdout。匯出涵蓋 SQLite 已收錄的所有使用量記錄，包含原生與匯入資料，保留既有匯出格式的完整欄位及 `import_source_id`。執行前請透過看板完成來源日誌同步；此命令不會自行掃描來源日誌，也不是包含原始對話檔、設定與匯入批次歷程的資料庫備份。
+
+`--out` 為 `https://` 開頭的 SAS URL 時，`export-all` 會以 `PUT` 上傳到 Azure Blob Storage，不寫入本機檔案：
+
+- 容器 SAS（`sr=c`）不需指定檔名，預設檔名為 `yyyy-MM-dd_HH-mm-ss_<電腦名稱>.json`（本機時間，例如 `2026-10-28_19-03-07_WILL-PC.json`）；電腦名稱中的空白、`/` 等特殊字元會轉為 `-`。Blob SAS（`sr=b`）則直接寫入該 SAS 指定的 Blob。
+- SAS 至少需具備 create 與 write 權限（`sp` 含 `c`、`w`），且必須使用 HTTPS；上傳成功回應 HTTP 201。同名 Blob 已存在時會被覆寫，SAS 無寫入權限時則回報 403。
+- 上傳成功後會印出不含 SAS 的 Blob 位址，以及可直接複製到另一台電腦執行的匯入命令（網址已含 SAS）。這串命令等同密碼，會留在終端機捲動記錄與 CI 日誌中，請妥善保管；錯誤訊息不會顯示 SAS 簽章。若 SAS 不含讀取權限（`sp` 無 `r`），會額外警告另一台電腦無法匯入。Shell 中請以單引號包住整段 URL，避免 `&` 被解讀為背景執行。
+- 匯出內容包含 `cwd`、`transcript_path`、`session_name` 等路徑與名稱欄位，請確認目標容器的存取權限與 SAS 有效期限。
+
+`import --url` 會以 HTTPS `GET` 下載後匯入，與 `--file` 擇一使用：
+
+- 網址必須是 HTTPS 且指向單一檔案；Azure Blob 網址需含具備讀取權限（`sp` 含 `r`）的 SAS，公開 Blob 則不需要。容器 SAS（`sr=c`）可用於容器內的 Blob，所以匯出時印出的網址可直接使用。
+- 下載內容上限為 200 MB，不跟隨重新導向；下載失敗時顯示 HTTP 狀態與 Azure 錯誤代碼（例如 `BlobNotFound`），不會顯示 SAS。
+- 匯入批次的來源檔名記錄為 Blob 檔名（不含 query string）；其餘行為與 `--file` 相同，重複匯入同一個網址會自動去重。
 
 完整匯出檔包含 `version`、`exported_at` 與 `exports` 陣列；每個元素都是原有格式的單一 Agent、單日匯出，依 Agent 與日期排序。空資料庫會輸出空的 `exports` 陣列。`import --file` 自動依檔案中的 `assistant` 匯入所有 Agent；單一 Agent 檔案也可自動辨識。只有需要篩選特定 Agent，或舊檔缺少 `assistant` 時，才需要指定 `--agent`。缺少或不支援的 Agent 會在寫入前回報錯誤。
 
@@ -527,6 +546,15 @@ cargo build --release --bin token-usage-insights
 - `records`（每筆會有 `import_source_id`）
 
 `import_source_id` 會與 `assistant_type` 一起做唯一鍵，重複匯入同一筆會被判為重複並自動跳過，不會重複寫入資料庫。
+
+### 以 Docker 容器分開檢視不同人的資料
+
+若要檢視他人匯出的資料、又不想和本機資料混在一起，可以使用 [`docker/`](docker/README.md) 資料夾提供的最小化容器與管理腳本。每個名稱各有獨立的容器、資料磁碟區與本機埠號，一行命令即可建立容器、匯入檔案或 SAS URL 並開啟瀏覽器：
+
+```bash
+docker/tui-docker.sh up alice ~/Downloads/alice-usage.json
+docker/tui-docker.sh up bob 'https://<account>.blob.core.windows.net/<container>/<檔名>.json?<SAS>'
+```
 
 * * *
 
@@ -831,14 +859,14 @@ token-usage-insights update --check
 # 原地自我更新至最新版本（亦支援 --force 強制覆蓋、--target-version 指定版本）
 token-usage-insights update
 token-usage-insights update --force
-token-usage-insights update --target-version v1.5.1
+token-usage-insights update --target-version v1.6.2
 ```
 
 環境變數可控制版本與安裝路徑（皆為選用）：
 
 | 變數 | 適用平台 | 說明 |
 | --- | --- | --- |
-| `TOKEN_USAGE_INSIGHTS_VERSION` | Linux / macOS / Windows | 指定要安裝的 Release tag，例如 `v1.5.1`。預設 `latest` |
+| `TOKEN_USAGE_INSIGHTS_VERSION` | Linux / macOS / Windows | 指定要安裝的 Release tag，例如 `v1.6.2`。預設 `latest` |
 | `TOKEN_USAGE_INSIGHTS_INSTALL_DIR` | Linux / macOS | 安裝目錄，會轉交給 `install.sh` |
 | `TOKEN_USAGE_INSIGHTS_BIN_DIR` | Linux / macOS | 執行檔連結目錄，會轉交給 `install.sh` |
 

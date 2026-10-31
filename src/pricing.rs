@@ -865,7 +865,7 @@ mod tests {
     fn gpt_daybreak_blue_uses_packaged_pricing() {
         let rules = load_pricing_rules();
 
-        // Identical to gpt-5.6-sol: input 5.00, cache_read 0.50, output 30.00
+        // Identical to gpt-5.6-sol: input 4.00, cache_read 0.40, output 20.00
         for model_name in [
             "gpt-daybreak-blue-latest",
             "gpt-daybreak-blue",
@@ -883,9 +883,9 @@ mod tests {
             )
             .unwrap();
 
-            // 5.00 + 0.50 + 30.00 = 35.50
+            // 4.00 + 0.40 + 20.00 = 24.40
             assert!(
-                (cost - 35.5).abs() < 1e-9,
+                (cost - 24.4).abs() < 1e-9,
                 "unexpected cost for {model_name}: {cost}"
             );
         }
@@ -902,9 +902,9 @@ mod tests {
             0,
         )
         .expect("gpt-daybreak-blue-latest turn 6 cost should calculate successfully");
-        let expected_turn_6 = (227.0 / 1_000_000.0) * 5.00
-            + (42_886.0 / 1_000_000.0) * 0.50
-            + (180.0 / 1_000_000.0) * 30.00;
+        let expected_turn_6 = (227.0 / 1_000_000.0) * 4.00
+            + (42_886.0 / 1_000_000.0) * 0.40
+            + (180.0 / 1_000_000.0) * 20.00;
         assert!((turn_6_cost - expected_turn_6).abs() < 1e-9);
     }
 
@@ -912,7 +912,7 @@ mod tests {
     fn gpt_reserve_matches_gpt_5_6_luna_packaged_pricing() {
         let rules = load_pricing_rules();
 
-        // gpt-reserve is an alias of gpt-5.6-luna: input 1.00, cache read 0.10, output 6.00
+        // gpt-reserve is an alias of gpt-5.6-luna: input 0.20, cache read 0.02, output 1.20
         let luna = calculate_usage_cost(
             &rules,
             Some("gpt-5.6-luna"),
@@ -946,9 +946,9 @@ mod tests {
         let turn_951_cost =
             calculate_usage_cost(&rules, Some("gpt-reserve"), 1_021, 1_388, 197_760, 0, 0)
                 .expect("gpt-reserve turn 951 cost should calculate successfully");
-        let expected_turn_951 = (1_021.0 / 1_000_000.0) * 1.00
-            + (197_760.0 / 1_000_000.0) * 0.10
-            + (1_388.0 / 1_000_000.0) * 6.00;
+        let expected_turn_951 = (1_021.0 / 1_000_000.0) * 0.20
+            + (197_760.0 / 1_000_000.0) * 0.02
+            + (1_388.0 / 1_000_000.0) * 1.20;
         assert!((turn_951_cost - expected_turn_951).abs() < 1e-9);
     }
 

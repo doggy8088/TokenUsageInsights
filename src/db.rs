@@ -423,7 +423,7 @@ impl InitialUserPromptSelector {
         };
     }
 
-    fn is_complete(&self) -> bool {
+    pub(crate) fn is_complete(&self) -> bool {
         matches!(self.state, InitialUserPromptState::Complete)
     }
 
@@ -1466,46 +1466,70 @@ fn get_antigravity_session_name(base_dir: &Path, session_id: &str) -> Option<Str
         .join("brain")
         .join(session_id)
         .join(".system_generated/logs/transcript_full.jsonl");
-    if !path.exists() {
-        return None;
-    }
-    let file = File::open(path).ok()?;
-    let reader = BufReader::new(file);
-    let mut selector = InitialUserPromptSelector::default();
-    for line_res in reader.lines() {
-        let Ok(line) = line_res else {
-            continue;
-        };
-        let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else {
-            continue;
-        };
-        match event.get("type").and_then(|event_type| event_type.as_str()) {
-            Some("USER_INPUT") => {
-                if let Some(content) = event.get("content").and_then(|content| content.as_str()) {
-                    let request_text = if let Some(start_idx) = content.find("<USER_REQUEST>") {
-                        let actual_start = start_idx + "<USER_REQUEST>".len();
-                        if let Some(end_idx) = content[actual_start..].find("</USER_REQUEST>") {
-                            &content[actual_start..(actual_start + end_idx)]
-                        } else {
-                            content
+    if path.exists() {
+        if let Ok(file) = File::open(path) {
+            let reader = BufReader::new(file);
+            let mut selector = InitialUserPromptSelector::default();
+            for line_res in reader.lines() {
+                let Ok(line) = line_res else {
+                    continue;
+                };
+                let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else {
+                    continue;
+                };
+                match event.get("type").and_then(|event_type| event_type.as_str()) {
+                    Some("USER_INPUT") => {
+                        if let Some(content) =
+                            event.get("content").and_then(|content| content.as_str())
+                        {
+                            selector.observe_user_prompt(
+                                crate::antigravity::extract_user_request_text(content),
+                            );
                         }
-                    } else {
-                        content
-                    };
-                    selector.observe_user_prompt(request_text);
+                    }
+                    Some("SYSTEM_MESSAGE") => {
+                        if let Some(content) =
+                            event.get("content").and_then(|content| content.as_str())
+                        {
+                            if let Some(
+                                crate::antigravity::AntigravitySystemMessage::AgentMessage {
+                                    content: body,
+                                    ..
+                                },
+                            ) = crate::antigravity::parse_system_message(content)
+                            {
+                                selector.observe_user_prompt(
+                                    crate::antigravity::extract_user_request_text(&body),
+                                );
+                            }
+                        }
+                    }
+                    Some("PLANNER_RESPONSE" | "RUN_COMMAND" | "GREP_SEARCH" | "LIST_DIRECTORY")
+                    | Some(
+                        "VIEW_FILE" | "CODE_ACTION" | "GENERIC" | "ERROR_MESSAGE" | "TOOL_CALL",
+                    ) => {
+                        selector.observe_non_user_message();
+                    }
+                    _ => {}
+                }
+                if selector.is_complete() {
+                    break;
                 }
             }
-            Some("PLANNER_RESPONSE" | "RUN_COMMAND" | "GREP_SEARCH" | "LIST_DIRECTORY")
-            | Some("VIEW_FILE" | "CODE_ACTION" | "GENERIC" | "ERROR_MESSAGE" | "TOOL_CALL") => {
-                selector.observe_non_user_message();
+            if let Some(name) = selector.into_name() {
+                return Some(name);
             }
-            _ => {}
-        }
-        if selector.is_complete() {
-            break;
         }
     }
-    selector.into_name()
+    let metadata = crate::antigravity_metadata::read_session_metadata(base_dir, session_id).ok()?;
+    if let Some(prompt) = metadata.initial_prompt.as_deref() {
+        let mut selector = InitialUserPromptSelector::default();
+        selector.observe_user_prompt(crate::antigravity::extract_user_request_text(prompt));
+        if let Some(name) = selector.into_name() {
+            return Some(name);
+        }
+    }
+    metadata.agent_role.or(metadata.agent_type)
 }
 
 /// Native records supersede hook snapshots only for the same source/session.
@@ -1519,6 +1543,7 @@ fn sync_antigravity_usage_logs_with_cancel(
     let source_key = encode_hex(root.as_os_str().as_encoded_bytes());
     let source_kind = crate::antigravity::SOURCE_KIND;
     let sync_states = load_sync_state_for_prefix(conn, "antigravity");
+    let subagent_descriptors = crate::antigravity_metadata::index_subagent_descriptor_paths(&root);
     for path in crate::antigravity::find_session_files(&root)? {
         if should_cancel() {
             return Ok(());
@@ -1527,18 +1552,25 @@ fn sync_antigravity_usage_logs_with_cancel(
             crate::antigravity::session_id(&path).ok_or("無效的 Antigravity session 路徑")?;
         let transcript = path.to_string_lossy().into_owned();
         let metadata = fs::metadata(&path).map_err(|e| e.to_string())?;
-        // Metadata may arrive after the transcript (including in SQLite WAL).
-        // Include all source revisions so a later model resolution is imported.
+        // Metadata may arrive after the transcript (including in SQLite WAL or
+        // parent subagents/<session_id>.json fallback). Include all source
+        // revisions so a later model or subagent descriptor resolution is imported.
         let modified = {
             use std::hash::{Hash, Hasher};
             let mut fingerprint = std::collections::hash_map::DefaultHasher::new();
             crate::antigravity::PARSER_VERSION.hash(&mut fingerprint);
             for file in [
-                path.clone(),
-                root.join("conversations").join(format!("{session_id}.db")),
-                root.join("conversations")
-                    .join(format!("{session_id}.db-wal")),
-            ] {
+                Some(path.clone()),
+                Some(root.join("conversations").join(format!("{session_id}.db"))),
+                Some(
+                    root.join("conversations")
+                        .join(format!("{session_id}.db-wal")),
+                ),
+                subagent_descriptors.get(session_id).cloned(),
+            ]
+            .into_iter()
+            .flatten()
+            {
                 if let Ok(meta) = fs::metadata(file) {
                     meta.len().hash(&mut fingerprint);
                     meta.modified().ok().hash(&mut fingerprint);
@@ -1583,7 +1615,9 @@ fn sync_antigravity_usage_logs_with_cancel(
         let name = get_antigravity_session_name(&root, session_id);
         for entry in &mut entries {
             entry.source_dir_key = Some(source_key.clone());
-            entry.session_name = name.clone();
+            if entry.session_name.is_none() {
+                entry.session_name = name.clone();
+            }
             if entry.model.is_none() {
                 entry.model = Some("Unknown Model".to_owned());
             }
@@ -6364,12 +6398,14 @@ fn insert_usage_entries(
                     assistant_type, source_kind, usage_identity, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
                     tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_reasoning, tokens_total,
                     delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total,
-                    duration_ms, premium_requests, reported_cost_usd, reasoning_effort, source_dir_key
+                    duration_ms, premium_requests, reported_cost_usd, reasoning_effort, source_dir_key,
+                    parent_session_id, agent_nickname, agent_role
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?,
+                    ?, ?, ?
                 )",
             params![
                 assistant_type,
@@ -6402,6 +6438,9 @@ fn insert_usage_entries(
                 cost.and_then(|value| value.reported_cost_usd),
                 entry.reasoning_effort.as_deref(),
                 entry.source_dir_key.as_deref(),
+                entry.parent_session_id.as_deref(),
+                entry.agent_nickname.as_deref(),
+                entry.agent_role.as_deref(),
             ],
         )
         .map_err(|error| format!("寫入 {assistant_label} 資料庫失敗: {error}"))?;
@@ -7104,11 +7143,17 @@ pub fn get_available_dates(
     Ok(dates)
 }
 
+enum DateMatch<'a> {
+    Exact(&'a str),
+    Prefix(&'a str),
+    /// Inclusive `YYYY-MM-DD` range.
+    Range(&'a str, &'a str),
+}
+
 fn query_usage_entries(
     conn: &rusqlite::Connection,
-    date_filter: &str,
+    date_match: DateMatch<'_>,
     assistant: &str,
-    exact_date: bool,
 ) -> Result<Vec<UsageDayRecordWithAssistant>, String> {
     let mut query = "SELECT
             timestamp, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
@@ -7117,9 +7162,22 @@ fn query_usage_entries(
             duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, assistant_type, reasoning_effort, import_source_id, source_kind, source_dir_key, reported_cost_usd
             , usage_identity, date
          FROM usage_entries WHERE date ".to_string();
-    query.push_str(if exact_date { "= ?" } else { "LIKE ?" });
     let mut params_vec = Vec::new();
-    params_vec.push(rusqlite::types::Value::Text(date_filter.to_string()));
+    match date_match {
+        DateMatch::Exact(date) => {
+            query.push_str("= ?");
+            params_vec.push(rusqlite::types::Value::Text(date.to_string()));
+        }
+        DateMatch::Prefix(prefix) => {
+            query.push_str("LIKE ?");
+            params_vec.push(rusqlite::types::Value::Text(prefix.to_string()));
+        }
+        DateMatch::Range(start, end) => {
+            query.push_str("BETWEEN ? AND ?");
+            params_vec.push(rusqlite::types::Value::Text(start.to_string()));
+            params_vec.push(rusqlite::types::Value::Text(end.to_string()));
+        }
+    }
 
     if assistant != "all" {
         let assistants: Vec<&str> = assistant.split(',').collect();
@@ -7330,7 +7388,7 @@ pub fn get_usage_entries_by_date(
     date: &str,
     assistant: &str,
 ) -> Result<Vec<UsageDayRecordWithAssistant>, String> {
-    query_usage_entries(conn, date, assistant, true)
+    query_usage_entries(conn, DateMatch::Exact(date), assistant)
 }
 
 fn entry_date_from_timestamp(timestamp: &str) -> Option<&str> {
@@ -8217,6 +8275,7 @@ pub struct SessionLookup {
     pub source_dir_key: Option<String>,
     pub parent_session_id: Option<String>,
     pub agent_nickname: Option<String>,
+    pub agent_role: Option<String>,
 }
 
 /// Database-backed details scoped to the same concrete session source as a
@@ -8465,7 +8524,7 @@ pub fn get_session_assistant_and_transcript_in_parent_scope(
 
     let mut sql = String::from(
         "SELECT assistant_type, transcript_path, source_kind, source_dir_key,
-                parent_session_id, agent_nickname
+                parent_session_id, agent_nickname, agent_role
          FROM usage_entries
          WHERE session_id = ? AND assistant_type = ? AND source_kind = ?",
     );
@@ -8516,6 +8575,11 @@ pub fn get_session_assistant_and_transcript_in_parent_scope(
             .ok()
             .flatten()
             .filter(|s| !s.is_empty());
+        let agent_role = row
+            .get::<_, Option<String>>(6)
+            .ok()
+            .flatten()
+            .filter(|s| !s.is_empty());
         Ok(SessionLookup {
             assistant_type: ast,
             transcript_path: path,
@@ -8523,6 +8587,7 @@ pub fn get_session_assistant_and_transcript_in_parent_scope(
             source_dir_key,
             parent_session_id,
             agent_nickname,
+            agent_role,
         })
     } else {
         Err("Session not found".to_string())
@@ -8916,7 +8981,11 @@ pub fn get_usage_entries_by_month(
     year_month: &str,
     assistant: &str,
 ) -> Result<Vec<DatedUsageEntry>, String> {
-    let rows = query_usage_entries(conn, &format!("{year_month}-%"), assistant, false)?;
+    let rows = query_usage_entries(
+        conn,
+        DateMatch::Prefix(&format!("{year_month}-%")),
+        assistant,
+    )?;
     Ok(rows
         .into_iter()
         .map(|row| DatedUsageEntry {
@@ -8972,7 +9041,7 @@ pub fn get_usage_entries_by_year(
     year: &str,
     assistant: &str,
 ) -> Result<Vec<DatedUsageEntry>, String> {
-    let rows = query_usage_entries(conn, &format!("{year}-%"), assistant, false)?;
+    let rows = query_usage_entries(conn, DateMatch::Prefix(&format!("{year}-%")), assistant)?;
     Ok(rows
         .into_iter()
         .map(|row| DatedUsageEntry {
@@ -8983,6 +9052,25 @@ pub fn get_usage_entries_by_year(
         })
         .collect())
 }
+
+/// 取得 `start` 至 `end`（含）之間的使用記錄，兩者皆為 `YYYY-MM-DD`。
+pub fn get_usage_entries_by_range(
+    conn: &rusqlite::Connection,
+    start: &str,
+    end: &str,
+    assistant: &str,
+) -> Result<Vec<DatedUsageEntry>, String> {
+    let rows = query_usage_entries(conn, DateMatch::Range(start, end), assistant)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| DatedUsageEntry {
+            entry: row.record.entry,
+            assistant_type: row.assistant_type,
+            date: row.date,
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9582,6 +9670,207 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM usage_entries", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn antigravity_native_syncs_subagent_hierarchy_labels_and_nested_children() {
+        fn field(number: u32, value: &[u8]) -> Vec<u8> {
+            let mut tag = (number << 3) | 2;
+            let mut bytes = Vec::new();
+            while tag >= 128 {
+                bytes.push((tag as u8 & 127) | 128);
+                tag >>= 7;
+            }
+            bytes.push(tag as u8);
+            let mut len = value.len();
+            while len >= 128 {
+                bytes.push((len as u8 & 127) | 128);
+                len >>= 7;
+            }
+            bytes.push(len as u8);
+            bytes.extend_from_slice(value);
+            bytes
+        }
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let root = temp_jsonl_path("antigravity-subagent-hierarchy").with_extension("");
+        fs::create_dir_all(root.join("conversations")).unwrap();
+
+        let parent_id = "11111111-1111-4111-8111-111111111111";
+        let child_id = "22222222-2222-4222-8222-222222222222";
+        let grandchild_id = "33333333-3333-4333-8333-333333333333";
+
+        // 1. Parent session with USER_INPUT
+        let parent_transcript = root
+            .join("brain")
+            .join(parent_id)
+            .join(".system_generated/logs/transcript_full.jsonl");
+        fs::create_dir_all(parent_transcript.parent().unwrap()).unwrap();
+        fs::write(
+            &parent_transcript,
+            concat!(
+                "{\"type\":\"USER_INPUT\",\"created_at\":\"2026-10-10T01:00:00Z\",\"content\":\"<USER_REQUEST>\\nImplement Antigravity subagent support\\n</USER_REQUEST>\"}\n",
+                "{\"type\":\"PLANNER_RESPONSE\",\"step_index\":1,\"created_at\":\"2026-10-10T01:00:05Z\",\"input_tokens\":100,\"output_tokens\":20}\n"
+            ),
+        )
+        .unwrap();
+
+        // 2. Depth-1 subagent with SYSTEM_MESSAGE initial prompt + SQLite CortexTrajectoryMetadata
+        let child_transcript = root
+            .join("brain")
+            .join(child_id)
+            .join(".system_generated/logs/transcript_full.jsonl");
+        fs::create_dir_all(child_transcript.parent().unwrap()).unwrap();
+        let child_step0 = serde_json::json!({
+            "type": "SYSTEM_MESSAGE",
+            "step_index": 0,
+            "created_at": "2026-10-10T01:00:10Z",
+            "content": format!(
+                "The following is a <SYSTEM_MESSAGE> not actually sent by the USER.\n\n<SYSTEM_MESSAGE>\n[Message] timestamp=2026-10-10T01:00:10Z sender={parent_id} priority=IMMEDIATE content=Investigate Antigravity subagent storage format and protobuf schema.\n</SYSTEM_MESSAGE>"
+            )
+        });
+        fs::write(
+            &child_transcript,
+            format!(
+                "{child_step0}\n{{\"type\":\"PLANNER_RESPONSE\",\"step_index\":1,\"created_at\":\"2026-10-10T01:00:15Z\",\"input_tokens\":50,\"output_tokens\":10}}\n"
+            ),
+        )
+        .unwrap();
+
+        let child_db = root.join("conversations").join(format!("{child_id}.db"));
+        {
+            let metadata = Connection::open(&child_db).unwrap();
+            metadata
+                .execute_batch(
+                    "CREATE TABLE trajectory_metadata_blob (id TEXT PRIMARY KEY, data BLOB);",
+                )
+                .unwrap();
+            let mut subagent_spec = Vec::new();
+            subagent_spec.extend(field(1, b"self"));
+            subagent_spec.extend(field(2, b"Antigravity Subagent Researcher"));
+            subagent_spec.extend(field(
+                3,
+                b"Investigate Antigravity subagent storage format and protobuf schema.",
+            ));
+            let mut blob = Vec::new();
+            blob.extend(field(5, parent_id.as_bytes()));
+            blob.extend(field(6, parent_id.as_bytes()));
+            blob.extend(field(7, b"file:///example/project"));
+            blob.extend(field(8, &subagent_spec));
+            metadata
+                .execute(
+                    "INSERT INTO trajectory_metadata_blob VALUES ('main', ?)",
+                    params![blob],
+                )
+                .unwrap();
+        }
+
+        // 3. Depth-2 nested subagent WITHOUT a .db file; first sync runs before
+        // the parent subagents/<id>.json descriptor arrives on disk.
+        let grandchild_transcript = root
+            .join("brain")
+            .join(grandchild_id)
+            .join(".system_generated/logs/transcript_full.jsonl");
+        fs::create_dir_all(grandchild_transcript.parent().unwrap()).unwrap();
+        let grandchild_step0 = serde_json::json!({
+            "type": "SYSTEM_MESSAGE",
+            "step_index": 0,
+            "created_at": "2026-10-10T01:00:20Z",
+            "content": format!(
+                "The following is a <SYSTEM_MESSAGE> not actually sent by the USER.\n\n<SYSTEM_MESSAGE>\n[Message] timestamp=2026-10-10T01:00:20Z sender={child_id} priority=IMMEDIATE content=Verify nested subagent depth-2 lineage.\n</SYSTEM_MESSAGE>"
+            )
+        });
+        fs::write(
+            &grandchild_transcript,
+            format!(
+                "{grandchild_step0}\n{{\"type\":\"PLANNER_RESPONSE\",\"step_index\":1,\"created_at\":\"2026-10-10T01:00:25Z\",\"input_tokens\":30,\"output_tokens\":5}}\n"
+            ),
+        )
+        .unwrap();
+
+        sync_antigravity_usage_logs_with_cancel(&mut conn, &root, &|| false).unwrap();
+
+        // Late-arriving parent subagents/<grandchild_id>.json must invalidate the
+        // synchronization fingerprint even when transcript_full.jsonl is unchanged.
+        let subagents_dir = root
+            .join("brain")
+            .join(child_id)
+            .join(".system_generated/subagents");
+        fs::create_dir_all(&subagents_dir).unwrap();
+        fs::write(
+            subagents_dir.join(format!("{grandchild_id}.json")),
+            serde_json::json!({
+                "conversationId": grandchild_id,
+                "subagentDescriptor": {
+                    "typeName": "research",
+                    "role": "Protobuf Descriptor Auditor"
+                },
+                "workspaceUris": ["file:///example/project"]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        sync_antigravity_usage_logs_with_cancel(&mut conn, &root, &|| false).unwrap();
+
+        type SessionRow = (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
+        let query_session = |sid: &str| -> SessionRow {
+            conn.query_row(
+                "SELECT session_name, parent_session_id, agent_nickname, agent_role, cwd
+                 FROM usage_entries WHERE session_id = ?",
+                params![sid],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap()
+        };
+
+        let parent_row = query_session(parent_id);
+        assert_eq!(
+            parent_row,
+            (
+                Some("Implement Antigravity subagent support".to_string()),
+                None,
+                None,
+                None,
+                None,
+            )
+        );
+
+        let child_row = query_session(child_id);
+        assert_eq!(
+            child_row,
+            (
+                Some(
+                    "Investigate Antigravity subagent storage format and protobuf schema."
+                        .to_string()
+                ),
+                Some(parent_id.to_string()),
+                Some("self".to_string()),
+                Some("Antigravity Subagent Researcher".to_string()),
+                Some("/example/project".to_string()),
+            )
+        );
+
+        let grandchild_row = query_session(grandchild_id);
+        assert_eq!(
+            grandchild_row,
+            (
+                Some("Verify nested subagent depth-2 lineage.".to_string()),
+                Some(child_id.to_string()),
+                Some("research".to_string()),
+                Some("Protobuf Descriptor Auditor".to_string()),
+                Some("/example/project".to_string()),
+            )
+        );
+
         fs::remove_dir_all(root).unwrap();
     }
 

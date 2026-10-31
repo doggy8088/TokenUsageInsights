@@ -1507,8 +1507,29 @@ input:checked + .slider-round:before {
 }
 
 .app-sidebar .tab-hover-dropdown {
-  flex-basis: 68px !important;
-  min-width: 68px !important;
+  flex-basis: 78px !important;
+  min-width: 78px !important;
+}
+
+.app-sidebar .range-tab-dropdown {
+  flex: 0 0 auto !important;
+  width: 100%;
+  min-width: 0 !important;
+}
+
+.app-sidebar .range-date-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 100%;
+}
+
+.app-sidebar .range-field-label {
+  align-self: flex-start;
+  width: 100%;
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  text-align: left !important;
 }
 
 .app-sidebar .tab-hover-dropdown .hover-dropdown-trigger {
@@ -1523,7 +1544,8 @@ input:checked + .slider-round:before {
 
 .app-sidebar #btn-reload-daily,
 .app-sidebar #btn-reload-monthly,
-.app-sidebar #btn-reload-yearly {
+.app-sidebar #btn-reload-yearly,
+.app-sidebar #btn-reload-range {
   width: 38px !important;
   min-width: 38px;
 }

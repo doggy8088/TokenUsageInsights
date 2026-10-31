@@ -17,7 +17,7 @@ const {
 } = require('node:fs');
 const { get } = require('node:https');
 const { tmpdir } = require('node:os');
-const { basename, join } = require('node:path');
+const { basename, join, win32 } = require('node:path');
 const { pipeline } = require('node:stream/promises');
 const { URL } = require('node:url');
 
@@ -144,10 +144,20 @@ function windowsPowerShellEnvironment(archive, destination, baseEnvironment = pr
   return env;
 }
 
+// Windows 10 1803 以後內建 bsdtar（System32\tar.exe），可直接解壓 zip。
+// 必須以絕對路徑呼叫：PATH 上若有 Git for Windows / MSYS2 的 GNU tar 排在前面，
+// GNU tar 會把 `C:\...` 的冒號解讀成 `主機:路徑` 而出現「Cannot connect to C: resolve failed」。
+function windowsTarPath(environment = process.env) {
+  const systemRoot = environment.SystemRoot || environment.SYSTEMROOT || environment.windir || 'C:\\Windows';
+  return win32.join(systemRoot, 'System32', 'tar.exe');
+}
+
 function extractWindowsZip(archive, destination) {
-  // Windows 10 1803 以後內建 bsdtar（tar.exe），可直接解壓 zip。
-  const tar = spawnSync('tar', ['-xf', archive, '-C', destination], { stdio: 'inherit' });
-  if (!tar.error && tar.status === 0) return;
+  const tarPath = windowsTarPath();
+  if (existsSync(tarPath)) {
+    const tar = spawnSync(tarPath, ['-xf', archive, '-C', destination], { stdio: 'inherit' });
+    if (!tar.error && tar.status === 0) return;
+  }
   run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', WINDOWS_ZIP_SCRIPT], {
     env: windowsPowerShellEnvironment(archive, destination),
   });
@@ -265,4 +275,5 @@ module.exports = {
   sha256,
   verifyChecksum,
   windowsPowerShellEnvironment,
+  windowsTarPath,
 };

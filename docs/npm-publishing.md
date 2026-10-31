@@ -21,7 +21,7 @@ npm 套件本身只包含 JavaScript 啟動器。第一次執行時會從同版�
 - Trusted Publisher workflow 檔名：`release.yml`
 - GitHub Environment：`npm`
 - GitHub Actions 啟用變數：`NPM_TRUSTED_PUBLISHING_ENABLED=true`
-- 使用 GitHub-hosted `ubuntu-latest` runner
+- 使用 GitHub-hosted `ubuntu-26.04` runner
 - 發布工作使用 Node.js 24 與最新版 npm
 - 一般使用者執行 npx 的最低 Node.js 版本：18.18
 

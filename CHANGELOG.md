@@ -4,6 +4,69 @@
 
 ## [未發行]
 
+## [1.6.2] - 2026-10-29
+
+本次 patch release 新增週／自訂區間分析與 Antigravity 子代理資訊，並更新官方模型定價及看板修正。
+
+### 新增與改善
+
+- 新增「週／區間」用量分析分頁，提供 ISO 週、本週、上週、最近 2／4 週、自訂日期範圍與前後區間切換；顯示區間總量、費用、每日趨勢與彙總，並支援網址還原期間。新增 `GET /api/:assistant/range/:start/:end`，最長 366 天；模型 Session 期間查詢新增 `start~end` 格式。
+- Antigravity 原生會話新增子代理階層、名稱與角色標籤，並在時間軸呈現父子代理傳遞的提示詞及系統生命週期訊息；支援巢狀子代理與提示詞搜尋。
+- 新增每日模型定價檢查 workflow，解析 Anthropic、OpenAI、Google Gemini 與 xAI 的官方定價文件，回報 `pricing.csv` 價格差異、促銷價期限、尚未收錄的模型及抓取／解析錯誤；發現異動時建立或更新 `pricing-drift` issue。此檢查只產生報告，不會自動改寫定價檔。
+
+### 修正
+
+- 依官方定價文件校正 `pricing.csv`：`gpt-5.6-sol`（含 `gpt-daybreak-blue`、`gpt-daybreak-blue-latest`）調整為輸入／快取輸入／輸出 4.00／0.40／20.00 美元，`gpt-5.6-terra` 為 2.00／0.20／12.00，`gpt-5.6-luna`（含 `gpt-reserve`）為 0.20／0.02／1.20；`GPT-5.4-mini` 快取輸入調整為 0.075，`gemini-3-flash-preview` 快取輸入調整為 0.05。上述價格會改變相關用量的費用估算。
+- 修正日、年報與區間看板的遲到回應互相覆蓋、區間匯入後未重新載入，以及只有在資料確實更新時才顯示重新整理成功通知的問題；調整日／月／年與區間分頁的選擇器及分頁控制版面。
+- 修正區間標題與無資料畫面的 HTML 插入處理，避免文字被當成標記解析，並解除 CodeQL 高風險警示。
+
+### 資料影響
+
+- Antigravity 解析器版本升級後，既有原生會話會在後續同步時重新解析並補上子代理階層與角色資料；無須清除資料庫或執行破壞性遷移。
+
+### 相容性
+
+- 未變更 SQLite 資料表結構或執行期環境變數。新增區間查詢 API 與模型 Session 區間參數；既有日、月、年查詢行為維持不變。
+
+### 變更
+
+- 將 `rustls` 更新至 0.23.46，並更新 GitHub Actions runner 與 workflow action 版本，以維持 CI 建置環境。
+
+## [1.6.1] - 2026-10-29
+
+本次 patch release 新增 Docker 隔離式用量看板與管理腳本，並修正 Windows 透過 `npx` 安裝時 GNU tar 顯示誤導錯誤訊息的問題。
+
+### 新增與改善
+
+- 新增 `docker/` 資料夾，提供最小化容器映像檔與管理腳本 `docker/tui-docker.sh`，用來分開檢視不同人的用量資料。`Dockerfile` 以 `rust:1-alpine` 編譯 musl 靜態執行檔、執行階段僅使用 `alpine:3.22`，以非 root 使用者執行並停用自我更新；資料庫固定在 `/data` 具名磁碟區，容器內不讀取任何本機 AI 工具日誌。
+- `tui-docker.sh up <名稱> [檔案|SAS URL...]` 一行命令完成建置映像檔、建立 `tui-<名稱>` 容器與 `tui-<名稱>-data` 磁碟區、自動挑選僅綁定 `127.0.0.1` 的本機埠號、匯入資料並開啟瀏覽器；另提供 `import`、`open`、`url`、`export`、`logs`、`stop`、`rm [--purge]`、`ls`、`build` 子命令。匯入以 `docker exec` 執行，SAS URL 不會寫入容器設定，終端機也只顯示不含 query string 的網址。
+
+### 修正
+
+- 修正 Windows 透過 `npx` 安裝時，若 PATH 上 Git for Windows / MSYS2 的 GNU tar 排在系統 `tar.exe` 之前，下載後會出現 `tar: Cannot connect to C: resolve failed` 錯誤訊息的問題。安裝程式改以 `%SystemRoot%\System32\tar.exe`（Windows 內建 bsdtar）的絕對路徑解壓 zip，找不到時直接改用 PowerShell 的 .NET ZipFile 解壓；先前雖會自動退回 PowerShell 而完成安裝，但會顯示誤導性的錯誤訊息。
+
+### 相容性
+
+- 未變更既有本機資料庫結構、公開 API、執行期環境變數或原生安裝流程；Docker 容器是新增的隔離式使用方式。
+
+## [1.6.0] - 2026-10-28
+
+本次 minor release 新增 Azure Blob Storage SAS 匯出與 HTTPS 網址匯入，讓多台電腦可透過完整用量匯出檔交換資料。
+
+### 新增與改善
+
+- `export-all --out` 支援 Azure Blob Storage SAS URL：`--out` 為 `https://` 開頭時改以 `PUT`（BlockBlob）上傳，不寫入本機檔案。容器 SAS 不需指定檔名，預設為 `yyyy-MM-dd_HH-mm-ss_<電腦名稱>.json`（本機時間）；Blob SAS（`sr=b`）則寫入 URL 指定的 Blob。SAS URL 的 query string 原樣保留，錯誤訊息不輸出 SAS 簽章，`http://`、缺少 `sig` 或缺少容器名稱的 URL 會在讀取資料庫前以參數錯誤（結束碼 2）拒絕；上傳失敗時顯示 HTTP 狀態與 Azure 錯誤代碼。
+- 上傳成功後印出不含 SAS 的 Blob 位址與可直接在另一台電腦執行的 `token-usage-insights import --url '<含 SAS 的完整網址>'` 命令；SAS 不含讀取權限（`sp` 無 `r`）時額外警告。該命令含 SAS 簽章，請妥善保管。
+- `import` 新增 `--url <URL>`，與 `--file` 擇一：以 HTTPS `GET` 下載（上限 200 MB、不跟隨重新導向）後沿用既有匯入與去重流程，匯入批次的來源檔名記錄 Blob 檔名；`http://`、容器網址（無檔名）、`--file` 與 `--url` 同時指定會在讀取資料庫前以參數錯誤（結束碼 2）拒絕，下載失敗時顯示 HTTP 狀態與 Azure 錯誤代碼。
+
+### 變更
+
+- 新增維護者用的 `fix-pr` 技能，驗證 PR 有效性、安全性及描述與差異的一致性；通過後留下分析、請求 Copilot Code Review，並核准對應提交的待核准 workflows。
+
+### 相容性
+
+- 本機檔案與 stdout 輸出行為、匯出 JSON 格式、資料庫結構與環境變數均未變更；`export`（單一 Agent）暫不支援 SAS URL。
+
 ## [1.5.1] - 2026-10-27
 
 本次 patch release 補上 OpenAI GPT-6.1 Terra 的官方定價資料。
@@ -1016,7 +1079,8 @@
 - 修正行動版側邊欄遮擋、黑畫面、標題擠壓、圖表導覽索引與年度版面問題。
 - 修正並補齊多個 Gemini、Claude、GPT 與 GPT-OSS 模型的定價規則。
 
-[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.1.0...HEAD
+[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.6.2...HEAD
+[1.6.2]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.6.1...v1.6.2
 [1.1.0]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.0.6...v1.1.0
 [1.0.6]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.0.5...v1.0.6
 [1.0.5]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.0.4...v1.0.5
