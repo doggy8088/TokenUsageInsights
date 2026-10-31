@@ -2,10 +2,12 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  buildSessionParentIndex,
   compareSessionRows,
   filterEntriesBySessionIdentity,
   matchesSessionIdentity,
   parentSessionIdentityKey,
+  rootSessionIdentityKey,
   sessionIdentityKey,
   sessionSearchMatchKey,
 } from '../static/session-utils.js';
@@ -269,4 +271,274 @@ test('search match keys keep colliding standalone and synthetic child selectable
     parentSessionIdentityKey(matchRows[1], [parentRow]),
     sessionIdentityKey(parentRow),
   );
+});
+
+test('session parent index matches uncached lookups across edge fixtures', () => {
+  // 覆蓋：獨立 `a__b`、合成子 Agent、巢狀鏈、父列缺席、多候選歧義、
+  // 重複列、成環（含環前尾巴）。快取／索引結果必須與未快取的
+  // parentSessionIdentityKey／rootSessionIdentityKey 完全一致。
+  const standalone = {
+    session_id: 'a__b',
+    parent_session_id: null,
+    assistant_type: 'copilot',
+    source_kind: 'copilot-app',
+    source_dir_key: 'aa',
+  };
+  const parentRow = {
+    session_id: 'a',
+    parent_session_id: null,
+    assistant_type: 'copilot',
+    source_kind: 'copilot-app',
+    source_dir_key: 'aa',
+  };
+  const syntheticChild = {
+    session_id: 'a__b',
+    parent_session_id: 'a',
+    assistant_type: 'copilot',
+    source_kind: 'copilot-app',
+    source_dir_key: 'aa',
+    agent_nickname: 'b',
+  };
+  const chainRoot = {
+    session_id: 'parent-uuid',
+    parent_session_id: null,
+    assistant_type: 'claude',
+    source_kind: 'legacy',
+    source_dir_key: null,
+  };
+  const chainChild = {
+    session_id: 'agent-a1',
+    parent_session_id: 'parent-uuid',
+    assistant_type: 'claude',
+    source_kind: 'legacy',
+    source_dir_key: null,
+  };
+  const chainGrandchild = {
+    session_id: 'agent-a2',
+    parent_session_id: 'agent-a1',
+    assistant_type: 'claude',
+    source_kind: 'legacy',
+    source_dir_key: null,
+  };
+  const orphan = {
+    session_id: 'orphan',
+    parent_session_id: 'ghost',
+    assistant_type: 'claude',
+    source_kind: 'legacy',
+    source_dir_key: null,
+  };
+  // 多候選歧義：兩列同 session_id `p`、同來源三欄，父層解析只能退回
+  // 「父層為 root」鍵。
+  const ambiguousOne = {
+    session_id: 'p',
+    parent_session_id: 'x',
+    assistant_type: 'pi',
+    source_kind: 'legacy',
+    source_dir_key: null,
+  };
+  const ambiguousTwo = {
+    session_id: 'p',
+    parent_session_id: 'y',
+    assistant_type: 'pi',
+    source_kind: 'legacy',
+    source_dir_key: null,
+  };
+  const ambiguousChild = {
+    session_id: 'p__c',
+    parent_session_id: 'p',
+    assistant_type: 'pi',
+    source_kind: 'legacy',
+    source_dir_key: null,
+  };
+  // 重複列（同身分鍵兩列）依舊版語意算「多候選」→ parentAsRootKey，
+  // 索引不得去重後誤走「唯一候選」分支。
+  const duplicateParent = {
+    session_id: 'dup',
+    parent_session_id: 'z',
+    assistant_type: 'mcode',
+    source_kind: 'legacy',
+    source_dir_key: null,
+  };
+  const duplicateChild = {
+    session_id: 'dup__c',
+    parent_session_id: 'dup',
+    assistant_type: 'mcode',
+    source_kind: 'legacy',
+    source_dir_key: null,
+  };
+  // 成環 a1 ⇄ a2，外加環前尾巴 tail → a1。
+  const cycleA1 = {
+    session_id: 'a1',
+    parent_session_id: 'a2',
+    assistant_type: 'grok',
+    source_kind: 'legacy',
+    source_dir_key: null,
+  };
+  const cycleA2 = {
+    session_id: 'a2',
+    parent_session_id: 'a1',
+    assistant_type: 'grok',
+    source_kind: 'legacy',
+    source_dir_key: null,
+  };
+  const cycleTail = {
+    session_id: 'tail',
+    parent_session_id: 'a1',
+    assistant_type: 'grok',
+    source_kind: 'legacy',
+    source_dir_key: null,
+  };
+
+  const sessions = [
+    standalone,
+    parentRow,
+    syntheticChild,
+    chainRoot,
+    chainChild,
+    chainGrandchild,
+    orphan,
+    ambiguousOne,
+    ambiguousTwo,
+    ambiguousChild,
+    duplicateParent,
+    { ...duplicateParent },
+    duplicateChild,
+    cycleA1,
+    cycleA2,
+    cycleTail,
+  ];
+
+  const index = buildSessionParentIndex(sessions);
+  for (const row of sessions) {
+    assert.equal(
+      index.parentKeyOf(row),
+      parentSessionIdentityKey(row, sessions),
+      `parentKeyOf 與未快取結果不一致: ${row.session_id}`,
+    );
+    assert.equal(
+      index.rootKeyOf(row),
+      rootSessionIdentityKey(row, sessions),
+      `rootKeyOf 與未快取結果不一致: ${row.session_id}`,
+    );
+    // 重複查找結果必須穩定（快取不得改變語意）。
+    assert.equal(index.parentKeyOf(row), parentSessionIdentityKey(row, sessions));
+    assert.equal(index.rootKeyOf(row), rootSessionIdentityKey(row, sessions));
+  }
+
+  // 關鍵語意鎖定（獨立於兩個實作的固定值）：
+  // 獨立 session `a__b` 與合成子 Agent `a__b` 是兩個身分，但子 Agent 仍
+  // 必須連回父列的完整 5 元鍵（f743b2e／1043bcd 不變量）。
+  assert.notEqual(sessionIdentityKey(standalone), sessionIdentityKey(syntheticChild));
+  assert.equal(index.parentKeyOf(syntheticChild), sessionIdentityKey(parentRow));
+  assert.equal(index.rootKeyOf(syntheticChild), sessionIdentityKey(parentRow));
+  assert.equal(index.rootKeyOf(standalone), sessionIdentityKey(standalone));
+
+  // 巢狀鏈：孫列連到「父列的完整身分鍵」（含父列自己的 parent_session_id）。
+  assert.equal(index.parentKeyOf(chainGrandchild), sessionIdentityKey(chainChild));
+  assert.equal(index.rootKeyOf(chainGrandchild), sessionIdentityKey(chainRoot));
+
+  // 父列缺席 → 「父層為 root」鍵；根節點仍是自己。
+  assert.equal(
+    index.parentKeyOf(orphan),
+    sessionIdentityKey({ ...orphan, session_id: 'ghost', parent_session_id: null }),
+  );
+  assert.equal(index.rootKeyOf(orphan), sessionIdentityKey(orphan));
+
+  // 多候選歧義與重複列 → parentAsRootKey。
+  assert.equal(
+    index.parentKeyOf(ambiguousChild),
+    sessionIdentityKey({ ...ambiguousChild, session_id: 'p', parent_session_id: null }),
+  );
+  assert.equal(
+    index.parentKeyOf(duplicateChild),
+    sessionIdentityKey({ ...duplicateChild, session_id: 'dup', parent_session_id: null }),
+  );
+
+  // 成環：環上每個節點（含環前尾巴）都結案到環上最小字序身分鍵
+  // （getRootParentKey 既有處理，app.js hover 依賴此行為）。
+  const cycleMin = [sessionIdentityKey(cycleA1), sessionIdentityKey(cycleA2)]
+    .sort((a, b) => a.localeCompare(b))[0];
+  assert.equal(index.rootKeyOf(cycleA1), cycleMin);
+  assert.equal(index.rootKeyOf(cycleA2), cycleMin);
+  assert.equal(index.rootKeyOf(cycleTail), cycleMin);
+});
+
+test('session parent index lookups never rescan the sessions array', () => {
+  // 以 Proxy 計算 sessions 陣列的「元素讀取次數」（掃描次數）作為決定性
+  // 量測：建索引 O(N) 走訪一次，之後每次 parentKeyOf／rootKeyOf 都是
+  // O(1) 查表、0 次陣列走訪。實作退化回線性掃描（f743b2e 的二次方回歸，
+  // comment 4436837586）即紅燈。不使用任何計時斷言。
+  const rows = [
+    {
+      session_id: 'parent',
+      parent_session_id: null,
+      assistant_type: 'copilot',
+      source_kind: 'copilot-app',
+      source_dir_key: 'aa',
+    },
+    ...Array.from({ length: 6 }, (_, i) => ({
+      session_id: `parent__agent-${i}`,
+      parent_session_id: 'parent',
+      assistant_type: 'copilot',
+      source_kind: 'copilot-app',
+      source_dir_key: 'aa',
+    })),
+    {
+      session_id: 'a1',
+      parent_session_id: 'a2',
+      assistant_type: 'grok',
+      source_kind: 'legacy',
+      source_dir_key: null,
+    },
+    {
+      session_id: 'a2',
+      parent_session_id: 'a1',
+      assistant_type: 'grok',
+      source_kind: 'legacy',
+      source_dir_key: null,
+    },
+    {
+      session_id: 'tail',
+      parent_session_id: 'a1',
+      assistant_type: 'grok',
+      source_kind: 'legacy',
+      source_dir_key: null,
+    },
+  ];
+
+  let elementReads = 0;
+  let iterations = 0;
+  const proxy = new Proxy(rows, {
+    get(target, prop, receiver) {
+      if (typeof prop === 'string' && /^(0|[1-9][0-9]*)$/.test(prop)) {
+        elementReads += 1;
+      }
+      if (prop === Symbol.iterator) {
+        iterations += 1;
+      }
+      return Reflect.get(target, prop, receiver);
+    },
+  });
+
+  const index = buildSessionParentIndex(proxy);
+  const buildReads = elementReads;
+  assert.equal(iterations, 1, '建索引只應走訪 sessions 一次');
+  assert.ok(
+    buildReads <= rows.length * 2,
+    `建索引應為 O(N)，實測 ${buildReads} 次元素讀取（N=${rows.length}）`,
+  );
+
+  const readsAfterBuild = elementReads;
+  for (let round = 0; round < 1000; round += 1) {
+    for (const row of rows) {
+      index.parentKeyOf(row);
+      index.rootKeyOf(row);
+    }
+  }
+  assert.equal(
+    elementReads,
+    readsAfterBuild,
+    '每次 parentKeyOf／rootKeyOf 都必須 O(1) 查表，不得重新掃描 sessions',
+  );
+  assert.equal(iterations, 1);
 });

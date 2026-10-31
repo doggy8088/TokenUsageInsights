@@ -8,13 +8,13 @@ import {
   getChartDataPointX,
 } from './chart-utils.js?v=10';
 import {
+  buildSessionParentIndex,
   compareSessionRows,
   filterEntriesBySessionIdentity,
   matchesSessionIdentity,
-  parentSessionIdentityKey,
   sessionIdentityKey,
   sessionSearchMatchKey,
-} from './session-utils.js?v=5';
+} from './session-utils.js?v=6';
 import { parseUsageTimestamp } from './time-utils.js?v=1';
 
 // Globals
@@ -3122,6 +3122,9 @@ function renderDashboard(data) {
     && nextSearchFingerprint !== currentSessionSearchDataFingerprint;
   currentSessionSearchDataFingerprint = nextSearchFingerprint;
   currentSessions = [...allSessions];
+  // 每次 master sessions 更新即預建父層／根節點索引（無篩選時下游建樹
+  // 直接重用；衍生陣列由呼叫端重建，見 sessionParentIndexFor）。
+  sessionParentIndexFor(currentSessions);
   updateSessionCwdFilterOptions(currentSessions);
   if (activeTab === 'daily') {
     updateUrlParams();
@@ -4524,7 +4527,23 @@ async function executeSessionPromptSearch(query, searchContext) {
   }
 }
 
+// 依當代 sessions 陣列取得（或建立）父層／根節點查找索引。索引以陣列
+// 參照識別世代：同一陣列重複查詢直接重用，衍生出的新陣列（篩選、扁平化）
+// 各自重建，確保查找結果與當代資料一致（comment 4436837586）。
+let sessionParentIndexSource = null;
+let sessionParentIndexValue = null;
+
+function sessionParentIndexFor(sessions) {
+  if (sessionParentIndexValue && sessionParentIndexSource === sessions) {
+    return sessionParentIndexValue;
+  }
+  sessionParentIndexValue = buildSessionParentIndex(sessions);
+  sessionParentIndexSource = sessions;
+  return sessionParentIndexValue;
+}
+
 function sortAndGetFlatSessions(sessions, sortCol, sortDir) {
+  const parentIndex = sessionParentIndexFor(sessions);
   const map = new Map();
   sessions.forEach(s => {
     map.set(sessionIdentityKey(s), { ...s, children: [] });
@@ -4533,7 +4552,7 @@ function sortAndGetFlatSessions(sessions, sortCol, sortDir) {
   const nodes = [...map.values()];
   const roots = [];
   nodes.forEach(item => {
-    const parentKey = parentSessionIdentityKey(item, sessions);
+    const parentKey = parentIndex.parentKeyOf(item);
     const parent = parentKey ? map.get(parentKey) : null;
     if (parent && parent !== item) {
       parent.children.push(item);
@@ -4655,6 +4674,7 @@ function getCursorModeBadge(mode) {
 }
 
 function renderSessionTable(sessions) {
+  const parentIndex = sessionParentIndexFor(sessions);
   const tbody = document.getElementById('session-list-body');
   const sessionCount = document.getElementById('session-count');
   const cwdFilteredTotal = currentSessionCwdFilter
@@ -4701,45 +4721,14 @@ function renderSessionTable(sessions) {
     return;
   }
 
-  // 建立快速查詢 Map 以供 Hover 高亮與樹狀結構查詢
-  const sessionsMap = new Map();
-  sessions.forEach(s => {
-    sessionsMap.set(sessionIdentityKey(s), s);
-  });
-
-  function getRootParentKey(session) {
-    let curr = session;
-    const path = [];
-    const positions = new Map();
-
-    while (curr) {
-      const key = sessionIdentityKey(curr);
-      if (positions.has(key)) {
-        return path
-          .slice(positions.get(key))
-          .map(node => sessionIdentityKey(node))
-          .sort((a, b) => a.localeCompare(b))[0];
-      }
-
-      positions.set(key, path.length);
-      path.push(curr);
-
-      const parentKey = parentSessionIdentityKey(curr, sessions);
-      if (!parentKey || !sessionsMap.has(parentKey)) {
-        return key;
-      }
-      curr = sessionsMap.get(parentKey);
-    }
-
-    return sessionIdentityKey(session);
-  }
-
+  // 逐列建立 Session 資料列（身分／父層／根節點鍵由預建索引 O(1) 取得）
   sessions.forEach(s => {
     const tr = document.createElement('tr');
     tr.setAttribute('data-session-id', s.session_id);
     tr.setAttribute('data-parent-id', s.parent_session_id || '');
     tr.setAttribute('data-session-key', sessionIdentityKey(s));
-    tr.setAttribute('data-parent-key', parentSessionIdentityKey(s, sessions) || '');
+    tr.setAttribute('data-parent-key', parentIndex.parentKeyOf(s) || '');
+    tr.setAttribute('data-root-key', parentIndex.rootKeyOf(s) || '');
 
     if (s.isSubagent) {
       tr.classList.add('subagent-row');
@@ -4824,15 +4813,17 @@ function renderSessionTable(sessions) {
       openSessionTimeline(s);
     });
 
-    // 群組 Hover 高亮
+    // 群組 Hover 高亮：比對預先寫入的 data-root-key／data-parent-key／
+    // data-session-key，每次 mouseenter 只做 O(列數) DOM 操作，不再逐列
+    // 重算根節點（comment 4436837586）。
     tr.addEventListener('mouseenter', () => {
-      const rootKey = getRootParentKey(s);
+      const rootKey = tr.getAttribute('data-root-key');
       tbody.querySelectorAll('tr').forEach(row => {
         const sid = row.getAttribute('data-session-key');
         const pid = row.getAttribute('data-parent-key');
-        const rowSession = sessionsMap.get(sid);
-        
-        if (sid === rootKey || pid === rootKey || (rowSession && getRootParentKey(rowSession) === rootKey)) {
+        const rowRootKey = row.getAttribute('data-root-key');
+
+        if (sid === rootKey || pid === rootKey || rowRootKey === rootKey) {
           row.classList.add('family-highlight');
         }
       });
