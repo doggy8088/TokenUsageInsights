@@ -1083,4 +1083,43 @@ mod tests {
             assert!(was_warned, "其他缺少價格規則的模型仍應提示錯誤");
         }
     }
+
+    /// Regression (code review comment 4403291365): a standalone session whose
+    /// id equals a synthetic sub-agent id (`<parent>__<agent>`) must not merge
+    /// with that sub-agent when sessions are grouped for the daily summary.
+    #[test]
+    fn group_sessions_keeps_colliding_standalone_and_synthetic_child_separate() {
+        let mut standalone = summary_entry(1, "gpt-5", token_stats(100, 0, 0), true);
+        standalone.session_id = "a__b".to_string();
+        standalone.source_kind = Some("copilot-app".to_string());
+        standalone.source_dir_key = Some("aa".to_string());
+
+        let mut child = summary_entry(1, "gpt-5", token_stats(900, 0, 0), true);
+        child.session_id = "a__b".to_string();
+        child.source_kind = Some("copilot-app".to_string());
+        child.source_dir_key = Some("aa".to_string());
+        child.parent_session_id = Some("a".to_string());
+        child.agent_nickname = Some("b".to_string());
+
+        let entries = [standalone, child];
+        let sessions = group_sessions(entries.iter().map(|entry| (entry, "copilot")));
+
+        assert_eq!(
+            sessions.len(),
+            2,
+            "獨立 session a__b 與 session a 的子 Agent b 必須分組成兩個 session"
+        );
+        let mut totals: Vec<u64> = sessions
+            .values()
+            .map(|group| {
+                group
+                    .entries
+                    .iter()
+                    .filter_map(|entry| entry.delta_tokens.as_ref().map(|tokens| tokens.input))
+                    .sum()
+            })
+            .collect();
+        totals.sort();
+        assert_eq!(totals, vec![100, 900], "兩組用量不得互相合併");
+    }
 }

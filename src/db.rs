@@ -7663,6 +7663,64 @@ pub fn rollback_usage_import_batch(
     })
 }
 
+/// Selects which `parent_session_id` row-set a session detail query targets.
+///
+/// Copilot App / CLI sub-agent calls are stored under a synthetic
+/// `<parent>__<agent>` session id with `parent_session_id = <parent>`, so a
+/// standalone session whose id happens to contain `__` (e.g. `a__b`) shares
+/// its `session_id` with session `a`'s sub-agent `b`. Every session detail
+/// query must therefore scope by `parent_session_id` in addition to
+/// `(assistant_type, session_id, source_kind, source_dir_key)`; otherwise the
+/// two row-sets merge in the per-turn usage and the sub-agent cannot be
+/// selected alone (review comment 4403291365).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParentSessionScope<'a> {
+    /// Legacy behaviour for callers that do not pass a parent: no
+    /// `parent_session_id` predicate at all, preserving the pre-existing API
+    /// behaviour exactly (main-session lookups are unaffected).
+    Unfiltered,
+    /// Only main-agent / standalone rows (`parent_session_id IS NULL`).
+    RootOnly,
+    /// Only sub-agent rows of the given parent (`parent_session_id = ?`).
+    ChildOf(&'a str),
+}
+
+impl<'a> ParentSessionScope<'a> {
+    /// The effective `parent_session_id` predicate: `None` means no filter
+    /// ([`Self::Unfiltered`]), `Some(None)` means `parent_session_id IS NULL`
+    /// and `Some(Some(p))` means `parent_session_id = p`.
+    fn parent_filter(&self) -> Option<Option<String>> {
+        match self {
+            Self::Unfiltered => None,
+            Self::RootOnly => Some(None),
+            Self::ChildOf(parent) => Some(Some((*parent).to_string())),
+        }
+    }
+
+    /// Appends the `parent_session_id` predicate for this scope, if any.
+    fn push_filter(&self, sql: &mut String, params: &mut Vec<rusqlite::types::Value>) {
+        if let Some(parent_filter) = self.parent_filter() {
+            push_parent_filter(sql, params, parent_filter.as_deref());
+        }
+    }
+}
+
+/// Appends the `parent_session_id` predicate: `None` for
+/// `parent_session_id IS NULL` and `Some(p)` for `parent_session_id = p`.
+fn push_parent_filter(
+    sql: &mut String,
+    params: &mut Vec<rusqlite::types::Value>,
+    parent_filter: Option<&str>,
+) {
+    match parent_filter {
+        Some(parent) => {
+            sql.push_str(" AND parent_session_id = ?");
+            params.push(rusqlite::types::Value::Text(parent.to_string()));
+        }
+        None => sql.push_str(" AND parent_session_id IS NULL"),
+    }
+}
+
 /// Database fields required to locate and parse one concrete session source.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct SessionLookup {
@@ -7685,48 +7743,72 @@ pub struct SessionData {
 }
 
 impl SessionLookup {
+    /// Legacy entry point preserving the pre-existing behaviour for callers
+    /// that do not pass a parent ([`ParentSessionScope::Unfiltered`]).
+    #[allow(dead_code)] // 保留既有 load_data 呼叫介面（既有測試仍在使用）；正式路徑一律改走 load_data_in_parent_scope。
     pub fn load_data(
         &self,
         conn: &rusqlite::Connection,
         session_id: &str,
     ) -> Result<SessionData, String> {
+        self.load_data_in_parent_scope(conn, session_id, ParentSessionScope::Unfiltered)
+    }
+
+    /// Loads CWD, model and per-turn stats sharing one explicit
+    /// [`ParentSessionScope`], so a standalone `a__b` never absorbs session
+    /// `a`'s sub-agent `b` (and vice versa) when both exist.
+    pub fn load_data_in_parent_scope(
+        &self,
+        conn: &rusqlite::Connection,
+        session_id: &str,
+        parent_scope: ParentSessionScope<'_>,
+    ) -> Result<SessionData, String> {
         let source_kind = Some(self.source_kind.as_str());
         let source_dir_key = self.source_dir_key.as_deref();
         Ok(SessionData {
-            cwd: get_session_cwd(
+            cwd: get_session_cwd_in_parent_scope(
                 conn,
                 &self.assistant_type,
                 session_id,
                 source_kind,
                 source_dir_key,
+                parent_scope,
             )?,
-            model: get_session_model(
+            model: get_session_model_in_parent_scope(
                 conn,
                 &self.assistant_type,
                 session_id,
                 source_kind,
                 source_dir_key,
+                parent_scope,
             )?,
-            turn_stats: get_session_turns_token_stats(
+            turn_stats: get_session_turns_token_stats_in_parent_scope(
                 conn,
                 &self.assistant_type,
                 session_id,
                 source_kind,
                 source_dir_key,
+                parent_scope,
             )?,
         })
     }
 }
 
-/// Resolves the single `source_kind` used by the legacy `source_kind = None`
-/// fallback. All four session-lookup helpers
-/// ([`get_session_assistant_and_transcript`], [`get_session_cwd`],
-/// [`get_session_model`], [`get_session_turns_token_stats`]) MUST call this
-/// helper when invoked with `source_kind = None` so that the identity, CWD,
-/// model, and turn-stats lookups always pick rows from the same source — even
-/// when a single session id has rows from multiple collectors
+/// Resolves the concrete `source_kind` shared by the scoped cores of all
+/// four session-lookup helpers
+/// ([`get_session_assistant_and_transcript_in_parent_scope`],
+/// [`get_session_cwd_in_parent_scope`], [`get_session_model_in_parent_scope`],
+/// [`get_session_turns_token_stats_in_parent_scope`]). All four MUST
+/// call this helper so that the identity, CWD, model, and turn-stats lookups
+/// always pick rows from the same source within the requested parent scope —
+/// even when a single session id has rows from multiple collectors
 /// (e.g. `copilot-cli` turn 1 + `vscode-chat` turn 2, both with
-/// `source_dir_key IS NULL`).
+/// `source_dir_key IS NULL`) or is shared by a standalone session and a
+/// synthetic sub-agent id (e.g. standalone `a__b` vs. session `a`'s
+/// sub-agent `b`).
+///
+/// Returns the resolved `source_kind`, honouring the optional
+/// `parent_session_id` predicate of `parent_scope`.
 ///
 /// Behaviour:
 ///
@@ -7735,26 +7817,27 @@ impl SessionLookup {
 ///   call sites that always pass a concrete `source_kind`.
 /// * `source_kind = None` — runs a single, parameter-bound query against
 ///   `usage_entries` matching `(assistant_type, session_id, source_dir_key
-///   predicate)`, ordered by the canonical tie-break:
+///   predicate)` plus the [`ParentSessionScope`] predicate (none for
+///   [`ParentSessionScope::Unfiltered`]), ordered by the canonical tie-break:
 ///   1. main agent rows first — `(parent_session_id IS NULL) DESC`,
 ///   2. `source_kind ASC`,
 ///   3. `turn_no ASC`,
 ///   4. `id ASC` (final stable tie-breaker).
 ///
-/// Returns the `source_kind` of the first row, or `None` if the query produced
-/// no rows. Never panics on empty result sets — it just returns `None`, so the
-/// downstream helper can still surface a clean "session not found" / empty
-/// result to the caller.
+/// Returns `None` if the query produced no rows. Never panics on empty result
+/// sets — it just returns `None`, so the downstream helper can still surface
+/// a clean "session not found" / empty result to the caller.
 ///
 /// `source_dir_key` follows the same semantics as the four helpers: `Some(k)`
 /// filters by `source_dir_key = k`, `None` filters by `source_dir_key IS NULL`.
 /// `None` therefore means "non-App rows only" and never "any source".
-fn resolve_session_source_kind(
+fn resolve_session_query_scope(
     conn: &rusqlite::Connection,
     assistant: &str,
     session_id: &str,
     source_kind: Option<&str>,
     source_dir_key: Option<&str>,
+    parent_scope: ParentSessionScope<'_>,
 ) -> Result<Option<String>, String> {
     if let Some(kind) = source_kind {
         return Ok(Some(kind.to_string()));
@@ -7768,12 +7851,17 @@ fn resolve_session_source_kind(
         rusqlite::types::Value::Text(assistant.to_string()),
         rusqlite::types::Value::Text(session_id.to_string()),
     ];
+    if let Some(kind) = source_kind {
+        sql.push_str(" AND source_kind = ?");
+        params_vec.push(rusqlite::types::Value::Text(kind.to_string()));
+    }
     if let Some(key) = source_dir_key {
         sql.push_str(" AND source_dir_key = ?");
         params_vec.push(rusqlite::types::Value::Text(key.to_string()));
     } else {
         sql.push_str(" AND source_dir_key IS NULL");
     }
+    parent_scope.push_filter(&mut sql, &mut params_vec);
     // Main agent rows first (parent_session_id IS NULL → 1; DESC puts them
     // ahead of subagent rows which evaluate to 0). Then `source_kind ASC`
     // for a deterministic tie-break between equally-scoped sources, then
@@ -7791,10 +7879,33 @@ fn resolve_session_source_kind(
         // The column is TEXT NOT NULL DEFAULT 'legacy' so this should always
         // be Some, but fall back to the column default if a NULL sneaks in
         // (e.g. via a future migration). This keeps the helper panic-free.
-        Ok(resolved.or_else(|| Some("legacy".to_string())))
+        Ok(Some(resolved.unwrap_or_else(|| "legacy".to_string())))
     } else {
         Ok(None)
     }
+}
+
+/// Legacy wrapper for callers that do not pass a parent session. Passes
+/// [`ParentSessionScope::Unfiltered`] (no parent filter — pre-existing
+/// behaviour) so main-session lookups keep their existing behaviour while the
+/// new scoped entry point can still disambiguate a synthetic sub-agent id
+/// that collides with a standalone session id.
+#[allow(dead_code)] // 保留既有 5 參呼叫介面給既有測試與外部呼叫端；正式路徑一律明確傳入 ParentSessionScope。
+pub fn get_session_assistant_and_transcript(
+    conn: &rusqlite::Connection,
+    assistant: &str,
+    session_id: &str,
+    source_kind: Option<&str>,
+    source_dir_key: Option<&str>,
+) -> Result<SessionLookup, String> {
+    get_session_assistant_and_transcript_in_parent_scope(
+        conn,
+        assistant,
+        session_id,
+        source_kind,
+        source_dir_key,
+        ParentSessionScope::Unfiltered,
+    )
 }
 
 /// Returns the fields required to locate and parse a given session id.
@@ -7824,34 +7935,45 @@ fn resolve_session_source_kind(
 /// them to locate the shared `events.jsonl` under the parent session
 /// directory and to filter events by agent id, so it must NOT derive the
 /// parent/agent from string-splitting the synthetic id.
-pub fn get_session_assistant_and_transcript(
+pub fn get_session_assistant_and_transcript_in_parent_scope(
     conn: &rusqlite::Connection,
     assistant: &str,
     session_id: &str,
     source_kind: Option<&str>,
     source_dir_key: Option<&str>,
+    parent_scope: ParentSessionScope<'_>,
 ) -> Result<SessionLookup, String> {
     // Build a deterministic query:
     // - When source_kind is provided, filter by it exactly.
     // - When source_dir_key is Some, filter by source_dir_key = ?.
     // - When source_dir_key is None, filter by source_dir_key IS NULL.
     //   This ensures None means "no source directory" (non-App), not "any".
-    // - When source_kind is None (legacy), resolve a single source_kind via
-    //   `resolve_session_source_kind` and then filter by it. This keeps the
+    // - The `ParentSessionScope` adds an optional `parent_session_id`
+    //   predicate (none / `IS NULL` / `= ?`), so the detail page can select a
+    //   synthetic sub-agent alone even when a standalone session shares its
+    //   id.
+    // - When source_kind is None (legacy), resolve a single `source_kind`
+    //   via `resolve_session_query_scope` (which also honours the parent
+    //   predicate) and then filter by it. This keeps the
     //   legacy `None` fallback consistent with the other three session
     //   helpers (`get_session_cwd`, `get_session_model`,
     //   `get_session_turns_token_stats`) so identity, CWD, model, and turn
     //   stats always observe the same source row even when the same
     //   session_id has rows from multiple collectors (e.g. `copilot-cli`
     //   turn 1 + `vscode-chat` turn 2, both with `source_dir_key IS NULL`).
-    let resolved_source_kind =
-        resolve_session_source_kind(conn, assistant, session_id, source_kind, source_dir_key)?;
-    // No matching row exists; mirror the previous "Session not found" error
-    // so callers see the same behaviour when the legacy lookup has nothing
-    // to fall back on.
-    let resolved_source_kind = match resolved_source_kind {
-        Some(k) => k,
-        None => return Err("Session not found".to_string()),
+    let Some(resolved_source_kind) = resolve_session_query_scope(
+        conn,
+        assistant,
+        session_id,
+        source_kind,
+        source_dir_key,
+        parent_scope,
+    )?
+    else {
+        // No matching row exists; mirror the previous "Session not found" error
+        // so callers see the same behaviour when the legacy lookup has nothing
+        // to fall back on.
+        return Err("Session not found".to_string());
     };
 
     let mut sql = String::from(
@@ -7873,6 +7995,7 @@ pub fn get_session_assistant_and_transcript(
         // None means source_dir_key IS NULL (non-App rows only).
         sql.push_str(" AND source_dir_key IS NULL");
     }
+    parent_scope.push_filter(&mut sql, &mut params_vec);
 
     // Deterministic ordering: main agent rows first
     // (`(parent_session_id IS NULL) DESC` puts NULL/main rows ahead of
@@ -7919,6 +8042,9 @@ pub fn get_session_assistant_and_transcript(
     }
 }
 
+/// Legacy wrapper for callers that do not pass a parent session (see
+/// [`ParentSessionScope::Unfiltered`]).
+#[allow(dead_code)] // 保留既有 5 參呼叫介面給既有測試與外部呼叫端；正式路徑一律明確傳入 ParentSessionScope。
 pub fn get_session_cwd(
     conn: &rusqlite::Connection,
     assistant: &str,
@@ -7926,18 +8052,42 @@ pub fn get_session_cwd(
     source_kind: Option<&str>,
     source_dir_key: Option<&str>,
 ) -> Result<Option<String>, String> {
+    get_session_cwd_in_parent_scope(
+        conn,
+        assistant,
+        session_id,
+        source_kind,
+        source_dir_key,
+        ParentSessionScope::Unfiltered,
+    )
+}
+
+pub fn get_session_cwd_in_parent_scope(
+    conn: &rusqlite::Connection,
+    assistant: &str,
+    session_id: &str,
+    source_kind: Option<&str>,
+    source_dir_key: Option<&str>,
+    parent_scope: ParentSessionScope<'_>,
+) -> Result<Option<String>, String> {
     // None means source_dir_key IS NULL (non-App rows only), not "any source".
     // The legacy `source_kind = None` path MUST resolve a single
-    // `source_kind` via `resolve_session_source_kind` so the CWD lookup
-    // always observes the same source row as identity / model / turn
-    // stats; otherwise a session_id with rows from multiple collectors
-    // (e.g. `copilot-cli` turn 1 + `vscode-chat` turn 2, both
-    // `source_dir_key IS NULL`) could leak CWD from a different source.
-    let resolved_source_kind =
-        resolve_session_source_kind(conn, assistant, session_id, source_kind, source_dir_key)?;
-    let resolved_source_kind = match resolved_source_kind {
-        Some(k) => k,
-        None => return Ok(None),
+    // `source_kind` via `resolve_session_query_scope` (which also honours
+    // the `ParentSessionScope` predicate) so the CWD lookup always observes
+    // the same source row as identity / model / turn stats; otherwise a
+    // session_id with rows from multiple collectors (e.g. `copilot-cli`
+    // turn 1 + `vscode-chat` turn 2, both `source_dir_key IS NULL`) or a
+    // colliding synthetic sub-agent id could leak CWD from a different row.
+    let Some(resolved_source_kind) = resolve_session_query_scope(
+        conn,
+        assistant,
+        session_id,
+        source_kind,
+        source_dir_key,
+        parent_scope,
+    )?
+    else {
+        return Ok(None);
     };
 
     let mut sql = String::from(
@@ -7956,6 +8106,7 @@ pub fn get_session_cwd(
     } else {
         sql.push_str(" AND source_dir_key IS NULL");
     }
+    parent_scope.push_filter(&mut sql, &mut params_vec);
     sql.push_str(
         " ORDER BY (parent_session_id IS NULL) DESC, source_kind ASC, turn_no ASC, id ASC LIMIT 1",
     );
@@ -7968,6 +8119,26 @@ pub fn get_session_cwd(
     } else {
         Ok(None)
     }
+}
+
+/// Legacy wrapper for callers that do not pass a parent session (see
+/// [`ParentSessionScope::Unfiltered`]).
+#[allow(dead_code)] // 保留既有 5 參呼叫介面給既有測試與外部呼叫端；正式路徑一律明確傳入 ParentSessionScope。
+pub fn get_session_model(
+    conn: &rusqlite::Connection,
+    assistant: &str,
+    session_id: &str,
+    source_kind: Option<&str>,
+    source_dir_key: Option<&str>,
+) -> Result<Option<String>, String> {
+    get_session_model_in_parent_scope(
+        conn,
+        assistant,
+        session_id,
+        source_kind,
+        source_dir_key,
+        ParentSessionScope::Unfiltered,
+    )
 }
 
 /// Returns the canonical model for a session row from the database.
@@ -7983,24 +8154,32 @@ pub fn get_session_cwd(
 /// `source_dir_key` mirrors the same scoping as [`get_session_cwd`] and
 /// [`get_session_turns_token_stats`]. Returns `None` when the session has no
 /// model column populated (caller then falls back to the parser default).
-pub fn get_session_model(
+pub fn get_session_model_in_parent_scope(
     conn: &rusqlite::Connection,
     assistant: &str,
     session_id: &str,
     source_kind: Option<&str>,
     source_dir_key: Option<&str>,
+    parent_scope: ParentSessionScope<'_>,
 ) -> Result<Option<String>, String> {
     // None means source_dir_key IS NULL (non-App rows only), not "any source".
     // The legacy `source_kind = None` path MUST resolve a single
-    // `source_kind` via `resolve_session_source_kind` so the model lookup
-    // always observes the same source row as identity / CWD / turn stats;
-    // otherwise a session_id with rows from multiple collectors could leak
-    // the model from a different source.
-    let resolved_source_kind =
-        resolve_session_source_kind(conn, assistant, session_id, source_kind, source_dir_key)?;
-    let resolved_source_kind = match resolved_source_kind {
-        Some(k) => k,
-        None => return Ok(None),
+    // `source_kind` via `resolve_session_query_scope` (which also honours
+    // the `ParentSessionScope` predicate) so the model lookup always
+    // observes the same source row as identity / CWD / turn stats;
+    // otherwise a
+    // session_id with rows from multiple collectors could leak the model
+    // from a different source.
+    let Some(resolved_source_kind) = resolve_session_query_scope(
+        conn,
+        assistant,
+        session_id,
+        source_kind,
+        source_dir_key,
+        parent_scope,
+    )?
+    else {
+        return Ok(None);
     };
 
     let mut sql = String::from(
@@ -8019,6 +8198,7 @@ pub fn get_session_model(
     } else {
         sql.push_str(" AND source_dir_key IS NULL");
     }
+    parent_scope.push_filter(&mut sql, &mut params_vec);
     sql.push_str(
         " ORDER BY (parent_session_id IS NULL) DESC, source_kind ASC, turn_no ASC, id ASC LIMIT 1",
     );
@@ -8039,6 +8219,9 @@ fn add_optional_token_total(current: &mut Option<u64>, incoming: Option<u64>) {
     }
 }
 
+/// Legacy wrapper for callers that do not pass a parent session (see
+/// [`ParentSessionScope::Unfiltered`]).
+#[allow(dead_code)] // 保留既有 5 參呼叫介面給既有測試與外部呼叫端；正式路徑一律明確傳入 ParentSessionScope。
 pub fn get_session_turns_token_stats(
     conn: &rusqlite::Connection,
     assistant: &str,
@@ -8046,22 +8229,46 @@ pub fn get_session_turns_token_stats(
     source_kind: Option<&str>,
     source_dir_key: Option<&str>,
 ) -> Result<HashMap<u32, (TokenStats, String)>, String> {
+    get_session_turns_token_stats_in_parent_scope(
+        conn,
+        assistant,
+        session_id,
+        source_kind,
+        source_dir_key,
+        ParentSessionScope::Unfiltered,
+    )
+}
+
+pub fn get_session_turns_token_stats_in_parent_scope(
+    conn: &rusqlite::Connection,
+    assistant: &str,
+    session_id: &str,
+    source_kind: Option<&str>,
+    source_dir_key: Option<&str>,
+    parent_scope: ParentSessionScope<'_>,
+) -> Result<HashMap<u32, (TokenStats, String)>, String> {
     let mut map: HashMap<u32, (TokenStats, String)> = HashMap::new();
     // None means source_dir_key IS NULL (non-App rows only), not "any source".
     // The legacy `source_kind = None` path MUST resolve a single
-    // `source_kind` via `resolve_session_source_kind` so the turn-stats
-    // lookup always observes the same source row as identity / CWD / model
-    // AND so all returned turns come from a single collector. Without
-    // resolving first, the previous per-turn "first row encountered" rule
-    // could mix rows from different sources (e.g. `copilot-cli` turn 1 +
-    // `vscode-chat` turn 2, both `source_dir_key IS NULL`) into a single
-    // map, violating the "legacy fallback must pick a single source"
-    // contract.
-    let resolved_source_kind =
-        resolve_session_source_kind(conn, assistant, session_id, source_kind, source_dir_key)?;
-    let resolved_source_kind = match resolved_source_kind {
-        Some(k) => k,
-        None => return Ok(map),
+    // `source_kind` via `resolve_session_query_scope` (which also honours
+    // the `ParentSessionScope` predicate) so the turn-stats lookup always
+    // observes the same source row as identity / CWD / model AND so all
+    // returned turns come from a single collector and a single parent scope.
+    // Without resolving first, the previous per-turn "first row encountered"
+    // rule could mix rows from different sources (e.g. `copilot-cli` turn 1 +
+    // `vscode-chat` turn 2, both `source_dir_key IS NULL`) or a colliding
+    // synthetic sub-agent id into a single map, violating the "legacy
+    // fallback must pick a single source" contract.
+    let Some(resolved_source_kind) = resolve_session_query_scope(
+        conn,
+        assistant,
+        session_id,
+        source_kind,
+        source_dir_key,
+        parent_scope,
+    )?
+    else {
+        return Ok(map);
     };
 
     let mut sql = String::from(
@@ -8080,6 +8287,7 @@ pub fn get_session_turns_token_stats(
     } else {
         sql.push_str(" AND source_dir_key IS NULL");
     }
+    parent_scope.push_filter(&mut sql, &mut params_vec);
     // Order by turn_no first so the per-turn map mirrors natural turn order.
     // Within the same turn_no, prefer main agent rows
     // (`(parent_session_id IS NULL) DESC` puts NULL/main rows ahead of
@@ -22295,5 +22503,164 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// Regression for code review comment 4403291365 (thread
+    /// PRRT_kwDOTOgsec6xOCAC): a standalone session whose id happens to equal
+    /// a Copilot App synthetic sub-agent id (`<parent>__<agent>`) must stay
+    /// separate from that sub-agent in `SessionIdentity::from_entry`, in the
+    /// grouping that feeds the daily summary, and in the per-turn detail
+    /// queries. Before the fix both rows merged into one session
+    /// (100 + 900 = 1000) and the detail page could not select the
+    /// sub-agent alone.
+    #[test]
+    fn copilot_app_standalone_session_colliding_with_synthetic_child_stays_separate() {
+        use crate::session_identity::SessionIdentity;
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // Standalone session literally named `a__b`: 1 call, 100 input tokens.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, model, usage_identity,
+                tokens_input, tokens_output, tokens_total,
+                delta_input, delta_output, delta_total
+             ) VALUES (
+                'copilot', 'copilot-app', 'aa', '2026-07-20T10:00:00Z', '2026-07-20',
+                'a__b', 1, 'gpt-5', 'source=aa;call=0001',
+                100, 10, 110,
+                100, 10, 110
+             )",
+            [],
+        )
+        .unwrap();
+        // Session `a` with sub-agent `b` stored under the synthetic id `a__b`
+        // (parent_session_id = 'a'): 1 call, 900 input tokens.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, model, usage_identity,
+                tokens_input, tokens_output, tokens_total,
+                delta_input, delta_output, delta_total,
+                parent_session_id, agent_nickname
+             ) VALUES (
+                'copilot', 'copilot-app', 'aa', '2026-07-20T10:00:30Z', '2026-07-20',
+                'a__b', 1, 'gpt-5', 'source=aa;call=0002',
+                900, 90, 990,
+                900, 90, 990,
+                'a', 'b'
+             )",
+            [],
+        )
+        .unwrap();
+
+        let records = get_usage_entries_by_date(&conn, "2026-07-20", "copilot").unwrap();
+        assert_eq!(records.len(), 2);
+        let standalone_record = records
+            .iter()
+            .find(|row| row.record.entry.parent_session_id.is_none())
+            .expect("應存在獨立 session a__b 的資料列");
+        let child_record = records
+            .iter()
+            .find(|row| row.record.entry.parent_session_id.is_some())
+            .expect("應存在 session a 的子 Agent b 資料列");
+
+        // 1) SessionIdentity::from_entry must yield two distinct keys.
+        let standalone_identity = SessionIdentity::from_entry(
+            &standalone_record.assistant_type,
+            &standalone_record.record.entry,
+        );
+        let child_identity =
+            SessionIdentity::from_entry(&child_record.assistant_type, &child_record.record.entry);
+        assert_ne!(
+            standalone_identity, child_identity,
+            "獨立 session a__b 與 session a 的子 Agent b 必須是兩個不同的 session 身分"
+        );
+
+        // 2) The grouping that feeds the daily summary must list two sessions
+        // (`aggregate_usage_details` pushes one SessionSummary per group and
+        // reports summary.total_sessions = sessions_map.len()).
+        let sessions_map = crate::reporting::group_sessions(
+            records
+                .iter()
+                .map(|row| (&row.record.entry, row.assistant_type.as_str())),
+        );
+        assert_eq!(
+            sessions_map.len(),
+            2,
+            "每日彙總必須分開列出兩個 session，而不是合併成單一 session"
+        );
+        let mut totals: Vec<u64> = sessions_map
+            .values()
+            .map(|group| {
+                group
+                    .entries
+                    .iter()
+                    .filter_map(|entry| entry.delta_tokens.as_ref().map(|tokens| tokens.input))
+                    .sum()
+            })
+            .collect();
+        totals.sort();
+        assert_eq!(totals, vec![100, 900], "兩組回合用量不得互相合併");
+
+        // 3) The detail page must be able to select each row-set alone with
+        // the parent-scoped queries (added by this fix — no API parameter
+        // could express this selection before).
+        let child_turns = get_session_turns_token_stats_in_parent_scope(
+            &conn,
+            "copilot",
+            "a__b",
+            Some("copilot-app"),
+            Some("aa"),
+            ParentSessionScope::ChildOf("a"),
+        )
+        .unwrap();
+        assert_eq!(
+            child_turns.get(&1).unwrap().0.input,
+            900,
+            "子 Agent 選取必須只回傳自己的 900 tokens"
+        );
+        let root_turns = get_session_turns_token_stats_in_parent_scope(
+            &conn,
+            "copilot",
+            "a__b",
+            Some("copilot-app"),
+            Some("aa"),
+            ParentSessionScope::RootOnly,
+        )
+        .unwrap();
+        assert_eq!(
+            root_turns.get(&1).unwrap().0.input,
+            100,
+            "獨立 session 選取必須只回傳自己的 100 tokens"
+        );
+        let child_lookup = get_session_assistant_and_transcript_in_parent_scope(
+            &conn,
+            "copilot",
+            "a__b",
+            Some("copilot-app"),
+            Some("aa"),
+            ParentSessionScope::ChildOf("a"),
+        )
+        .unwrap();
+        assert_eq!(
+            child_lookup.parent_session_id.as_deref(),
+            Some("a"),
+            "詳細頁必須能單獨選取子 Agent"
+        );
+        assert_eq!(
+            child_lookup
+                .load_data_in_parent_scope(&conn, "a__b", ParentSessionScope::ChildOf("a"))
+                .unwrap()
+                .turn_stats
+                .get(&1)
+                .unwrap()
+                .0
+                .input,
+            900,
+            "子 Agent 詳細頁回合用量不得混入獨立 session 的 100 tokens"
+        );
     }
 }

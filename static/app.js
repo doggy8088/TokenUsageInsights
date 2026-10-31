@@ -4404,7 +4404,9 @@ function updateSessionCwdFilterOptions(sessions) {
 }
 
 function sessionSearchMatchKey(session) {
-  return sessionIdentityKey(session);
+  // 搜尋後端回傳的 match 列未帶 parent_session_id，比對時忽略父層以維持
+  // 既有過濾行為（合成 id 碰撞的兩列可能同時顯示，但不會漏掉符合列）。
+  return sessionIdentityKey({ ...session, parent_session_id: null });
 }
 
 function getSearchFilteredSessions() {
@@ -4519,7 +4521,7 @@ function sortAndGetFlatSessions(sessions, sortCol, sortDir) {
   const nodes = [...map.values()];
   const roots = [];
   nodes.forEach(item => {
-    const parentKey = parentSessionIdentityKey(item);
+    const parentKey = parentSessionIdentityKey(item, sessions);
     const parent = parentKey ? map.get(parentKey) : null;
     if (parent && parent !== item) {
       parent.children.push(item);
@@ -4710,7 +4712,7 @@ function renderSessionTable(sessions) {
       positions.set(key, path.length);
       path.push(curr);
 
-      const parentKey = parentSessionIdentityKey(curr);
+      const parentKey = parentSessionIdentityKey(curr, sessions);
       if (!parentKey || !sessionsMap.has(parentKey)) {
         return key;
       }
@@ -4725,7 +4727,7 @@ function renderSessionTable(sessions) {
     tr.setAttribute('data-session-id', s.session_id);
     tr.setAttribute('data-parent-id', s.parent_session_id || '');
     tr.setAttribute('data-session-key', sessionIdentityKey(s));
-    tr.setAttribute('data-parent-key', parentSessionIdentityKey(s) || '');
+    tr.setAttribute('data-parent-key', parentSessionIdentityKey(s, sessions) || '');
 
     if (s.isSubagent) {
       tr.classList.add('subagent-row');
@@ -4854,6 +4856,7 @@ async function openSessionTimeline(session) {
     cost_usd: estimatedCost,
     source_kind: sourceKind,
     source_dir_key: sourceDirKey,
+    parent_session_id: parentSessionId,
   } = session;
   const drawerOverlay = document.getElementById('timeline-drawer');
   const timelineContainer = document.getElementById('timeline-items');
@@ -4929,6 +4932,14 @@ async function openSessionTimeline(session) {
     const queryParams = new URLSearchParams();
     if (sourceKind) queryParams.set('source_kind', sourceKind);
     if (sourceDirKey) queryParams.set('source_dir_key', sourceDirKey);
+    // 攜帶 parent_session_id，讓後端能單獨選取子 Agent session（合成
+    // `<parent>__<agent>`），不會與同 id 的獨立 session 混淆。無父層的
+    // session 顯式送空字串（parent_session_id IS NULL 選取）；呼叫端拿
+    // 不到父層時（例如搜尋結果列未帶 parent_session_id）省略參數，讓
+    // 後端維持既有查詢行為。
+    if (parentSessionId !== undefined) {
+      queryParams.set('parent_session_id', parentSessionId || '');
+    }
     const queryString = queryParams.toString();
     const sessionUrl = `/api/${encodeURIComponent(resolvedAssistant)}/session/${encodeURIComponent(sessionId)}${queryString ? `?${queryString}` : ''}`;
     const res = await fetch(sessionUrl);
@@ -6121,7 +6132,7 @@ function renderModelSessionDrilldown(sessions) {
                   const cwd = session.cwd || t('unknown_cwd');
                   const time = formatLocalTime(session.timestamp, true) || '—';
                   return `
-                    <button type="button" class="model-session-link" data-session-id="${escapeHtml(session.session_id)}" data-assistant-type="${escapeHtml(session.assistant_type || '')}" data-source-kind="${escapeHtml(session.source_kind || '')}" data-source-dir-key="${escapeHtml(session.source_dir_key || '')}" aria-label="${escapeHtml(`${t('open_session')}: ${name}`)}">
+                    <button type="button" class="model-session-link" data-session-id="${escapeHtml(session.session_id)}" data-assistant-type="${escapeHtml(session.assistant_type || '')}" data-source-kind="${escapeHtml(session.source_kind || '')}" data-source-dir-key="${escapeHtml(session.source_dir_key || '')}" data-parent-session-id="${escapeHtml(session.parent_session_id || '')}" aria-label="${escapeHtml(`${t('open_session')}: ${name}`)}">
                       <span class="model-session-primary">
                         <span class="model-session-name-row">
                           <span class="model-session-name">${escapeHtml(name)}</span>
@@ -6256,6 +6267,7 @@ function appendModelSummaryRows(tbody, models, period) {
         assistant_type: sessionButton.dataset.assistantType,
         source_kind: sessionButton.dataset.sourceKind,
         source_dir_key: sessionButton.dataset.sourceDirKey,
+        parent_session_id: sessionButton.dataset.parentSessionId || null,
       }));
       if (session) {
         openSessionTimeline({

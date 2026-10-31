@@ -260,20 +260,39 @@ fn legacy_timeline(timeline: Vec<TimelineItem>) -> Vec<LegacyEventWrapper> {
         .collect()
 }
 
+/// `parent_session_id` disambiguates a Copilot App / CLI synthetic sub-agent
+/// session (`<parent>__<agent>`, stored with `parent_session_id = <parent>`)
+/// from a standalone session that shares the same `session_id` (review
+/// comment 4403291365, thread PRRT_kwDOTOgsec6xOCAC):
+///
+/// * `None` — the caller did not pass a parent;
+///   [`db::ParentSessionScope::Unfiltered`] keeps the existing API behaviour
+///   (main-session lookups are unaffected).
+/// * `Some(p)` with empty `p` — explicitly select the parentless
+///   (main / standalone) rows.
+/// * `Some(p)` — select only session `p`'s sub-agent rows, so the detail page
+///   can open the sub-agent alone.
 pub(crate) fn load_session_details(
     assistant: String,
     session_id: String,
     requested_source_kind: Option<String>,
     source_dir_key: Option<String>,
+    parent_session_id: Option<String>,
 ) -> Result<serde_json::Value, SessionDetailsError> {
+    let parent_scope = match parent_session_id.as_deref() {
+        None => db::ParentSessionScope::Unfiltered,
+        Some("") => db::ParentSessionScope::RootOnly,
+        Some(parent) => db::ParentSessionScope::ChildOf(parent),
+    };
     let conn = db::get_db_conn()
         .map_err(|error| SessionDetailsError::new(StatusCode::INTERNAL_SERVER_ERROR, error))?;
-    let lookup = db::get_session_assistant_and_transcript(
+    let lookup = db::get_session_assistant_and_transcript_in_parent_scope(
         &conn,
         &assistant,
         &session_id,
         requested_source_kind.as_deref(),
         source_dir_key.as_deref(),
+        parent_scope,
     )
     .map_err(|error| SessionDetailsError::new(StatusCode::NOT_FOUND, error))?;
     if lookup.assistant_type != assistant {
@@ -350,7 +369,7 @@ pub(crate) fn load_session_details(
     }
 
     let session_data = lookup
-        .load_data(&conn, &session_id)
+        .load_data_in_parent_scope(&conn, &session_id, parent_scope)
         .map_err(|error| SessionDetailsError::new(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     let session_cwd = session_data.cwd;
     let session_model = session_data.model;

@@ -94,7 +94,10 @@ fn aggregate_usage_details(
             duration_ms: session_duration,
             total_requests: session_requests,
             cost_usd: session_usage.usage.cost_usd,
-            parent_session_id: last_entry.parent_session_id.clone(),
+            // 以分組身分（含 parent_session_id）為準，確保摘要列的父層
+            // 識別與 session 分組鍵一致，獨立 session 不會與同名合成
+            // 子 Agent 列混淆。
+            parent_session_id: identity.parent_session_id.clone(),
             agent_nickname: last_entry.agent_nickname.clone(),
             agent_role: last_entry.agent_role.clone(),
             reasoning_effort: last_entry.reasoning_effort.clone(),
@@ -115,6 +118,10 @@ pub struct SessionSearchQuery {
 pub struct SessionDetailsQuery {
     source_kind: Option<String>,
     source_dir_key: Option<String>,
+    /// 選用的父層 session 識別：用來單獨選取合成子 Agent session
+    /// （`<parent>__<agent>`）。未提供時維持既有行為（主要 session 查詢不受
+    /// 影響）；空字串表示明確選取無父層（主／獨立）資料列。
+    parent_session_id: Option<String>,
 }
 
 pub async fn get_available_dates(Path(assistant): Path<String>) -> impl IntoResponse {
@@ -537,8 +544,30 @@ pub async fn get_session_details(
             .into_response();
     }
 
+    let parent_session_id = query
+        .parent_session_id
+        .as_deref()
+        .map(str::trim)
+        .map(str::to_string);
+    if parent_session_id
+        .as_deref()
+        .is_some_and(|parent| !parent.is_empty() && !is_safe_session_id(parent))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "非法的 parent_session_id 格式。" })),
+        )
+            .into_response();
+    }
+
     match tokio::task::spawn_blocking(move || {
-        load_session_details(assistant, session_id, source_kind, query.source_dir_key)
+        load_session_details(
+            assistant,
+            session_id,
+            source_kind,
+            query.source_dir_key,
+            parent_session_id,
+        )
     })
     .await
     {

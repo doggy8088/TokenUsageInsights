@@ -184,7 +184,9 @@ fn collect_model_session_details(
             session_total_cache_write_tokens: session_usage.usage.cache_write_tokens,
             session_total_reasoning_tokens: session_usage.usage.reasoning_tokens,
             session_cost_usd: session_usage.usage.cost_usd,
-            parent_session_id: last_entry.parent_session_id.clone(),
+            // 以分組身分（含 parent_session_id）為準，讓前端能以完整身分
+            // 單獨選取子 Agent，不會與同名獨立 session 混淆。
+            parent_session_id: identity.parent_session_id.clone(),
             agent_nickname: last_entry.agent_nickname.clone(),
             agent_role: last_entry.agent_role.clone(),
             reasoning_effort: last_entry.reasoning_effort.clone(),

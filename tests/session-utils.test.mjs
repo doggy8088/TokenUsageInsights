@@ -87,18 +87,108 @@ test('parent session identity remains scoped to the child source', () => {
     source_kind: 'copilot-app',
     source_dir_key: 'aa',
   };
+  const parentAsRoot = { ...child, session_id: 'parent', parent_session_id: null };
 
   assert.equal(
     parentSessionIdentityKey(child),
-    sessionIdentityKey({ ...child, session_id: 'parent' }),
+    sessionIdentityKey(parentAsRoot),
   );
   assert.notEqual(
     parentSessionIdentityKey(child),
     sessionIdentityKey({
-      ...child,
-      session_id: 'parent',
+      ...parentAsRoot,
       source_dir_key: 'bb',
     }),
+  );
+});
+
+test('parent session identity links nested sub-agent rows through the sessions list', () => {
+  const root = {
+    session_id: 'parent-uuid',
+    parent_session_id: null,
+    assistant_type: 'claude',
+    source_kind: 'legacy',
+    source_dir_key: null,
+  };
+  const child = {
+    session_id: 'agent-a1',
+    parent_session_id: 'parent-uuid',
+    assistant_type: 'claude',
+    source_kind: 'legacy',
+    source_dir_key: null,
+  };
+  const grandchild = {
+    session_id: 'agent-a2',
+    parent_session_id: 'agent-a1',
+    assistant_type: 'claude',
+    source_kind: 'legacy',
+    source_dir_key: null,
+  };
+  const rows = [root, child, grandchild];
+
+  assert.equal(parentSessionIdentityKey(child, rows), sessionIdentityKey(root));
+  assert.equal(
+    parentSessionIdentityKey(grandchild, rows),
+    sessionIdentityKey(child),
+  );
+});
+
+test('session identity distinguishes standalone session ids from synthetic sub-agent ids', () => {
+  // 真實獨立 session 恰好命名為 `a__b`（parent_session_id 為空）與
+  // session `a` 的子 Agent `b`（合成 id `a__b`、parent_session_id 為 `a`）
+  // 必須是兩個不同的 session 身分。
+  const standalone = {
+    session_id: 'a__b',
+    parent_session_id: null,
+    assistant_type: 'copilot',
+    source_kind: 'copilot-app',
+    source_dir_key: 'aa',
+  };
+  const syntheticChild = {
+    session_id: 'a__b',
+    parent_session_id: 'a',
+    assistant_type: 'copilot',
+    source_kind: 'copilot-app',
+    source_dir_key: 'aa',
+    agent_nickname: 'b',
+  };
+
+  assert.notEqual(
+    sessionIdentityKey(standalone),
+    sessionIdentityKey(syntheticChild),
+  );
+  assert.equal(matchesSessionIdentity(standalone, { ...standalone }), true);
+  assert.equal(
+    matchesSessionIdentity(syntheticChild, { ...syntheticChild }),
+    true,
+  );
+  assert.equal(matchesSessionIdentity(standalone, syntheticChild), false);
+  assert.equal(matchesSessionIdentity(syntheticChild, standalone), false);
+
+  const entries = [
+    { ...standalone, total_tokens: 100 },
+    { ...syntheticChild, total_tokens: 900 },
+  ];
+  assert.deepEqual(
+    filterEntriesBySessionIdentity([entries[1]], [standalone]),
+    [],
+  );
+  assert.deepEqual(
+    filterEntriesBySessionIdentity(entries, [syntheticChild]),
+    [entries[1]],
+  );
+
+  // 子 Agent 仍必須能對應到其父層 session `a`。
+  const parentRow = {
+    session_id: 'a',
+    parent_session_id: null,
+    assistant_type: 'copilot',
+    source_kind: 'copilot-app',
+    source_dir_key: 'aa',
+  };
+  assert.equal(
+    parentSessionIdentityKey(syntheticChild),
+    sessionIdentityKey(parentRow),
   );
 });
 
