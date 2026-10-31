@@ -1,5 +1,7 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    cmp::Ordering,
+    collections::{hash_map::Entry, BTreeMap, HashMap, HashSet},
+    hash::Hash,
     sync::{LazyLock, Mutex},
 };
 
@@ -176,22 +178,94 @@ fn entry_model(entry: &UsageEntry) -> Option<&str> {
         .filter(|model| !model.is_empty())
 }
 
+/// 用量列先後順序：(turn_no, timestamp)，供「取最新一筆」語意共用。
+fn usage_entry_order(left: &UsageEntry, right: &UsageEntry) -> Ordering {
+    left.turn_no
+        .cmp(&right.turn_no)
+        .then_with(|| left.timestamp.cmp(&right.timestamp))
+}
+
 pub(crate) fn latest_usage_entry<'a>(
     entries: impl IntoIterator<Item = &'a UsageEntry>,
 ) -> Option<&'a UsageEntry> {
-    entries.into_iter().max_by(|left, right| {
-        left.turn_no
-            .cmp(&right.turn_no)
-            .then_with(|| left.timestamp.cmp(&right.timestamp))
-    })
+    entries
+        .into_iter()
+        .max_by(|left, right| usage_entry_order(left, right))
 }
 
 /// 逐次呼叫列（Copilot App / CLI agents 的逐呼叫對帳列）的
-/// `import_source_id` 一定帶 `:call:` 標記（見 `db::replace_copilot_call_rows`
-/// 寫入的 `…:call:{call_identity}`）。這類列的 `duration_ms` 只是單次呼叫
-/// 耗時；舊聚合列、Codex session 累積值等其他來源每列已帶整回合／整個
-/// session 的累積耗時。
+/// `import_source_id` 帶 `:call:{call_identity}` 標記（見
+/// `db::replace_copilot_call_rows` 寫入的 `…:call:{call_identity}`）。這類列的
+/// `duration_ms` 只是單次呼叫耗時；舊聚合列、Codex session 累積值等其他來源
+/// 每列已帶整回合／整個 session 的累積耗時。
 const PER_CALL_IMPORT_SOURCE_MARKER: &str = ":call:";
+
+/// 逐次呼叫列判別（review PRRT_kwDOTOgsec6yUKF4）：必須同時滿足
+/// (1) 來源種類是 Copilot collector（copilot-app / copilot-cli）；
+/// (2) ID 落在該 collector 寫入端的命名空間前綴內（注意：kind "copilot-cli"
+///     的列前綴是 "copilot-cli-agents:"，kind 與前綴不同名，對應表照
+///     `db::replace_copilot_call_rows` 寫入格式抄錄）；
+/// (3) 前綴之後帶 `:call:{call_identity}` 標記。
+/// 外部匯入（`import --file/--url`）的 `import_source_id` 是自由格式
+/// （`db::normalize_import_source_id` 只做 trim），單比 `:call:` 子字串會把
+/// 偽裝的累積快照列誤判成逐次呼叫列而被加總。殘餘風險：同時偽造 kind＋前綴
+/// ＋標記的匯入列與真逐次呼叫列不可區分（db.rs 全域同此信任模型）；聚合列的
+/// agent 段字面含 `:call:` 亦會誤判，但該段為來源提供的 slug，實際不可達。
+fn is_per_call_import_source(source_kind: Option<&str>, import_source_id: &str) -> bool {
+    let namespace = match source_kind {
+        Some("copilot-app") => "copilot-app:",
+        Some("copilot-cli") => "copilot-cli-agents:",
+        _ => return false,
+    };
+    import_source_id
+        .strip_prefix(namespace)
+        .is_some_and(|rest| rest.contains(PER_CALL_IMPORT_SOURCE_MARKER))
+}
+
+/// 非逐次呼叫列的覆蓋認領（review PRRT_kwDOTOgsec6yUKGR），形狀鏡像
+/// `db::classify_copilot_app_coverage_claim`：`copilot-app:{key}:{sid}:{turn}`
+/// 三段式 ID（sid 為本組 session）認領整個回合；其他形狀只認領自己的
+/// (turn, model) 桶（欄位取自 `UsageEntry`，不解析 ID）。回合 0 無法放置於
+/// 回合空間，保守落在桶級認領（匯入端對此判定為 Conflict，顯示端無拒絕語意）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AggregateCoverageClaim {
+    WholeTurn(u32),
+    Split(u32, Option<String>),
+}
+
+fn aggregate_coverage_claim(
+    entry: &UsageEntry,
+    import_source_id: Option<&str>,
+) -> AggregateCoverageClaim {
+    if entry.turn_no > 0 {
+        if let Some(rest) = import_source_id.and_then(|id| id.strip_prefix("copilot-app:")) {
+            let segments: Vec<&str> = rest.split(':').collect();
+            if segments.len() == 3 && segments[1] == entry.session_id.as_str() {
+                return AggregateCoverageClaim::WholeTurn(entry.turn_no);
+            }
+        }
+    }
+    AggregateCoverageClaim::Split(entry.turn_no, entry.model.clone())
+}
+
+/// 同認領重複列取最新一筆（排序沿用 `usage_entry_order`）：同一覆蓋範圍的
+/// 快照／重寫殘影絕不疊加，維持累積值 latest-only 不變量。
+fn keep_latest<'a, K: Eq + Hash>(
+    claims: &mut HashMap<K, &'a UsageEntry>,
+    key: K,
+    entry: &'a UsageEntry,
+) {
+    match claims.entry(key) {
+        Entry::Occupied(mut occupied) => {
+            if usage_entry_order(entry, occupied.get()).is_gt() {
+                occupied.insert(entry);
+            }
+        }
+        Entry::Vacant(vacant) => {
+            vacant.insert(entry);
+        }
+    }
+}
 
 fn entry_duration_ms(entry: &UsageEntry) -> f64 {
     entry
@@ -203,32 +277,82 @@ fn entry_duration_ms(entry: &UsageEntry) -> f64 {
 
 /// 計算單一 session 分組的顯示耗時（毫秒）。
 ///
-/// 含 `:call:` 標記的逐次呼叫列每列只有單次呼叫耗時，同回合多次呼叫必須
-/// 全部加總才等於逐次呼叫接管前聚合列顯示的回合總耗時（review comment
-/// 4436837582）；沒有逐次呼叫列的分組（舊聚合列、Codex 每列皆為 session
-/// 累積值等）維持「取最新一筆」的累積值語意。混和分組（逐次呼叫列與
-/// 匯入聚合列並存）以逐次呼叫列的加總為準。
+/// 逐次呼叫列（`is_per_call_import_source`）每列只有單次呼叫耗時，同回合多次
+/// 呼叫必須全部加總才等於逐次呼叫接管前聚合列顯示的回合總耗時（review
+/// comment 4436837582）；匯入聚合列是整回合／(turn, model) 桶的 per-turn
+/// SUM，依實際覆蓋範圍納入（review PRRT_kwDOTOgsec6yUKGR）：與呼叫列同覆蓋
+/// 範圍的聚合列讓位不計（呼叫優先防雙計——`copilot-cli` 匯入不經覆蓋裁決，
+/// 同覆蓋並存是合法狀態），不重疊的聚合列按認領加總；同認領重複列取最新一
+/// 筆（同一覆蓋的快照殘影，絕不疊加），WholeTurn 認領吸收同回合 Split 認領
+/// （同回合雙表示）。1448fc7 的「混和群組固定以逐次呼叫列加總為準」收斂為
+/// 「同覆蓋範圍以逐次呼叫列為準、不重疊聚合按覆蓋另計」。
+/// 沒有逐次呼叫列的分組（舊聚合列、Codex 每列皆為 session 累積值等）維持
+/// 「取最新一筆」的累積值語意。
 pub(crate) fn session_duration_ms<'a>(
     entries: impl IntoIterator<Item = (&'a UsageEntry, Option<&'a str>)>,
 ) -> u64 {
     let entries: Vec<(&UsageEntry, Option<&str>)> = entries.into_iter().collect();
     let mut per_call_rows = 0usize;
     let mut per_call_duration = 0.0;
-    for (entry, import_source_id) in &entries {
+    // 呼叫列已覆蓋的 (turn, model) 桶。重疊判定必須到桶級：同回合跨模型的
+    // 聚合列是合法的不重疊歷史（`db::copilot_app_claims_overlap` 同語意），
+    // 回合級連坐會把這類聚合列誤丟而少計。
+    let mut covered_buckets: HashSet<(u32, Option<String>)> = HashSet::new();
+    for &(entry, import_source_id) in &entries {
         if import_source_id
-            .as_deref()
-            .is_some_and(|id| id.contains(PER_CALL_IMPORT_SOURCE_MARKER))
+            .is_some_and(|id| is_per_call_import_source(entry.source_kind.as_deref(), id))
         {
             per_call_rows += 1;
             per_call_duration += entry_duration_ms(entry);
+            covered_buckets.insert((entry.turn_no, entry.model.clone()));
         }
     }
-    if per_call_rows > 0 {
-        return per_call_duration as u64;
+    if per_call_rows == 0 {
+        return latest_usage_entry(entries.iter().map(|(entry, _)| *entry))
+            .map(entry_duration_ms)
+            .unwrap_or(0.0) as u64;
     }
-    latest_usage_entry(entries.iter().map(|(entry, _)| *entry))
-        .map(entry_duration_ms)
-        .unwrap_or(0.0) as u64
+    let mut whole_turn_claims: HashMap<u32, &UsageEntry> = HashMap::new();
+    let mut split_claims: HashMap<(u32, Option<String>), &UsageEntry> = HashMap::new();
+    for &(entry, import_source_id) in &entries {
+        if import_source_id
+            .is_some_and(|id| is_per_call_import_source(entry.source_kind.as_deref(), id))
+        {
+            continue;
+        }
+        let claim = aggregate_coverage_claim(entry, import_source_id);
+        // 覆蓋讓位：與呼叫列同覆蓋範圍的聚合列不計（呼叫優先）。
+        let overlaps_calls = match &claim {
+            AggregateCoverageClaim::WholeTurn(turn) => covered_buckets
+                .iter()
+                .any(|(covered_turn, _)| covered_turn == turn),
+            AggregateCoverageClaim::Split(turn, model) => {
+                covered_buckets.contains(&(*turn, model.clone()))
+            }
+        };
+        if overlaps_calls {
+            continue;
+        }
+        match claim {
+            AggregateCoverageClaim::WholeTurn(turn) => {
+                keep_latest(&mut whole_turn_claims, turn, entry);
+            }
+            AggregateCoverageClaim::Split(turn, model) => {
+                keep_latest(&mut split_claims, (turn, model), entry);
+            }
+        }
+    }
+    let mut total = per_call_duration;
+    for entry in whole_turn_claims.values() {
+        total += entry_duration_ms(entry);
+    }
+    for ((turn, _), entry) in &split_claims {
+        // WholeTurn 吸收同回合 Split（同回合雙表示，同回合只留一支）。
+        if !whole_turn_claims.contains_key(turn) {
+            total += entry_duration_ms(entry);
+        }
+    }
+    total as u64
 }
 
 /// 依 session 身分（`SessionIdentity`，含 `parent_session_id`）預先彙總各
@@ -772,6 +896,22 @@ mod tests {
     }
 
     fn duration_entry(turn_no: u32, timestamp: &str, duration_ms: f64) -> UsageEntry {
+        duration_entry_with_source(
+            turn_no,
+            timestamp,
+            duration_ms,
+            Some("copilot-app"),
+            "gpt-5",
+        )
+    }
+
+    fn duration_entry_with_source(
+        turn_no: u32,
+        timestamp: &str,
+        duration_ms: f64,
+        source_kind: Option<&str>,
+        model: &str,
+    ) -> UsageEntry {
         UsageEntry {
             timestamp: timestamp.to_string(),
             session_id: "duration-session".to_string(),
@@ -780,8 +920,8 @@ mod tests {
             cwd: None,
             version: None,
             turn_no,
-            model: Some("gpt-5".to_string()),
-            model_id: Some("gpt-5".to_string()),
+            model: Some(model.to_string()),
+            model_id: Some(model.to_string()),
             tokens: None,
             delta_tokens: None,
             context: None,
@@ -791,7 +931,7 @@ mod tests {
                 total_premium_requests: None,
                 reported_cost_usd: None,
             }),
-            source_kind: Some("copilot-app".to_string()),
+            source_kind: source_kind.map(str::to_string),
             source_dir_key: Some("aa".to_string()),
             parent_session_id: None,
             agent_nickname: None,
@@ -835,21 +975,208 @@ mod tests {
     }
 
     #[test]
+    fn session_duration_ms_keeps_free_format_colon_call_ids_latest_only() {
+        // 外部匯入的 import_source_id 是自由格式：兩筆 Codex 累積快照即使帶
+        // `:call:` 子字樣也不得被當成逐次呼叫列加總成 7000ms（review
+        // PRRT_kwDOTOgsec6yUKF4），必須維持累積值 latest-only 3500ms。
+        let mut first = duration_entry_with_source(
+            1,
+            "2026-07-10T10:00:00Z",
+            3500.0,
+            Some("codex-desktop"),
+            "gpt-5",
+        );
+        first.session_id = "vendor-s".to_string();
+        let mut second = duration_entry_with_source(
+            2,
+            "2026-07-10T10:05:00Z",
+            3500.0,
+            Some("codex-desktop"),
+            "gpt-5",
+        );
+        second.session_id = "vendor-s".to_string();
+
+        assert_eq!(
+            session_duration_ms([
+                (&first, Some("vendor:call:1")),
+                (&second, Some("vendor:call:2")),
+            ]),
+            3500
+        );
+    }
+
+    #[test]
+    fn session_duration_ms_requires_collector_namespace_for_per_call_sum() {
+        // 來源種類正確但 ID 不在 collector 寫入端命名空間前綴內的自由格式列
+        // 不得冒充逐次呼叫列（前綴檢查）：latest-only 3500ms，不可加總成 7000ms。
+        let first = duration_entry(1, "2026-07-10T10:00:00Z", 3500.0);
+        let second = duration_entry(2, "2026-07-10T10:05:00Z", 3500.0);
+
+        assert_eq!(
+            session_duration_ms([
+                (&first, Some("vendor:call:1")),
+                (&second, Some("vendor:call:2")),
+            ]),
+            3500
+        );
+    }
+
+    #[test]
+    fn session_duration_ms_requires_source_kind_for_per_call_sum() {
+        // ID 前綴正確但來源種類不是 Copilot collector 的列不得冒充逐次呼叫列
+        // （來源種類檢查）：latest-only 100ms，不可加總成 200ms。
+        let first = duration_entry_with_source(1, "2026-07-10T10:00:00Z", 100.0, None, "gpt-5");
+        let second = duration_entry_with_source(1, "2026-07-10T10:01:00Z", 100.0, None, "gpt-5");
+
+        assert_eq!(
+            session_duration_ms([
+                (&first, Some("copilot-app:aa:duration-session:call:h1")),
+                (&second, Some("copilot-app:aa:duration-session:call:h2")),
+            ]),
+            100
+        );
+    }
+
+    #[test]
     fn session_duration_ms_mixed_group_prefers_per_call_sum() {
-        // 混和分組（逐次呼叫列 + 匯入聚合列並存）固定以逐次呼叫列加總為準。
+        // 混和分組（逐次呼叫列 + 匯入聚合列並存）同覆蓋範圍以逐次呼叫列加總
+        // 為準：同回合重疊時聚合列讓位（1448fc7 鎖定的「呼叫優先」取捨收斂為
+        // 「同覆蓋呼叫優先、不重疊聚合另計」，跨回合情境見
+        // session_duration_ms_mixed_group_adds_disjoint_aggregate_turns）。
         let call = duration_entry(1, "2026-07-10T10:00:00Z", 100.0);
         let aggregate = duration_entry(1, "2026-07-10T10:05:00Z", 3500.0);
 
         assert_eq!(
             session_duration_ms([
-                (
-                    &call,
-                    Some("copilot-cli-agents:bb:duration-session:call:h9")
-                ),
+                (&call, Some("copilot-app:bb:duration-session:call:h9")),
                 (&aggregate, Some("copilot-app:bb:duration-session:1")),
             ]),
             100
         );
+    }
+
+    #[test]
+    fn session_duration_ms_mixed_group_adds_disjoint_aggregate_turns() {
+        // 混和分組中跨回合不重疊的聚合列必須按覆蓋範圍納入（review
+        // PRRT_kwDOTOgsec6yUKGR）：turn 1 聚合 3500ms + turn 2 呼叫 100ms =
+        // 3600ms，不可因存在呼叫列而整組丟棄只剩 100ms。
+        let aggregate = duration_entry(1, "2026-07-10T10:00:00Z", 3500.0);
+        let call = duration_entry(2, "2026-07-10T10:05:00Z", 100.0);
+
+        assert_eq!(
+            session_duration_ms([
+                (&aggregate, Some("copilot-app:aa:duration-session:1")),
+                (&call, Some("copilot-app:aa:duration-session:call:h9")),
+            ]),
+            3600
+        );
+    }
+
+    #[test]
+    fn session_duration_ms_mixed_group_sums_disjoint_aggregates_and_keeps_overlap_subordinate() {
+        // 不同回合的聚合列是 per-turn SUM，須按不相交覆蓋加總而非整組取最新：
+        // 3500 + 400 + 100 = 4000ms（「聚合取最新一支」的錯誤修法會得 500ms；
+        // 驗證報告 B-4 所列期望值 3900 為漏加呼叫列的算術筆誤，其公式
+        // ΣCall + ΣAggregate 與 500ms 交叉驗證皆指向 4000ms）。
+        let first = duration_entry(1, "2026-07-10T10:00:00Z", 3500.0);
+        let second = duration_entry(2, "2026-07-10T10:05:00Z", 400.0);
+        let call = duration_entry(3, "2026-07-10T10:10:00Z", 100.0);
+
+        assert_eq!(
+            session_duration_ms([
+                (&first, Some("copilot-app:aa:duration-session:1")),
+                (&second, Some("copilot-app:aa:duration-session:2")),
+                (&call, Some("copilot-app:aa:duration-session:call:h9")),
+            ]),
+            4000
+        );
+    }
+
+    #[test]
+    fn session_duration_ms_mixed_group_keeps_cross_model_aggregate_beside_calls() {
+        // 同回合跨模型的聚合列與呼叫列覆蓋不同 (turn, model) 桶，是合法的
+        // 不重疊歷史（db::copilot_app_claims_overlap 同語意），不可被回合級
+        // 連坐丟棄：3500 + 100 = 3600ms。
+        let aggregate = duration_entry_with_source(
+            1,
+            "2026-07-10T10:00:00Z",
+            3500.0,
+            Some("copilot-app"),
+            "gpt-5",
+        );
+        let call = duration_entry_with_source(
+            1,
+            "2026-07-10T10:05:00Z",
+            100.0,
+            Some("copilot-app"),
+            "gpt-5-mini",
+        );
+
+        assert_eq!(
+            session_duration_ms([
+                (
+                    &aggregate,
+                    Some("copilot-app:aa:duration-session:1:main:aa3")
+                ),
+                (&call, Some("copilot-app:aa:duration-session:call:h9")),
+            ]),
+            3600
+        );
+    }
+
+    #[test]
+    fn session_duration_ms_mixed_group_keeps_latest_duplicate_aggregate_claim() {
+        // 同認領重複聚合列＝同一覆蓋範圍的快照／重寫殘影，只取最新一筆、
+        // 絕不疊加：3500/4000ms 兩列同認領 + turn 2 呼叫 100ms = 4100ms。
+        let stale = duration_entry_with_source(
+            1,
+            "2026-07-10T10:00:00Z",
+            3500.0,
+            Some("copilot-app"),
+            "gpt-5",
+        );
+        let fresh = duration_entry_with_source(
+            1,
+            "2026-07-10T10:05:00Z",
+            4000.0,
+            Some("copilot-app"),
+            "gpt-5",
+        );
+        let call = duration_entry(2, "2026-07-10T10:10:00Z", 100.0);
+
+        assert_eq!(
+            session_duration_ms([
+                (&stale, Some("copilot-app:aa:duration-session:1:main:aa3")),
+                (&fresh, Some("copilot-app:aa:duration-session:1:main:bb4")),
+                (&call, Some("copilot-app:aa:duration-session:call:h9")),
+            ]),
+            4100
+        );
+    }
+
+    #[test]
+    fn session_durations_by_identity_sums_disjoint_aggregate_and_call_turns() {
+        // 月報模型明細／日報 session 明細共用的分組耗時路徑（handler 層測試
+        // 位於 src/handlers/*，非本模組所有）：混和分組跨回合不重疊的聚合 +
+        // 呼叫須合計 3600ms，而非只剩呼叫的 100ms。
+        let aggregate = duration_entry(1, "2026-07-10T10:00:00Z", 3500.0);
+        let call = duration_entry(2, "2026-07-10T10:05:00Z", 100.0);
+
+        let durations = session_durations_by_identity([
+            (
+                &aggregate,
+                "copilot",
+                Some("copilot-app:aa:duration-session:1"),
+            ),
+            (
+                &call,
+                "copilot",
+                Some("copilot-app:aa:duration-session:call:h9"),
+            ),
+        ]);
+
+        let identity = SessionIdentity::from_entry("copilot", &aggregate);
+        assert_eq!(durations.get(&identity).copied(), Some(3600));
     }
 
     #[test]
