@@ -6,15 +6,16 @@ import {
   calculateMovingAverageTrend,
   calculateMovingAverageViewportTrend,
   getChartDataPointX,
-} from './chart-utils.js?v=11';
+} from './chart-utils.js?v=12';
 import {
   buildSessionParentIndex,
   compareSessionRows,
   filterEntriesBySessionIdentity,
   matchesSessionIdentity,
   sessionIdentityKey,
+  sessionSearchDataFingerprint,
   sessionSearchMatchKey,
-} from './session-utils.js?v=6';
+} from './session-utils.js?v=7';
 import { parseUsageTimestamp } from './time-utils.js?v=1';
 
 // Globals
@@ -3175,17 +3176,7 @@ function renderDashboard(data) {
     }
     currentSessionSearchContext = nextSearchContext;
   }
-  const nextSearchFingerprint = JSON.stringify(
-    allSessions
-      .map(session => [
-        session.assistant_type,
-        session.source_kind,
-        session.source_dir_key,
-        session.session_id,
-        session.max_turn_no,
-      ])
-      .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)))
-  );
+  const nextSearchFingerprint = sessionSearchDataFingerprint(allSessions);
   const shouldRefreshSearch = currentSessionSearchQuery
     && nextSearchFingerprint !== currentSessionSearchDataFingerprint;
   currentSessionSearchDataFingerprint = nextSearchFingerprint;

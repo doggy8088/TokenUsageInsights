@@ -9,6 +9,7 @@ import {
   parentSessionIdentityKey,
   rootSessionIdentityKey,
   sessionIdentityKey,
+  sessionSearchDataFingerprint,
   sessionSearchMatchKey,
 } from '../static/session-utils.js';
 
@@ -541,4 +542,116 @@ test('session parent index lookups never rescan the sessions array', () => {
     '每次 parentKeyOf／rootKeyOf 都必須 O(1) 查表，不得重新掃描 sessions',
   );
   assert.equal(iterations, 1);
+});
+
+test('search data fingerprint changes when parent_session_id changes', () => {
+  const rows = [
+    {
+      assistant_type: 'codex',
+      source_kind: 'cli',
+      source_dir_key: 'aa',
+      session_id: 'a__b',
+      max_turn_no: 3,
+      parent_session_id: '',
+    },
+  ];
+  const parentAttached = [{ ...rows[0], parent_session_id: 'a' }];
+
+  assert.notEqual(
+    sessionSearchDataFingerprint(rows),
+    sessionSearchDataFingerprint(parentAttached),
+  );
+  assert.notEqual(
+    sessionSearchDataFingerprint(parentAttached),
+    sessionSearchDataFingerprint(rows),
+  );
+});
+
+test('search data fingerprint is stable across refreshes and row order', () => {
+  const rows = [
+    {
+      assistant_type: 'copilot',
+      source_kind: 'copilot-app',
+      source_dir_key: 'aa',
+      session_id: 'root',
+      max_turn_no: 1,
+      parent_session_id: '',
+    },
+    {
+      assistant_type: 'copilot',
+      source_kind: 'copilot-app',
+      source_dir_key: 'aa',
+      session_id: 'root__agent-1',
+      max_turn_no: 4,
+      parent_session_id: 'root',
+    },
+    {
+      assistant_type: 'copilot',
+      source_kind: 'copilot-app',
+      source_dir_key: 'bb',
+      session_id: 'other',
+      max_turn_no: 2,
+      parent_session_id: '',
+    },
+  ];
+  const refreshed = rows.map(row => ({ ...row }));
+  const shuffled = [rows[2], rows[0], rows[1]].map(row => ({ ...row }));
+
+  assert.equal(
+    sessionSearchDataFingerprint(rows),
+    sessionSearchDataFingerprint(refreshed),
+  );
+  assert.equal(
+    sessionSearchDataFingerprint(rows),
+    sessionSearchDataFingerprint(rows),
+  );
+  assert.equal(
+    sessionSearchDataFingerprint(rows),
+    sessionSearchDataFingerprint(shuffled),
+  );
+});
+
+test('search data fingerprint treats empty and absent parent_session_id as the same', () => {
+  const baseRow = {
+    assistant_type: 'copilot',
+    source_kind: 'copilot-app',
+    source_dir_key: 'aa',
+    session_id: 'a__b',
+    max_turn_no: 3,
+  };
+  const emptyParent = { ...baseRow, parent_session_id: '' };
+  const nullParent = { ...baseRow, parent_session_id: null };
+  const absentParent = { ...baseRow };
+
+  assert.equal(
+    sessionSearchDataFingerprint([emptyParent]),
+    sessionSearchDataFingerprint([nullParent]),
+  );
+  assert.equal(
+    sessionSearchDataFingerprint([nullParent]),
+    sessionSearchDataFingerprint([absentParent]),
+  );
+  assert.equal(
+    sessionSearchDataFingerprint([emptyParent]),
+    sessionSearchDataFingerprint([absentParent]),
+  );
+});
+
+test('search data fingerprint changes when max_turn_no changes', () => {
+  const rows = [
+    {
+      assistant_type: 'codex',
+      source_kind: 'cli',
+      source_dir_key: 'aa',
+      session_id: 'a',
+      max_turn_no: 3,
+      parent_session_id: '',
+    },
+  ];
+  const grown = [{ ...rows[0], max_turn_no: 4 }];
+
+  assert.notEqual(
+    sessionSearchDataFingerprint(rows),
+    sessionSearchDataFingerprint(grown),
+  );
 });

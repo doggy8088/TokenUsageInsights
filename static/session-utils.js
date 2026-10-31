@@ -46,6 +46,25 @@ export function sessionSearchMatchKey(session) {
   return sessionIdentityKey(session);
 }
 
+// 搜尋重跑門檻的資料指紋：必須涵蓋 sessionSearchMatchKey 的完整鍵空間
+// （含 parent_session_id），否則父層單獨變更時指紋不變、搜尋不重跑，
+// 舊命中鍵無法匹配新列。既有 5 元維持裸欄位（parity）；父層正規化
+// empty==absent 鏡像 sessionIdentityKey。
+export function sessionSearchDataFingerprint(rows) {
+  return JSON.stringify(
+    (rows || [])
+      .map(session => [
+        session.assistant_type,
+        session.source_kind,
+        session.source_dir_key,
+        session.session_id,
+        session.max_turn_no,
+        session?.parent_session_id || '',
+      ])
+      .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)))
+  );
+}
+
 export function parentSessionIdentityKey(session, sessions) {
   if (!session?.parent_session_id) return null;
   // 父層通常是主／獨立 session（Copilot 合成 `<parent>__<agent>` 約定），
