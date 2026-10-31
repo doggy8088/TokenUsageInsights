@@ -375,7 +375,14 @@ pub fn parse_copilot_timeline_filtered(
         };
 
         let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
-        let event_agent_id = event.get("agentId").and_then(|v| v.as_str());
+        // One empty-`agentId` rule for prompt classification and the entry
+        // key (mirrors `copilot::read_calls`, `copilot_filtered_agent_turns`
+        // and `read_copilot_cli_native_calls`): an empty id is the shared
+        // timeline (`None`), never a dedicated sub-agent marker.
+        let event_agent_id = event
+            .get("agentId")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
 
         // Apply the agent filter before any state mutation so per-agent
         // `tool_calls_map` and `current_turn_no` bookkeeping stay consistent
@@ -1847,6 +1854,116 @@ mod tests {
             item,
             TimelineItem::UserPrompt { prompt, .. } if prompt == "hi"
         )));
+        let _ = fs::remove_file(path);
+    }
+
+    fn timeline_stats(total: u64) -> TokenStats {
+        TokenStats {
+            input: total,
+            output: 0,
+            cache_read: None,
+            cache_write: None,
+            cache_write_5m: None,
+            cache_write_1h: None,
+            reasoning: None,
+            total,
+        }
+    }
+
+    fn reply_turn_usage(timeline: &[TimelineItem]) -> Vec<(u32, Option<u64>)> {
+        timeline
+            .iter()
+            .filter_map(|item| match item {
+                TimelineItem::AgentReply {
+                    turn_no, tokens, ..
+                } => Some((*turn_no, tokens.as_ref().map(|stats| stats.total))),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn empty_agent_id_prompt_is_shared_and_keeps_reply_usage_alignment() {
+        // An `agentId: ""` prompt belongs to the shared timeline on the import
+        // side (`read_calls` normalizes the empty id to `None`); the filtered
+        // timeline must count its turn the same way, otherwise the following
+        // reply keeps the previous turn and can no longer pick up the usage
+        // recorded for its own turn (thread PRRT_kwDOTOgsec6yUKFl).
+        let events = vec![
+            r#"{"type":"user.message","agentId":"","data":{"content":"p1"},"timestamp":"2026-07-23T12:00:00Z"}"#,
+            r#"{"type":"assistant.message","data":{"content":"r1"},"timestamp":"2026-07-23T12:00:10Z"}"#,
+            r#"{"type":"user.message","data":{"content":"p2"},"timestamp":"2026-07-23T12:01:00Z"}"#,
+            r#"{"type":"assistant.message","data":{"content":"r2"},"timestamp":"2026-07-23T12:01:10Z"}"#,
+        ];
+        let (reader, path) = reader_for_events(&events);
+        // read_calls numbering for this sequence: r1's usage lands in turn 1,
+        // r2's usage in turn 2.
+        let db_entries = HashMap::from([
+            (1u32, (timeline_stats(110), "m".to_string())),
+            (2u32, (timeline_stats(220), "m".to_string())),
+        ]);
+        let mut timeline = Vec::new();
+        let mut metadata = HashMap::new();
+        parse_copilot_timeline_filtered(
+            reader,
+            &db_entries,
+            &mut timeline,
+            &mut metadata,
+            None,
+            None,
+        );
+
+        assert_eq!(
+            reply_turn_usage(&timeline),
+            vec![(1, Some(110)), (2, Some(220))],
+            "空 Agent ID 的提示必須推進回合，讓回覆掛到自己的用量"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn empty_agent_id_prompt_in_subagent_view_advances_the_filtered_turn() {
+        // The subagent drawer mirrors `copilot_filtered_agent_turns`, where an
+        // empty agent id is shared context: two shared prompts with one child
+        // reply each must number the replies [1, 2], not [1, 1].
+        let events = vec![
+            r#"{"type":"user.message","agentId":"","data":{"content":"p1"},"timestamp":"2026-07-23T12:00:00Z"}"#,
+            r#"{"type":"assistant.message","agentId":"child","data":{"content":"r1"},"timestamp":"2026-07-23T12:00:10Z"}"#,
+            r#"{"type":"user.message","agentId":"","data":{"content":"p2"},"timestamp":"2026-07-23T12:01:00Z"}"#,
+            r#"{"type":"assistant.message","agentId":"child","data":{"content":"r2"},"timestamp":"2026-07-23T12:01:10Z"}"#,
+        ];
+        let (reader, path) = reader_for_events(&events);
+        let db_entries = HashMap::from([
+            (1u32, (timeline_stats(110), "m".to_string())),
+            (2u32, (timeline_stats(220), "m".to_string())),
+        ]);
+        let mut timeline = Vec::new();
+        let mut metadata = HashMap::new();
+        parse_copilot_timeline_filtered(
+            reader,
+            &db_entries,
+            &mut timeline,
+            &mut metadata,
+            Some("child"),
+            None,
+        );
+
+        let turns: Vec<u32> = timeline
+            .iter()
+            .filter_map(|item| match item {
+                TimelineItem::AgentReply { turn_no, .. } => Some(*turn_no),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            turns,
+            vec![1, 2],
+            "子代理視角下空 Agent ID 的共用提示也必須推進過濾回合"
+        );
+        assert_eq!(
+            reply_turn_usage(&timeline),
+            vec![(1, Some(110)), (2, Some(220))]
+        );
         let _ = fs::remove_file(path);
     }
 

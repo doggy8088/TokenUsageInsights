@@ -18427,6 +18427,93 @@ mod tests {
     }
 
     #[test]
+    fn app_review_empty_agent_id_shared_prompt_aligns_main_reply_turns() {
+        // (thread PRRT_kwDOTOgsec6yUKFl) An `agentId: ""` prompt is a shared
+        // prompt on the import side (`read_calls` normalizes the empty id to
+        // the shared stream). With usage-before-reply ordering the import side
+        // numbers the two turns [1, 2]; the timeline must render the replies at
+        // the same turns or each reply picks up the wrong usage.
+        let mut f = AppReviewFixture::new(&["app"]);
+        let empty_prompt = |kind: &str, ts: &str| {
+            let mut event = app_text_at(kind, ts);
+            event["agentId"] = serde_json::json!("");
+            event
+        };
+        f.write(
+            "app",
+            &[
+                empty_prompt("user.message", "2026-07-23T12:00:00Z"),
+                cli_usage_fixture(1, "2026-07-23T12:00:05Z"),
+                app_text_at("assistant.message", "2026-07-23T12:00:10Z"),
+                app_text_at("user.message", "2026-07-23T12:01:00Z"),
+                cli_usage_fixture(2, "2026-07-23T12:01:05Z"),
+                app_text_at("assistant.message", "2026-07-23T12:01:10Z"),
+            ],
+        );
+        f.sync();
+        let turns: Vec<i64> = f
+            .conn
+            .prepare(
+                "SELECT turn_no FROM usage_entries
+                 WHERE session_id = 'app' AND parent_session_id IS NULL
+                 ORDER BY timestamp",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(turns, vec![1, 2], "匯入端回合編號不受時間軸顯示影響");
+        assert_eq!(
+            f.replies("app", None),
+            vec![(1, 110), (2, 110)],
+            "時間軸回覆必須與匯入端回合對齊才能掛到各自的用量"
+        );
+    }
+
+    #[test]
+    fn app_review_empty_agent_id_calls_after_reply_join_the_next_reply() {
+        // Reviewer's literal order: empty-id prompt → plain reply → call →
+        // prompt → reply. The call lands after the first reply already closed
+        // turn 1, so the import side books it into turn 2 and only the second
+        // reply may claim it. A timeline that skips the empty-id prompt keeps
+        // both replies in turn 1 and orphans the call.
+        let mut f = AppReviewFixture::new(&["app"]);
+        let empty_prompt = |kind: &str, ts: &str| {
+            let mut event = app_text_at(kind, ts);
+            event["agentId"] = serde_json::json!("");
+            event
+        };
+        f.write(
+            "app",
+            &[
+                empty_prompt("user.message", "2026-07-23T12:00:00Z"),
+                app_text_at("assistant.message", "2026-07-23T12:00:10Z"),
+                cli_usage_fixture(1, "2026-07-23T12:00:15Z"),
+                app_text_at("user.message", "2026-07-23T12:01:00Z"),
+                app_text_at("assistant.message", "2026-07-23T12:01:10Z"),
+            ],
+        );
+        f.sync();
+        let turns: Vec<i64> = f
+            .conn
+            .prepare(
+                "SELECT turn_no FROM usage_entries
+                 WHERE session_id = 'app' AND parent_session_id IS NULL
+                 ORDER BY timestamp",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(turns, vec![2], "回覆後的呼叫屬於下一個回覆的回合");
+        // `replies()` only reports replies that joined usage: r1 has none and
+        // must stay silent, while r2 has to reach the turn-2 call.
+        assert_eq!(f.replies("app", None), vec![(2, 110)]);
+    }
+
+    #[test]
     fn sqlite_only_subagent_call_with_untimestamped_reply_keeps_timeline_turn() {
         // (review comment 4436837487) The child's single reply has no
         // parseable timestamp, but `timeline::parse_copilot_timeline_filtered`
