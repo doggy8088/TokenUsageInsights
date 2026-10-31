@@ -17987,6 +17987,119 @@ mod tests {
     }
 
     #[test]
+    fn app_review_dedicated_agent_prompts_advance_subagent_usage_turns() {
+        // (review comment 4436837470) A prompt dedicated to a sub-agent opens
+        // that agent's own turn in the filtered timeline and in
+        // `copilot_filtered_agent_turns`; `copilot::read_calls` must advance the
+        // same way. Otherwise the second usage call keeps the first turn and
+        // the detail page joins both calls onto the first reply.
+        let mut f = AppReviewFixture::new(&["app"]);
+        let dedicated = |kind: &str, ts: &str| {
+            let mut event = app_text_at(kind, ts);
+            event["agentId"] = serde_json::json!("child");
+            event
+        };
+        let dedicated_usage = |id: usize, ts: &str| {
+            let mut event = cli_usage_fixture(id, ts);
+            event["agentId"] = serde_json::json!("child");
+            event
+        };
+        f.write(
+            "app",
+            &[
+                dedicated("user.message", "2026-07-23T12:00:00Z"),
+                dedicated_usage(1, "2026-07-23T12:00:05Z"),
+                dedicated("assistant.message", "2026-07-23T12:00:10Z"),
+                dedicated("user.message", "2026-07-23T12:01:00Z"),
+                dedicated_usage(2, "2026-07-23T12:01:05Z"),
+                dedicated("assistant.message", "2026-07-23T12:01:10Z"),
+            ],
+        );
+        f.sync();
+        let turns: Vec<i64> = f
+            .conn
+            .prepare(
+                "SELECT turn_no FROM usage_entries
+                 WHERE session_id = 'app__child' AND parent_session_id = 'app'
+                 ORDER BY timestamp",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(turns, vec![1, 2]);
+        assert_eq!(
+            f.replies("app__child", Some("child")),
+            vec![(1, 110), (2, 110)]
+        );
+    }
+
+    #[test]
+    fn app_review_dedicated_agent_prompts_leave_main_turns_untouched() {
+        // Boundary guard for the shared/dedicated split: a dedicated prompt may
+        // mark ONLY its own agent's turn pending. If it also marked the shared
+        // state, the main reply below would advance the main counter and push
+        // the following main usage call off the turn that renders it.
+        let mut f = AppReviewFixture::new(&["app"]);
+        let dedicated = |kind: &str, ts: &str| {
+            let mut event = app_text_at(kind, ts);
+            event["agentId"] = serde_json::json!("child");
+            event
+        };
+        let dedicated_usage = |id: usize, ts: &str| {
+            let mut event = cli_usage_fixture(id, ts);
+            event["agentId"] = serde_json::json!("child");
+            event
+        };
+        f.write(
+            "app",
+            &[
+                cli_usage_fixture(10, "2026-07-23T11:59:58Z"),
+                dedicated("user.message", "2026-07-23T12:00:00Z"),
+                dedicated_usage(1, "2026-07-23T12:00:02Z"),
+                dedicated("assistant.message", "2026-07-23T12:00:04Z"),
+                app_text_at("assistant.message", "2026-07-23T12:00:06Z"),
+                cli_usage_fixture(11, "2026-07-23T12:00:08Z"),
+                dedicated("user.message", "2026-07-23T12:01:00Z"),
+                dedicated_usage(2, "2026-07-23T12:01:02Z"),
+                dedicated("assistant.message", "2026-07-23T12:01:04Z"),
+            ],
+        );
+        f.sync();
+        let main_turns: Vec<i64> = f
+            .conn
+            .prepare(
+                "SELECT turn_no FROM usage_entries
+                 WHERE session_id = 'app' AND parent_session_id IS NULL
+                 ORDER BY timestamp",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        // The main reply has no shared prompt behind it, so the main counter
+        // stays at one and both main calls join the same filtered turn the
+        // timeline renders.
+        assert_eq!(main_turns, vec![1, 1]);
+        assert_eq!(f.replies("app", None), vec![(1, 220)]);
+        let child_turns: Vec<i64> = f
+            .conn
+            .prepare(
+                "SELECT turn_no FROM usage_entries
+                 WHERE session_id = 'app__child' AND parent_session_id = 'app'
+                 ORDER BY timestamp",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(child_turns, vec![1, 2]);
+    }
+
+    #[test]
     fn sqlite_only_subagent_call_uses_child_filtered_turn() {
         let mut f = AppReviewFixture::new(&["app"]);
         let mut child_reply = app_text_at("assistant.message", "2026-07-23T12:02:10Z");

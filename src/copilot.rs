@@ -180,8 +180,11 @@ pub(crate) fn read_calls(
         }
         let event: Event =
             serde_json::from_str(&line).map_err(|_| "Copilot 事件檔包含無效 JSON".to_string())?;
-        if matches!(event.kind.as_str(), "user.message" | "USER_PROMPT") && event.agent_id.is_none()
-        {
+        let is_prompt = matches!(event.kind.as_str(), "user.message" | "USER_PROMPT");
+        // One empty-`agentId` rule for prompt classification, the entry key,
+        // and usage attribution: an empty id is the shared timeline (`None`).
+        let agent = event.agent_id.filter(|id| !id.is_empty());
+        if is_prompt && agent.is_none() {
             seen_prompt = true;
             for state in turns.values_mut() {
                 let state: &mut TurnState = state;
@@ -189,8 +192,17 @@ pub(crate) fn read_calls(
             }
         }
         let state = turns
-            .entry(event.agent_id.clone().filter(|id| !id.is_empty()))
+            .entry(agent.clone())
             .or_insert_with(|| TurnState::new(seen_prompt));
+        if is_prompt {
+            // (review comment 4436837470) A prompt also marks its dedicated
+            // agent's own turn pending: `db::copilot_filtered_agent_turns` and
+            // the filtered timeline both treat a dedicated sub-agent prompt as
+            // a turn boundary. Shared prompts re-set every state above and here
+            // (idempotent); a dedicated prompt must never touch the shared
+            // state, whose counter only shared prompts and main replies move.
+            state.pending = true;
+        }
         if matches!(event.kind.as_str(), "assistant.message" | "ASSISTANT_REPLY")
             && event.payload.as_ref().unwrap_or(&event.data).content
             && state.pending
@@ -206,7 +218,7 @@ pub(crate) fn read_calls(
         // Subagents have independent accounting session IDs even though their
         // events are embedded in the parent's transcript. Keep that identity
         // for deduplication while attributing the call via the top-level agent.
-        let agent_id = event.agent_id.filter(|s| !s.is_empty());
+        let agent_id = agent;
         let source_session = accounting["sourceSessionId"].as_str().unwrap_or(session_id);
         if agent_id.is_none() && source_session != session_id {
             return Err("Copilot 用量的來源 session 不符".into());
