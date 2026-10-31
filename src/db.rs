@@ -4266,29 +4266,48 @@ fn sync_copilot_cli_agent_usage_logs_with_cancel(
             let cwd = store
                 .as_ref()
                 .and_then(|s| resolve_session_store_cwd(s, &sid));
+            // Mirror `sync_copilot_app_transcripts`: `merge_calls` appends
+            // SQLite-only sub-agent calls with the parent's `turn_index + 1`,
+            // but the drawer joins their usage on the sub-agent's own filtered
+            // timeline. Derive that turn here; paired calls keep their
+            // event-derived turns (review comment 4403291628).
+            let subagent_turns = if calls.iter().any(is_native_only_subagent_call) {
+                Some(copilot_filtered_agent_turns(&path, should_cancel)?)
+            } else {
+                None
+            };
             let rows: Vec<_> = calls
                 .into_iter()
-                .map(|r| CopilotCliUsageRow {
-                    session_id: sid.clone(),
-                    call_identity: r.identity,
-                    turn_no: r.turn_no.unwrap_or(1),
-                    native_identity: r.native_identity,
-                    reasoning_effort: None,
-                    ts: r
-                        .timestamp
-                        .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
-                    model: r.model,
-                    agent_id: r.agent_id,
-                    initiator: r.initiator,
-                    cwd: cwd.clone(),
-                    input_tokens: r.metrics.input.saturating_sub(r.metrics.cache_read),
-                    output_tokens: r.metrics.output,
-                    cache_read: r.metrics.cache_read,
-                    cache_write: r.metrics.cache_write,
-                    reasoning: r.metrics.reasoning,
-                    duration_ms: r.metrics.duration_ms,
+                .map(|r| {
+                    // An undecidable sub-agent turn propagates 「保留原資料
+                    // 待重試」 into the pending-marker retry below instead of
+                    // persisting a guessed turn (review comment 4436837487).
+                    let derived = match &subagent_turns {
+                        Some(turns) => native_only_subagent_turn(&r, turns)?,
+                        None => None,
+                    };
+                    Ok(CopilotCliUsageRow {
+                        session_id: sid.clone(),
+                        call_identity: r.identity,
+                        turn_no: derived.unwrap_or(r.turn_no.unwrap_or(1)),
+                        native_identity: r.native_identity,
+                        reasoning_effort: None,
+                        ts: r
+                            .timestamp
+                            .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
+                        model: r.model,
+                        agent_id: r.agent_id,
+                        initiator: r.initiator,
+                        cwd: cwd.clone(),
+                        input_tokens: r.metrics.input.saturating_sub(r.metrics.cache_read),
+                        output_tokens: r.metrics.output,
+                        cache_read: r.metrics.cache_read,
+                        cache_write: r.metrics.cache_write,
+                        reasoning: r.metrics.reasoning,
+                        duration_ms: r.metrics.duration_ms,
+                    })
                 })
-                .collect();
+                .collect::<Result<Vec<_>, String>>()?;
             let tx = conn.transaction().map_err(|e| e.to_string())?;
             if !rows.is_empty() {
                 replace_copilot_cli_call_rows(&tx, &root, &source_key, &sid, &rows)?;
@@ -5052,9 +5071,11 @@ fn replace_copilot_call_rows(
             session_name,
             transcript_path.as_ref(),
             row.cwd.as_deref(),
-            // Preserve the existing synthetic turn number; the call ID
-            // separates independent rows without inventing user turns.
-            if app { i64::from(row.turn_no) } else { 1i64 },
+            // Persist the filtered-timeline turn for App and CLI rows alike:
+            // the call ID separates independent rows without inventing user
+            // turns, and the detail page joins per-reply usage strictly by
+            // `usage_entries.turn_no` (thread PRRT_kwDOTOgsec6yUXNI).
+            i64::from(row.turn_no),
             row.model,
             row.model,
             row.input_tokens as i64,
@@ -20065,6 +20086,339 @@ mod tests {
             cli_daily_totals(&conn, sid),
             vec![("2026-07-23".into(), 330)]
         );
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    /// Replies that mounted usage, rebuilt inline like
+    /// `app_transcript_turns_keep_session_detail_usage`: rows group by their
+    /// persisted `turn_no` and the filtered timeline joins them per reply.
+    fn cli_review_replies(
+        conn: &Connection,
+        events: &Path,
+        row_session_id: &str,
+        agent: Option<&str>,
+    ) -> Vec<(u32, u64)> {
+        let entries: HashMap<u32, (TokenStats, String)> = conn
+            .prepare(
+                "SELECT turn_no, SUM(delta_total) FROM usage_entries
+                 WHERE session_id = ? GROUP BY turn_no",
+            )
+            .unwrap()
+            .query_map([row_session_id], |r| {
+                Ok((r.get::<_, u32>(0)?, r.get::<_, u64>(1)?))
+            })
+            .unwrap()
+            .map(|row| {
+                let (turn, total) = row.unwrap();
+                (
+                    turn,
+                    (
+                        TokenStats {
+                            total,
+                            input: 0,
+                            output: 0,
+                            cache_read: None,
+                            cache_write: None,
+                            cache_write_5m: None,
+                            cache_write_1h: None,
+                            reasoning: None,
+                        },
+                        "B".to_string(),
+                    ),
+                )
+            })
+            .collect();
+        let mut timeline = Vec::new();
+        crate::timeline::parse_copilot_timeline_filtered(
+            BufReader::new(File::open(events).unwrap()),
+            &entries,
+            &mut timeline,
+            &mut HashMap::new(),
+            agent,
+            None,
+        );
+        timeline
+            .into_iter()
+            .filter_map(|item| match item {
+                crate::timeline::TimelineItem::AgentReply {
+                    turn_no,
+                    tokens: Some(tokens),
+                    ..
+                } => Some((turn_no, tokens.total)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The transcript fingerprint an older build (with
+    /// `copilot::PARSER_VERSION = 2`) would have stored for `path`.
+    fn legacy_cli_fingerprint(path: &Path) -> (u64, i64) {
+        use std::hash::{Hash, Hasher};
+        let meta = fs::metadata(path).unwrap();
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        2u32.hash(&mut hash);
+        meta.modified().unwrap().hash(&mut hash);
+        (meta.len(), (hash.finish() & i64::MAX as u64) as i64)
+    }
+
+    #[test]
+    fn cli_review_call_rows_carry_filtered_turns_for_empty_id_streams() {
+        // (thread PRRT_kwDOTOgsec6yUXNI) `73bdb9a` normalized empty-`agentId`
+        // prompt+reply pairs into shared events, so this CLI stream reaches
+        // turn two. The CLI writer must persist the filtered turns or every
+        // reply after the first renders without usage.
+        let base = temp_jsonl_path("cli-review-empty-id-turns").with_extension("");
+        let sid = "cli-empty-id";
+        let empty_id = |kind: &str, ts: &str| {
+            let mut event = app_text_at(kind, ts);
+            event["agentId"] = serde_json::json!("");
+            event
+        };
+        write_cli_usage_fixture(
+            &base,
+            sid,
+            &[
+                empty_id("user.message", "2026-07-23T12:00:00Z"),
+                cli_usage_fixture(1, "2026-07-23T12:00:05Z"),
+                empty_id("assistant.message", "2026-07-23T12:00:10Z"),
+                app_text_at("user.message", "2026-07-23T12:01:00Z"),
+                cli_usage_fixture(2, "2026-07-23T12:01:05Z"),
+                app_text_at("assistant.message", "2026-07-23T12:01:10Z"),
+            ],
+        );
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        sync_copilot_cli_agent_usage_logs_from(&mut conn, &base).unwrap();
+        let turns: Vec<i64> = conn
+            .prepare("SELECT turn_no FROM usage_entries WHERE session_id = ? ORDER BY timestamp")
+            .unwrap()
+            .query_map([sid], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(turns, vec![1, 2], "CLI 逐筆用量必須寫入過濾後回合");
+        let events = base.join("session-state").join(sid).join("events.jsonl");
+        assert_eq!(
+            cli_review_replies(&conn, &events, sid, None),
+            vec![(1, 110), (2, 110)],
+            "每個回覆必須掛到同回合用量"
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn cli_review_native_only_subagent_call_uses_filtered_turns() {
+        // (thread PRRT_kwDOTOgsec6yUXNI) `merge_calls` appends SQLite-only
+        // sub-agent calls with the parent's `turn_index + 1`, but the drawer
+        // joins their usage on the sub-agent's own filtered timeline. The CLI
+        // row builder must derive that turn like the App side: here the call
+        // follows both child replies, so the parent counter says 3 and the
+        // old synthetic hard-code says 1 while the filtered turn is 2.
+        let base = temp_jsonl_path("cli-review-native-subagent-turns").with_extension("");
+        let sid = "cli-sub-turns";
+        fs::create_dir_all(&base).unwrap();
+        let store = build_cli_reconciler_fixture(&base, &[], &[sid]);
+        let child_reply = |ts: Option<&str>| {
+            let mut event = match ts {
+                Some(ts) => app_text_at("assistant.message", ts),
+                None => app_text("assistant.message"),
+            };
+            event["agentId"] = serde_json::json!("child");
+            event
+        };
+        write_cli_usage_fixture(
+            &base,
+            sid,
+            &[
+                app_text_at("user.message", "2026-07-23T12:00:00Z"),
+                child_reply(Some("2026-07-23T12:00:10Z")),
+                app_text_at("user.message", "2026-07-23T12:00:20Z"),
+                // The untimed reply still decides the call's turn because no
+                // definitely-later reply spans a second candidate.
+                child_reply(None),
+            ],
+        );
+        insert_cli_event(
+            &store,
+            CliEventIdentity {
+                id: 3,
+                session_id: sid,
+                model: "B",
+                agent_id: Some("child"),
+                initiator: Some("sub-agent"),
+            },
+            CliEventTokens {
+                input: 100,
+                output: 10,
+                cache_read: 80,
+                cache_write: 0,
+                reasoning: 0,
+                duration_ms: 50,
+            },
+            "2026-07-23T12:00:30Z",
+        );
+        store
+            .execute(
+                "UPDATE assistant_usage_events SET turn_index=2 WHERE id=3",
+                [],
+            )
+            .unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        sync_copilot_cli_agent_usage_logs_from(&mut conn, &base).unwrap();
+        let rows: Vec<(i64, Option<String>)> = conn
+            .prepare(
+                "SELECT turn_no, agent_role FROM usage_entries
+                 WHERE session_id = ? ORDER BY timestamp",
+            )
+            .unwrap()
+            .query_map([format!("{sid}__child")], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            rows,
+            vec![(2, Some("sub-agent".to_string()))],
+            "SQLite-only 子 Agent 呼叫必須寫入子 Agent 過濾後回合"
+        );
+        let events = base.join("session-state").join(sid).join("events.jsonl");
+        assert_eq!(
+            cli_review_replies(&conn, &events, &format!("{sid}__child"), Some("child")),
+            vec![(2, 110)],
+            "用量必須掛到子 Agent 第 2 個回覆而非錯置到第 1 個"
+        );
+        drop(store);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn cli_review_parser_version_bump_resyncs_unchanged_sessions() {
+        // (thread PRRT_kwDOTOgsec6yUXNI) Rows written before this fix keep
+        // `turn_no = 1` and predate `2543627`'s SQLite initiator recovery.
+        // `copilot_cli_transcript_fingerprint` hashes
+        // `copilot::PARSER_VERSION`, so the bump must invalidate every stored
+        // `copilot-cli-transcript:*` fingerprint once and rebuild unchanged
+        // sessions — without touching `sync:copilot_cli_agents:pending:*`.
+        let base = temp_jsonl_path("cli-review-fingerprint-resync").with_extension("");
+        let sid = "cli-resync";
+        fs::create_dir_all(&base).unwrap();
+        let store = build_cli_reconciler_fixture(&base, &[], &[sid]);
+        let dedicated = |kind: &str, ts: &str| {
+            let mut event = app_text_at(kind, ts);
+            event["agentId"] = serde_json::json!("child");
+            event
+        };
+        let mut first = cli_usage_fixture(1, "2026-07-23T12:00:05Z");
+        first["agentId"] = serde_json::json!("child");
+        let mut second = cli_usage_fixture(2, "2026-07-23T12:01:05Z");
+        second["agentId"] = serde_json::json!("child");
+        write_cli_usage_fixture(
+            &base,
+            sid,
+            &[
+                app_text_at("user.message", "2026-07-23T12:00:00Z"),
+                first,
+                dedicated("assistant.message", "2026-07-23T12:00:10Z"),
+                app_text_at("user.message", "2026-07-23T12:01:00Z"),
+                second,
+                dedicated("assistant.message", "2026-07-23T12:01:10Z"),
+            ],
+        );
+        // The paired SQLite rows carry `initiator='sub-agent'` while the
+        // transcript records carry none: only `merge_calls` can recover it.
+        for (id, ts) in [(1i64, "2026-07-23T12:00:05Z"), (2, "2026-07-23T12:01:05Z")] {
+            insert_cli_event(
+                &store,
+                CliEventIdentity {
+                    id,
+                    session_id: sid,
+                    model: "B",
+                    agent_id: Some("child"),
+                    initiator: Some("sub-agent"),
+                },
+                CliEventTokens {
+                    input: 100,
+                    output: 10,
+                    cache_read: 80,
+                    cache_write: 0,
+                    reasoning: 0,
+                    duration_ms: 50,
+                },
+                ts,
+            );
+        }
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let source = encode_hex(
+            crate::config::absolute_root(&base)
+                .as_os_str()
+                .as_encoded_bytes(),
+        );
+        let state_key = format!("copilot-cli-transcript:{source}:{sid}");
+        let other_pending = format!("sync:copilot_cli_agents:pending:{source}::other-session");
+        let rows = |conn: &Connection| -> Vec<(i64, Option<String>)> {
+            conn.prepare("SELECT turn_no, agent_role FROM usage_entries WHERE session_id = ? ORDER BY timestamp")
+                .unwrap()
+                .query_map([format!("{sid}__child")], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        sync_copilot_cli_agent_usage_logs_from(&mut conn, &base).unwrap();
+        let rebuilt = vec![
+            (1, Some("sub-agent".to_string())),
+            (2, Some("sub-agent".to_string())),
+        ];
+        assert_eq!(rows(&conn), rebuilt);
+        // Simulate rows persisted by an old build. The stored fingerprint
+        // still matches, so an unchanged session must stay untouched.
+        conn.execute("UPDATE usage_entries SET turn_no=1, agent_role=NULL", [])
+            .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO sync_state VALUES (?, 0, 0)",
+            [&other_pending],
+        )
+        .unwrap();
+        sync_copilot_cli_agent_usage_logs_from(&mut conn, &base).unwrap();
+        assert_eq!(
+            rows(&conn),
+            vec![(1, None), (1, None)],
+            "指紋相符時未變更的 session 不得重建"
+        );
+        // The pre-upgrade build hashed `PARSER_VERSION = 2` into the same
+        // fingerprint slot; after the bump it can never match again.
+        let legacy =
+            legacy_cli_fingerprint(&base.join("session-state").join(sid).join("events.jsonl"));
+        let stored: (u64, i64) = conn
+            .query_row(
+                "SELECT last_synced_size, last_synced_time FROM sync_state WHERE filename = ?",
+                [&state_key],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_ne!(stored, legacy, "升版後舊指紋必須失效");
+        conn.execute(
+            "INSERT OR REPLACE INTO sync_state VALUES (?, ?, ?)",
+            params![state_key, legacy.0, legacy.1],
+        )
+        .unwrap();
+        sync_copilot_cli_agent_usage_logs_from(&mut conn, &base).unwrap();
+        assert_eq!(
+            rows(&conn),
+            rebuilt,
+            "失效指紋後未變更的 session 必須重建並補回 SQLite initiator"
+        );
+        let pending: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state WHERE filename = ?",
+                [&other_pending],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 1, "pending 標記不得被指紋失效波及");
+        sync_copilot_cli_agent_usage_logs_from(&mut conn, &base).unwrap();
+        assert_eq!(rows(&conn), rebuilt, "重建必須收斂");
+        drop(store);
         fs::remove_dir_all(base).unwrap();
     }
 

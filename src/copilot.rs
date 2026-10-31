@@ -7,7 +7,9 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
-pub(crate) const PARSER_VERSION: u32 = 2;
+// Parser/reconciliation revision, hashed into the Copilot CLI/App transcript
+// fingerprints: bumping it re-syncs every unchanged session exactly once.
+pub(crate) const PARSER_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) struct Metrics {
