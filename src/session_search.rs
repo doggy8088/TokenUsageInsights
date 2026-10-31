@@ -15,6 +15,10 @@ pub(crate) struct SessionSearchMatch {
     assistant_type: String,
     source_kind: String,
     source_dir_key: Option<String>,
+    /// 與 `SessionIdentity` 同一組身分欄位：獨立 session `a__b`（無父層）
+    /// 與 session `a` 的合成子 Agent `b`（合成 id 同為 `a__b`）必須能在
+    /// 搜尋結果中被區分並單獨選取（comment 4403291365）。
+    parent_session_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -55,15 +59,11 @@ fn build_searchable_sessions(
     .into_iter()
     .map(|(identity, group)| {
         let mut transcript_path = None;
-        let mut parent_session_id = None;
         let mut agent_nickname = None;
         let mut model = None;
         for entry in group.entries {
             if transcript_path.is_none() {
                 transcript_path = entry.transcript_path;
-            }
-            if entry.parent_session_id.is_some() {
-                parent_session_id = entry.parent_session_id;
             }
             if entry.agent_nickname.is_some() {
                 agent_nickname = entry.agent_nickname;
@@ -78,7 +78,9 @@ fn build_searchable_sessions(
             transcript_path,
             source_kind: identity.source_kind,
             source_dir_key: identity.source_dir_key,
-            parent_session_id,
+            // 身分鍵（SessionIdentity）已含父層，直接沿用同一組欄位，
+            // 確保搜尋列與其他彙整看到完全相同的 session 身分。
+            parent_session_id: identity.parent_session_id,
             agent_nickname,
             model,
         }
@@ -160,6 +162,7 @@ pub(crate) fn search_user_prompts(
                 assistant_type: session.assistant_type,
                 source_kind: session.source_kind,
                 source_dir_key: session.source_dir_key,
+                parent_session_id: session.parent_session_id,
             });
         }
     }
@@ -170,6 +173,9 @@ pub(crate) fn search_user_prompts(
             .then_with(|| a.source_kind.cmp(&b.source_kind))
             .then_with(|| a.source_dir_key.cmp(&b.source_dir_key))
             .then_with(|| a.session_id.cmp(&b.session_id))
+            // 合成子 Agent id 可能與獨立 session id 相同（`a__b`），補上
+            // 父層決定性排序，避免同身分鍵前綴的兩列順序不穩。
+            .then_with(|| a.parent_session_id.cmp(&b.parent_session_id))
     });
     Ok(SessionSearchResponse {
         matches,
@@ -271,6 +277,60 @@ mod tests {
                     && session.source_dir_key.as_deref() == Some(source_dir_key)
                     && session.session_id == "shared-search-session"
             }));
+        }
+    }
+
+    #[test]
+    fn prompt_search_keeps_colliding_standalone_and_synthetic_child_separate() {
+        // 真實獨立 session `a__b`（無父層）與 session `a` 的子 Agent `b`
+        // （合成 id 同為 `a__b`、parent_session_id = `a`）在搜尋結果中必須
+        // 是兩個可單獨選取的身分（comment 4403291365）。
+        let mut standalone = usage_record("aa");
+        standalone.record.entry.session_id = "a__b".to_string();
+        let mut child = usage_record("aa");
+        child.record.entry.session_id = "a__b".to_string();
+        child.record.entry.parent_session_id = Some("a".to_string());
+
+        let sessions = build_searchable_sessions(&[standalone, child]);
+        assert_eq!(sessions.len(), 2, "碰撞的兩列必須分開成兩個可搜尋 session");
+
+        let matches: Vec<SessionSearchMatch> = sessions
+            .into_iter()
+            .map(|session| SessionSearchMatch {
+                session_id: session.session_id,
+                assistant_type: session.assistant_type,
+                source_kind: session.source_kind,
+                source_dir_key: session.source_dir_key,
+                parent_session_id: session.parent_session_id,
+            })
+            .collect();
+        let mut identity_tuples: Vec<(String, Option<String>)> = matches
+            .iter()
+            .map(|row| (row.session_id.clone(), row.parent_session_id.clone()))
+            .collect();
+        identity_tuples.sort();
+        assert_eq!(
+            identity_tuples,
+            vec![
+                ("a__b".to_string(), None),
+                ("a__b".to_string(), Some("a".to_string())),
+            ],
+            "獨立 session 與合成子 Agent 必須是兩個不同的搜尋身分"
+        );
+
+        // 序列化契約：搜尋列必須原樣帶出 parent_session_id，前端才可用
+        // 同一把 5 欄位身分鍵區分並單獨選取。
+        for row in &matches {
+            let value = serde_json::to_value(row).expect("搜尋列必須可序列化");
+            let expected_parent = match row.parent_session_id.as_deref() {
+                Some(parent) => serde_json::json!(parent),
+                None => serde_json::Value::Null,
+            };
+            assert_eq!(
+                value.get("parent_session_id"),
+                Some(&expected_parent),
+                "搜尋列序列化必須帶 parent_session_id（前端身分鍵契約）"
+            );
         }
     }
 }

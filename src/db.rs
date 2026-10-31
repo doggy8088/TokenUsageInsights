@@ -1,6 +1,6 @@
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -156,12 +156,16 @@ pub struct UsageEntry {
 
 /// A usage entry together with the assistant and calendar date selected by a
 /// period query. Keeping these values named prevents month/year reporting from
-/// depending on positional tuple conventions.
+/// depending on positional tuple conventions. `import_source_id` is retained
+/// so reporting can tell per-call rows (`:call:` marker; each row carries only
+/// one call's duration) apart from cumulative/aggregate rows. This struct is
+/// internal-only and appears in no serialized shape.
 #[derive(Debug, Clone)]
 pub struct DatedUsageEntry {
     pub entry: UsageEntry,
     pub assistant_type: String,
     pub date: String,
+    pub import_source_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -186,6 +190,10 @@ pub struct UsageDayImportSummary {
     pub total: usize,
     pub imported: usize,
     pub skipped_duplicates: usize,
+    /// Records whose overlap with existing usage could not be proven either
+    /// way (for example a turn-less legacy aggregate). They are neither
+    /// imported nor counted as duplicates (review 4403291574).
+    pub skipped_conflicts: usize,
     pub batch_id: String,
 }
 
@@ -205,6 +213,7 @@ pub struct UsageImportBatch {
     pub total: usize,
     pub imported: usize,
     pub skipped_duplicates: usize,
+    pub skipped_conflicts: usize,
     pub created_at: i64,
     pub rolled_back_at: Option<i64>,
     pub removed_records: usize,
@@ -219,6 +228,17 @@ pub struct UsageImportRollbackSummary {
 const CODEX_PARSER_MIGRATION_KEY: &str = "migration:codex_session_identity_v9";
 const CODEX_SOURCE_KIND_MIGRATION_KEY: &str = "migration:codex_source_kind_v1";
 const CODEX_ROLLOUT_IDENTITY_MIGRATION_KEY: &str = "migration:codex_rollout_identity_v1";
+const PARENT_SESSION_NORMALIZATION_MIGRATION_KEY: &str =
+    "migration:parent_session_id_normalization_v1";
+/// 一次性父層碰撞復原（PRRT_kwDOTOgsec6yUXND）：與 v1 正規化遷移分開的獨立
+/// sync_state key，避免兩者互相把對方的一次性修復吞掉。
+const COPILOT_PARENT_COLLISION_RECOVERY_KEY: &str =
+    "migration:copilot_parent_collision_recovery_v1";
+/// 一次性父層正規化 v2（PRRT_kwDOTOgsec6yUXNe）：修復 v1（feca7c9）之後才落盤
+/// 的空白／padded 父層值。獨立於 v1 的 sync_state key——沿用 v1 的 key 會被
+/// 已消費的一次性標記擋住、永遠不跑。
+const PARENT_SESSION_NORMALIZATION_MIGRATION_V2_KEY: &str =
+    "migration:parent_session_id_normalization_v2";
 const CODEX_CLI_SOURCE_KIND: &str = "codex-cli";
 const CODEX_DESKTOP_SOURCE_KIND: &str = "codex-desktop";
 const CODEX_OTHER_SOURCE_KIND: &str = "codex-other";
@@ -343,6 +363,14 @@ const COPILOT_CLI_AGENT_CURSOR_PREFIX: &str = "sync:copilot_cli_agents:";
 /// `assistant_usage_events`. These sessions are retried even when no new agent
 /// event arrives, without forcing already-valid sessions to roll back.
 const COPILOT_CLI_AGENT_PENDING_PREFIX: &str = "sync:copilot_cli_agents:pending:";
+
+/// Durable marker for Copilot App sessions whose transcript reconciliation has
+/// not completed yet (review comment 4403291310). Mirrors
+/// [`COPILOT_CLI_AGENT_PENDING_PREFIX`] so the SQLite fallback can force a full
+/// native-history rescan once the event file disappears instead of leaving the
+/// session permanently uncovered. Stored without a trailing separator so the
+/// prefix also works with [`load_sync_state_for_prefix`] (which appends `:%`).
+const COPILOT_APP_TRANSCRIPT_PENDING_PREFIX: &str = "sync:copilot_app_transcript:pending";
 
 /// Versioned, root-scoped repair key (canonical source key is appended).
 /// Upgrades scan all CLI sessions regardless of older SQLite cursors. Each
@@ -530,6 +558,18 @@ fn build_usage_entry_import_source_id(
         ));
     }
     format!("{:016x}", hash_fnv1a_64(&signature))
+}
+
+/// Normalize a persisted `parent_session_id` at write boundaries: an empty or
+/// blank parent means "no parent" for every consumer — the frontend
+/// `sessionIdentityKey` collapses `''` to absent and the detail page requests
+/// the parentless row-set with `parent_session_id=''` → `RootOnly` — so the
+/// `Some("")` vs `None` distinction must never reach storage or identity keys
+/// (review thread PRRT_kwDOTOgsec6yUKGs).
+pub(crate) fn normalize_parent_session_id(parent: Option<String>) -> Option<String> {
+    parent
+        .map(|parent| parent.trim().to_string())
+        .filter(|parent| !parent.is_empty())
 }
 
 /// Directory resolution helpers
@@ -948,9 +988,21 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
     // the original uniqueness because existing collectors use the default
     // empty usage_identity, while explicitly keyed collectors may retain
     // multiple independently upsertable rows for one logical turn.
+    // The NORMALIZED parent participates in uniqueness (COALESCE(NULLIF(TRIM(
+    // parent_session_id), ''), '') — not the bare nullable column, because
+    // SQLite treats NULLs as distinct and that would stop INSERT OR REPLACE
+    // from deduplicating parentless rows): a standalone session `a__main`
+    // (no parent) and session `a`'s agent `main` (synthetic `a__main`,
+    // parent `a`) share (session_id, turn_no, usage_identity) but must never
+    // clobber each other before grouping can tell the families apart.
+    // init_db DROPs + CREATEs these indexes each startup, so this key change
+    // is itself the rebuild migration.
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS uidx_assistant_source_session_turn
-         ON usage_entries(assistant_type, source_kind, session_id, turn_no, usage_identity)
+         ON usage_entries(
+            assistant_type, source_kind, session_id, turn_no, usage_identity,
+            COALESCE(NULLIF(TRIM(parent_session_id), ''), '')
+         )
          WHERE source_dir_key IS NULL",
         [],
     )
@@ -962,11 +1014,14 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
     })?;
 
     // Partial index for copilot-app rows (source_dir_key IS NOT NULL): includes
-    // source_dir_key so different COPILOT_APP_DIR values are isolated.
+    // source_dir_key so different COPILOT_APP_DIR values are isolated. Carries
+    // the same normalized-parent key as uidx_assistant_source_session_turn so
+    // the fallback rebuild's INSERT OR REPLACE keeps both parent families.
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS uidx_assistant_source_dir_session_turn
          ON usage_entries(
-            assistant_type, source_kind, source_dir_key, session_id, turn_no, usage_identity
+            assistant_type, source_kind, source_dir_key, session_id, turn_no, usage_identity,
+            COALESCE(NULLIF(TRIM(parent_session_id), ''), '')
          )
          WHERE source_dir_key IS NOT NULL",
         [],
@@ -1064,6 +1119,7 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
             total_records INTEGER NOT NULL,
             imported_records INTEGER NOT NULL,
             skipped_duplicates INTEGER NOT NULL,
+            skipped_conflicts INTEGER NOT NULL DEFAULT 0,
             created_at INTEGER NOT NULL,
             rolled_back_at INTEGER,
             removed_records INTEGER NOT NULL DEFAULT 0
@@ -1071,6 +1127,13 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
         [],
     )
     .map_err(|e| format!("建立 import_batches 表失敗: {e}"))?;
+    // Tolerated-ALTER migration: databases created before the conflict bucket
+    // existed keep counting unprovable-overlap records honestly (review
+    // 4403291574). A duplicate-column error simply means it is already there.
+    let _ = conn.execute(
+        "ALTER TABLE import_batches ADD COLUMN skipped_conflicts INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_import_batches_assistant_created
          ON import_batches(assistant_type, created_at DESC)",
@@ -1354,6 +1417,13 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
         )
         .map_err(|error| format!("記錄 Grok Build parser migration 失敗: {error}"))?;
     }
+
+    // 一次性遷移（掛載於 init_db 尾端、sync_state 表建立之後：只要開庫就
+    // 執行，且不與 App sync 入口的 legacy cursor 升級路徑互相干擾）：
+    // - 父層碰撞復原（PRRT_kwDOTOgsec6yUXND）
+    // - 父層正規化 v2（PRRT_kwDOTOgsec6yUXNe）
+    run_copilot_parent_collision_recovery_migration(conn)?;
+    run_parent_session_id_normalization_migration_v2(conn)?;
 
     Ok(())
 }
@@ -2030,7 +2100,7 @@ fn insert_vscode_usage_entry(
                 .map(|value| value as i64),
             cost.and_then(|value| value.total_premium_requests)
                 .map(|value| value as i64),
-            entry.parent_session_id.as_deref(),
+            normalize_parent_session_id(entry.parent_session_id.clone()),
             entry.agent_nickname.as_deref(),
             entry.agent_role.as_deref(),
             entry.reasoning_effort.as_deref(),
@@ -2191,6 +2261,143 @@ fn run_codex_parser_migration(conn: &mut Connection) -> Result<(), String> {
         tx.commit()
             .map_err(|e| format!("Codex parser migration COMMIT 失敗: {}", e))?;
     }
+    Ok(())
+}
+
+/// One-time repair for rows persisted before empty parents were normalized:
+/// `parent_session_id = ''` (Codex `parent_thread_id: ""`, imported
+/// `parent_session_id: ""`) means "no parent" everywhere else in the stack
+/// (frontend identity key, `ParentSessionScope::RootOnly`), so collapse `''` /
+/// blank parents to NULL and TRIM the rest.
+///
+/// Deliberately NOT done via the Copilot App reconciliation revision
+/// (`4u32.hash`): that fingerprint only covers App transcript rows — whose
+/// parents are always real session ids — while Codex and imported rows bypass
+/// the App reconciliation entirely, so bumping it would rescan unrelated data
+/// and leave every `''` row untouched. A `sync_state` marker (same pattern as
+/// [`run_codex_parser_migration`]) keeps this UPDATE one-shot and idempotent.
+fn run_parent_session_id_normalization_migration(conn: &mut Connection) -> Result<(), String> {
+    let migration_done: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = ?)",
+            params![PARENT_SESSION_NORMALIZATION_MIGRATION_KEY],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    if migration_done {
+        return Ok(());
+    }
+
+    let tx = conn
+        .transaction()
+        .map_err(|error| format!("父層身分正規化遷移 BEGIN 失敗: {error}"))?;
+    tx.execute(
+        "UPDATE usage_entries
+         SET parent_session_id = NULLIF(TRIM(parent_session_id), '')
+         WHERE parent_session_id IS NOT NULL",
+        [],
+    )
+    .map_err(|error| format!("修正空白父層資料失敗: {error}"))?;
+    tx.execute(
+        "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time) VALUES (?, 1, 0)",
+        params![PARENT_SESSION_NORMALIZATION_MIGRATION_KEY],
+    )
+    .map_err(|error| format!("寫入父層身分正規化遷移狀態失敗: {error}"))?;
+    tx.commit()
+        .map_err(|error| format!("父層身分正規化遷移 COMMIT 失敗: {error}"))
+}
+
+/// 一次性父層正規化 v2（PRRT_kwDOTOgsec6yUXNe）。
+///
+/// v1 之後仍可能落盤空白／padded 父層值（codex parser 的
+/// `parent_thread_id` filter 未 trim、匯入端以外的寫入邊界未正規化）。摘要層
+/// 分組會 trim、詳情頁 `RootOnly` 只認 `IS NULL`/`''`，`'  '` 列變成「清單
+/// 看得到、詳情 404」。此遷移把既有列折成與 `SessionIdentity` 相同語意
+/// （trim＋空即無父）。SQL 謂詞用 null-safe 的 `IS NOT`：`x <> NULLIF(TRIM(x),'')`
+/// 對會折成 NULL 的列永遠是 NULL 比較、恰好漏掉最需要修的純空白列。
+/// 以獨立 sync_state 標記守門、標記最後寫入，冪等且一次性。
+fn run_parent_session_id_normalization_migration_v2(conn: &Connection) -> Result<(), String> {
+    let migration_done: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = ?)",
+            params![PARENT_SESSION_NORMALIZATION_MIGRATION_V2_KEY],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    if migration_done {
+        return Ok(());
+    }
+
+    let repaired = conn
+        .execute(
+            "UPDATE usage_entries
+             SET parent_session_id = NULLIF(TRIM(parent_session_id), '')
+             WHERE parent_session_id IS NOT NULL
+               AND parent_session_id IS NOT NULLIF(TRIM(parent_session_id), '')",
+            [],
+        )
+        .map_err(|error| format!("修正空白／padded 父層資料失敗: {error}"))?;
+    conn.execute(
+        "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time) VALUES (?, 1, 0)",
+        params![PARENT_SESSION_NORMALIZATION_MIGRATION_V2_KEY],
+    )
+    .map_err(|error| format!("寫入父層正規化 v2 遷移狀態失敗: {error}"))?;
+    if repaired > 0 {
+        println!(
+            "✅ 遷移：父層正規化 v2——修正 {} 列空白／padded 父層",
+            repaired
+        );
+    }
+    Ok(())
+}
+
+/// 一次性父層碰撞復原（PRRT_kwDOTOgsec6yUXND）。
+///
+/// 唯一索引納入「正規化父層」之前，`INSERT OR REPLACE` 會讓獨立 session
+/// `a__main`（無父層）與 session `a` 的 agent `main`（合成 `a__main`、
+/// parent = `a`）互相覆寫；資料庫中只剩最後寫入者，光看倖存列無法還原被吞
+/// 掉的列。因此清掉 fallback cursor 與 App transcript 指紋，讓下次同步把每
+/// 回合全部重聚合，在新的（含父層）唯一鍵下復原遺失列。
+///
+/// 刻意保留 pending keys（`sync:copilot_app_transcript:pending:*`、
+/// `sync:copilot_cli_agents:pending:*`）：它們承載尚未入庫的來源資料，不屬於
+/// 重聚合範圍。以 sync_state 標記做一次性閘門，標記最後寫入即具冪等性。
+fn run_copilot_parent_collision_recovery_migration(conn: &Connection) -> Result<(), String> {
+    let migration_done: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = ?)",
+            params![COPILOT_PARENT_COLLISION_RECOVERY_KEY],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    if migration_done {
+        return Ok(());
+    }
+
+    let cursor_cleared = conn
+        .execute(
+            "DELETE FROM sync_state WHERE filename LIKE 'sync:copilot_app:cursor:%'",
+            [],
+        )
+        .map_err(|error| format!("清除 Copilot App fallback cursor 失敗: {error}"))?;
+    let fingerprint_cleared = conn
+        .execute(
+            "DELETE FROM sync_state WHERE filename LIKE 'copilot-app-transcript:%'",
+            [],
+        )
+        .map_err(|error| format!("清除 Copilot App transcript 指紋失敗: {error}"))?;
+    conn.execute(
+        "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time) VALUES (?, 1, 0)",
+        params![COPILOT_PARENT_COLLISION_RECOVERY_KEY],
+    )
+    .map_err(|error| format!("寫入父層碰撞復原遷移狀態失敗: {error}"))?;
+    println!(
+        "✅ 遷移：父層碰撞復原——清除 {} 個 fallback cursor 與 {} 個 transcript 指紋，下次同步將全歷史重聚合",
+        cursor_cleared, fingerprint_cleared
+    );
     Ok(())
 }
 
@@ -2482,7 +2689,349 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
     sync_copilot_app_usage_logs_from(conn, &crate::paths::copilot_app_dir())
 }
 
+/// Per-sub-agent turn boundaries of the agent's filtered timeline view.
+///
+/// The detail page numbers each agent's replies with its own filtered counter
+/// (see `timeline::parse_copilot_timeline_filtered`): prompts share a turn and
+/// the first nonempty reply after a prompt closes it. Usage joins those replies
+/// strictly by that number, so a SQLite-only sub-agent call must not keep the
+/// parent session's `turn_index + 1` (review comment 4403291628).
+struct AgentFilteredTurns {
+    /// `(timestamp, turn_no)` of every nonempty reply, in stream order.
+    replies: Vec<(Option<chrono::DateTime<chrono::Utc>>, u32)>,
+    /// Turn counter after the last reply, for calls that follow every reply.
+    end_turn: u32,
+}
+
+impl AgentFilteredTurns {
+    /// A call belongs to the next reply of the agent's filtered timeline — the
+    /// same forward attribution `copilot::read_calls` derives from the stream.
+    /// A reply without a parseable timestamp may sit on either side of the
+    /// call, so it competes with the first reply that is definitely at or after
+    /// the call (review comment 4436837487): attribute to the earliest reply
+    /// that can follow the call, and return `None` when those candidates span
+    /// different turns so the caller keeps the source rows for retry instead of
+    /// writing a guessed turn.
+    fn turn_at(&self, ts: chrono::DateTime<chrono::Utc>) -> Option<u32> {
+        let mut candidate: Option<u32> = None;
+        for (reply_ts, turn) in &self.replies {
+            let definitely_after_call = match reply_ts {
+                // Definitely before the call: never the next reply.
+                Some(reply_ts) if *reply_ts < ts => continue,
+                Some(_) => true,
+                // Timestamp missing or unparseable: either side of the call,
+                // so it stays a candidate until a definitely-later reply ends
+                // the run.
+                None => false,
+            };
+            if candidate.is_some_and(|previous| previous != *turn) {
+                return None;
+            }
+            candidate = Some(*turn);
+            if definitely_after_call {
+                break;
+            }
+        }
+        Some(candidate.unwrap_or(self.end_turn))
+    }
+}
+
+/// Replay each sub-agent's filtered timeline from the shared events file to
+/// learn its per-reply turn numbers. Mirrors the keep and numbering rules of
+/// `timeline::parse_copilot_timeline_filtered` with `agent_filter = Some(a)`:
+/// shared prompts (no `agentId`) and the agent's own prompts open a turn, and
+/// the agent's first nonempty reply closes it.
+fn copilot_filtered_agent_turns(
+    path: &Path,
+    should_cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<HashMap<String, AgentFilteredTurns>, String> {
+    struct AgentState {
+        next: u32,
+        pending_prompt: bool,
+        replies: Vec<(Option<chrono::DateTime<chrono::Utc>>, u32)>,
+    }
+    let file = File::open(path).map_err(|e| format!("讀取 Copilot 事件檔失敗: {e}"))?;
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    let mut states: HashMap<String, AgentState> = HashMap::new();
+    let mut shared_prompt_seen = false;
+    loop {
+        if should_cancel() {
+            return Err("Copilot 同步已取消".into());
+        }
+        line.clear();
+        if reader.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
+            break;
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event: serde_json::Value =
+            serde_json::from_str(&line).map_err(|_| "Copilot 事件檔包含無效 JSON".to_string())?;
+        let kind = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let agent = event
+            .get("agentId")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+        let ts = event
+            .get("timestamp")
+            .and_then(|v| v.as_str())
+            .and_then(|raw| crate::copilot::parse_timestamp(raw).ok());
+        match (kind, agent) {
+            ("user.message" | "USER_PROMPT", None) => {
+                shared_prompt_seen = true;
+                for state in states.values_mut() {
+                    state.pending_prompt = true;
+                }
+            }
+            ("user.message" | "USER_PROMPT", Some(agent)) => {
+                states
+                    .entry(agent.to_owned())
+                    .or_insert_with(|| AgentState {
+                        next: 1,
+                        pending_prompt: shared_prompt_seen,
+                        replies: Vec::new(),
+                    })
+                    .pending_prompt = true;
+            }
+            ("assistant.message" | "ASSISTANT_REPLY", Some(agent)) => {
+                let content = event
+                    .get("payload")
+                    .or_else(|| event.get("data"))
+                    .and_then(|p| p.get("content"))
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("");
+                if content.is_empty() {
+                    continue;
+                }
+                let state = states
+                    .entry(agent.to_owned())
+                    .or_insert_with(|| AgentState {
+                        next: 1,
+                        pending_prompt: shared_prompt_seen,
+                        replies: Vec::new(),
+                    });
+                state.replies.push((ts, state.next));
+                if state.pending_prompt {
+                    state.next = state.next.checked_add(1).ok_or("Copilot 回合數超出範圍")?;
+                    state.pending_prompt = false;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(states
+        .into_iter()
+        .map(|(agent, state)| {
+            (
+                agent,
+                AgentFilteredTurns {
+                    replies: state.replies,
+                    end_turn: state.next,
+                },
+            )
+        })
+        .collect())
+}
+
+/// True for a merged call that exists only in `assistant_usage_events` and
+/// belongs to a sub-agent: `merge_calls` appends those unchanged with the
+/// parent's `turn_index + 1`, while paired calls carry `event:` identities.
+fn is_native_only_subagent_call(call: &crate::copilot::Call) -> bool {
+    call.agent_id.is_some() && call.identity.starts_with("sqlite:")
+}
+
+/// Filtered-timeline turn for a merged call that needs derivation; `Ok(None)`
+/// for paired calls and main-agent calls, which keep their existing turns.
+/// `Err` (「保留原資料待重試」, mirroring the `merge_calls` ambiguity precedent)
+/// when an untimed reply makes the turn undecidable: the caller keeps the
+/// source rows intact and retries instead of persisting a guessed turn.
+fn native_only_subagent_turn(
+    call: &crate::copilot::Call,
+    turns: &HashMap<String, AgentFilteredTurns>,
+) -> Result<Option<u32>, String> {
+    if !is_native_only_subagent_call(call) {
+        return Ok(None);
+    }
+    let Some(agent) = call.agent_id.as_deref() else {
+        return Ok(None);
+    };
+    match turns.get(agent) {
+        // The agent has no filtered events at all; its timeline starts at one.
+        None => Ok(Some(1)),
+        Some(boundaries) => boundaries.turn_at(call.timestamp).map(Some).ok_or_else(|| {
+            "Copilot 子 Agent 用量無法判定回覆回合歸屬，保留原資料待重試".to_string()
+        }),
+    }
+}
+
+/// Rebuild registered App sessions from complete per-call sources, independently
+/// of the legacy SQLite cursor. Failed reads leave both rows and state intact.
+fn sync_copilot_app_transcripts(
+    conn: &mut Connection,
+    root: &Path,
+    key: &str,
+    registry: &HashSet<String>,
+    data_db: &Connection,
+    should_cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<(), String> {
+    let store_path = root.join("session-store.db");
+    let store = if store_path.exists() {
+        let store = Connection::open_with_flags(&store_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| e.to_string())?;
+        store
+            .execute_batch("BEGIN DEFERRED")
+            .map_err(|e| e.to_string())?;
+        let exists: bool = store
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='assistant_usage_events')",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if exists {
+            Some(store)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let states = load_sync_state_for_prefix(conn, "copilot-app-transcript");
+    let mut sessions: Vec<_> = registry.iter().collect();
+    sessions.sort();
+    for sid in sessions {
+        if should_cancel() {
+            break;
+        }
+        if !crate::session_files::is_safe_session_id(sid) {
+            continue;
+        }
+        let path = root.join("session-state").join(sid).join("events.jsonl");
+        if !path.exists() {
+            continue;
+        }
+        let result = (|| -> Result<(), String> {
+            let before = copilot_cli_transcript_fingerprint(&path)?;
+            let native = read_copilot_cli_native_calls(store.as_ref(), sid)?;
+            let state_key = format!("copilot-app-transcript:{key}:{sid}");
+            // Native rows can arrive without any transcript growth. Include
+            // their complete ordered contents, not the global SQLite cursor.
+            use std::hash::{Hash, Hasher};
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            before.hash(&mut hash);
+            format!("{native:?}").hash(&mut hash);
+            let cwd = store
+                .as_ref()
+                .and_then(|s| resolve_session_store_cwd(s, sid));
+            cwd.hash(&mut hash);
+            let title = data_db
+                .query_row("SELECT title FROM sessions WHERE id=?", [sid], |r| {
+                    r.get::<_, Option<String>>(0)
+                })
+                .ok()
+                .flatten();
+            // v6 (PRRT_kwDOTOgsec6yUXND): storage uniqueness now includes the
+            // normalized parent, so the App transcript takeover must replay
+            // once more to restore rows the old key had clobbered.
+            6u32.hash(&mut hash); // App reconciliation/accounting revision.
+            title.hash(&mut hash);
+            let fingerprint = (before.0, (hash.finish() & i64::MAX as u64) as i64);
+            if states.get(&state_key) == Some(&fingerprint) {
+                return Ok(());
+            }
+            let calls = crate::copilot::read_calls(&path, sid, should_cancel)?;
+            let calls = crate::copilot::merge_calls(calls, native.clone())?;
+            if before != copilot_cli_transcript_fingerprint(&path)? {
+                return Err("Copilot App 事件檔在讀取時變更".into());
+            }
+            // (review comment 4403291628) `merge_calls` appends SQLite-only
+            // sub-agent calls unchanged, so they would keep the PARENT
+            // session's `turn_index + 1`, while the detail page joins their
+            // usage on the sub-agent's own filtered timeline, whose numbering
+            // restarts at one. Re-derive those turns from the agent's filtered
+            // replies and event timestamps; paired calls keep their
+            // event-derived turns and main-agent calls keep `turn_index + 1`
+            // (they match the main timeline).
+            let subagent_turns = if calls.iter().any(is_native_only_subagent_call) {
+                Some(copilot_filtered_agent_turns(&path, should_cancel)?)
+            } else {
+                None
+            };
+            let mut rows = Vec::with_capacity(calls.len());
+            for r in calls {
+                let derived = match &subagent_turns {
+                    // An undecidable sub-agent turn propagates as 「保留原資料
+                    // 待重試」: no rows are replaced and no fingerprint is
+                    // stored, so the unchanged source retries like every other
+                    // reconciliation failure (review comment 4436837487).
+                    Some(turns) => native_only_subagent_turn(&r, turns)?,
+                    None => None,
+                };
+                let turn_no = derived.unwrap_or(r.turn_no.unwrap_or(1));
+                rows.push(CopilotCliUsageRow {
+                    session_id: sid.to_string(),
+                    call_identity: r.identity,
+                    turn_no,
+                    native_identity: r.native_identity,
+                    reasoning_effort: r.reasoning_effort,
+                    ts: r
+                        .timestamp
+                        .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
+                    model: r.model,
+                    agent_id: r.agent_id,
+                    initiator: r.initiator,
+                    cwd: cwd.clone(),
+                    input_tokens: r.metrics.input.saturating_sub(r.metrics.cache_read),
+                    output_tokens: r.metrics.output,
+                    cache_read: r.metrics.cache_read,
+                    cache_write: r.metrics.cache_write,
+                    reasoning: r.metrics.reasoning,
+                    duration_ms: r.metrics.duration_ms,
+                });
+            }
+            if should_cancel() {
+                return Err("Copilot App 同步已取消".into());
+            }
+            let tx = conn.transaction().map_err(|e| e.to_string())?;
+            let context = AppCallContext {
+                native: &native,
+                title,
+            };
+            replace_copilot_call_rows(&tx, root, key, sid, &rows, Some(&context))?;
+            tx.execute(
+                "INSERT OR REPLACE INTO sync_state VALUES (?, ?, ?)",
+                params![state_key, fingerprint.0, fingerprint.1],
+            )
+            .map_err(|e| e.to_string())?;
+            if should_cancel() {
+                return Err("Copilot App 同步已取消".into());
+            }
+            tx.commit().map_err(|e| e.to_string())
+        })();
+        if let Err(error) = result {
+            eprintln!("⚠️ Copilot App 用量尚待重試: {error}");
+        }
+    }
+    if let Some(store) = store {
+        store.execute_batch("ROLLBACK").map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn sync_copilot_app_usage_logs_from(conn: &mut Connection, app_dir: &Path) -> Result<(), String> {
+    sync_copilot_app_usage_logs_from_with_cancel(conn, app_dir, &|| false)
+}
+
+fn sync_copilot_app_usage_logs_from_with_cancel(
+    conn: &mut Connection,
+    app_dir: &Path,
+    should_cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<(), String> {
+    if should_cancel() {
+        return Ok(());
+    }
     let session_store_path = app_dir.join("session-store.db");
 
     // Canonicalize the source directory so the cursor is stable across trailing
@@ -2495,13 +3044,17 @@ fn sync_copilot_app_usage_logs_from(conn: &mut Connection, app_dir: &Path) -> Re
         .canonicalize()
         .unwrap_or_else(|_| app_dir.to_path_buf());
     let source_key = encode_hex(canonical_app_dir.as_os_str().as_encoded_bytes());
-    register_usage_source_directory(
-        conn,
-        "copilot",
-        COPILOT_APP_SOURCE_KIND,
-        &source_key,
-        &canonical_app_dir,
-    )?;
+    if get_usage_source_directory(conn, "copilot", COPILOT_APP_SOURCE_KIND, &source_key)?.as_deref()
+        != Some(canonical_app_dir.as_path())
+    {
+        register_usage_source_directory(
+            conn,
+            "copilot",
+            COPILOT_APP_SOURCE_KIND,
+            &source_key,
+            &canonical_app_dir,
+        )?;
+    }
     let cursor_key_prefix = format!("{}{}::", COPILOT_APP_CURSOR_PREFIX, source_key);
 
     // `data.db.sessions` is the authoritative registry for Copilot App
@@ -2569,13 +3122,116 @@ fn sync_copilot_app_usage_logs_from(conn: &mut Connection, app_dir: &Path) -> Re
         }
     };
 
+    if let Err(error) = sync_copilot_app_transcripts(
+        conn,
+        &canonical_app_dir,
+        &source_key,
+        &app_session_ids,
+        &data_db,
+        should_cancel,
+    ) {
+        eprintln!("⚠️ Copilot App 事件檔同步尚待重試: {error}");
+    }
+    if should_cancel() {
+        return Ok(());
+    }
+    // Repair only derived App totals from already stored breakdowns. No source
+    // data is deleted, and a missing source cannot block correcting double counts.
+    conn.execute("UPDATE usage_entries SET
+        tokens_total=COALESCE(tokens_input,0)+COALESCE(tokens_cache_read,0)+COALESCE(tokens_output,0),
+        delta_total=COALESCE(delta_input,0)+COALESCE(delta_cache_read,0)+COALESCE(delta_output,0)
+        WHERE source_kind='copilot-app' AND source_dir_key=?1 AND import_batch_id IS NULL
+          AND (tokens_total != COALESCE(tokens_input,0)+COALESCE(tokens_cache_read,0)+COALESCE(tokens_output,0)
+            OR delta_total != COALESCE(delta_input,0)+COALESCE(delta_cache_read,0)+COALESCE(delta_output,0))", [&source_key])
+        .map_err(|e| e.to_string())?;
+    let authoritative_registry = app_session_ids.clone();
+    let managed = load_sync_state_for_prefix(conn, "copilot-app-transcript");
+    // (review comment 4403291310) Transcript reconciliation failures used to be
+    // log-only: the session stayed excluded from the SQLite fallback while the
+    // global cursor advanced past its native calls, so once its event file was
+    // removed the unprocessed usage became unreachable. Record every
+    // registered session whose transcript has not been reconciled with a
+    // durable pending marker (mirroring `COPILOT_CLI_AGENT_PENDING_PREFIX`) so
+    // the fallback can force a full native-history rescan once it owns the
+    // session. Reconciled sessions and sessions that left the registry drop
+    // their marker again, so an unchanged source always converges.
+    let pending_prefix = format!("{COPILOT_APP_TRANSCRIPT_PENDING_PREFIX}:{source_key}::");
+    let pending_states = load_sync_state_for_prefix(conn, COPILOT_APP_TRANSCRIPT_PENDING_PREFIX);
+    let mut pending_session_ids: HashSet<String> = HashSet::new();
+    for filename in pending_states.keys() {
+        if let Some(sid) = filename.strip_prefix(&pending_prefix) {
+            if authoritative_registry.contains(sid) {
+                pending_session_ids.insert(sid.to_owned());
+            } else {
+                conn.execute(
+                    "DELETE FROM sync_state WHERE filename = ?",
+                    params![filename],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
+    }
+    for sid in &authoritative_registry {
+        if !crate::session_files::is_safe_session_id(sid) {
+            continue;
+        }
+        let state_key = format!("copilot-app-transcript:{source_key}:{sid}");
+        let pending_key = format!("{pending_prefix}{sid}");
+        if managed.contains_key(&state_key) {
+            if pending_session_ids.remove(sid) {
+                conn.execute(
+                    "DELETE FROM sync_state WHERE filename = ?",
+                    params![pending_key],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        } else if app_dir
+            .join("session-state")
+            .join(sid)
+            .join("events.jsonl")
+            .exists()
+            && pending_session_ids.insert(sid.clone())
+        {
+            conn.execute(
+                "INSERT OR REPLACE INTO sync_state VALUES (?, 0, 0)",
+                params![pending_key],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+    }
+    let app_session_ids: HashSet<String> = app_session_ids
+        .into_iter()
+        .filter(|sid| {
+            !app_dir
+                .join("session-state")
+                .join(sid)
+                .join("events.jsonl")
+                .exists()
+                && !managed.contains_key(&format!("copilot-app-transcript:{source_key}:{sid}"))
+        })
+        .collect();
     let existing_app_session_ids = query_copilot_app_session_ids(conn, &source_key)?;
-    let reconciliation_session_ids: Vec<String> = app_session_ids
+    let mut reconciliation_session_ids: Vec<String> = app_session_ids
         .difference(&existing_app_session_ids)
         .cloned()
         .collect();
+    // (review comment 4403291310) A session whose transcript reconciliation
+    // failed keeps its pending marker; once the fallback owns it (event file
+    // gone), re-aggregate its complete native history even when older rows
+    // exist and the global cursor already passed its events — otherwise the
+    // session ends up permanently outside both collectors.
+    // `forced_recovery_ids` tracks the markers to clear once the rebuild runs.
+    let mut forced_recovery_ids: Vec<String> = Vec::new();
+    for sid in &app_session_ids {
+        if pending_session_ids.contains(sid) {
+            if !reconciliation_session_ids.contains(sid) {
+                reconciliation_session_ids.push(sid.clone());
+            }
+            forced_recovery_ids.push(sid.clone());
+        }
+    }
     let stale_app_session_ids: Vec<String> = existing_app_session_ids
-        .difference(&app_session_ids)
+        .difference(&authoritative_registry)
         .cloned()
         .collect();
 
@@ -2678,6 +3334,9 @@ fn sync_copilot_app_usage_logs_from(conn: &mut Connection, app_dir: &Path) -> Re
     let mut max_event_cursor: Option<(String, i64)> = None;
     let mut scan_failed = false;
     for row_res in touched_iter {
+        if should_cancel() {
+            return Ok(());
+        }
         match row_res {
             Ok((session_id, turn_index, created_at, id)) => {
                 max_event_cursor = Some((created_at, id));
@@ -2706,6 +3365,7 @@ fn sync_copilot_app_usage_logs_from(conn: &mut Connection, app_dir: &Path) -> Re
     // Add all turns for registry sessions which do not yet have an App row.
     // This is the history-based reconciliation path for events whose cursor
     // was already advanced before data.db.sessions contained the session.
+    let mut recovered_pending_ids: Vec<String> = Vec::new();
     if !reconciliation_session_ids.is_empty() {
         let mut reconciliation_stmt = session_store
             .prepare(
@@ -2721,11 +3381,28 @@ fn sync_copilot_app_usage_logs_from(conn: &mut Connection, app_dir: &Path) -> Re
                     Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
                 })
                 .map_err(|e| format!("執行 Copilot App reconciliation 查詢失敗: {}", e))?;
+            let mut native_turns = 0usize;
             for row in rows {
                 let turn =
                     row.map_err(|e| format!("讀取 Copilot App reconciliation turn 失敗: {}", e))?;
+                native_turns += 1;
                 if touched_set.insert(turn.clone()) {
                     touched_turns.push(turn);
+                }
+            }
+            // (review comment 4403291310) A forced-recovery session without
+            // native events has nothing left to rebuild: clear its marker now.
+            // Sessions with native turns clear theirs inside the rebuild
+            // transaction below, so a failed write keeps retrying instead.
+            if forced_recovery_ids.contains(session_id) {
+                if native_turns == 0 {
+                    conn.execute(
+                        "DELETE FROM sync_state WHERE filename = ?",
+                        params![format!("{pending_prefix}{session_id}")],
+                    )
+                    .map_err(|e| e.to_string())?;
+                } else {
+                    recovered_pending_ids.push(session_id.clone());
                 }
             }
         }
@@ -2753,6 +3430,9 @@ fn sync_copilot_app_usage_logs_from(conn: &mut Connection, app_dir: &Path) -> Re
                 legacy_timestamp,
                 max_id.unwrap_or(0),
             )?;
+            if should_cancel() {
+                return Ok(());
+            }
             tx.commit()
                 .map_err(|e| format!("Copilot App cursor migration COMMIT 失敗: {}", e))?;
         }
@@ -2780,8 +3460,8 @@ fn sync_copilot_app_usage_logs_from(conn: &mut Connection, app_dir: &Path) -> Re
     // the net non-cached input as `tokens_input = SUM(input_tokens) -
     // SUM(cache_read_tokens)`, mirroring the Copilot CLI normalization
     // (`separate_copilot_cli_cached_input`). `tokens_cache_read` keeps the
-    // raw cache-read total; `tokens_total` sums net input + output +
-    // cache_read + cache_write + reasoning, so cache read is counted once.
+    // raw cache-read total. Total is net input + cache read + output;
+    // cache write and reasoning are already represented in source input/output.
     let aggregate_query = "SELECT MIN(created_at) AS ts,
                 SUM(input_tokens), SUM(output_tokens),
                 SUM(cache_read_tokens), SUM(cache_write_tokens),
@@ -2797,6 +3477,9 @@ fn sync_copilot_app_usage_logs_from(conn: &mut Connection, app_dir: &Path) -> Re
 
     let mut turn_rows: Vec<CopilotAppTurnRow> = Vec::new();
     for (session_id, turn_index) in &touched_turns {
+        if should_cancel() {
+            return Ok(());
+        }
         let rows_res = agg_stmt
             .query_map(params![session_id, turn_index], |row| {
                 let raw_input: i64 = row.get::<_, Option<i64>>(1)?.unwrap_or(0).max(0);
@@ -2870,8 +3553,129 @@ fn sync_copilot_app_usage_logs_from(conn: &mut Connection, app_dir: &Path) -> Re
     // rows with this source_kind and a non-null source_dir_key are affected;
     // CLI/VS Code rows never match.
     let touched_session_ids: HashSet<&String> = turn_rows.iter().map(|r| &r.session_id).collect();
+    // (review 4436837575 / yTxje) A per-call representation — imported or
+    // local — holds the family's claim on its calls. The fallback aggregate is
+    // a different granularity whose identity keys never collide with call
+    // rows, so writing it would double-count the same usage. The same claim
+    // logic as the transcript takeover's `imported_aggregates` deferral
+    // (review 4403291503) applies to imported turn aggregates: the fallback
+    // upsert shares their identity keys and would silently replace a batch
+    // row, breaking its revocability. Defer the whole
+    // family (its session and sub-agent rows) and keep a durable pending
+    // marker so the rebuild re-runs once the batch is revoked: the
+    // `sync:copilot_app_transcript:pending:` prefix survives
+    // `rollback_usage_import_batch` on purpose. Aggregates carry no call
+    // identities, so they can never injectively cover call rows
+    // (`cover_previous_calls`): deferring is the only legal outcome.
+    let mut deferred_session_ids: HashSet<String> = HashSet::new();
+    for session_id in &touched_session_ids {
+        if should_cancel() {
+            return Ok(());
+        }
+        let call_rows: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = ?1
+                   AND (source_dir_key IS NULL OR source_dir_key = ?2)
+                   AND ((session_id = ?3 AND parent_session_id IS NULL) OR parent_session_id = ?3)
+                   AND (import_source_id LIKE '%:call:%' OR import_batch_id IS NOT NULL)",
+                params![COPILOT_APP_SOURCE_KIND, source_key, session_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if call_rows > 0 {
+            eprintln!(
+                "⚠️ Copilot App 用量尚待重試: {session_id}（既有逐次呼叫列或匯入批次持有家族代表權）"
+            );
+            deferred_session_ids.insert((*session_id).clone());
+            tx.execute(
+                "INSERT OR REPLACE INTO sync_state VALUES (?, 0, 0)",
+                params![format!("{pending_prefix}{session_id}")],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+    }
+    // (review 4436837475 / yTxip) The forced rescan used to hand sessions with
+    // older aggregates straight to the cleanup + upsert rewrite without
+    // checking that the native source still covers the stored usage: a shrunk
+    // source silently replaced larger rows and the pending marker was cleared,
+    // losing both the data and its retry. Mirror the transcript takeover's
+    // coverage guard per session — classify every stored non-call aggregate at
+    // its original granularity and require the re-aggregated native turns to
+    // cover it metric by metric — and on failure keep the old rows, keep or
+    // create the pending marker and retry on the next sync. This fallback only
+    // re-aggregates touched turns, so rows outside the touched (turn, session)
+    // positions cannot lose coverage and are not required; legacy whole-turn
+    // rows stay always required because the cleanup below deletes them
+    // session-wide.
+    for session_id in &touched_session_ids {
+        if deferred_session_ids.contains(*session_id) {
+            continue;
+        }
+        if should_cancel() {
+            return Ok(());
+        }
+        let mut split: BTreeMap<(String, u32, String, Option<String>), [u64; 5]> = BTreeMap::new();
+        let mut whole_turn: BTreeMap<u32, [u64; 5]> = BTreeMap::new();
+        let mut at_risk: BTreeSet<(u32, String)> = BTreeSet::new();
+        for row in turn_rows.iter().filter(|r| r.session_id == **session_id) {
+            let sid = match &row.agent_id {
+                Some(agent) if !agent.is_empty() => format!("{}__{}", row.session_id, agent),
+                _ => row.session_id.clone(),
+            };
+            let timestamp = normalize_copilot_app_timestamp(&row.ts);
+            let day = timestamp.get(..10).unwrap_or(&row.ts).to_owned();
+            let turn = (row.turn_index.max(0) + 1) as u32;
+            let values = [
+                row.input_tokens,
+                row.output_tokens,
+                row.cache_read,
+                row.cache_write,
+                row.reasoning,
+            ];
+            accumulate_usage_sums(
+                split
+                    .entry((day, turn, sid.clone(), row.model.clone()))
+                    .or_default(),
+                values,
+                "Copilot App 原生回合用量超出範圍",
+            )?;
+            accumulate_usage_sums(
+                whole_turn.entry(turn).or_default(),
+                values,
+                "Copilot App 原生回合用量超出範圍",
+            )?;
+            at_risk.insert((turn, sid));
+        }
+        let evidence = AggregateCoverageEvidence {
+            // The fallback's complete native re-aggregation of a touched turn
+            // is also its merged-snapshot evidence: there is no event file.
+            hook: split.clone(),
+            split,
+            whole_turn,
+        };
+        if let Err(reason) = verify_stored_aggregate_coverage(
+            &tx,
+            COPILOT_APP_SOURCE_KIND,
+            &source_key,
+            session_id,
+            &evidence,
+            Some(&at_risk),
+        ) {
+            eprintln!("⚠️ Copilot App 用量尚待重試: {session_id}（{reason}）");
+            deferred_session_ids.insert((*session_id).clone());
+            tx.execute(
+                "INSERT OR REPLACE INTO sync_state VALUES (?, 0, 0)",
+                params![format!("{pending_prefix}{session_id}")],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+    }
     let mut legacy_cleaned = 0usize;
     for session_id in &touched_session_ids {
+        if deferred_session_ids.contains(*session_id) {
+            continue;
+        }
         legacy_cleaned += tx
             .execute(
                 "DELETE FROM usage_entries
@@ -2879,7 +3683,8 @@ fn sync_copilot_app_usage_logs_from(conn: &mut Connection, app_dir: &Path) -> Re
                    AND source_dir_key = ?
                    AND session_id = ?
                    AND import_source_id LIKE 'copilot-app:%:%:%'
-                   AND import_source_id NOT LIKE 'copilot-app:%:%:%:%'",
+                   AND import_source_id NOT LIKE 'copilot-app:%:%:%:%'
+                   AND import_batch_id IS NULL",
                 params![COPILOT_APP_SOURCE_KIND, source_key, session_id],
             )
             .map_err(|e| format!("清除舊版合併 Copilot App 資料失敗: {}", e))?;
@@ -2892,6 +3697,12 @@ fn sync_copilot_app_usage_logs_from(conn: &mut Connection, app_dir: &Path) -> Re
     }
 
     for row in turn_rows {
+        if should_cancel() {
+            return Ok(());
+        }
+        if deferred_session_ids.contains(&row.session_id) {
+            continue;
+        }
         // Resolve session metadata (title + cwd) from the original session.
         let meta = session_meta_cache
             .entry(row.session_id.clone())
@@ -2908,8 +3719,7 @@ fn sync_copilot_app_usage_logs_from(conn: &mut Connection, app_dir: &Path) -> Re
 
         // tokens_total counts cache_read once (as its own component), since
         // tokens_input has already been normalized to the non-cached portion.
-        let total =
-            row.input_tokens + row.output_tokens + row.cache_read + row.cache_write + row.reasoning;
+        let total = row.input_tokens + row.output_tokens + row.cache_read;
 
         // Delta tokens: the source records per-API-call usage (not cumulative
         // session totals), so the per-turn SUM already represents the delta for
@@ -2954,6 +3764,12 @@ fn sync_copilot_app_usage_logs_from(conn: &mut Connection, app_dir: &Path) -> Re
                 _ => (row.session_id.clone(), None, None, "main".to_string(), None),
             };
 
+        // Normalize the parent once at the write boundary so the stored value
+        // agrees with the normalized-parent key of the unique indexes (a padded
+        // ` a ` and `a` must be the same family, and blank must match the
+        // parentless family).
+        let parent_session_id = normalize_parent_session_id(parent_session_id);
+
         // Build a session name for subagents that surfaces their agent id.
         let session_name = match (&row.agent_id, &meta.title) {
             (Some(agent), Some(title)) if !agent.is_empty() => {
@@ -2982,6 +3798,9 @@ fn sync_copilot_app_usage_logs_from(conn: &mut Connection, app_dir: &Path) -> Re
         // may have merged several models into the default identity. Remove
         // only the matching logical agent/turn row before inserting the
         // independently keyed model rows; untouched turns remain intact.
+        // The legacy row is family-scoped by the normalized parent as well, so
+        // rebuilding the child `a__main` (parent `a`) never deletes the
+        // standalone `a__main` legacy row (parent blank) and vice versa.
         tx.execute(
             "DELETE FROM usage_entries
              WHERE assistant_type = 'copilot'
@@ -2989,12 +3808,15 @@ fn sync_copilot_app_usage_logs_from(conn: &mut Connection, app_dir: &Path) -> Re
                AND source_dir_key = ?
                AND session_id = ?
                AND turn_no = ?
-               AND usage_identity = ''",
+               AND usage_identity = ''
+               AND COALESCE(NULLIF(TRIM(parent_session_id), ''), '') = ?
+               AND import_batch_id IS NULL",
             params![
                 COPILOT_APP_SOURCE_KIND,
                 source_key,
                 row_session_id,
-                turn_no as i64
+                turn_no as i64,
+                parent_session_id.clone().unwrap_or_default()
             ],
         )
         .map_err(|e| format!("清除舊版 Copilot App 單列模型資料失敗: {}", e))?;
@@ -3080,6 +3902,24 @@ fn sync_copilot_app_usage_logs_from(conn: &mut Connection, app_dir: &Path) -> Re
         }
     }
 
+    // (review comment 4403291310) The forced full-history rebuild commits
+    // together with its rows: clear its pending markers so an unchanged source
+    // converges instead of rescanning on every sync. A rollback keeps the
+    // markers so the rebuild is retried on the next sync.
+    for session_id in &recovered_pending_ids {
+        if deferred_session_ids.contains(session_id) {
+            continue;
+        }
+        tx.execute(
+            "DELETE FROM sync_state WHERE filename = ?",
+            params![format!("{pending_prefix}{session_id}")],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
+    if should_cancel() {
+        return Ok(());
+    }
     tx.commit()
         .map_err(|e| format!("Copilot App transaction COMMIT 失敗: {}", e))?;
 
@@ -3125,7 +3965,7 @@ fn query_copilot_app_session_ids(
 ) -> Result<HashSet<String>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT DISTINCT session_id
+            "SELECT DISTINCT COALESCE(parent_session_id, session_id)
              FROM usage_entries
              WHERE assistant_type = 'copilot'
                AND source_kind = ?
@@ -3140,12 +3980,7 @@ fn query_copilot_app_session_ids(
     let mut ids = HashSet::new();
     for row in rows {
         let raw = row.map_err(|e| format!("讀取 Copilot App session 失敗: {}", e))?;
-        // Subagent rows use a synthetic `<session_id>__<agent_id>` id. Strip
-        // the agent suffix so reconciliation compares the original session id
-        // against `data.db.sessions`, otherwise subagent rows would always be
-        // classified as stale and deleted on every sync.
-        let base = raw.split("__").next().unwrap_or(&raw).to_string();
-        ids.insert(base);
+        ids.insert(raw);
     }
     Ok(ids)
 }
@@ -3157,24 +3992,23 @@ fn delete_stale_copilot_app_rows(
 ) -> Result<usize, String> {
     let mut deleted = 0usize;
     for session_id in session_ids {
-        // Delete the main session row plus any subagent synthetic rows
-        // (`<session_id>__<agent_id>`). Use a prefix match (`session_id` + '__')
-        // so stale subagent rows are removed together with their parent.
+        // Only an explicit parent establishes App ownership. An independently
+        // registered session may legitimately contain the `__` separator.
         deleted += tx
             .execute(
                 "DELETE FROM usage_entries
                  WHERE assistant_type = 'copilot'
                    AND source_kind = ?
                    AND source_dir_key = ?
-                   AND (session_id = ? OR session_id LIKE ? ESCAPE '\\')",
-                params![
-                    COPILOT_APP_SOURCE_KIND,
-                    source_key,
-                    session_id,
-                    format!("{}\\__%", session_id)
-                ],
+                   AND ((session_id = ?3 AND parent_session_id IS NULL) OR parent_session_id = ?3)",
+                params![COPILOT_APP_SOURCE_KIND, source_key, session_id],
             )
             .map_err(|e| format!("刪除錯誤 Copilot App 資料失敗: {}", e))?;
+        tx.execute(
+            "DELETE FROM sync_state WHERE filename = ?",
+            [format!("copilot-app-transcript:{source_key}:{session_id}")],
+        )
+        .map_err(|e| format!("清除 Copilot App 事件檔狀態失敗: {e}"))?;
     }
     Ok(deleted)
 }
@@ -3329,6 +4163,9 @@ fn encode_hex(bytes: &[u8]) -> String {
 struct CopilotCliUsageRow {
     session_id: String,
     call_identity: String,
+    native_identity: Option<String>,
+    turn_no: u32,
+    reasoning_effort: Option<String>,
     /// Original call timestamp in UTC, including fractional seconds.
     ts: String,
     model: Option<String>,
@@ -3567,26 +4404,48 @@ fn sync_copilot_cli_agent_usage_logs_with_cancel(
             let cwd = store
                 .as_ref()
                 .and_then(|s| resolve_session_store_cwd(s, &sid));
+            // Mirror `sync_copilot_app_transcripts`: `merge_calls` appends
+            // SQLite-only sub-agent calls with the parent's `turn_index + 1`,
+            // but the drawer joins their usage on the sub-agent's own filtered
+            // timeline. Derive that turn here; paired calls keep their
+            // event-derived turns (review comment 4403291628).
+            let subagent_turns = if calls.iter().any(is_native_only_subagent_call) {
+                Some(copilot_filtered_agent_turns(&path, should_cancel)?)
+            } else {
+                None
+            };
             let rows: Vec<_> = calls
                 .into_iter()
-                .map(|r| CopilotCliUsageRow {
-                    session_id: sid.clone(),
-                    call_identity: r.identity,
-                    ts: r
-                        .timestamp
-                        .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
-                    model: r.model,
-                    agent_id: r.agent_id,
-                    initiator: r.initiator,
-                    cwd: cwd.clone(),
-                    input_tokens: r.metrics.input.saturating_sub(r.metrics.cache_read),
-                    output_tokens: r.metrics.output,
-                    cache_read: r.metrics.cache_read,
-                    cache_write: r.metrics.cache_write,
-                    reasoning: r.metrics.reasoning,
-                    duration_ms: r.metrics.duration_ms,
+                .map(|r| {
+                    // An undecidable sub-agent turn propagates 「保留原資料
+                    // 待重試」 into the pending-marker retry below instead of
+                    // persisting a guessed turn (review comment 4436837487).
+                    let derived = match &subagent_turns {
+                        Some(turns) => native_only_subagent_turn(&r, turns)?,
+                        None => None,
+                    };
+                    Ok(CopilotCliUsageRow {
+                        session_id: sid.clone(),
+                        call_identity: r.identity,
+                        turn_no: derived.unwrap_or(r.turn_no.unwrap_or(1)),
+                        native_identity: r.native_identity,
+                        reasoning_effort: None,
+                        ts: r
+                            .timestamp
+                            .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
+                        model: r.model,
+                        agent_id: r.agent_id,
+                        initiator: r.initiator,
+                        cwd: cwd.clone(),
+                        input_tokens: r.metrics.input.saturating_sub(r.metrics.cache_read),
+                        output_tokens: r.metrics.output,
+                        cache_read: r.metrics.cache_read,
+                        cache_write: r.metrics.cache_write,
+                        reasoning: r.metrics.reasoning,
+                        duration_ms: r.metrics.duration_ms,
+                    })
                 })
-                .collect();
+                .collect::<Result<Vec<_>, String>>()?;
             let tx = conn.transaction().map_err(|e| e.to_string())?;
             if !rows.is_empty() {
                 replace_copilot_cli_call_rows(&tx, &root, &source_key, &sid, &rows)?;
@@ -3653,7 +4512,7 @@ fn read_copilot_cli_native_calls(
     let mut stmt = store
         .prepare(
             "SELECT created_at, model, agent_id, initiator, input_tokens, output_tokens,
-                cache_read_tokens, cache_write_tokens, reasoning_tokens, duration_ms, id
+                cache_read_tokens, cache_write_tokens, reasoning_tokens, duration_ms, id, reasoning_effort, turn_index
          FROM assistant_usage_events WHERE session_id = ? ORDER BY created_at, id",
         )
         .map_err(|e| e.to_string())?;
@@ -3668,6 +4527,18 @@ fn read_copilot_cli_native_calls(
             u64::try_from(n).map_err(|_| "Copilot SQLite 用量不可為負數".into())
         };
         calls.push(crate::copilot::Call {
+            turn_no: row
+                .get::<_, Option<i64>>(12)
+                .map_err(|e| e.to_string())?
+                .map(|turn| {
+                    u32::try_from(turn.max(0))
+                        .ok()
+                        .and_then(|turn| turn.checked_add(1))
+                        .ok_or("Copilot SQLite 回合數超出範圍")
+                })
+                .transpose()?,
+            native_identity: None,
+            reasoning_effort: row.get(11).map_err(|e| e.to_string())?,
             identity: format!(
                 "sqlite:{}",
                 row.get::<_, i64>(10).map_err(|e| e.to_string())?
@@ -3701,7 +4572,287 @@ fn replace_copilot_cli_call_rows(
     session_id: &str,
     agent_rows: &[CopilotCliUsageRow],
 ) -> Result<(), String> {
+    replace_copilot_call_rows(tx, copilot_dir, source_key, session_id, agent_rows, None)
+}
+
+/// Add one call's five token breakdown sums into a running total.
+fn accumulate_usage_sums(
+    target: &mut [u64; 5],
+    values: [u64; 5],
+    overflow_error: &str,
+) -> Result<(), String> {
+    for (sum, value) in target.iter_mut().zip(values) {
+        *sum = sum.checked_add(value).ok_or(overflow_error)?;
+    }
+    Ok(())
+}
+
+/// The granularity a stored aggregate row was originally written with. The old
+/// collector merged a whole turn (main + sub agents across models, into
+/// MIN(model)) on one 3-segment `copilot-app:<key>:<sid>:<turn>` row, so it
+/// must be validated against the whole turn's complete native calls before
+/// being split per call (review 4403291695). Per-agent/model turn rows keep
+/// their finer key, and Hook rows predate `import_source_id`.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum AggregateKey {
+    Hook((String, u32, String, Option<String>)),
+    Split((String, u32, String, Option<String>)),
+    WholeTurn(u32),
+}
+
+/// Source evidence keyed at the granularity stored rows were written with:
+/// merged-snapshot buckets for Hook rows, per-agent/model turn buckets for
+/// split rows and complete per-turn sums for legacy whole-turn rows.
+#[derive(Default)]
+struct AggregateCoverageEvidence {
+    hook: BTreeMap<(String, u32, String, Option<String>), [u64; 5]>,
+    split: BTreeMap<(String, u32, String, Option<String>), [u64; 5]>,
+    whole_turn: BTreeMap<u32, [u64; 5]>,
+}
+
+/// Classify every stored non-call aggregate at its original granularity, sum
+/// same-key rows first so two rows can never draw coverage from the same
+/// evidence twice, and require the source to still cover each key's five
+/// metrics `new >= old`, plus the merged-turn net when whole-turn and split
+/// rows of one turn coexist (reviews 4403291428 / 4403291695 / 4436837475).
+/// A metric sum can never prove coverage by itself.
+///
+/// `at_risk` limits the required set to rows the caller is about to delete or
+/// overwrite, given as `(turn_no, session_id)` positions. `None` requires full
+/// coverage of every stored row (the transcript takeover reconciles the whole
+/// session history). `Some` is used by the SQLite fallback, which re-aggregates
+/// touched turns only: legacy whole-turn rows stay always required because the
+/// legacy cleanup deletes them session-wide, while finer rows outside the
+/// touched positions are left untouched and cannot lose coverage.
+fn verify_stored_aggregate_coverage(
+    conn: &rusqlite::Connection,
+    kind: &str,
+    source_key: &str,
+    family: &str,
+    evidence: &AggregateCoverageEvidence,
+    at_risk: Option<&BTreeSet<(u32, String)>>,
+) -> Result<(), String> {
+    let mut required: BTreeMap<AggregateKey, [u64; 5]> = BTreeMap::new();
+    let mut native_derived_turns: BTreeMap<u32, [u64; 5]> = BTreeMap::new();
+    let mut merged_turns: HashSet<u32> = HashSet::new();
+    let mut stmt = conn
+        .prepare(
+            "SELECT date, turn_no, session_id, model, import_source_id,
+        COALESCE(tokens_input,0), COALESCE(tokens_output,0),
+        COALESCE(tokens_cache_read,0), COALESCE(tokens_cache_write,0),
+        COALESCE(tokens_reasoning,0) FROM usage_entries
+        WHERE source_kind=?1
+          AND (source_dir_key IS NULL OR source_dir_key=?2)
+          AND ((session_id=?3 AND parent_session_id IS NULL) OR parent_session_id=?3)
+          AND (import_source_id IS NULL OR import_source_id NOT LIKE '%:call:%')
+          AND import_batch_id IS NULL",
+        )
+        .map_err(|e| e.to_string())?;
+    let mut legacy_rows = stmt
+        .query(params![kind, source_key, family])
+        .map_err(|e| e.to_string())?;
+    while let Some(row) = legacy_rows.next().map_err(|e| e.to_string())? {
+        let date: String = row.get(0).map_err(|e| e.to_string())?;
+        let turn: u32 = row.get(1).map_err(|e| e.to_string())?;
+        let sid: String = row.get(2).map_err(|e| e.to_string())?;
+        let model: Option<String> = row.get(3).map_err(|e| e.to_string())?;
+        let import: Option<String> = row.get(4).map_err(|e| e.to_string())?;
+        let mut sums = [0u64; 5];
+        for (slot, column) in sums.iter_mut().zip(5..10usize) {
+            let value = row
+                .get::<_, Option<i64>>(column)
+                .map_err(|e| e.to_string())?;
+            *slot = value
+                .map(|value| u64::try_from(value).map_err(|_| "Copilot App 歷史用量不可為負數"))
+                .transpose()?
+                .unwrap_or(0);
+        }
+        let native_derived = import
+            .as_deref()
+            .is_some_and(|id| id.starts_with("copilot-app:"));
+        let whole_turn = match import.as_deref() {
+            Some(id) if id.starts_with("copilot-app:") => {
+                sid == family && id["copilot-app:".len()..].matches(':').count() == 2
+            }
+            _ => false,
+        };
+        if !whole_turn && at_risk.is_some_and(|positions| !positions.contains(&(turn, sid.clone())))
+        {
+            continue;
+        }
+        if native_derived {
+            accumulate_usage_sums(
+                native_derived_turns.entry(turn).or_default(),
+                sums,
+                "Copilot App 歷史用量超出範圍",
+            )?;
+        }
+        let key = if whole_turn {
+            merged_turns.insert(turn);
+            AggregateKey::WholeTurn(turn)
+        } else if native_derived {
+            AggregateKey::Split((date, turn, sid, model))
+        } else {
+            AggregateKey::Hook((date, turn, sid, model))
+        };
+        accumulate_usage_sums(
+            required.entry(key).or_default(),
+            sums,
+            "Copilot App 歷史用量超出範圍",
+        )?;
+    }
+    drop(legacy_rows);
+    drop(stmt);
+    for (key, previous) in &required {
+        let covered = match key {
+            AggregateKey::Hook(key) => evidence.hook.get(key),
+            AggregateKey::Split(key) => evidence.split.get(key),
+            AggregateKey::WholeTurn(turn) => evidence.whole_turn.get(turn),
+        };
+        if !covered
+            .is_some_and(|current| current.iter().zip(previous).all(|(new, old)| *new >= *old))
+        {
+            return Err("Copilot App 來源未涵蓋既有回合用量，保留原資料待重試".to_string());
+        }
+    }
+    // When a whole-turn merge coexists with finer rows of the same turn,
+    // one native call must not cover both: the turn's complete native
+    // evidence has to cover every native-derived row of that turn.
+    for turn in &merged_turns {
+        let Some(previous) = native_derived_turns.get(turn) else {
+            continue;
+        };
+        if !evidence
+            .whole_turn
+            .get(turn)
+            .is_some_and(|current| current.iter().zip(previous).all(|(new, old)| *new >= *old))
+        {
+            return Err("Copilot App 來源未涵蓋既有回合用量，保留原資料待重試".to_string());
+        }
+    }
+    Ok(())
+}
+
+/// SHA-256 call/native identity hashes for one rebuild pass, indexed once so
+/// the coverage check and the row insert never re-hash a call. The previous
+/// per-persisted-call scan recomputed every digest for every candidate row,
+/// costing a quadratic pile of hashes on each new call (review 4403291765).
+struct CallIdentityIndex {
+    call_hashes: Vec<String>,
+    by_call: HashMap<String, Vec<usize>>,
+    by_native: HashMap<String, Vec<usize>>,
+}
+
+fn index_call_identities(rows: &[CopilotCliUsageRow]) -> CallIdentityIndex {
     use sha2::{Digest, Sha256};
+    let mut index = CallIdentityIndex {
+        call_hashes: Vec::with_capacity(rows.len()),
+        by_call: HashMap::new(),
+        by_native: HashMap::new(),
+    };
+    for (idx, row) in rows.iter().enumerate() {
+        let call_hash = hex::encode(Sha256::digest(row.call_identity.as_bytes()));
+        index
+            .by_call
+            .entry(call_hash.clone())
+            .or_default()
+            .push(idx);
+        if let Some(native) = &row.native_identity {
+            let native_hash = hex::encode(Sha256::digest(native.as_bytes()));
+            index.by_native.entry(native_hash).or_default().push(idx);
+        }
+        index.call_hashes.push(call_hash);
+    }
+    index
+}
+
+/// One persisted per-call row awaiting proof that the rebuild still contains
+/// its call.
+struct PreviousCallCoverage {
+    hash: String,
+    ts: String,
+    model: Option<String>,
+    agent: Option<String>,
+    metrics: [u64; 6],
+}
+
+/// Prove one-to-one coverage of the persisted per-call rows before deleting
+/// them: every old call must claim its own distinct reconciled row, even when
+/// one row carries both the call_identity and the native_identity of two old
+/// rows (review 4403291561). A native_identity hit may prove a SQLite ->
+/// transcript transition (timestamp exempt); a call_identity hit keeps the
+/// exact timestamp requirement and the model/agent/metric equality. When any
+/// old call cannot be covered without reuse, the caller keeps the original
+/// rows and retries.
+fn cover_previous_calls(
+    rows: &[CopilotCliUsageRow],
+    index: &CallIdentityIndex,
+    previous: &[PreviousCallCoverage],
+) -> Result<(), String> {
+    let same_fields = |row: &CopilotCliUsageRow, old: &PreviousCallCoverage| {
+        row.model == old.model
+            && row.agent_id == old.agent
+            && [
+                row.input_tokens,
+                row.output_tokens,
+                row.cache_read,
+                row.cache_write,
+                row.reasoning,
+                row.duration_ms,
+            ] == old.metrics
+    };
+    // Shared across both identity keys: one reconciled row may stand in for at
+    // most one persisted call.
+    let mut claimed = vec![false; rows.len()];
+    for old in previous {
+        let call_hits: &[usize] = index
+            .by_call
+            .get(&old.hash)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let native_hits: &[usize] = index
+            .by_native
+            .get(&old.hash)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let covered = call_hits
+            .iter()
+            .chain(native_hits.iter())
+            .copied()
+            .find(|&idx| {
+                let row = &rows[idx];
+                !claimed[idx]
+                    && (row.ts == old.ts || native_hits.contains(&idx))
+                    && same_fields(row, old)
+            });
+        match covered {
+            Some(idx) => claimed[idx] = true,
+            None => return Err("Copilot App 來源缺少已匯入呼叫身分，保留原資料待重試".into()),
+        }
+    }
+    Ok(())
+}
+
+struct AppCallContext<'a> {
+    native: &'a [crate::copilot::Call],
+    title: Option<String>,
+}
+
+fn replace_copilot_call_rows(
+    tx: &rusqlite::Transaction<'_>,
+    copilot_dir: &Path,
+    source_key: &str,
+    session_id: &str,
+    agent_rows: &[CopilotCliUsageRow],
+    app_context: Option<&AppCallContext<'_>>,
+) -> Result<(), String> {
+    let app = app_context.is_some();
+    let kind = if app {
+        COPILOT_APP_SOURCE_KIND
+    } else {
+        COPILOT_CLI_SOURCE_KIND
+    };
+    let identity_index = index_call_identities(agent_rows);
     let transcript = copilot_dir
         .join("session-state")
         .join(session_id)
@@ -3714,13 +4865,15 @@ fn replace_copilot_cli_call_rows(
         .prepare(
             "SELECT id, source_dir_key, transcript_path, import_source_id,
                 delta_total, tokens_total FROM usage_entries
-         WHERE assistant_type='copilot' AND source_kind='copilot-cli'
-           AND (session_id=?1 OR parent_session_id=?1
-                OR substr(session_id,1,length(?1)+2)=?1 || '__')
+         WHERE assistant_type='copilot' AND source_kind=?2
+           AND ((session_id=?1 AND (?3=0 OR parent_session_id IS NULL)) OR parent_session_id=?1
+                OR (?3=0 AND substr(session_id,1,length(?1)+2)=?1 || '__'))
            AND import_batch_id IS NULL",
         )
         .map_err(|e| e.to_string())?;
-    let mut records = stmt.query([session_id]).map_err(|e| e.to_string())?;
+    let mut records = stmt
+        .query(params![session_id, kind, app])
+        .map_err(|e| e.to_string())?;
     let mut owned_ids = Vec::new();
     let mut hook_sum = None;
     let mut hook_max = 0i64;
@@ -3729,9 +4882,10 @@ fn replace_copilot_cli_call_rows(
         let key: Option<String> = row.get(1).map_err(|e| e.to_string())?;
         let path: Option<String> = row.get(2).map_err(|e| e.to_string())?;
         let import: Option<String> = row.get(3).map_err(|e| e.to_string())?;
-        if import
-            .as_deref()
-            .is_some_and(|id| !id.starts_with("copilot-cli-agents:"))
+        if !app
+            && import
+                .as_deref()
+                .is_some_and(|id| !id.starts_with("copilot-cli-agents:"))
         {
             continue;
         }
@@ -3775,6 +4929,174 @@ fn replace_copilot_cli_call_rows(
     let hook_total = hook_sum.unwrap_or(hook_max);
     drop(records);
     drop(stmt);
+    if app {
+        // A backup import of this source is a revocable claim on the same
+        // usage. Imported turn aggregates carry no call identities, so their
+        // overlap with the per-call rewrite cannot be proven disjoint
+        // (review 4403291503): defer the takeover — keep every row and save no
+        // fingerprint — until the batch is revoked. `rollback_usage_import_batch`
+        // deletes the batch rows and clears the affected App fingerprints so
+        // the local calls rebuild on the next sync (review 4403291263).
+        // The source key weak-matches in both directions so a key-less legacy
+        // aggregate resolves to the same source as the keyed local rows
+        // (review 4403291578); the deferral stays whole-session because a
+        // per-turn partial takeover would break the injective 1:1 coverage.
+        let imported_aggregates: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+             WHERE assistant_type='copilot' AND source_kind=?2
+               AND (source_dir_key IS NULL OR source_dir_key=?3)
+               AND ((session_id=?1 AND parent_session_id IS NULL) OR parent_session_id=?1)
+               AND import_batch_id IS NOT NULL
+               AND (import_source_id IS NULL OR import_source_id NOT LIKE '%:call:%')",
+                params![session_id, kind, source_key],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if imported_aggregates > 0 {
+            return Err(
+                "Copilot App 匯入批次已持有同來源回合用量，暫緩接管，保留原資料待重試".into(),
+            );
+        }
+        // Legacy aggregates have no call identities. Require every historical
+        // bucket to remain covered before first takeover at the granularity
+        // its row was originally written with; a larger session total alone
+        // cannot prove the snapshot is complete.
+        let mut buckets: BTreeMap<(String, u32, String, Option<String>), [u64; 5]> =
+            BTreeMap::new();
+        for row in agent_rows {
+            let sid = row
+                .agent_id
+                .as_ref()
+                .map(|agent| format!("{}__{agent}", row.session_id))
+                .unwrap_or_else(|| row.session_id.clone());
+            let bucket = buckets
+                .entry((
+                    row.ts.get(..10).unwrap_or(&row.ts).to_owned(),
+                    row.turn_no,
+                    sid,
+                    row.model.clone(),
+                ))
+                .or_default();
+            for (sum, value) in bucket.iter_mut().zip([
+                row.input_tokens,
+                row.output_tokens,
+                row.cache_read,
+                row.cache_write,
+                row.reasoning,
+            ]) {
+                *sum = sum
+                    .checked_add(value)
+                    .ok_or("Copilot App 歷史用量超出範圍")?;
+            }
+        }
+        // Evidence for stored aggregates must come from the source at the
+        // granularity each row was originally written with. Native-derived
+        // rows (`copilot-app:<key>:...`) are proven only by the complete
+        // `context.native` calls — an event-file bucket alone must never stand
+        // in for a missing native call (review 4403291428).
+        type NativeBucket = (u32, String, Option<String>);
+        let mut native_buckets: BTreeMap<NativeBucket, (String, [u64; 5])> = BTreeMap::new();
+        let mut native_turns: BTreeMap<u32, [u64; 5]> = BTreeMap::new();
+        if let Some(context) = app_context {
+            for call in context.native {
+                let turn = call.turn_no.unwrap_or(1);
+                let sid = call
+                    .agent_id
+                    .as_ref()
+                    .map(|agent| format!("{session_id}__{agent}"))
+                    .unwrap_or_else(|| session_id.to_owned());
+                let day = call.timestamp.format("%Y-%m-%d").to_string();
+                let values = [
+                    call.metrics.input.saturating_sub(call.metrics.cache_read),
+                    call.metrics.output,
+                    call.metrics.cache_read,
+                    call.metrics.cache_write,
+                    call.metrics.reasoning,
+                ];
+                let bucket = native_buckets
+                    .entry((turn, sid, call.model.clone()))
+                    .or_insert_with(|| (day.clone(), [0; 5]));
+                bucket.0 = bucket.0.clone().min(day);
+                accumulate_usage_sums(&mut bucket.1, values, "Copilot App 原生回合用量超出範圍")?;
+                accumulate_usage_sums(
+                    native_turns.entry(turn).or_default(),
+                    values,
+                    "Copilot App 原生回合用量超出範圍",
+                )?;
+            }
+        }
+        // Split native buckets keep the legacy collectors' whole-turn-on-
+        // MIN(created_at) date placement so clock jitter and cross-midnight
+        // redistribution cannot break the key match.
+        let native_split: BTreeMap<(String, u32, String, Option<String>), [u64; 5]> =
+            native_buckets
+                .iter()
+                .map(|((turn, sid, model), (day, values))| {
+                    ((day.clone(), *turn, sid.clone(), model.clone()), *values)
+                })
+                .collect();
+        // Hook rows predate import_source_id and are not native-derived; they
+        // keep the merged-snapshot evidence (with the native date overlay) that
+        // the previous check used.
+        let mut hook_buckets = buckets;
+        for (key, values) in &native_split {
+            hook_buckets.insert(key.clone(), *values);
+        }
+        // Classify each stored aggregate by its original granularity and
+        // verify the source evidence still covers it before any rewrite
+        // (review 4403291695). The transcript takeover reconciles the full
+        // session history, so every stored row must stay covered.
+        let evidence = AggregateCoverageEvidence {
+            hook: hook_buckets,
+            split: native_split,
+            whole_turn: native_turns,
+        };
+        verify_stored_aggregate_coverage(tx, kind, source_key, session_id, &evidence, None)?;
+        // Event identities are authoritative. Only a native SQLite identity
+        // retained by merge_calls may prove a SQLite -> transcript transition;
+        // an unrelated equal-valued event must never stand in for a lost call,
+        // and one reconciled row may stand in for at most one persisted call
+        // (reviews 4403291561 / 4403291765).
+        let mut stmt = tx
+            .prepare(
+                "SELECT import_source_id, timestamp, model, agent_nickname,
+            tokens_input, tokens_output, tokens_cache_read, tokens_cache_write,
+            tokens_reasoning, duration_ms FROM usage_entries
+            WHERE source_kind=?1
+              AND (source_dir_key IS NULL OR source_dir_key=?2)
+              AND ((session_id=?3 AND parent_session_id IS NULL) OR parent_session_id=?3)
+              AND import_source_id LIKE '%:call:%' AND import_batch_id IS NULL",
+            )
+            .map_err(|e| e.to_string())?;
+        let mut previous = stmt
+            .query(params![kind, source_key, session_id])
+            .map_err(|e| e.to_string())?;
+        let mut persisted_calls = Vec::new();
+        while let Some(old) = previous.next().map_err(|e| e.to_string())? {
+            let import: String = old.get(0).map_err(|e| e.to_string())?;
+            let hash = import
+                .rsplit(':')
+                .next()
+                .ok_or("Copilot App 呼叫身分遺失")?;
+            let metrics = (4..10)
+                .map(|i| old.get::<_, Option<u64>>(i).map(|v| v.unwrap_or(0)))
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|e| e.to_string())?;
+            persisted_calls.push(PreviousCallCoverage {
+                hash: hash.to_owned(),
+                ts: old.get(1).map_err(|e| e.to_string())?,
+                model: old.get(2).map_err(|e| e.to_string())?,
+                agent: old.get(3).map_err(|e| e.to_string())?,
+                metrics: metrics
+                    .try_into()
+                    .map_err(|_| "Copilot App 呼叫指標數量不符")?,
+            });
+        }
+        drop(previous);
+        drop(stmt);
+        cover_previous_calls(agent_rows, &identity_index, &persisted_calls)?;
+    }
     let new_total = agent_rows
         .iter()
         .try_fold(0u64, |sum, r| {
@@ -3784,7 +5106,7 @@ fn replace_copilot_cli_call_rows(
         })
         .and_then(|n| i64::try_from(n).ok())
         .ok_or("Copilot session 總量超出範圍")?;
-    if hook_total.max(previous_total) > new_total {
+    if !app && hook_total.max(previous_total) > new_total {
         return Err(format!(
             "來源用量尚未補齊（已知={}，重建={new_total}）",
             hook_total.max(previous_total)
@@ -3797,14 +5119,12 @@ fn replace_copilot_cli_call_rows(
         delete.execute([id]).map_err(|e| e.to_string())?;
     }
     drop(delete);
-    register_usage_source_directory(
-        tx,
-        "copilot",
-        COPILOT_CLI_SOURCE_KIND,
-        source_key,
-        copilot_dir,
-    )?;
-    let session_name = get_copilot_session_name(copilot_dir, session_id);
+    register_usage_source_directory(tx, "copilot", kind, source_key, copilot_dir)?;
+    let session_name = if let Some(context) = app_context {
+        context.title.clone()
+    } else {
+        get_copilot_session_name(copilot_dir, session_id)
+    };
     let transcript_path = transcript.to_string_lossy();
     let mut insert = tx.prepare_cached("INSERT OR IGNORE INTO usage_entries (
                     assistant_type, source_kind, source_dir_key, usage_identity, timestamp, date, session_id, session_name,
@@ -3820,17 +5140,16 @@ fn replace_copilot_cli_call_rows(
                     ?, ?, NULL, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?,
-                    ?, NULL, ?, NULL,
+                    ?, NULL, ?, ?,
                     ?, ?, ?
                 )").map_err(|e| e.to_string())?;
     // Insert one row for every reconciled call.
-    for row in agent_rows {
+    for (row, call_identity) in agent_rows.iter().zip(&identity_index.call_hashes) {
         let timestamp = &row.ts;
         let date_str = timestamp.get(..10).unwrap_or(&row.ts).to_string();
-        // CLI accounting mirrors the hook: raw input + output. Since
-        // `input_tokens` was normalized to exclude cache reads, add
-        // `cache_read` back once. Reasoning and cache write remain separate
-        // breakdowns and are not added to tokens_total.
+        // Copilot's raw input already includes cached input; output includes
+        // reasoning. App and CLI count raw input + output exactly once. Cache
+        // read/write and reasoning remain separate breakdowns, never additions.
         let total = row.input_tokens + row.cache_read + row.output_tokens;
 
         let (row_session_id, parent_session_id, agent_nickname, agent_role) = match &row.agent_id {
@@ -3866,17 +5185,22 @@ fn replace_copilot_cli_call_rows(
         // agents, models, and token counts are equal. Native-only calls keep
         // SQLite row IDs; matched pairs retain the transcript API identity.
         // Fixed-size keys avoid repeating potentially long API request IDs
-        // in every SQLite index and export record.
-        let call_identity = hex::encode(Sha256::digest(row.call_identity.as_bytes()));
+        // in every SQLite index and export record. The hash was computed once
+        // per row in `index_call_identities`.
         let usage_identity = format!("source={source_key};call={call_identity}");
         let import_source_id = format!(
-            "copilot-cli-agents:{source_key}:{}:call:{call_identity}",
+            "{}:{source_key}:{}:call:{call_identity}",
+            if app {
+                "copilot-app"
+            } else {
+                "copilot-cli-agents"
+            },
             row.session_id
         );
 
         let insert_res = insert.execute(params![
             "copilot",
-            COPILOT_CLI_SOURCE_KIND,
+            kind,
             source_key,
             usage_identity,
             timestamp,
@@ -3885,9 +5209,11 @@ fn replace_copilot_cli_call_rows(
             session_name,
             transcript_path.as_ref(),
             row.cwd.as_deref(),
-            // Preserve the existing synthetic turn number; the call ID
-            // separates independent rows without inventing user turns.
-            1i64,
+            // Persist the filtered-timeline turn for App and CLI rows alike:
+            // the call ID separates independent rows without inventing user
+            // turns, and the detail page joins per-reply usage strictly by
+            // `usage_entries.turn_no` (thread PRRT_kwDOTOgsec6yUXNI).
+            i64::from(row.turn_no),
             row.model,
             row.model,
             row.input_tokens as i64,
@@ -3904,7 +5230,8 @@ fn replace_copilot_cli_call_rows(
             total as i64,
             row.duration_ms as i64,
             import_source_id,
-            parent_session_id,
+            row.reasoning_effort,
+            normalize_parent_session_id(parent_session_id),
             agent_nickname,
             agent_role,
         ]);
@@ -4367,6 +5694,8 @@ fn sync_codex_usage_logs_from_with_cancel(
     run_codex_parser_migration(conn)?;
     run_codex_source_kind_migration(conn)?;
     run_codex_rollout_identity_migration(conn)?;
+    run_parent_session_id_normalization_migration(conn)?;
+    run_parent_session_id_normalization_migration_v2(conn)?;
 
     let mut transcripts = Vec::new();
     for root in roots {
@@ -4643,7 +5972,7 @@ fn sync_codex_transcript(
                 delta.map(|t| t.total as i64),
                 cost.and_then(|c| c.total_api_duration_ms.map(|d| d as i64)),
                 cost.and_then(|c| c.total_premium_requests.map(|r| r as i64)),
-                entry.parent_session_id.as_deref(),
+                normalize_parent_session_id(entry.parent_session_id.clone()),
                 entry.agent_nickname.as_deref(),
                 entry.agent_role.as_deref(),
                 entry.reasoning_effort.as_deref()
@@ -4915,7 +6244,7 @@ fn sync_claude_usage_logs_from_with_cancel(
                         delta.map(|t| t.total as i64),
                         cost.and_then(|c| c.total_api_duration_ms.map(|d| d as i64)),
                         cost.and_then(|c| c.total_premium_requests.map(|r| r as i64)),
-                        entry.parent_session_id.as_deref(),
+                        normalize_parent_session_id(entry.parent_session_id.clone()),
                         entry.agent_nickname.as_deref(),
                         entry.agent_role.as_deref(),
                         entry.reasoning_effort.as_deref()
@@ -5328,7 +6657,7 @@ fn insert_usage_entries(
                 cost.and_then(|value| value.reported_cost_usd),
                 entry.reasoning_effort.as_deref(),
                 entry.source_dir_key.as_deref(),
-                entry.parent_session_id.as_deref(),
+                normalize_parent_session_id(entry.parent_session_id.clone()),
                 entry.agent_nickname.as_deref(),
                 entry.agent_role.as_deref(),
             ],
@@ -5689,7 +7018,9 @@ fn sync_configured_sources_with_cancel(
                 Harness::Copilot => {
                     sync_hook_usage_logs_with_cancel(conn, "copilot", root, should_cancel)
                 }
-                Harness::CopilotApp => sync_copilot_app_usage_logs_from(conn, root),
+                Harness::CopilotApp => {
+                    sync_copilot_app_usage_logs_from_with_cancel(conn, root, should_cancel)
+                }
                 Harness::Claude => {
                     sync_claude_usage_logs_from_with_cancel(conn, root, should_cancel)
                 }
@@ -5936,7 +7267,7 @@ fn migrate_records(
                 delta_total,
                 row.get::<_, Option<i64>>(20)?,
                 row.get::<_, Option<i64>>(21)?,
-                parent_sid,
+                normalize_parent_session_id(parent_sid),
                 nickname,
                 role
             ],
@@ -6333,6 +7664,212 @@ pub fn export_usage_period_entries(
     Ok(records)
 }
 
+/// Which source calls one Copilot App usage row claims to represent
+/// (review 4403291574). The claim is the unit of import deduplication: two
+/// records may only be deduped when their claimed call sets provably overlap.
+#[derive(Debug, PartialEq, Eq)]
+enum CopilotAppCoverageClaim {
+    /// One per-call row: exactly one call, identified by its call hash and
+    /// placed at `(turn, session, model)`.
+    Call {
+        hash: String,
+        turn: u32,
+        sid: String,
+        model: Option<String>,
+    },
+    /// A per-agent/model turn row (4/5-segment id): every call of its
+    /// `(turn, session, model)` bucket.
+    Split {
+        turn: u32,
+        sid: String,
+        model: Option<String>,
+    },
+    /// A legacy 3-segment main-session turn row: every call of that turn
+    /// across agents and models.
+    WholeTurn { turn: u32 },
+    /// The row cannot be placed in the family's turn space (turn missing or
+    /// 0), so its overlap with anything else is unprovable.
+    Undecidable,
+}
+
+/// Classify a row's coverage claim from its identity shape and its declared
+/// turn/session/model (never from metric sums — numbers cannot prove
+/// coverage). `family` disambiguates a whole-turn merge from a split row.
+fn classify_copilot_app_coverage_claim(
+    import_source_id: Option<&str>,
+    turn_no: u32,
+    session_id: &str,
+    family: &str,
+    model: Option<&str>,
+) -> CopilotAppCoverageClaim {
+    if turn_no == 0 {
+        return CopilotAppCoverageClaim::Undecidable;
+    }
+    let sid = session_id.to_string();
+    let model = model.map(|model| model.to_string());
+    if let Some(id) = import_source_id {
+        if id.contains(":call:") {
+            let hash = id.rsplit(':').next().unwrap_or_default().to_string();
+            return CopilotAppCoverageClaim::Call {
+                hash,
+                turn: turn_no,
+                sid,
+                model,
+            };
+        }
+        if let Some(rest) = id.strip_prefix("copilot-app:") {
+            if rest.matches(':').count() == 2 && session_id == family {
+                return CopilotAppCoverageClaim::WholeTurn { turn: turn_no };
+            }
+            return CopilotAppCoverageClaim::Split {
+                turn: turn_no,
+                sid,
+                model,
+            };
+        }
+    }
+    // Exports without a recognizable source id land at their declared row
+    // position and can only claim that `(turn, session, model)` bucket.
+    CopilotAppCoverageClaim::Split {
+        turn: turn_no,
+        sid,
+        model,
+    }
+}
+
+fn copilot_app_claims_overlap(a: &CopilotAppCoverageClaim, b: &CopilotAppCoverageClaim) -> bool {
+    use CopilotAppCoverageClaim::{Call, Split, WholeTurn};
+    match (a, b) {
+        // Two per-call rows are the same call only when their hashes match;
+        // distinct hashes are distinct calls of the same bucket.
+        (Call { hash: left, .. }, Call { hash: right, .. }) => left == right,
+        (
+            Call {
+                turn: t1,
+                sid: s1,
+                model: m1,
+                ..
+            },
+            Split {
+                turn: t2,
+                sid: s2,
+                model: m2,
+            },
+        )
+        | (
+            Split {
+                turn: t1,
+                sid: s1,
+                model: m1,
+            },
+            Call {
+                turn: t2,
+                sid: s2,
+                model: m2,
+                ..
+            },
+        )
+        | (
+            Split {
+                turn: t1,
+                sid: s1,
+                model: m1,
+            },
+            Split {
+                turn: t2,
+                sid: s2,
+                model: m2,
+            },
+        ) => t1 == t2 && s1 == s2 && m1 == m2,
+        // A whole-turn claim covers every agent/model bucket of its turn.
+        (Call { turn: t1, .. }, WholeTurn { turn: t2 })
+        | (WholeTurn { turn: t1 }, Call { turn: t2, .. })
+        | (Split { turn: t1, .. }, WholeTurn { turn: t2 })
+        | (WholeTurn { turn: t1 }, Split { turn: t2, .. })
+        | (WholeTurn { turn: t1 }, WholeTurn { turn: t2 }) => t1 == t2,
+        // Undecidable claims never reach this function.
+        _ => false,
+    }
+}
+
+enum ImportCoverageDecision {
+    Import,
+    Duplicate,
+    Conflict,
+}
+
+/// Three-way adjudication of one Copilot App import record against the
+/// family's existing claims: provable overlap keeps first-come-first-served
+/// deduplication, provable disjointness imports normally, and anything
+/// unprovable is reported as a conflict (review 4403291574). Source keys
+/// weak-match in both directions so a key-less legacy row and the keyed rows
+/// of the same session resolve to one source (review 4403291578).
+fn adjudicate_copilot_app_import_coverage(
+    conn: &Connection,
+    entry: &UsageEntry,
+    normalized_id: Option<&str>,
+    family: &str,
+) -> Result<ImportCoverageDecision, String> {
+    let claim = classify_copilot_app_coverage_claim(
+        normalized_id,
+        entry.turn_no,
+        &entry.session_id,
+        family,
+        entry.model.as_deref(),
+    );
+    if claim == CopilotAppCoverageClaim::Undecidable {
+        return Ok(ImportCoverageDecision::Conflict);
+    }
+    let mut stmt = conn
+        .prepare(
+            "SELECT import_source_id, turn_no, session_id, model
+             FROM usage_entries
+             WHERE assistant_type='copilot' AND source_kind='copilot-app'
+               AND (?1 IS NULL OR source_dir_key IS NULL OR source_dir_key = ?1)
+               AND ((session_id = ?2 AND parent_session_id IS NULL)
+                    OR parent_session_id = ?2)",
+        )
+        .map_err(|e| format!("準備覆蓋範圍裁決查詢失敗: {e}"))?;
+    let rows = stmt
+        .query_map(params![entry.source_dir_key.as_deref(), family], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, u32>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })
+        .map_err(|e| format!("執行覆蓋範圍裁決查詢失敗: {e}"))?;
+    let mut saw_overlap = false;
+    for row in rows {
+        let (import, turn, sid, model) = row.map_err(|e| format!("讀取覆蓋範圍裁決列失敗: {e}"))?;
+        let existing = classify_copilot_app_coverage_claim(
+            import.as_deref(),
+            turn,
+            &sid,
+            family,
+            model.as_deref(),
+        );
+        match existing {
+            CopilotAppCoverageClaim::Undecidable => {
+                // An existing claim that cannot be placed in the turn space
+                // may cover anything: refuse to guess and report a conflict.
+                return Ok(ImportCoverageDecision::Conflict);
+            }
+            claim_overlap if copilot_app_claims_overlap(&claim, &claim_overlap) => {
+                // Conflict verdicts must win over duplicates, so remember the
+                // overlap and keep scanning for an unplaceable claim.
+                saw_overlap = true;
+            }
+            _ => {}
+        }
+    }
+    if saw_overlap {
+        return Ok(ImportCoverageDecision::Duplicate);
+    }
+    Ok(ImportCoverageDecision::Import)
+}
+
 pub fn import_usage_day_entries(
     conn: &mut Connection,
     assistant: &str,
@@ -6351,6 +7888,7 @@ pub fn import_usage_day_entries(
     let source_file_name = normalize_import_metadata_value(metadata.source_file_name, 255);
     let mut inserted = 0usize;
     let mut skipped_duplicates = 0usize;
+    let mut skipped_conflicts = 0usize;
 
     let tx = conn
         .transaction()
@@ -6358,8 +7896,9 @@ pub fn import_usage_day_entries(
     tx.execute(
         "INSERT INTO import_batches (
             id, assistant_type, source_assistant, source_file_name, import_date,
-            total_records, imported_records, skipped_duplicates, created_at
-         ) VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?)",
+            total_records, imported_records, skipped_duplicates, skipped_conflicts,
+            created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, ?)",
         params![
             batch_id,
             assistant,
@@ -6372,12 +7911,42 @@ pub fn import_usage_day_entries(
     )
     .map_err(|e| format!("建立匯入批次失敗: {e}"))?;
 
+    // Copilot App 備份匯入以「家族代表權先到先得」避免兩種粒度的列同時宣告同一筆
+    // 呼叫（review 4403291503 的「同步先、匯入聚合後」殘留重複計量）：逐次呼叫列
+    // 是本機同步的代表格式，先處理；回合聚合後處理。判重以「可證明的覆蓋範圍」
+    // 為準（review 4403291574）：來源鍵雙向弱匹配（既有 NULL key 列依「同 session
+    // 視為同源」慣例匹配任意探鍵，review 4403291578），再以 (family × turn_no) 判斷
+    // 覆蓋集合是否相交——3 段式整回合聚合認領整個回合，細粒度列（逐次呼叫與 4/5
+    // 段式聚合）以 (turn, session, model) 收緊；日期不進鍵（整回合聚合掛在
+    // MIN(created_at)，跨午夜不得再誤判）；metric 加總永不用來證明覆蓋。
+    // 可證明重疊 → skipped_duplicates（先到先得，語意不變）；可證明不重疊（不同
+    // 回合鍵）→ 正常寫入；無法判定（turn 缺失／為 0、家族內既有無法對映的回合
+    // 空間）→ skipped_conflicts：不寫入、不計重複、不中斷整批交易（批次仍可撤銷）。
+    // 被跳過與衝突的列都不寫入批次（撤銷性不受影響），帳務恆為
+    // total = imported + skipped_duplicates + skipped_conflicts。
+    let mut per_call_records = Vec::new();
+    let mut other_records = Vec::new();
     for record in records {
+        let is_per_call = assistant == "copilot"
+            && record.entry.source_kind.as_deref() == Some(COPILOT_APP_SOURCE_KIND)
+            && normalize_import_source_id(record.import_source_id.as_deref())
+                .is_some_and(|id| id.contains(":call:"));
+        if is_per_call {
+            per_call_records.push(record);
+        } else {
+            other_records.push(record);
+        }
+    }
+    for record in per_call_records.into_iter().chain(other_records) {
         let UsageDayExportRecord {
             mut entry,
             import_source_id,
             usage_identity: exported_usage_identity,
         } = record;
+        // Empty parent ≡ no parent at the storage boundary (thread
+        // PRRT_kwDOTOgsec6yUKGs): the frontend identity key collapses `''` to
+        // absent and RootOnly lookups cannot find rows persisted with `''`.
+        entry.parent_session_id = normalize_parent_session_id(entry.parent_session_id.take());
         let normalized_id = normalize_import_source_id(import_source_id.as_deref());
         let record_date = entry_date_from_timestamp(&entry.timestamp)
             .ok_or_else(|| "無效的 timestamp 格式，無法取得日期".to_string())?
@@ -6386,6 +7955,34 @@ pub fn import_usage_day_entries(
             .source_kind
             .clone()
             .unwrap_or_else(|| "legacy".to_string());
+        if assistant == "copilot" && source_kind == COPILOT_APP_SOURCE_KIND {
+            // 同一來源家族只允許一種代表粒度宣告同一筆呼叫，與接管的一對一覆蓋
+            // 是同一不變量。家族以 parent_session_id 分群（不解析合成 id），
+            // key 缺失的舊備份跨目錄比對（同 session 視為同源，寧可少計重複）。
+            // 重疊判定以覆蓋集合為準（review 4403291574）：只有能證明覆蓋範圍
+            // 重疊的列才是重複；不重疊的歷史照常入庫；無法判定的列誠實回報衝突，
+            // 不得混入 skipped_duplicates。
+            let family = entry
+                .parent_session_id
+                .clone()
+                .unwrap_or_else(|| entry.session_id.clone());
+            match adjudicate_copilot_app_import_coverage(
+                &tx,
+                &entry,
+                normalized_id.as_deref(),
+                &family,
+            )? {
+                ImportCoverageDecision::Duplicate => {
+                    skipped_duplicates += 1;
+                    continue;
+                }
+                ImportCoverageDecision::Conflict => {
+                    skipped_conflicts += 1;
+                    continue;
+                }
+                ImportCoverageDecision::Import => {}
+            }
+        }
         let usage_identity = exported_usage_identity
             .as_deref()
             .map(str::trim)
@@ -6584,9 +8181,14 @@ pub fn import_usage_day_entries(
 
     tx.execute(
         "UPDATE import_batches
-         SET imported_records = ?, skipped_duplicates = ?
+         SET imported_records = ?, skipped_duplicates = ?, skipped_conflicts = ?
          WHERE id = ?",
-        params![inserted as i64, skipped_duplicates as i64, batch_id],
+        params![
+            inserted as i64,
+            skipped_duplicates as i64,
+            skipped_conflicts as i64,
+            batch_id
+        ],
     )
     .map_err(|e| format!("更新匯入批次結果失敗: {e}"))?;
     tx.commit()
@@ -6597,6 +8199,7 @@ pub fn import_usage_day_entries(
         total,
         imported: inserted,
         skipped_duplicates,
+        skipped_conflicts,
         batch_id,
     })
 }
@@ -6610,8 +8213,8 @@ pub fn list_usage_import_batches(
     let mut stmt = conn
         .prepare(
             "SELECT id, assistant_type, source_assistant, source_file_name, import_date,
-                    total_records, imported_records, skipped_duplicates, created_at,
-                    rolled_back_at, removed_records
+                    total_records, imported_records, skipped_duplicates, skipped_conflicts,
+                    created_at, rolled_back_at, removed_records
              FROM import_batches
              WHERE assistant_type = ?
              ORDER BY created_at DESC, id DESC
@@ -6629,9 +8232,10 @@ pub fn list_usage_import_batches(
                 total: row.get::<_, i64>(5)? as usize,
                 imported: row.get::<_, i64>(6)? as usize,
                 skipped_duplicates: row.get::<_, i64>(7)? as usize,
-                created_at: row.get(8)?,
-                rolled_back_at: row.get(9)?,
-                removed_records: row.get::<_, i64>(10)? as usize,
+                skipped_conflicts: row.get::<_, i64>(8)? as usize,
+                created_at: row.get(9)?,
+                rolled_back_at: row.get(10)?,
+                removed_records: row.get::<_, i64>(11)? as usize,
             })
         })
         .map_err(|e| format!("查詢匯入批次失敗: {e}"))?;
@@ -6714,6 +8318,92 @@ pub fn rollback_usage_import_batch(
         }
     }
 
+    if assistant == "copilot" {
+        // Reconcile local sources whose rows this batch shadowed or duplicated:
+        // drop their sync fingerprints alongside the imported rows so the next
+        // sync re-reads the unchanged local events and rebuilds the missing
+        // calls (review 4403291263). Without this, INSERT OR IGNORE had skipped
+        // the shadowed local rows while their sync fingerprint remained
+        // "done", permanently losing their usage.
+        // Intentionally NOT deleted here: the reconciliation retry markers
+        // `sync:copilot_app_transcript:pending:{key}::{family}`. They are
+        // retry state, not sync progress — deleting them would lose a forced
+        // rescan, while the fingerprint invalidation below triggers a re-sync
+        // that clears the markers on success.
+        let mut stmt = tx
+            .prepare(
+                "SELECT DISTINCT source_dir_key, COALESCE(parent_session_id, session_id)
+             FROM usage_entries
+             WHERE assistant_type='copilot' AND import_batch_id=?1",
+            )
+            .map_err(|e| e.to_string())?;
+        let mut local_sources = stmt.query(params![batch_id]).map_err(|e| e.to_string())?;
+        let mut invalidated: BTreeSet<(String, String)> = BTreeSet::new();
+        let mut keyless_families: Vec<String> = Vec::new();
+        while let Some(row) = local_sources.next().map_err(|e| e.to_string())? {
+            let source_key: Option<String> = row.get(0).map_err(|e| e.to_string())?;
+            let family: String = row.get(1).map_err(|e| e.to_string())?;
+            match source_key {
+                Some(source_key) => {
+                    invalidated.insert((source_key, family));
+                }
+                None => keyless_families.push(family),
+            }
+        }
+        drop(local_sources);
+        drop(stmt);
+        // A key-less batch row weak-matched rows of every source key while it
+        // lived ("same session is the same source", review 4403291578), so
+        // revocation must invalidate the weak-matched real keys' fingerprints
+        // too — otherwise the shadowed local usage cannot rebuild and the
+        // as-if-never-imported guarantee breaks.
+        for family in keyless_families {
+            let mut keys: Vec<String> = Vec::new();
+            let mut stmt = tx
+                .prepare(
+                    "SELECT DISTINCT source_dir_key FROM usage_entries
+                 WHERE assistant_type='copilot' AND source_kind='copilot-app'
+                   AND source_dir_key IS NOT NULL
+                   AND ((session_id=?1 AND parent_session_id IS NULL) OR parent_session_id=?1)",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(params![family], |row| row.get::<_, String>(0))
+                .map_err(|e| e.to_string())?;
+            for key in rows {
+                keys.push(key.map_err(|e| e.to_string())?);
+            }
+            drop(stmt);
+            let mut stmt = tx
+                .prepare(
+                    "SELECT source_dir_key FROM usage_source_directories
+                 WHERE assistant_type='copilot' AND source_kind='copilot-app'",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|e| e.to_string())?;
+            for key in rows {
+                keys.push(key.map_err(|e| e.to_string())?);
+            }
+            drop(stmt);
+            keys.sort();
+            keys.dedup();
+            for source_key in keys {
+                invalidated.insert((source_key, family.clone()));
+            }
+        }
+        for (source_key, family) in invalidated {
+            for key in [
+                format!("copilot-app-transcript:{source_key}:{family}"),
+                format!("copilot-cli-transcript:{source_key}:{family}"),
+                format!("{COPILOT_CLI_AGENT_PENDING_PREFIX}{source_key}::{family}"),
+            ] {
+                tx.execute("DELETE FROM sync_state WHERE filename = ?", params![key])
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+    }
     let removed_records = tx
         .execute(
             "DELETE FROM usage_entries
@@ -6741,6 +8431,72 @@ pub fn rollback_usage_import_batch(
     })
 }
 
+/// Selects which `parent_session_id` row-set a session detail query targets.
+///
+/// Copilot App / CLI sub-agent calls are stored under a synthetic
+/// `<parent>__<agent>` session id with `parent_session_id = <parent>`, so a
+/// standalone session whose id happens to contain `__` (e.g. `a__b`) shares
+/// its `session_id` with session `a`'s sub-agent `b`. Every session detail
+/// query must therefore scope by `parent_session_id` in addition to
+/// `(assistant_type, session_id, source_kind, source_dir_key)`; otherwise the
+/// two row-sets merge in the per-turn usage and the sub-agent cannot be
+/// selected alone (review comment 4403291365).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParentSessionScope<'a> {
+    /// Legacy behaviour for callers that do not pass a parent: no
+    /// `parent_session_id` predicate at all, preserving the pre-existing API
+    /// behaviour exactly (main-session lookups are unaffected).
+    Unfiltered,
+    /// Only main-agent / standalone rows (`parent_session_id IS NULL`, plus
+    /// legacy rows persisted with `parent_session_id = ''` before empty-parent
+    /// normalization — the frontend reads an empty parent as absent, so those
+    /// rows are roots too and must stay reachable).
+    RootOnly,
+    /// Only sub-agent rows of the given parent (`parent_session_id = ?`).
+    ChildOf(&'a str),
+}
+
+impl<'a> ParentSessionScope<'a> {
+    /// The effective `parent_session_id` predicate: `None` means no filter
+    /// ([`Self::Unfiltered`]), `Some(None)` selects the root row-set (see
+    /// [`push_parent_filter`]) and `Some(Some(p))` means `parent_session_id = p`.
+    fn parent_filter(&self) -> Option<Option<String>> {
+        match self {
+            Self::Unfiltered => None,
+            Self::RootOnly => Some(None),
+            Self::ChildOf(parent) => Some(Some((*parent).to_string())),
+        }
+    }
+
+    /// Appends the `parent_session_id` predicate for this scope, if any.
+    fn push_filter(&self, sql: &mut String, params: &mut Vec<rusqlite::types::Value>) {
+        if let Some(parent_filter) = self.parent_filter() {
+            push_parent_filter(sql, params, parent_filter.as_deref());
+        }
+    }
+}
+
+/// Appends the `parent_session_id` predicate: `None` for the root scope
+/// (`parent_session_id IS NULL`, plus legacy `''` rows) and `Some(p)` for
+/// `parent_session_id = p`.
+fn push_parent_filter(
+    sql: &mut String,
+    params: &mut Vec<rusqlite::types::Value>,
+    parent_filter: Option<&str>,
+) {
+    match parent_filter {
+        Some(parent) => {
+            sql.push_str(" AND parent_session_id = ?");
+            params.push(rusqlite::types::Value::Text(parent.to_string()));
+        }
+        // RootOnly must also match rows persisted with `''` before empty-parent
+        // normalization: the frontend sends `parent_session_id=''` for them and
+        // an `IS NULL`-only predicate made their detail page 404
+        // (review PRRT_kwDOTOgsec6yUKGs).
+        None => sql.push_str(" AND (parent_session_id IS NULL OR parent_session_id = '')"),
+    }
+}
+
 /// Database fields required to locate and parse one concrete session source.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct SessionLookup {
@@ -6764,48 +8520,72 @@ pub struct SessionData {
 }
 
 impl SessionLookup {
+    /// Legacy entry point preserving the pre-existing behaviour for callers
+    /// that do not pass a parent ([`ParentSessionScope::Unfiltered`]).
+    #[allow(dead_code)] // 保留既有 load_data 呼叫介面（既有測試仍在使用）；正式路徑一律改走 load_data_in_parent_scope。
     pub fn load_data(
         &self,
         conn: &rusqlite::Connection,
         session_id: &str,
     ) -> Result<SessionData, String> {
+        self.load_data_in_parent_scope(conn, session_id, ParentSessionScope::Unfiltered)
+    }
+
+    /// Loads CWD, model and per-turn stats sharing one explicit
+    /// [`ParentSessionScope`], so a standalone `a__b` never absorbs session
+    /// `a`'s sub-agent `b` (and vice versa) when both exist.
+    pub fn load_data_in_parent_scope(
+        &self,
+        conn: &rusqlite::Connection,
+        session_id: &str,
+        parent_scope: ParentSessionScope<'_>,
+    ) -> Result<SessionData, String> {
         let source_kind = Some(self.source_kind.as_str());
         let source_dir_key = self.source_dir_key.as_deref();
         Ok(SessionData {
-            cwd: get_session_cwd(
+            cwd: get_session_cwd_in_parent_scope(
                 conn,
                 &self.assistant_type,
                 session_id,
                 source_kind,
                 source_dir_key,
+                parent_scope,
             )?,
-            model: get_session_model(
+            model: get_session_model_in_parent_scope(
                 conn,
                 &self.assistant_type,
                 session_id,
                 source_kind,
                 source_dir_key,
+                parent_scope,
             )?,
-            turn_stats: get_session_turns_token_stats(
+            turn_stats: get_session_turns_token_stats_in_parent_scope(
                 conn,
                 &self.assistant_type,
                 session_id,
                 source_kind,
                 source_dir_key,
+                parent_scope,
             )?,
         })
     }
 }
 
-/// Resolves the single `source_kind` used by the legacy `source_kind = None`
-/// fallback. All four session-lookup helpers
-/// ([`get_session_assistant_and_transcript`], [`get_session_cwd`],
-/// [`get_session_model`], [`get_session_turns_token_stats`]) MUST call this
-/// helper when invoked with `source_kind = None` so that the identity, CWD,
-/// model, and turn-stats lookups always pick rows from the same source — even
-/// when a single session id has rows from multiple collectors
+/// Resolves the concrete `source_kind` shared by the scoped cores of all
+/// four session-lookup helpers
+/// ([`get_session_assistant_and_transcript_in_parent_scope`],
+/// [`get_session_cwd_in_parent_scope`], [`get_session_model_in_parent_scope`],
+/// [`get_session_turns_token_stats_in_parent_scope`]). All four MUST
+/// call this helper so that the identity, CWD, model, and turn-stats lookups
+/// always pick rows from the same source within the requested parent scope —
+/// even when a single session id has rows from multiple collectors
 /// (e.g. `copilot-cli` turn 1 + `vscode-chat` turn 2, both with
-/// `source_dir_key IS NULL`).
+/// `source_dir_key IS NULL`) or is shared by a standalone session and a
+/// synthetic sub-agent id (e.g. standalone `a__b` vs. session `a`'s
+/// sub-agent `b`).
+///
+/// Returns the resolved `source_kind`, honouring the optional
+/// `parent_session_id` predicate of `parent_scope`.
 ///
 /// Behaviour:
 ///
@@ -6814,26 +8594,27 @@ impl SessionLookup {
 ///   call sites that always pass a concrete `source_kind`.
 /// * `source_kind = None` — runs a single, parameter-bound query against
 ///   `usage_entries` matching `(assistant_type, session_id, source_dir_key
-///   predicate)`, ordered by the canonical tie-break:
+///   predicate)` plus the [`ParentSessionScope`] predicate (none for
+///   [`ParentSessionScope::Unfiltered`]), ordered by the canonical tie-break:
 ///   1. main agent rows first — `(parent_session_id IS NULL) DESC`,
 ///   2. `source_kind ASC`,
 ///   3. `turn_no ASC`,
 ///   4. `id ASC` (final stable tie-breaker).
 ///
-/// Returns the `source_kind` of the first row, or `None` if the query produced
-/// no rows. Never panics on empty result sets — it just returns `None`, so the
-/// downstream helper can still surface a clean "session not found" / empty
-/// result to the caller.
+/// Returns `None` if the query produced no rows. Never panics on empty result
+/// sets — it just returns `None`, so the downstream helper can still surface
+/// a clean "session not found" / empty result to the caller.
 ///
 /// `source_dir_key` follows the same semantics as the four helpers: `Some(k)`
 /// filters by `source_dir_key = k`, `None` filters by `source_dir_key IS NULL`.
 /// `None` therefore means "non-App rows only" and never "any source".
-fn resolve_session_source_kind(
+fn resolve_session_query_scope(
     conn: &rusqlite::Connection,
     assistant: &str,
     session_id: &str,
     source_kind: Option<&str>,
     source_dir_key: Option<&str>,
+    parent_scope: ParentSessionScope<'_>,
 ) -> Result<Option<String>, String> {
     if let Some(kind) = source_kind {
         return Ok(Some(kind.to_string()));
@@ -6847,12 +8628,17 @@ fn resolve_session_source_kind(
         rusqlite::types::Value::Text(assistant.to_string()),
         rusqlite::types::Value::Text(session_id.to_string()),
     ];
+    if let Some(kind) = source_kind {
+        sql.push_str(" AND source_kind = ?");
+        params_vec.push(rusqlite::types::Value::Text(kind.to_string()));
+    }
     if let Some(key) = source_dir_key {
         sql.push_str(" AND source_dir_key = ?");
         params_vec.push(rusqlite::types::Value::Text(key.to_string()));
     } else {
         sql.push_str(" AND source_dir_key IS NULL");
     }
+    parent_scope.push_filter(&mut sql, &mut params_vec);
     // Main agent rows first (parent_session_id IS NULL → 1; DESC puts them
     // ahead of subagent rows which evaluate to 0). Then `source_kind ASC`
     // for a deterministic tie-break between equally-scoped sources, then
@@ -6870,10 +8656,33 @@ fn resolve_session_source_kind(
         // The column is TEXT NOT NULL DEFAULT 'legacy' so this should always
         // be Some, but fall back to the column default if a NULL sneaks in
         // (e.g. via a future migration). This keeps the helper panic-free.
-        Ok(resolved.or_else(|| Some("legacy".to_string())))
+        Ok(Some(resolved.unwrap_or_else(|| "legacy".to_string())))
     } else {
         Ok(None)
     }
+}
+
+/// Legacy wrapper for callers that do not pass a parent session. Passes
+/// [`ParentSessionScope::Unfiltered`] (no parent filter — pre-existing
+/// behaviour) so main-session lookups keep their existing behaviour while the
+/// new scoped entry point can still disambiguate a synthetic sub-agent id
+/// that collides with a standalone session id.
+#[allow(dead_code)] // 保留既有 5 參呼叫介面給既有測試與外部呼叫端；正式路徑一律明確傳入 ParentSessionScope。
+pub fn get_session_assistant_and_transcript(
+    conn: &rusqlite::Connection,
+    assistant: &str,
+    session_id: &str,
+    source_kind: Option<&str>,
+    source_dir_key: Option<&str>,
+) -> Result<SessionLookup, String> {
+    get_session_assistant_and_transcript_in_parent_scope(
+        conn,
+        assistant,
+        session_id,
+        source_kind,
+        source_dir_key,
+        ParentSessionScope::Unfiltered,
+    )
 }
 
 /// Returns the fields required to locate and parse a given session id.
@@ -6903,34 +8712,45 @@ fn resolve_session_source_kind(
 /// them to locate the shared `events.jsonl` under the parent session
 /// directory and to filter events by agent id, so it must NOT derive the
 /// parent/agent from string-splitting the synthetic id.
-pub fn get_session_assistant_and_transcript(
+pub fn get_session_assistant_and_transcript_in_parent_scope(
     conn: &rusqlite::Connection,
     assistant: &str,
     session_id: &str,
     source_kind: Option<&str>,
     source_dir_key: Option<&str>,
+    parent_scope: ParentSessionScope<'_>,
 ) -> Result<SessionLookup, String> {
     // Build a deterministic query:
     // - When source_kind is provided, filter by it exactly.
     // - When source_dir_key is Some, filter by source_dir_key = ?.
     // - When source_dir_key is None, filter by source_dir_key IS NULL.
     //   This ensures None means "no source directory" (non-App), not "any".
-    // - When source_kind is None (legacy), resolve a single source_kind via
-    //   `resolve_session_source_kind` and then filter by it. This keeps the
+    // - The `ParentSessionScope` adds an optional `parent_session_id`
+    //   predicate (none / `IS NULL` / `= ?`), so the detail page can select a
+    //   synthetic sub-agent alone even when a standalone session shares its
+    //   id.
+    // - When source_kind is None (legacy), resolve a single `source_kind`
+    //   via `resolve_session_query_scope` (which also honours the parent
+    //   predicate) and then filter by it. This keeps the
     //   legacy `None` fallback consistent with the other three session
     //   helpers (`get_session_cwd`, `get_session_model`,
     //   `get_session_turns_token_stats`) so identity, CWD, model, and turn
     //   stats always observe the same source row even when the same
     //   session_id has rows from multiple collectors (e.g. `copilot-cli`
     //   turn 1 + `vscode-chat` turn 2, both with `source_dir_key IS NULL`).
-    let resolved_source_kind =
-        resolve_session_source_kind(conn, assistant, session_id, source_kind, source_dir_key)?;
-    // No matching row exists; mirror the previous "Session not found" error
-    // so callers see the same behaviour when the legacy lookup has nothing
-    // to fall back on.
-    let resolved_source_kind = match resolved_source_kind {
-        Some(k) => k,
-        None => return Err("Session not found".to_string()),
+    let Some(resolved_source_kind) = resolve_session_query_scope(
+        conn,
+        assistant,
+        session_id,
+        source_kind,
+        source_dir_key,
+        parent_scope,
+    )?
+    else {
+        // No matching row exists; mirror the previous "Session not found" error
+        // so callers see the same behaviour when the legacy lookup has nothing
+        // to fall back on.
+        return Err("Session not found".to_string());
     };
 
     let mut sql = String::from(
@@ -6952,6 +8772,7 @@ pub fn get_session_assistant_and_transcript(
         // None means source_dir_key IS NULL (non-App rows only).
         sql.push_str(" AND source_dir_key IS NULL");
     }
+    parent_scope.push_filter(&mut sql, &mut params_vec);
 
     // Deterministic ordering: main agent rows first
     // (`(parent_session_id IS NULL) DESC` puts NULL/main rows ahead of
@@ -7004,6 +8825,9 @@ pub fn get_session_assistant_and_transcript(
     }
 }
 
+/// Legacy wrapper for callers that do not pass a parent session (see
+/// [`ParentSessionScope::Unfiltered`]).
+#[allow(dead_code)] // 保留既有 5 參呼叫介面給既有測試與外部呼叫端；正式路徑一律明確傳入 ParentSessionScope。
 pub fn get_session_cwd(
     conn: &rusqlite::Connection,
     assistant: &str,
@@ -7011,18 +8835,42 @@ pub fn get_session_cwd(
     source_kind: Option<&str>,
     source_dir_key: Option<&str>,
 ) -> Result<Option<String>, String> {
+    get_session_cwd_in_parent_scope(
+        conn,
+        assistant,
+        session_id,
+        source_kind,
+        source_dir_key,
+        ParentSessionScope::Unfiltered,
+    )
+}
+
+pub fn get_session_cwd_in_parent_scope(
+    conn: &rusqlite::Connection,
+    assistant: &str,
+    session_id: &str,
+    source_kind: Option<&str>,
+    source_dir_key: Option<&str>,
+    parent_scope: ParentSessionScope<'_>,
+) -> Result<Option<String>, String> {
     // None means source_dir_key IS NULL (non-App rows only), not "any source".
     // The legacy `source_kind = None` path MUST resolve a single
-    // `source_kind` via `resolve_session_source_kind` so the CWD lookup
-    // always observes the same source row as identity / model / turn
-    // stats; otherwise a session_id with rows from multiple collectors
-    // (e.g. `copilot-cli` turn 1 + `vscode-chat` turn 2, both
-    // `source_dir_key IS NULL`) could leak CWD from a different source.
-    let resolved_source_kind =
-        resolve_session_source_kind(conn, assistant, session_id, source_kind, source_dir_key)?;
-    let resolved_source_kind = match resolved_source_kind {
-        Some(k) => k,
-        None => return Ok(None),
+    // `source_kind` via `resolve_session_query_scope` (which also honours
+    // the `ParentSessionScope` predicate) so the CWD lookup always observes
+    // the same source row as identity / model / turn stats; otherwise a
+    // session_id with rows from multiple collectors (e.g. `copilot-cli`
+    // turn 1 + `vscode-chat` turn 2, both `source_dir_key IS NULL`) or a
+    // colliding synthetic sub-agent id could leak CWD from a different row.
+    let Some(resolved_source_kind) = resolve_session_query_scope(
+        conn,
+        assistant,
+        session_id,
+        source_kind,
+        source_dir_key,
+        parent_scope,
+    )?
+    else {
+        return Ok(None);
     };
 
     let mut sql = String::from(
@@ -7041,6 +8889,7 @@ pub fn get_session_cwd(
     } else {
         sql.push_str(" AND source_dir_key IS NULL");
     }
+    parent_scope.push_filter(&mut sql, &mut params_vec);
     sql.push_str(
         " ORDER BY (parent_session_id IS NULL) DESC, source_kind ASC, turn_no ASC, id ASC LIMIT 1",
     );
@@ -7053,6 +8902,26 @@ pub fn get_session_cwd(
     } else {
         Ok(None)
     }
+}
+
+/// Legacy wrapper for callers that do not pass a parent session (see
+/// [`ParentSessionScope::Unfiltered`]).
+#[allow(dead_code)] // 保留既有 5 參呼叫介面給既有測試與外部呼叫端；正式路徑一律明確傳入 ParentSessionScope。
+pub fn get_session_model(
+    conn: &rusqlite::Connection,
+    assistant: &str,
+    session_id: &str,
+    source_kind: Option<&str>,
+    source_dir_key: Option<&str>,
+) -> Result<Option<String>, String> {
+    get_session_model_in_parent_scope(
+        conn,
+        assistant,
+        session_id,
+        source_kind,
+        source_dir_key,
+        ParentSessionScope::Unfiltered,
+    )
 }
 
 /// Returns the canonical model for a session row from the database.
@@ -7068,24 +8937,32 @@ pub fn get_session_cwd(
 /// `source_dir_key` mirrors the same scoping as [`get_session_cwd`] and
 /// [`get_session_turns_token_stats`]. Returns `None` when the session has no
 /// model column populated (caller then falls back to the parser default).
-pub fn get_session_model(
+pub fn get_session_model_in_parent_scope(
     conn: &rusqlite::Connection,
     assistant: &str,
     session_id: &str,
     source_kind: Option<&str>,
     source_dir_key: Option<&str>,
+    parent_scope: ParentSessionScope<'_>,
 ) -> Result<Option<String>, String> {
     // None means source_dir_key IS NULL (non-App rows only), not "any source".
     // The legacy `source_kind = None` path MUST resolve a single
-    // `source_kind` via `resolve_session_source_kind` so the model lookup
-    // always observes the same source row as identity / CWD / turn stats;
-    // otherwise a session_id with rows from multiple collectors could leak
-    // the model from a different source.
-    let resolved_source_kind =
-        resolve_session_source_kind(conn, assistant, session_id, source_kind, source_dir_key)?;
-    let resolved_source_kind = match resolved_source_kind {
-        Some(k) => k,
-        None => return Ok(None),
+    // `source_kind` via `resolve_session_query_scope` (which also honours
+    // the `ParentSessionScope` predicate) so the model lookup always
+    // observes the same source row as identity / CWD / turn stats;
+    // otherwise a
+    // session_id with rows from multiple collectors could leak the model
+    // from a different source.
+    let Some(resolved_source_kind) = resolve_session_query_scope(
+        conn,
+        assistant,
+        session_id,
+        source_kind,
+        source_dir_key,
+        parent_scope,
+    )?
+    else {
+        return Ok(None);
     };
 
     let mut sql = String::from(
@@ -7104,6 +8981,7 @@ pub fn get_session_model(
     } else {
         sql.push_str(" AND source_dir_key IS NULL");
     }
+    parent_scope.push_filter(&mut sql, &mut params_vec);
     sql.push_str(
         " ORDER BY (parent_session_id IS NULL) DESC, source_kind ASC, turn_no ASC, id ASC LIMIT 1",
     );
@@ -7124,6 +9002,9 @@ fn add_optional_token_total(current: &mut Option<u64>, incoming: Option<u64>) {
     }
 }
 
+/// Legacy wrapper for callers that do not pass a parent session (see
+/// [`ParentSessionScope::Unfiltered`]).
+#[allow(dead_code)] // 保留既有 5 參呼叫介面給既有測試與外部呼叫端；正式路徑一律明確傳入 ParentSessionScope。
 pub fn get_session_turns_token_stats(
     conn: &rusqlite::Connection,
     assistant: &str,
@@ -7131,22 +9012,46 @@ pub fn get_session_turns_token_stats(
     source_kind: Option<&str>,
     source_dir_key: Option<&str>,
 ) -> Result<HashMap<u32, (TokenStats, String)>, String> {
+    get_session_turns_token_stats_in_parent_scope(
+        conn,
+        assistant,
+        session_id,
+        source_kind,
+        source_dir_key,
+        ParentSessionScope::Unfiltered,
+    )
+}
+
+pub fn get_session_turns_token_stats_in_parent_scope(
+    conn: &rusqlite::Connection,
+    assistant: &str,
+    session_id: &str,
+    source_kind: Option<&str>,
+    source_dir_key: Option<&str>,
+    parent_scope: ParentSessionScope<'_>,
+) -> Result<HashMap<u32, (TokenStats, String)>, String> {
     let mut map: HashMap<u32, (TokenStats, String)> = HashMap::new();
     // None means source_dir_key IS NULL (non-App rows only), not "any source".
     // The legacy `source_kind = None` path MUST resolve a single
-    // `source_kind` via `resolve_session_source_kind` so the turn-stats
-    // lookup always observes the same source row as identity / CWD / model
-    // AND so all returned turns come from a single collector. Without
-    // resolving first, the previous per-turn "first row encountered" rule
-    // could mix rows from different sources (e.g. `copilot-cli` turn 1 +
-    // `vscode-chat` turn 2, both `source_dir_key IS NULL`) into a single
-    // map, violating the "legacy fallback must pick a single source"
-    // contract.
-    let resolved_source_kind =
-        resolve_session_source_kind(conn, assistant, session_id, source_kind, source_dir_key)?;
-    let resolved_source_kind = match resolved_source_kind {
-        Some(k) => k,
-        None => return Ok(map),
+    // `source_kind` via `resolve_session_query_scope` (which also honours
+    // the `ParentSessionScope` predicate) so the turn-stats lookup always
+    // observes the same source row as identity / CWD / model AND so all
+    // returned turns come from a single collector and a single parent scope.
+    // Without resolving first, the previous per-turn "first row encountered"
+    // rule could mix rows from different sources (e.g. `copilot-cli` turn 1 +
+    // `vscode-chat` turn 2, both `source_dir_key IS NULL`) or a colliding
+    // synthetic sub-agent id into a single map, violating the "legacy
+    // fallback must pick a single source" contract.
+    let Some(resolved_source_kind) = resolve_session_query_scope(
+        conn,
+        assistant,
+        session_id,
+        source_kind,
+        source_dir_key,
+        parent_scope,
+    )?
+    else {
+        return Ok(map);
     };
 
     let mut sql = String::from(
@@ -7165,6 +9070,7 @@ pub fn get_session_turns_token_stats(
     } else {
         sql.push_str(" AND source_dir_key IS NULL");
     }
+    parent_scope.push_filter(&mut sql, &mut params_vec);
     // Order by turn_no first so the per-turn map mirrors natural turn order.
     // Within the same turn_no, prefer main agent rows
     // (`(parent_session_id IS NULL) DESC` puts NULL/main rows ahead of
@@ -7317,6 +9223,7 @@ pub fn get_usage_entries_by_month(
             entry: row.record.entry,
             assistant_type: row.assistant_type,
             date: row.date,
+            import_source_id: row.record.import_source_id,
         })
         .collect())
 }
@@ -7372,6 +9279,7 @@ pub fn get_usage_entries_by_year(
             entry: row.record.entry,
             assistant_type: row.assistant_type,
             date: row.date,
+            import_source_id: row.record.import_source_id,
         })
         .collect())
 }
@@ -7390,6 +9298,7 @@ pub fn get_usage_entries_by_range(
             entry: row.record.entry,
             assistant_type: row.assistant_type,
             date: row.date,
+            import_source_id: row.record.import_source_id,
         })
         .collect())
 }
@@ -8427,6 +10336,50 @@ mod tests {
     }
 
     #[test]
+    fn import_usage_day_entries_normalizes_empty_parent_session_id() {
+        // (thread PRRT_kwDOTOgsec6yUKGs) The export/import serde channel keeps
+        // `parent_session_id: ""` as `Some("")`. Storage must normalize it to
+        // "no parent" at the write boundary: the frontend identity key
+        // collapses `''` to absent and the detail page requests the parentless
+        // row-set with `parent_session_id=''` → `RootOnly`, which cannot find
+        // a row persisted with `''`.
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut record = sample_import_record();
+        record.entry.parent_session_id = Some(String::new());
+
+        let summary = import_usage_day_entries(
+            &mut conn,
+            "codex",
+            "2026-07-10",
+            vec![record],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        assert_eq!(summary.imported, 1);
+
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT parent_session_id FROM usage_entries WHERE session_id = 'import-session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, None, "空父層必須以無父層（NULL）儲存");
+
+        let lookup = get_session_assistant_and_transcript_in_parent_scope(
+            &conn,
+            "codex",
+            "import-session",
+            None,
+            None,
+            ParentSessionScope::RootOnly,
+        )
+        .expect("RootOnly 詳情查詢必須查得到空父層 session（否則詳情頁 404）");
+        assert_eq!(lookup.parent_session_id, None);
+    }
+
+    #[test]
     fn import_preserves_copilot_source_directories_and_multi_model_rows() {
         let mut conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
@@ -9436,6 +11389,65 @@ mod tests {
     }
 
     #[test]
+    fn parent_session_id_empty_string_migration_repairs_existing_rows() {
+        // One-time repair vehicle for rows persisted before empty-parent
+        // normalization (thread PRRT_kwDOTOgsec6yUKGs / audit F4). Not the
+        // Copilot App reconciliation revision (`4u32`): that fingerprint never
+        // sees Codex or imported rows, which are exactly the `''` producers.
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        for (index, parent) in [Some(""), Some("  "), Some(" p "), None]
+            .into_iter()
+            .enumerate()
+        {
+            conn.execute(
+                "INSERT INTO usage_entries (
+                    assistant_type, timestamp, date, session_id,
+                    turn_no, parent_session_id
+                 ) VALUES ('codex', '2026-09-10T16:06:50Z', '2026-09-10', ?, ?, ?)",
+                params![format!("session-{index}"), (index + 1) as i64, parent],
+            )
+            .unwrap();
+        }
+
+        run_parent_session_id_normalization_migration(&mut conn).unwrap();
+
+        let parents: Vec<Option<String>> = conn
+            .prepare("SELECT parent_session_id FROM usage_entries ORDER BY session_id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            parents,
+            vec![None, None, Some("p".to_string()), None],
+            "''／全空白父層修為 NULL、空白包夾的真實父層 trim、NULL 不動"
+        );
+
+        let marker: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = ?)",
+                params![PARENT_SESSION_NORMALIZATION_MIGRATION_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(marker, "遷移必須寫入 sync_state marker 保證只跑一次");
+
+        let changes_before = conn
+            .query_row::<i64, _, _>("SELECT total_changes()", [], |row| row.get(0))
+            .unwrap();
+        run_parent_session_id_normalization_migration(&mut conn).unwrap();
+        let changes_after = conn
+            .query_row::<i64, _, _>("SELECT total_changes()", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            changes_after, changes_before,
+            "第二次執行必須為 no-op（冪等）"
+        );
+    }
+
+    #[test]
     fn codex_rollout_identity_migration_keeps_imported_rows() {
         let mut conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
@@ -9943,13 +11955,16 @@ mod tests {
     fn import_usage_day_entries_dedupes_codex_rollouts_against_local_rows() {
         let mut conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
+        // 同一條邏輯列的 parent 元資料必須一致：唯一鍵自 PRRT_kwDOTOgsec6yUXND
+        // 起以正規化父層分家，此處與 sample_import_record 的 parent 對齊，
+        // 測試重點（source_kind 採納後同鍵 dedup）不變。
         conn.execute(
             "INSERT INTO usage_entries (
                 assistant_type, source_kind, timestamp, date, session_id, transcript_path,
-                turn_no, usage_identity
+                turn_no, usage_identity, parent_session_id
              ) VALUES ('codex', 'codex-desktop', '2026-07-10T12:34:56Z', '2026-07-10',
                 'import-session', '/codex/sessions/2026/09/11/rollout-2026-09-11T00-06-46-legacy.jsonl',
-                1, 'rollout=rollout-2026-09-11T00-06-46-legacy')",
+                1, 'rollout=rollout-2026-09-11T00-06-46-legacy', 'parent-session')",
             [],
         )
         .unwrap();
@@ -9988,13 +12003,16 @@ mod tests {
     fn import_usage_day_entries_dedupes_exports_that_carry_the_legacy_kind() {
         let mut conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
+        // 同一條邏輯列的 parent 元資料必須一致（PRRT_kwDOTOgsec6yUXND 起唯一鍵
+        // 以正規化父層分家）；對齊 sample_import_record 的 parent，測試重點
+        // （legacy kind 匯出回流後同鍵 dedup）不變。
         conn.execute(
             "INSERT INTO usage_entries (
                 assistant_type, source_kind, timestamp, date, session_id, transcript_path,
-                turn_no, usage_identity
+                turn_no, usage_identity, parent_session_id
              ) VALUES ('codex', 'codex-cli', '2026-07-10T12:34:56Z', '2026-07-10',
                 'import-session', '/codex/sessions/2026/09/11/rollout-2026-09-11T00-06-46-legacy.jsonl',
-                1, 'rollout=rollout-2026-09-11T00-06-46-legacy')",
+                1, 'rollout=rollout-2026-09-11T00-06-46-legacy', 'parent-session')",
             [],
         )
         .unwrap();
@@ -13158,10 +15176,10 @@ mod tests {
         );
         assert_eq!(row.2, 1_370, "tokens_output");
         assert_eq!(row.3, 384, "tokens_reasoning");
-        // total = net_input + cache_read + output + reasoning = 42_530 + 401_024 + 1_370 + 384
-        assert_eq!(row.4, 445_308, "tokens_total counts cache_read once");
+        // Reasoning is included in output: total = net input + cache read + output.
+        assert_eq!(row.4, 444_924, "tokens_total counts cache_read once");
         assert_eq!(row.5, 42_530, "delta_input must also exclude cache_read");
-        assert_eq!(row.6, 445_308, "delta_total must match tokens_total");
+        assert_eq!(row.6, 444_924, "delta_total must match tokens_total");
 
         if let Some(value) = old_app_dir {
             std::env::set_var("COPILOT_APP_DIR", value);
@@ -13635,7 +15653,7 @@ mod tests {
             "main agent agent_role must be NULL (initiator is NULL)"
         );
         // DP4F events: input 100000+1261894=1361894, output 800+17622=18422, reasoning 1500+88=1588
-        let dp4f_total = 1361894 + 18422 + 1588;
+        let dp4f_total = 1361894 + 18422;
         assert_eq!(
             main_row.0, dp4f_total,
             "main agent total must match DP4F event sum"
@@ -13686,7 +15704,7 @@ mod tests {
             "subagent agent_role must be 'sub-agent' when initiator is 'sub-agent'"
         );
         // K2.7 events: input 2000000+1156615=3156615, output 20000+8069=28069, reasoning 100+97=197
-        let k27_total = 3156615 + 28069 + 197;
+        let k27_total = 3156615 + 28069;
         assert_eq!(
             sub_row.0, k27_total,
             "subagent total must match K2.7 event sum"
@@ -15511,6 +17529,2701 @@ mod tests {
         .collect()
     }
 
+    /// Source handles are dropped before fixture cleanup on every platform.
+    struct AppReviewFixture {
+        root: PathBuf,
+        conn: Connection,
+        store: Option<Connection>,
+    }
+
+    impl AppReviewFixture {
+        fn new(ids: &[&str]) -> Self {
+            let root = temp_jsonl_path("app-review").with_extension("");
+            fs::create_dir_all(&root).unwrap();
+            let store = build_cli_reconciler_fixture(&root, ids, &[]);
+            let conn = Connection::open_in_memory().unwrap();
+            init_db(&conn).unwrap();
+            Self {
+                root,
+                conn,
+                store: Some(store),
+            }
+        }
+        fn write(&self, sid: &str, events: &[serde_json::Value]) {
+            write_cli_usage_fixture(&self.root, sid, events);
+        }
+        fn sync(&mut self) {
+            sync_copilot_app_usage_logs_from(&mut self.conn, &self.root).unwrap();
+        }
+        fn native(
+            &self,
+            id: i64,
+            sid: &str,
+            timestamp: &str,
+            turn: Option<i64>,
+            agent: Option<&str>,
+        ) {
+            let store = self.store.as_ref().unwrap();
+            insert_cli_event(
+                store,
+                CliEventIdentity {
+                    id,
+                    session_id: sid,
+                    model: "B",
+                    agent_id: agent,
+                    initiator: None,
+                },
+                CliEventTokens {
+                    input: 100,
+                    output: 10,
+                    cache_read: 80,
+                    cache_write: 0,
+                    reasoning: 0,
+                    duration_ms: 50,
+                },
+                timestamp,
+            );
+            store
+                .execute(
+                    "UPDATE assistant_usage_events SET turn_index=? WHERE id=?",
+                    params![turn, id],
+                )
+                .unwrap();
+        }
+        fn rows(&self, sid: &str) -> Vec<(i64, String, u32, u64)> {
+            self.conn.prepare("SELECT id,import_source_id,turn_no,delta_total FROM usage_entries WHERE session_id=? AND parent_session_id IS NULL ORDER BY import_source_id")
+                .unwrap().query_map([sid], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap().map(Result::unwrap).collect()
+        }
+        fn replies(&self, sid: &str, agent: Option<&str>) -> Vec<(u32, u64)> {
+            let entries = self.conn.prepare("SELECT turn_no,SUM(delta_total) FROM usage_entries WHERE session_id=? GROUP BY turn_no")
+                .unwrap().query_map([sid], |r|Ok((r.get::<_,u32>(0)?,r.get::<_,u64>(1)?))).unwrap()
+                .map(|r| { let (turn,total)=r.unwrap(); (turn,(TokenStats { total,input:0,output:0,cache_read:None,cache_write:None,cache_write_5m:None,cache_write_1h:None,reasoning:None }, "B".into())) }).collect();
+            let mut timeline = Vec::new();
+            crate::timeline::parse_copilot_timeline_filtered(
+                BufReader::new(
+                    File::open(self.root.join("session-state/app/events.jsonl")).unwrap(),
+                ),
+                &entries,
+                &mut timeline,
+                &mut HashMap::new(),
+                agent,
+                None,
+            );
+            timeline
+                .into_iter()
+                .filter_map(|item| match item {
+                    crate::timeline::TimelineItem::AgentReply {
+                        turn_no,
+                        tokens: Some(tokens),
+                        ..
+                    } => Some((turn_no, tokens.total)),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+    impl Drop for AppReviewFixture {
+        fn drop(&mut self) {
+            drop(self.store.take());
+            if !std::thread::panicking() {
+                fs::remove_dir_all(&self.root).unwrap();
+            }
+        }
+    }
+    fn app_text(kind: &str) -> serde_json::Value {
+        serde_json::json!({"type":kind,"data":{"content":"fixture"}})
+    }
+
+    #[test]
+    fn app_review_preserves_canonical_source_key_in_rows_and_state() {
+        let mut f = AppReviewFixture::new(&["app"]);
+        let root = f.root.canonicalize().unwrap();
+        #[cfg(windows)]
+        assert!(root.to_string_lossy().starts_with(r"\\?\"));
+        let key = encode_hex(root.as_os_str().as_encoded_bytes());
+        f.native(1, "app", "2026-07-23T12:00:00Z", Some(0), None);
+        f.sync();
+        f.write("app", &[cli_usage_fixture(1, "2026-07-23T12:00:00Z")]);
+        f.sync();
+        assert_eq!(f.rows("app").len(), 1);
+        let actual: String = f
+            .conn
+            .query_row("SELECT source_dir_key FROM usage_entries", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(actual, key);
+        assert!(
+            load_sync_state_for_prefix(&f.conn, "copilot-app-transcript")
+                .contains_key(&format!("copilot-app-transcript:{key}:app"))
+        );
+        let changes = f
+            .conn
+            .query_row::<i64, _, _>("SELECT total_changes()", [], |r| r.get(0))
+            .unwrap();
+        f.sync();
+        assert_eq!(
+            f.conn
+                .query_row::<i64, _, _>("SELECT total_changes()", [], |r| r.get(0))
+                .unwrap(),
+            changes
+        );
+    }
+
+    #[test]
+    fn app_review_independent_double_underscore_session_survives_rebuild_and_cleanup() {
+        let mut f = AppReviewFixture::new(&["a", "a__b"]);
+        let first = cli_usage_fixture(1, "2026-07-23T12:00:00Z");
+        f.write("a", std::slice::from_ref(&first));
+        f.write("a__b", &[cli_usage_fixture(2, "2026-07-23T12:01:00Z")]);
+        f.sync();
+        let independent = f.rows("a__b");
+        f.write("a", &[first, cli_usage_fixture(3, "2026-07-23T12:02:00Z")]);
+        f.sync();
+        assert_eq!(f.rows("a__b"), independent);
+        Connection::open(f.root.join("data.db"))
+            .unwrap()
+            .execute("DELETE FROM sessions WHERE id='a'", [])
+            .unwrap();
+        f.sync();
+        assert!(f.rows("a").is_empty());
+        assert_eq!(f.rows("a__b"), independent);
+        let key = encode_hex(
+            f.root
+                .canonicalize()
+                .unwrap()
+                .as_os_str()
+                .as_encoded_bytes(),
+        );
+        assert_eq!(
+            query_copilot_app_session_ids(&f.conn, &key).unwrap(),
+            HashSet::from(["a__b".to_owned()])
+        );
+    }
+
+    #[test]
+    fn app_review_registered_id_cannot_claim_another_sessions_child_with_same_display_id() {
+        let mut f = AppReviewFixture::new(&["a", "a__b"]);
+        let mut child = cli_usage_fixture(1, "2026-07-23T12:00:00Z");
+        child["agentId"] = serde_json::json!("b");
+        f.write("a", &[child]);
+        let independent = cli_usage_fixture(2, "2026-07-23T12:01:00Z");
+        f.write("a__b", std::slice::from_ref(&independent));
+        f.sync();
+        let child_id: i64 = f
+            .conn
+            .query_row(
+                "SELECT id FROM usage_entries WHERE parent_session_id='a'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        f.write(
+            "a__b",
+            &[independent, cli_usage_fixture(3, "2026-07-23T12:02:00Z")],
+        );
+        f.sync();
+        let still_child: i64 = f
+            .conn
+            .query_row(
+                "SELECT id FROM usage_entries WHERE parent_session_id='a'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(still_child, child_id);
+        assert_eq!(f.rows("a__b").len(), 2);
+    }
+
+    fn sha256_hex(value: &str) -> String {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(value.as_bytes()))
+    }
+
+    /// Column values for one pre-existing Copilot App usage row, mirroring
+    /// what the old collectors or a backup import persisted before the
+    /// per-call takeover existed.
+    struct SeedAppRow<'a> {
+        source_key: &'a str,
+        session_id: &'a str,
+        turn_no: u32,
+        date: &'a str,
+        timestamp: &'a str,
+        model: &'a str,
+        agent: Option<&'a str>,
+        duration_ms: u64,
+        usage_identity: &'a str,
+        import_source_id: &'a str,
+        tokens_input: u64,
+        tokens_output: u64,
+        tokens_cache_read: u64,
+        tokens_cache_write: u64,
+        tokens_reasoning: u64,
+    }
+
+    fn seed_app_row(conn: &Connection, seed: &SeedAppRow<'_>) {
+        let total = seed.tokens_input + seed.tokens_output + seed.tokens_cache_read;
+        let (row_session_id, parent_session_id) = match seed.agent {
+            Some(agent) => (
+                format!("{}__{}", seed.session_id, agent),
+                Some(seed.session_id),
+            ),
+            None => (seed.session_id.to_string(), None),
+        };
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, usage_identity,
+                timestamp, date, session_id, turn_no, model, model_id,
+                tokens_input, tokens_output, tokens_cache_read, tokens_cache_write,
+                tokens_reasoning, tokens_total,
+                delta_input, delta_output, delta_cache_read, delta_cache_write,
+                delta_reasoning, delta_total, duration_ms,
+                parent_session_id, agent_nickname, import_source_id
+             ) VALUES (
+                'copilot', 'copilot-app', ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?
+             )",
+            params![
+                seed.source_key,
+                seed.usage_identity,
+                seed.timestamp,
+                seed.date,
+                row_session_id,
+                seed.turn_no as i64,
+                seed.model,
+                seed.model,
+                seed.tokens_input as i64,
+                seed.tokens_output as i64,
+                seed.tokens_cache_read as i64,
+                seed.tokens_cache_write as i64,
+                seed.tokens_reasoning as i64,
+                total as i64,
+                seed.tokens_input as i64,
+                seed.tokens_output as i64,
+                seed.tokens_cache_read as i64,
+                seed.tokens_cache_write as i64,
+                seed.tokens_reasoning as i64,
+                total as i64,
+                seed.duration_ms as i64,
+                parent_session_id,
+                seed.agent,
+                seed.import_source_id,
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn copilot_app_missing_native_source_cannot_satisfy_aggregate_coverage() {
+        let root = temp_jsonl_path("app-review-missing-native").with_extension("");
+        fs::create_dir_all(&root).unwrap();
+        create_copilot_app_registry(&root, &["app"]);
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let key = test_copilot_source_key(&root);
+        let aggregate_id = format!("copilot-app:{key}:app:0:main:42");
+        seed_app_row(
+            &conn,
+            &SeedAppRow {
+                source_key: &key,
+                session_id: "app",
+                turn_no: 1,
+                date: "2026-07-23",
+                timestamp: "2026-07-23T09:00:00Z",
+                model: "B",
+                agent: None,
+                duration_ms: 50,
+                usage_identity: "agent=6d61696e;model=42",
+                import_source_id: &aggregate_id,
+                tokens_input: 100,
+                tokens_output: 50,
+                tokens_cache_read: 0,
+                tokens_cache_write: 0,
+                tokens_reasoning: 0,
+            },
+        );
+        // An unrelated event-file call in the same day/turn/model bucket is
+        // never evidence for a native-derived aggregate, especially while
+        // session-store.db is missing.
+        let unrelated = serde_json::json!({"type":"session.usage_record","id":"event-y",
+            "timestamp":"2026-07-23T10:00:00Z","data":{"usage":{"model":"B","inputTokens":500,
+            "outputTokens":200,"cacheReadTokens":0,"duration":50,
+            "accounting":{"usageId":"api-y","sequence":1}}}});
+        write_cli_usage_fixture(&root, "app", &[unrelated]);
+        sync_copilot_app_usage_logs_from(&mut conn, &root).unwrap();
+        let kept: Vec<(i64, i64)> = conn
+            .prepare("SELECT tokens_input, tokens_output FROM usage_entries")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(kept, vec![(100, 50)]);
+        assert!(
+            load_sync_state_for_prefix(&conn, "copilot-app-transcript").is_empty(),
+            "uncovered aggregates must stay retryable instead of finalizing the fingerprint"
+        );
+        // The native database returns with the real call: the aggregate is
+        // covered at its own granularity and rebuilt per call.
+        let store = create_test_copilot_session_store(&root);
+        insert_cli_event(
+            &store,
+            CliEventIdentity {
+                id: 1,
+                session_id: "app",
+                model: "B",
+                agent_id: None,
+                initiator: None,
+            },
+            CliEventTokens {
+                input: 100,
+                output: 50,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+                duration_ms: 50,
+            },
+            "2026-07-23 09:00:00",
+        );
+        drop(store);
+        sync_copilot_app_usage_logs_from(&mut conn, &root).unwrap();
+        let aggregate_left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries WHERE import_source_id NOT LIKE '%:call:%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(aggregate_left, 0);
+        assert_eq!(
+            cli_daily_totals(&conn, "app"),
+            vec![("2026-07-23".into(), 850)]
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn copilot_app_legacy_merged_row_validates_as_whole_turn() {
+        let mut f = AppReviewFixture::new(&["app"]);
+        {
+            let store = f.store.as_ref().unwrap();
+            insert_cli_event(
+                store,
+                CliEventIdentity {
+                    id: 1,
+                    session_id: "app",
+                    model: "M1",
+                    agent_id: None,
+                    initiator: None,
+                },
+                CliEventTokens {
+                    input: 100,
+                    output: 10,
+                    cache_read: 0,
+                    cache_write: 0,
+                    reasoning: 0,
+                    duration_ms: 50,
+                },
+                "2026-07-23 12:00:00",
+            );
+            insert_cli_event(
+                store,
+                CliEventIdentity {
+                    id: 2,
+                    session_id: "app",
+                    model: "M2",
+                    agent_id: Some("child"),
+                    initiator: Some("sub-agent"),
+                },
+                CliEventTokens {
+                    input: 200,
+                    output: 20,
+                    cache_read: 0,
+                    cache_write: 0,
+                    reasoning: 0,
+                    duration_ms: 60,
+                },
+                "2026-07-23 12:00:01",
+            );
+        }
+        f.write("app", &[app_text("user.message")]);
+        let key = test_copilot_source_key(&f.root);
+        // The old collector merged the whole turn (main + sub agent across two
+        // models, MIN(model)) into one 3-segment row.
+        let merged_id = format!("copilot-app:{key}:app:0");
+        seed_app_row(
+            &f.conn,
+            &SeedAppRow {
+                source_key: &key,
+                session_id: "app",
+                turn_no: 1,
+                date: "2026-07-23",
+                timestamp: "2026-07-23T12:00:00Z",
+                model: "M1",
+                agent: None,
+                duration_ms: 110,
+                usage_identity: "",
+                import_source_id: &merged_id,
+                tokens_input: 300,
+                tokens_output: 30,
+                tokens_cache_read: 0,
+                tokens_cache_write: 0,
+                tokens_reasoning: 0,
+            },
+        );
+        f.sync();
+        let legacy: i64 = f
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries WHERE import_source_id NOT LIKE '%:call:%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            legacy, 0,
+            "whole-turn covered legacy rows must split into per-call rows"
+        );
+        let rows: Vec<(String, Option<String>, u64, u64)> = f
+            .conn
+            .prepare(
+                "SELECT session_id, model, tokens_input, tokens_output
+                 FROM usage_entries ORDER BY session_id",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("app".to_string(), Some("M1".to_string()), 100, 10),
+                ("app__child".to_string(), Some("M2".to_string()), 200, 20),
+            ]
+        );
+        assert_eq!(
+            cli_daily_totals(&f.conn, "app"),
+            vec![("2026-07-23".into(), 330)]
+        );
+    }
+
+    #[test]
+    fn copilot_app_takeover_requires_one_to_one_call_coverage() {
+        let mut f = AppReviewFixture::new(&["app"]);
+        f.native(5, "app", "2026-07-23T12:00:00Z", Some(0), None);
+        f.write("app", &[cli_usage_fixture(1, "2026-07-23T12:00:00Z")]);
+        let key = test_copilot_source_key(&f.root);
+        // An earlier snapshot persisted the event call and the SQLite-only
+        // call as two rows; the source now merges them into ONE row keeping
+        // both identities. One replacement must not stand in for two calls.
+        for raw in [r#"event:["app",null,"api-1"]"#, "sqlite:5"] {
+            let hash = sha256_hex(raw);
+            let usage_identity = format!("source={key};call={hash}");
+            let import_source_id = format!("copilot-app:{key}:app:call:{hash}");
+            seed_app_row(
+                &f.conn,
+                &SeedAppRow {
+                    source_key: &key,
+                    session_id: "app",
+                    turn_no: 1,
+                    date: "2026-07-23",
+                    timestamp: "2026-07-23T12:00:00Z",
+                    model: "B",
+                    agent: None,
+                    duration_ms: 50,
+                    usage_identity: &usage_identity,
+                    import_source_id: &import_source_id,
+                    tokens_input: 20,
+                    tokens_output: 10,
+                    tokens_cache_read: 80,
+                    tokens_cache_write: 0,
+                    tokens_reasoning: 0,
+                },
+            );
+        }
+        let before = f.rows("app");
+        assert_eq!(before.len(), 2);
+        f.sync();
+        assert_eq!(
+            f.rows("app"),
+            before,
+            "one merged row must not cover two persisted calls"
+        );
+        assert!(load_sync_state_for_prefix(&f.conn, "copilot-app-transcript").is_empty());
+    }
+
+    #[test]
+    fn copilot_app_imported_aggregate_defers_takeover_until_revocation() {
+        let mut f = AppReviewFixture::new(&["app"]);
+        f.write("app", &[cli_usage_fixture(1, "2026-07-23T12:00:00Z")]);
+        let key = test_copilot_source_key(&f.root);
+        // A backup exported by the old collector: one revocable turn aggregate
+        // covering exactly the local call's usage.
+        let record = UsageDayExportRecord {
+            entry: UsageEntry {
+                timestamp: "2026-07-23T12:00:00Z".to_string(),
+                session_id: "app".to_string(),
+                session_name: None,
+                transcript_path: None,
+                cwd: None,
+                version: None,
+                turn_no: 1,
+                model: Some("B".to_string()),
+                model_id: Some("B".to_string()),
+                tokens: Some(TokenStats {
+                    input: 20,
+                    output: 10,
+                    cache_read: Some(80),
+                    cache_write: Some(0),
+                    cache_write_5m: None,
+                    cache_write_1h: None,
+                    reasoning: Some(0),
+                    total: 110,
+                }),
+                delta_tokens: Some(TokenStats {
+                    input: 20,
+                    output: 10,
+                    cache_read: Some(80),
+                    cache_write: Some(0),
+                    cache_write_5m: None,
+                    cache_write_1h: None,
+                    reasoning: Some(0),
+                    total: 110,
+                }),
+                context: None,
+                cost: None,
+                source_kind: Some("copilot-app".to_string()),
+                source_dir_key: Some(key.clone()),
+                parent_session_id: None,
+                agent_nickname: None,
+                agent_role: None,
+                reasoning_effort: None,
+            },
+            import_source_id: Some(format!("copilot-app:{key}:app:0:main:42")),
+            usage_identity: Some("agent=6d61696e;model=42".to_string()),
+        };
+        let summary = import_usage_day_entries(
+            &mut f.conn,
+            "copilot",
+            "2026-07-23",
+            vec![record],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        f.sync();
+        // The revocable import is the single representation while it exists.
+        assert_eq!(
+            cli_daily_totals(&f.conn, "app"),
+            vec![("2026-07-23".into(), 110)]
+        );
+        let local: i64 = f
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries WHERE import_batch_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(local, 0, "takeover must defer to the imported aggregate");
+        let rollback =
+            rollback_usage_import_batch(&mut f.conn, "copilot", &summary.batch_id).unwrap();
+        assert_eq!(rollback.removed_records, 1);
+        f.sync();
+        assert_eq!(
+            cli_daily_totals(&f.conn, "app"),
+            vec![("2026-07-23".into(), 110)]
+        );
+        let rebuilt: i64 = f
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE import_batch_id IS NULL AND import_source_id LIKE '%:call:%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            rebuilt, 1,
+            "revoking the batch must rebuild the local call rows"
+        );
+    }
+
+    #[test]
+    fn copilot_app_call_shadowed_by_import_batch_is_rebuilt_after_rollback() {
+        let mut f = AppReviewFixture::new(&["app"]);
+        f.write("app", &[cli_usage_fixture(1, "2026-07-23T12:00:00Z")]);
+        f.sync();
+        let records = export_usage_day_entries(&f.conn, "copilot", "2026-07-23").unwrap();
+        assert_eq!(records.len(), 1);
+        let call_id = records[0].import_source_id.clone().unwrap();
+        // Restore the same source on a fresh database: the imported backup row
+        // now owns the call's import id and shadows the local insert.
+        f.conn.execute("DELETE FROM usage_entries", []).unwrap();
+        f.conn.execute("DELETE FROM sync_state", []).unwrap();
+        let summary = import_usage_day_entries(
+            &mut f.conn,
+            "copilot",
+            "2026-07-23",
+            records,
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        f.sync();
+        let shadowing: i64 = f
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries WHERE import_batch_id = ?",
+                params![summary.batch_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(shadowing, 1);
+        let key = test_copilot_source_key(&f.root);
+        assert!(
+            load_sync_state_for_prefix(&f.conn, "copilot-app-transcript")
+                .contains_key(&format!("copilot-app-transcript:{key}:app"))
+        );
+        assert_eq!(
+            cli_daily_totals(&f.conn, "app"),
+            vec![("2026-07-23".into(), 110)]
+        );
+        rollback_usage_import_batch(&mut f.conn, "copilot", &summary.batch_id).unwrap();
+        f.sync();
+        let local: i64 = f
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE import_batch_id IS NULL AND import_source_id = ?",
+                params![call_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            local, 1,
+            "revoking the batch must rebuild the shadowed local call"
+        );
+        assert_eq!(
+            cli_daily_totals(&f.conn, "app"),
+            vec![("2026-07-23".into(), 110)]
+        );
+    }
+
+    #[test]
+    fn copilot_app_lookup_coverage_keeps_native_transition_and_order_independence() {
+        let mut f = AppReviewFixture::new(&["app"]);
+        f.native(1, "app", "2026-07-23T12:00:00Z", Some(0), None);
+        f.native(2, "app", "2026-07-23T12:01:00Z", Some(0), None);
+        f.write("app", &[]);
+        f.sync();
+        assert_eq!(f.rows("app").len(), 2);
+        // Call 1 becomes a merged row reachable only via native_identity (its
+        // timestamp moves with the transcript); call 2 stays native-only at
+        // the END of agent_rows and must still be matched by lookup.
+        f.write("app", &[cli_usage_fixture(1, "2026-07-23T12:00:00.200Z")]);
+        f.sync();
+        let after = f.rows("app");
+        assert_eq!(after.len(), 2);
+        let ids: Vec<&str> = after.iter().map(|row| row.1.as_str()).collect();
+        let key = test_copilot_source_key(&f.root);
+        let merged = format!(
+            "copilot-app:{key}:app:call:{}",
+            sha256_hex(r#"event:["app",null,"api-1"]"#)
+        );
+        let kept_native = format!("copilot-app:{key}:app:call:{}", sha256_hex("sqlite:2"));
+        let replaced_native = format!("copilot-app:{key}:app:call:{}", sha256_hex("sqlite:1"));
+        assert!(
+            ids.contains(&merged.as_str()),
+            "a native-only hit must transition the persisted row"
+        );
+        assert!(
+            ids.contains(&kept_native.as_str()),
+            "the target at the end of agent_rows must be matched"
+        );
+        assert!(!ids.contains(&replaced_native.as_str()));
+        assert_eq!(
+            cli_daily_totals(&f.conn, "app"),
+            vec![("2026-07-23".into(), 220)]
+        );
+    }
+
+    /// A backup record shaped like the turn aggregate an old release exported
+    /// for one Copilot App call (same usage as `cli_usage_fixture`).
+    fn app_aggregate_backup_record(key: &str) -> UsageDayExportRecord {
+        UsageDayExportRecord {
+            entry: UsageEntry {
+                timestamp: "2026-07-23T12:00:00Z".to_string(),
+                session_id: "app".to_string(),
+                session_name: None,
+                transcript_path: None,
+                cwd: None,
+                version: None,
+                turn_no: 1,
+                model: Some("B".to_string()),
+                model_id: Some("B".to_string()),
+                tokens: Some(TokenStats {
+                    input: 20,
+                    output: 10,
+                    cache_read: Some(80),
+                    cache_write: Some(0),
+                    cache_write_5m: None,
+                    cache_write_1h: None,
+                    reasoning: Some(0),
+                    total: 110,
+                }),
+                delta_tokens: Some(TokenStats {
+                    input: 20,
+                    output: 10,
+                    cache_read: Some(80),
+                    cache_write: Some(0),
+                    cache_write_5m: None,
+                    cache_write_1h: None,
+                    reasoning: Some(0),
+                    total: 110,
+                }),
+                context: None,
+                cost: None,
+                source_kind: Some("copilot-app".to_string()),
+                source_dir_key: Some(key.to_string()),
+                parent_session_id: None,
+                agent_nickname: None,
+                agent_role: None,
+                reasoning_effort: None,
+            },
+            import_source_id: Some(format!("copilot-app:{key}:app:0:main:42")),
+            usage_identity: Some("agent=6d61696e;model=42".to_string()),
+        }
+    }
+
+    #[test]
+    fn copilot_app_imported_aggregate_never_doubles_local_per_call_totals() {
+        let mut f = AppReviewFixture::new(&["app"]);
+        f.write("app", &[cli_usage_fixture(1, "2026-07-23T12:00:00Z")]);
+        f.sync();
+        let key = test_copilot_source_key(&f.root);
+        // Sync-only baseline: one local per-call row for the call.
+        assert_eq!(
+            cli_daily_totals(&f.conn, "app"),
+            vec![("2026-07-23".into(), 110)]
+        );
+        // A backup of the same source brings the old turn aggregate for the
+        // family that already holds the local per-call rows: the daily totals
+        // must keep counting exactly one set.
+        let summary = import_usage_day_entries(
+            &mut f.conn,
+            "copilot",
+            "2026-07-23",
+            vec![app_aggregate_backup_record(&key)],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            cli_daily_totals(&f.conn, "app"),
+            vec![("2026-07-23".into(), 110)],
+            "backup aggregates must not double the synced per-call usage"
+        );
+        assert_eq!(
+            summary.imported, 0,
+            "the duplicate aggregate must not be imported"
+        );
+        assert_eq!(
+            summary.skipped_duplicates, 1,
+            "the skipped aggregate must be reported honestly"
+        );
+        // The takeover stays live: a follow-up sync must neither defer nor
+        // duplicate once no aggregate claims the family.
+        f.sync();
+        assert_eq!(
+            cli_daily_totals(&f.conn, "app"),
+            vec![("2026-07-23".into(), 110)]
+        );
+    }
+
+    #[test]
+    fn copilot_app_aggregate_import_revocation_restores_the_sync_only_state() {
+        let mut f = AppReviewFixture::new(&["app"]);
+        f.write("app", &[cli_usage_fixture(1, "2026-07-23T12:00:00Z")]);
+        f.sync();
+        let key = test_copilot_source_key(&f.root);
+        let summary = import_usage_day_entries(
+            &mut f.conn,
+            "copilot",
+            "2026-07-23",
+            vec![app_aggregate_backup_record(&key)],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        // End-to-end: the import never doubles the synced usage…
+        assert_eq!(
+            cli_daily_totals(&f.conn, "app"),
+            vec![("2026-07-23".into(), 110)]
+        );
+        // …so revoking the batch is a no-op for the family: the report shows
+        // exactly the sync-only baseline and nothing local was lost.
+        let rollback =
+            rollback_usage_import_batch(&mut f.conn, "copilot", &summary.batch_id).unwrap();
+        assert_eq!(
+            rollback.removed_records, 0,
+            "skipped rows are not batch rows"
+        );
+        assert_eq!(
+            cli_daily_totals(&f.conn, "app"),
+            vec![("2026-07-23".into(), 110)],
+            "revocation must restore the sync-only baseline"
+        );
+        let local: i64 = f
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries WHERE import_batch_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(local, 1, "the local call row must survive revocation");
+        // A batch that never touched the family must not invalidate its sync
+        // fingerprint: the retryable-state machinery stays untouched.
+        assert!(
+            load_sync_state_for_prefix(&f.conn, "copilot-app-transcript")
+                .contains_key(&format!("copilot-app-transcript:{key}:app")),
+            "a skipped import must not invalidate the family fingerprint"
+        );
+        f.sync();
+        assert_eq!(
+            cli_daily_totals(&f.conn, "app"),
+            vec![("2026-07-23".into(), 110)]
+        );
+    }
+
+    #[test]
+    fn copilot_app_per_call_import_defers_to_an_earlier_aggregate_batch() {
+        let mut f = AppReviewFixture::new(&["app"]);
+        f.write("app", &[cli_usage_fixture(1, "2026-07-23T12:00:00Z")]);
+        f.sync();
+        let per_call_backup = export_usage_day_entries(&f.conn, "copilot", "2026-07-23").unwrap();
+        assert_eq!(per_call_backup.len(), 1);
+        let key = test_copilot_source_key(&f.root);
+        // Restore onto a fresh database: the old aggregate batch arrives first
+        // and claims the family representation.
+        f.conn.execute("DELETE FROM usage_entries", []).unwrap();
+        f.conn.execute("DELETE FROM sync_state", []).unwrap();
+        let aggregate_batch = import_usage_day_entries(
+            &mut f.conn,
+            "copilot",
+            "2026-07-23",
+            vec![app_aggregate_backup_record(&key)],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            aggregate_batch.imported, 1,
+            "the first aggregate import must claim the family"
+        );
+        // The per-call backup of the same source must not add a second set.
+        let call_batch = import_usage_day_entries(
+            &mut f.conn,
+            "copilot",
+            "2026-07-23",
+            per_call_backup.clone(),
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            cli_daily_totals(&f.conn, "app"),
+            vec![("2026-07-23".into(), 110)],
+            "imported aggregates and per-call rows must never both claim a call"
+        );
+        assert_eq!(call_batch.imported, 0);
+        assert_eq!(call_batch.skipped_duplicates, 1);
+        // Revoking the claiming batch releases the family: re-importing the
+        // per-call backup restores that representation exactly once.
+        rollback_usage_import_batch(&mut f.conn, "copilot", &aggregate_batch.batch_id).unwrap();
+        let retry = import_usage_day_entries(
+            &mut f.conn,
+            "copilot",
+            "2026-07-23",
+            per_call_backup,
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        assert_eq!(retry.imported, 1);
+        assert_eq!(
+            cli_daily_totals(&f.conn, "app"),
+            vec![("2026-07-23".into(), 110)]
+        );
+    }
+
+    #[test]
+    fn app_review_equal_metrics_cannot_replace_a_persisted_event_identity() {
+        let mut f = AppReviewFixture::new(&["app"]);
+        f.write("app", &[cli_usage_fixture(1, "2026-07-23T12:00:00Z")]);
+        f.sync();
+        let before = f.rows("app");
+        f.write("app", &[cli_usage_fixture(222, "2026-07-23T12:00:00Z")]);
+        f.sync();
+        assert_eq!(f.rows("app"), before);
+    }
+
+    #[test]
+    fn app_review_verified_sqlite_identity_can_transition_to_transcript() {
+        let mut f = AppReviewFixture::new(&["app"]);
+        f.native(1, "app", "2026-07-23T12:00:00Z", Some(0), None);
+        f.write("app", &[]);
+        f.sync();
+        let before = f.rows("app");
+        f.write("app", &[cli_usage_fixture(1, "2026-07-23T12:00:00.500Z")]);
+        f.sync();
+        let after = f.rows("app");
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].3, 110);
+        assert_ne!(before[0].1, after[0].1);
+        let changes = f
+            .conn
+            .query_row::<i64, _, _>("SELECT total_changes()", [], |r| r.get(0))
+            .unwrap();
+        f.sync();
+        assert_eq!(
+            f.conn
+                .query_row::<i64, _, _>("SELECT total_changes()", [], |r| r.get(0))
+                .unwrap(),
+            changes
+        );
+    }
+
+    #[test]
+    fn app_review_native_null_turn_does_not_override_inferred_later_turn() {
+        let mut f = AppReviewFixture::new(&["app"]);
+        f.native(2, "app", "2026-07-23T12:01:00Z", None, None);
+        f.write(
+            "app",
+            &[
+                app_text("user.message"),
+                cli_usage_fixture(1, "2026-07-23T12:00:00Z"),
+                app_text("assistant.message"),
+                app_text("user.message"),
+                cli_usage_fixture(2, "2026-07-23T12:01:00Z"),
+                app_text("assistant.message"),
+            ],
+        );
+        f.sync();
+        assert_eq!(f.replies("app", None), vec![(1, 110), (2, 110)]);
+    }
+
+    #[test]
+    fn app_review_negative_native_turn_index_clamps_to_first_turn() {
+        let mut f = AppReviewFixture::new(&["app"]);
+        f.native(1, "app", "2026-07-23T12:00:00Z", Some(-1), None);
+        f.write("app", &[cli_usage_fixture(1, "2026-07-23T12:00:00Z")]);
+        f.sync();
+        assert_eq!(f.rows("app")[0].2, 1);
+    }
+
+    #[test]
+    fn app_review_consecutive_prompts_and_late_child_match_filtered_timeline() {
+        let mut f = AppReviewFixture::new(&["app"]);
+        let mut child = cli_usage_fixture(3, "2026-07-23T12:02:00Z");
+        child["agentId"] = serde_json::json!("child");
+        let mut reply = app_text("assistant.message");
+        reply["agentId"] = serde_json::json!("child");
+        f.native(3, "app", "2026-07-23T12:02:00Z", Some(2), Some("child"));
+        f.write(
+            "app",
+            &[
+                app_text("user.message"),
+                app_text("user.message"),
+                cli_usage_fixture(1, "2026-07-23T12:00:00Z"),
+                app_text("assistant.message"),
+                app_text("user.message"),
+                cli_usage_fixture(2, "2026-07-23T12:01:00Z"),
+                app_text("assistant.message"),
+                app_text("user.message"),
+                child,
+                reply,
+            ],
+        );
+        f.sync();
+        assert_eq!(f.replies("app", None), vec![(1, 110), (2, 110)]);
+        assert_eq!(f.replies("app__child", Some("child")), vec![(1, 110)]);
+    }
+
+    fn app_text_at(kind: &str, ts: &str) -> serde_json::Value {
+        let mut event = app_text(kind);
+        event["timestamp"] = serde_json::json!(ts);
+        event
+    }
+
+    #[test]
+    fn transcript_failure_records_pending_and_rebuilds_native_history_after_file_removal() {
+        let mut f = AppReviewFixture::new(&["app"]);
+        let key = encode_hex(
+            f.root
+                .canonicalize()
+                .unwrap()
+                .as_os_str()
+                .as_encoded_bytes(),
+        );
+        let pending_key = format!("sync:copilot_app_transcript:pending:{key}::app");
+        // Older aggregates keep the session out of the plain reconciliation set.
+        f.conn
+            .execute(
+                "INSERT INTO usage_entries (
+                    assistant_type, source_kind, source_dir_key, usage_identity,
+                    timestamp, date, session_id, turn_no,
+                    tokens_input, tokens_output, tokens_total,
+                    delta_input, delta_output, delta_total,
+                    import_source_id
+                 ) VALUES ('copilot', 'copilot-app', ?1, '', '2026-07-20T00:00:00Z',
+                    '2026-07-20', 'app', 1, 1, 0, 1, 1, 0, 1, ?2)",
+                params![key, format!("copilot-app:{key}:app:0")],
+            )
+            .unwrap();
+        f.native(1, "app", "2026-07-23T12:00:00Z", Some(0), None);
+        f.native(2, "app", "2026-07-23T12:01:00Z", Some(1), None);
+        // A line without a trailing newline deterministically fails transcript
+        // reconciliation ("事件檔仍在寫入") for an unchanged source.
+        let events = f
+            .root
+            .join("session-state")
+            .join("app")
+            .join("events.jsonl");
+        fs::create_dir_all(events.parent().unwrap()).unwrap();
+        fs::write(&events, "{\"type\":\"session.info\"}").unwrap();
+        f.sync();
+        assert!(
+            load_sync_state_for_prefix(&f.conn, "sync:copilot_app_transcript:pending")
+                .contains_key(&pending_key),
+            "failed transcript reconciliation must leave a durable pending marker"
+        );
+        fs::remove_file(&events).unwrap();
+        f.sync();
+        {
+            let states: Vec<String> = f
+                .conn
+                .prepare("SELECT filename FROM sync_state")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            let native: Vec<(String, i64, i64)> = f
+                .store
+                .as_ref()
+                .unwrap()
+                .prepare("SELECT session_id,turn_index,id FROM assistant_usage_events")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            let rows: Vec<(String, i64, i64)> = f
+                .conn
+                .prepare("SELECT session_id,turn_no,delta_total FROM usage_entries")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            eprintln!("DEBUG states={states:?} native={native:?} rows={rows:?}");
+        }
+        let rebuilt: (i64, i64) = f
+            .conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(delta_total), 0) FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(rebuilt, (2, 220));
+        assert!(
+            !load_sync_state_for_prefix(&f.conn, "sync:copilot_app_transcript:pending")
+                .contains_key(&pending_key),
+            "a completed rebuild must clear the pending marker"
+        );
+        let changes = f
+            .conn
+            .query_row::<i64, _, _>("SELECT total_changes()", [], |r| r.get(0))
+            .unwrap();
+        f.sync();
+        assert_eq!(
+            f.conn
+                .query_row::<i64, _, _>("SELECT total_changes()", [], |r| r.get(0))
+                .unwrap(),
+            changes,
+            "an unchanged source must converge instead of rescanning forever"
+        );
+    }
+
+    #[test]
+    fn app_review_dedicated_agent_prompts_advance_subagent_usage_turns() {
+        // (review comment 4436837470) A prompt dedicated to a sub-agent opens
+        // that agent's own turn in the filtered timeline and in
+        // `copilot_filtered_agent_turns`; `copilot::read_calls` must advance the
+        // same way. Otherwise the second usage call keeps the first turn and
+        // the detail page joins both calls onto the first reply.
+        let mut f = AppReviewFixture::new(&["app"]);
+        let dedicated = |kind: &str, ts: &str| {
+            let mut event = app_text_at(kind, ts);
+            event["agentId"] = serde_json::json!("child");
+            event
+        };
+        let dedicated_usage = |id: usize, ts: &str| {
+            let mut event = cli_usage_fixture(id, ts);
+            event["agentId"] = serde_json::json!("child");
+            event
+        };
+        f.write(
+            "app",
+            &[
+                dedicated("user.message", "2026-07-23T12:00:00Z"),
+                dedicated_usage(1, "2026-07-23T12:00:05Z"),
+                dedicated("assistant.message", "2026-07-23T12:00:10Z"),
+                dedicated("user.message", "2026-07-23T12:01:00Z"),
+                dedicated_usage(2, "2026-07-23T12:01:05Z"),
+                dedicated("assistant.message", "2026-07-23T12:01:10Z"),
+            ],
+        );
+        f.sync();
+        let turns: Vec<i64> = f
+            .conn
+            .prepare(
+                "SELECT turn_no FROM usage_entries
+                 WHERE session_id = 'app__child' AND parent_session_id = 'app'
+                 ORDER BY timestamp",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(turns, vec![1, 2]);
+        assert_eq!(
+            f.replies("app__child", Some("child")),
+            vec![(1, 110), (2, 110)]
+        );
+    }
+
+    #[test]
+    fn app_review_dedicated_agent_prompts_leave_main_turns_untouched() {
+        // Boundary guard for the shared/dedicated split: a dedicated prompt may
+        // mark ONLY its own agent's turn pending. If it also marked the shared
+        // state, the main reply below would advance the main counter and push
+        // the following main usage call off the turn that renders it.
+        let mut f = AppReviewFixture::new(&["app"]);
+        let dedicated = |kind: &str, ts: &str| {
+            let mut event = app_text_at(kind, ts);
+            event["agentId"] = serde_json::json!("child");
+            event
+        };
+        let dedicated_usage = |id: usize, ts: &str| {
+            let mut event = cli_usage_fixture(id, ts);
+            event["agentId"] = serde_json::json!("child");
+            event
+        };
+        f.write(
+            "app",
+            &[
+                cli_usage_fixture(10, "2026-07-23T11:59:58Z"),
+                dedicated("user.message", "2026-07-23T12:00:00Z"),
+                dedicated_usage(1, "2026-07-23T12:00:02Z"),
+                dedicated("assistant.message", "2026-07-23T12:00:04Z"),
+                app_text_at("assistant.message", "2026-07-23T12:00:06Z"),
+                cli_usage_fixture(11, "2026-07-23T12:00:08Z"),
+                dedicated("user.message", "2026-07-23T12:01:00Z"),
+                dedicated_usage(2, "2026-07-23T12:01:02Z"),
+                dedicated("assistant.message", "2026-07-23T12:01:04Z"),
+            ],
+        );
+        f.sync();
+        let main_turns: Vec<i64> = f
+            .conn
+            .prepare(
+                "SELECT turn_no FROM usage_entries
+                 WHERE session_id = 'app' AND parent_session_id IS NULL
+                 ORDER BY timestamp",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        // The main reply has no shared prompt behind it, so the main counter
+        // stays at one and both main calls join the same filtered turn the
+        // timeline renders.
+        assert_eq!(main_turns, vec![1, 1]);
+        assert_eq!(f.replies("app", None), vec![(1, 220)]);
+        let child_turns: Vec<i64> = f
+            .conn
+            .prepare(
+                "SELECT turn_no FROM usage_entries
+                 WHERE session_id = 'app__child' AND parent_session_id = 'app'
+                 ORDER BY timestamp",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(child_turns, vec![1, 2]);
+    }
+
+    #[test]
+    fn app_review_empty_agent_id_shared_prompt_aligns_main_reply_turns() {
+        // (thread PRRT_kwDOTOgsec6yUKFl) An `agentId: ""` prompt is a shared
+        // prompt on the import side (`read_calls` normalizes the empty id to
+        // the shared stream). With usage-before-reply ordering the import side
+        // numbers the two turns [1, 2]; the timeline must render the replies at
+        // the same turns or each reply picks up the wrong usage.
+        let mut f = AppReviewFixture::new(&["app"]);
+        let empty_prompt = |kind: &str, ts: &str| {
+            let mut event = app_text_at(kind, ts);
+            event["agentId"] = serde_json::json!("");
+            event
+        };
+        f.write(
+            "app",
+            &[
+                empty_prompt("user.message", "2026-07-23T12:00:00Z"),
+                cli_usage_fixture(1, "2026-07-23T12:00:05Z"),
+                app_text_at("assistant.message", "2026-07-23T12:00:10Z"),
+                app_text_at("user.message", "2026-07-23T12:01:00Z"),
+                cli_usage_fixture(2, "2026-07-23T12:01:05Z"),
+                app_text_at("assistant.message", "2026-07-23T12:01:10Z"),
+            ],
+        );
+        f.sync();
+        let turns: Vec<i64> = f
+            .conn
+            .prepare(
+                "SELECT turn_no FROM usage_entries
+                 WHERE session_id = 'app' AND parent_session_id IS NULL
+                 ORDER BY timestamp",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(turns, vec![1, 2], "匯入端回合編號不受時間軸顯示影響");
+        assert_eq!(
+            f.replies("app", None),
+            vec![(1, 110), (2, 110)],
+            "時間軸回覆必須與匯入端回合對齊才能掛到各自的用量"
+        );
+    }
+
+    #[test]
+    fn app_review_empty_agent_id_calls_after_reply_join_the_next_reply() {
+        // Reviewer's literal order: empty-id prompt → plain reply → call →
+        // prompt → reply. The call lands after the first reply already closed
+        // turn 1, so the import side books it into turn 2 and only the second
+        // reply may claim it. A timeline that skips the empty-id prompt keeps
+        // both replies in turn 1 and orphans the call.
+        let mut f = AppReviewFixture::new(&["app"]);
+        let empty_prompt = |kind: &str, ts: &str| {
+            let mut event = app_text_at(kind, ts);
+            event["agentId"] = serde_json::json!("");
+            event
+        };
+        f.write(
+            "app",
+            &[
+                empty_prompt("user.message", "2026-07-23T12:00:00Z"),
+                app_text_at("assistant.message", "2026-07-23T12:00:10Z"),
+                cli_usage_fixture(1, "2026-07-23T12:00:15Z"),
+                app_text_at("user.message", "2026-07-23T12:01:00Z"),
+                app_text_at("assistant.message", "2026-07-23T12:01:10Z"),
+            ],
+        );
+        f.sync();
+        let turns: Vec<i64> = f
+            .conn
+            .prepare(
+                "SELECT turn_no FROM usage_entries
+                 WHERE session_id = 'app' AND parent_session_id IS NULL
+                 ORDER BY timestamp",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(turns, vec![2], "回覆後的呼叫屬於下一個回覆的回合");
+        // `replies()` only reports replies that joined usage: r1 has none and
+        // must stay silent, while r2 has to reach the turn-2 call.
+        assert_eq!(f.replies("app", None), vec![(2, 110)]);
+    }
+
+    #[test]
+    fn app_review_absent_then_present_reasoning_effort_survives_into_usage_row() {
+        // (thread PRRT_kwDOTOgsec6yUXNX) Event-only App sessions have no
+        // SQLite row to back-fill `reasoning_effort`. If the same-identity
+        // dedup keeps only the first copy, a later duplicate that supplies the
+        // metadata is lost before the writer and the badge/export silently
+        // drop it — the merge must reach the persisted row, not just the map.
+        let mut f = AppReviewFixture::new(&["app"]);
+        let mut first = cli_usage_fixture(1, "2026-07-23T12:00:00Z");
+        first["id"] = serde_json::json!("event-first");
+        let mut second = first.clone();
+        second["id"] = serde_json::json!("event-second");
+        second["data"]["usage"]["reasoningEffort"] = serde_json::json!("high");
+        f.write("app", &[first, second]);
+        f.sync();
+        let effort: Option<String> = f
+            .conn
+            .query_row(
+                "SELECT reasoning_effort FROM usage_entries WHERE session_id = 'app'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            effort.as_deref(),
+            Some("high"),
+            "後到重複份的推理強度必須回填到保留份並寫入用量列"
+        );
+        let count: i64 = f
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries WHERE session_id = 'app'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "同身分重複仍須維持單一用量列");
+    }
+
+    #[test]
+    fn sqlite_only_subagent_call_with_untimestamped_reply_keeps_timeline_turn() {
+        // (review comment 4436837487) The child's single reply has no
+        // parseable timestamp, but `timeline::parse_copilot_timeline_filtered`
+        // numbers replies purely by stream order and renders it at turn one.
+        // `AgentFilteredTurns::turn_at` must treat the untimed reply as the
+        // earliest possible boundary instead of skipping it and falling
+        // through to `end_turn`, or the SQLite-only call lands on turn two and
+        // the detail page shows no usage at all.
+        for ts in [None, Some("not-a-timestamp")] {
+            let mut f = AppReviewFixture::new(&["app"]);
+            let mut child_reply = app_text("assistant.message");
+            child_reply["agentId"] = serde_json::json!("child");
+            if let Some(ts) = ts {
+                child_reply["timestamp"] = serde_json::json!(ts);
+            }
+            // SQLite-only sub-agent call: no matching transcript usage record,
+            // so its turn is derived through the `turn_at` timestamp proxy.
+            f.native(3, "app", "2026-07-23T12:00:30Z", Some(2), Some("child"));
+            f.write(
+                "app",
+                &[
+                    app_text_at("user.message", "2026-07-23T12:00:00Z"),
+                    child_reply,
+                ],
+            );
+            f.sync();
+            let turns: Vec<i64> = f
+                .conn
+                .prepare(
+                    "SELECT turn_no FROM usage_entries
+                     WHERE session_id = 'app__child' AND parent_session_id = 'app'
+                     ORDER BY timestamp",
+                )
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert_eq!(turns, vec![1], "reply timestamp = {ts:?}");
+            assert_eq!(
+                f.replies("app__child", Some("child")),
+                vec![(1, 110)],
+                "reply timestamp = {ts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_only_subagent_turn_retries_when_reply_candidates_span_turns() {
+        use chrono::{DateTime, Utc};
+
+        fn at(raw: &str) -> DateTime<Utc> {
+            crate::copilot::parse_timestamp(raw).unwrap()
+        }
+        fn call_at(raw: &str) -> crate::copilot::Call {
+            crate::copilot::Call {
+                identity: "sqlite:3".into(),
+                reasoning_effort: None,
+                turn_no: None,
+                native_identity: Some("sqlite:3".into()),
+                timestamp: at(raw),
+                model: Some("B".into()),
+                agent_id: Some("child".into()),
+                initiator: None,
+                metrics: crate::copilot::Metrics::default(),
+            }
+        }
+        fn turns(
+            replies: Vec<(Option<DateTime<Utc>>, u32)>,
+        ) -> HashMap<String, AgentFilteredTurns> {
+            HashMap::from([(
+                "child".to_string(),
+                AgentFilteredTurns {
+                    replies,
+                    end_turn: 3,
+                },
+            )])
+        }
+
+        // The untimed reply may sit on either side of the call, so the next
+        // reply is turn one or turn two: undecidable, keep the source rows and
+        // retry (review comment 4436837487).
+        let undecidable = turns(vec![(None, 1), (Some(at("2026-07-23T12:03:00Z")), 2)]);
+        let error = native_only_subagent_turn(&call_at("2026-07-23T12:02:00Z"), &undecidable)
+            .expect_err("candidates spanning turns must retry");
+        assert!(error.contains("保留原資料待重試"), "{error}");
+        // A single untimed reply is decidable: attribute to the earliest
+        // possible reply, matching the timeline's stream-order numbering.
+        let decidable = turns(vec![(None, 1)]);
+        assert_eq!(
+            native_only_subagent_turn(&call_at("2026-07-23T12:00:30Z"), &decidable).unwrap(),
+            Some(1)
+        );
+        // Replies after the first definitely-later boundary never compete for
+        // "next reply": the guard must not fire on ordinary multi-reply streams.
+        let later = turns(vec![
+            (Some(at("2026-07-23T12:00:10Z")), 1),
+            (Some(at("2026-07-23T12:05:00Z")), 2),
+            (Some(at("2026-07-23T12:20:00Z")), 3),
+        ]);
+        assert_eq!(
+            native_only_subagent_turn(&call_at("2026-07-23T12:02:00Z"), &later).unwrap(),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn sqlite_only_subagent_call_uses_child_filtered_turn() {
+        let mut f = AppReviewFixture::new(&["app"]);
+        let mut child_reply = app_text_at("assistant.message", "2026-07-23T12:02:10Z");
+        child_reply["agentId"] = serde_json::json!("child");
+        // SQLite-only sub-agent call: the parent session's turn_index is 2
+        // (turn 3) but the child's filtered timeline only has one reply.
+        f.native(3, "app", "2026-07-23T12:02:00Z", Some(2), Some("child"));
+        f.write(
+            "app",
+            &[
+                app_text_at("user.message", "2026-07-23T12:00:00Z"),
+                app_text_at("assistant.message", "2026-07-23T12:00:10Z"),
+                app_text_at("user.message", "2026-07-23T12:01:00Z"),
+                app_text_at("assistant.message", "2026-07-23T12:01:10Z"),
+                app_text_at("user.message", "2026-07-23T12:01:50Z"),
+                child_reply,
+            ],
+        );
+        f.sync();
+        let turns: Vec<i64> = f
+            .conn
+            .prepare(
+                "SELECT turn_no FROM usage_entries
+                 WHERE session_id = 'app__child' AND parent_session_id = 'app'
+                 ORDER BY turn_no",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(turns, vec![1]);
+        assert_eq!(f.replies("app__child", Some("child")), vec![(1, 110)]);
+    }
+
+    #[test]
+    fn app_review_intermediate_text_reply_advances_usage_with_timeline() {
+        let mut f = AppReviewFixture::new(&["app"]);
+        f.write(
+            "app",
+            &[
+                app_text("user.message"),
+                cli_usage_fixture(1, "2026-07-23T12:00:00Z"),
+                app_text("assistant.message"),
+                cli_usage_fixture(2, "2026-07-23T12:01:00Z"),
+                app_text("assistant.message"),
+            ],
+        );
+        f.sync();
+        assert_eq!(f.replies("app", None), vec![(1, 110), (2, 110)]);
+    }
+
+    #[test]
+    fn app_review_legacy_midnight_turn_and_jitter_migrate_to_actual_call_dates() {
+        let mut f = AppReviewFixture::new(&["app"]);
+        f.native(1, "app", "2026-07-23T23:59:59.900Z", Some(0), None);
+        f.native(2, "app", "2026-07-24T00:00:01Z", Some(0), None);
+        f.sync();
+        assert_eq!(
+            cli_daily_totals(&f.conn, "app"),
+            vec![("2026-07-23".into(), 220)]
+        );
+        f.write(
+            "app",
+            &[
+                cli_usage_fixture(1, "2026-07-24T00:00:00.100Z"),
+                cli_usage_fixture(2, "2026-07-24T00:00:01Z"),
+                cli_usage_fixture(3, "2026-07-24T00:01:00Z"),
+            ],
+        );
+        f.sync();
+        assert_eq!(
+            cli_daily_totals(&f.conn, "app"),
+            vec![("2026-07-24".into(), 330)]
+        );
+        assert_eq!(f.rows("app").len(), 3);
+    }
+
+    #[test]
+    fn app_review_cancellation_during_read_leaves_session_uncommitted() {
+        use std::sync::atomic::AtomicUsize;
+        let mut f = AppReviewFixture::new(&["app"]);
+        f.write(
+            "app",
+            &[
+                cli_usage_fixture(1, "2026-07-23T12:00:00Z"),
+                cli_usage_fixture(2, "2026-07-23T12:01:00Z"),
+            ],
+        );
+        let checks = AtomicUsize::new(0);
+        sync_copilot_app_usage_logs_from_with_cancel(&mut f.conn, &f.root, &|| {
+            checks.fetch_add(1, Ordering::SeqCst) >= 3
+        })
+        .unwrap();
+        assert!(f.rows("app").is_empty());
+        assert!(load_sync_state_for_prefix(&f.conn, "copilot-app-transcript").is_empty());
+        f.sync();
+        assert_eq!(f.rows("app").len(), 2);
+    }
+
+    #[test]
+    fn app_review_cancellation_before_commit_rolls_back_current_session() {
+        use std::sync::atomic::AtomicUsize;
+        let mut f = AppReviewFixture::new(&["app"]);
+        f.write("app", &[cli_usage_fixture(1, "2026-07-23T12:00:00Z")]);
+        let checks = AtomicUsize::new(0);
+        sync_copilot_app_usage_logs_from_with_cancel(&mut f.conn, &f.root, &|| {
+            checks.fetch_add(1, Ordering::SeqCst) >= 5
+        })
+        .unwrap();
+        assert!(f.rows("app").is_empty());
+        assert!(load_sync_state_for_prefix(&f.conn, "copilot-app-transcript").is_empty());
+        f.sync();
+        assert_eq!(f.rows("app").len(), 1);
+    }
+
+    #[test]
+    fn app_review_corrects_double_counted_totals_without_losing_breakdowns_or_calls() {
+        let mut f = AppReviewFixture::new(&["app"]);
+        let mut event = cli_usage_fixture(1, "2026-07-23T12:00:00Z");
+        event["data"]["usage"]["cacheWriteTokens"] = serde_json::json!(4);
+        event["data"]["usage"]["reasoningTokens"] = serde_json::json!(5);
+        f.write("app", &[event]);
+        f.sync();
+        f.conn
+            .execute(
+                "UPDATE usage_entries SET tokens_total=119,delta_total=119",
+                [],
+            )
+            .unwrap();
+        f.sync();
+        let totals:(u64,u64,u64,u64)=f.conn.query_row("SELECT tokens_total,delta_total,tokens_cache_write,tokens_reasoning FROM usage_entries",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+        assert_eq!(totals, (110, 110, 4, 5));
+        assert_eq!(f.rows("app").len(), 1);
+    }
+
+    #[test]
+    fn app_transcript_first_takeover_retries_invalid_partial_and_missing_native_source() {
+        let mut f = AppReviewFixture::new(&["app"]);
+        f.native(1, "app", "2026-07-23T12:00:00Z", Some(0), None);
+        f.sync();
+        let original = f.rows("app");
+        f.write("app", &[]);
+        let path = f.root.join("session-state/app/events.jsonl");
+        for invalid in ["{", "{invalid}\n"] {
+            fs::write(&path, invalid).unwrap();
+            f.sync();
+            assert_eq!(f.rows("app"), original);
+        }
+        drop(f.store.take());
+        let native = f.root.join("session-store.db");
+        let hidden = f.root.join("hidden-store.db");
+        fs::rename(&native, &hidden).unwrap();
+        let mut unrelated = cli_usage_fixture(50, "2026-07-24T12:00:00Z");
+        unrelated["data"]["usage"]["outputTokens"] = serde_json::json!(10000);
+        f.write("app", &[unrelated]);
+        f.sync();
+        assert_eq!(f.rows("app"), original);
+        fs::rename(&hidden, &native).unwrap();
+        f.store = Some(Connection::open(native).unwrap());
+        f.write("app", &[cli_usage_fixture(1, "2026-07-23T12:00:00Z")]);
+        f.sync();
+        assert_eq!(f.rows("app").len(), 1);
+        assert_eq!(f.rows("app")[0].3, 110);
+    }
+
+    #[test]
+    fn app_transcript_append_backfills_past_cursor_and_ignores_checkpoint() {
+        let mut f = AppReviewFixture::new(&["app"]);
+        f.native(1, "app", "2026-07-23T12:00:00Z", Some(0), None);
+        f.sync();
+        let first = cli_usage_fixture(1, "2026-07-23T12:00:00Z");
+        let second = cli_usage_fixture(2, "2026-07-23T12:01:00Z");
+        let mut child = cli_usage_fixture(3, "2026-07-23T12:02:00Z");
+        child["agentId"] = serde_json::json!("child");
+        child["data"]["usage"]["initiator"] = serde_json::json!("sub-agent");
+        child["data"]["usage"]["reasoningEffort"] = serde_json::json!("high");
+        child["data"]["usage"]["cacheWriteTokens"] = serde_json::json!(4);
+        child["data"]["usage"]["reasoningTokens"] = serde_json::json!(5);
+        let mut events = vec![
+            first,
+            second,
+            child,
+            serde_json::json!({"type":"session.usage_checkpoint","data":{"usage":{"inputTokens":999999}}}),
+        ];
+        f.write("app", &events);
+        f.sync();
+        f.sync();
+        assert_eq!(
+            cli_daily_totals(&f.conn, "app"),
+            vec![("2026-07-23".into(), 330)]
+        );
+        let metadata:(String,String)=f.conn.query_row("SELECT agent_role,reasoning_effort FROM usage_entries WHERE parent_session_id='app'",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!(metadata, ("sub-agent".into(), "high".into()));
+        events.push(cli_usage_fixture(4, "2026-07-23T12:03:00Z"));
+        f.write("app", &events);
+        f.sync();
+        assert_eq!(cli_daily_totals(&f.conn, "app")[0].1, 440);
+    }
+
+    /// One 110-token Copilot App backup record (net input 20 + output 10 +
+    /// cache read 80, matching `cli_usage_fixture`) at the caller's declared
+    /// source key / turn / identity, used by the coverage-adjudication tests.
+    fn coverage_backup_entry(
+        key: Option<&str>,
+        timestamp: &str,
+        turn_no: u32,
+        import_source_id: Option<&str>,
+        usage_identity: Option<&str>,
+    ) -> UsageDayExportRecord {
+        UsageDayExportRecord {
+            entry: UsageEntry {
+                timestamp: timestamp.to_string(),
+                session_id: "app".to_string(),
+                session_name: None,
+                transcript_path: None,
+                cwd: None,
+                version: None,
+                turn_no,
+                model: Some("B".to_string()),
+                model_id: Some("B".to_string()),
+                tokens: Some(TokenStats {
+                    input: 20,
+                    output: 10,
+                    cache_read: Some(80),
+                    cache_write: Some(0),
+                    cache_write_5m: None,
+                    cache_write_1h: None,
+                    reasoning: Some(0),
+                    total: 110,
+                }),
+                delta_tokens: Some(TokenStats {
+                    input: 20,
+                    output: 10,
+                    cache_read: Some(80),
+                    cache_write: Some(0),
+                    cache_write_5m: None,
+                    cache_write_1h: None,
+                    reasoning: Some(0),
+                    total: 110,
+                }),
+                context: None,
+                cost: None,
+                source_kind: Some(COPILOT_APP_SOURCE_KIND.to_string()),
+                source_dir_key: key.map(|key| key.to_string()),
+                parent_session_id: None,
+                agent_nickname: None,
+                agent_role: None,
+                reasoning_effort: None,
+            },
+            import_source_id: import_source_id.map(|id| id.to_string()),
+            usage_identity: usage_identity.map(|id| id.to_string()),
+        }
+    }
+
+    /// A turn-aggregate backup record: the 5-segment native id when the source
+    /// key is known, the legacy 3-segment id (whole-turn claim) when it is not.
+    fn coverage_agg_backup_record(
+        key: Option<&str>,
+        timestamp: &str,
+        turn_no: u32,
+    ) -> UsageDayExportRecord {
+        let import_source_id = match key {
+            Some(key) => format!("copilot-app:{key}:app:0:main:42"),
+            None => "copilot-app:legacy:app:0".to_string(),
+        };
+        coverage_backup_entry(
+            key,
+            timestamp,
+            turn_no,
+            Some(&import_source_id),
+            Some("agent=6d61696e;model=42"),
+        )
+    }
+
+    /// A per-call backup record in the local identity format.
+    fn coverage_call_backup_record(
+        key: &str,
+        timestamp: &str,
+        turn_no: u32,
+        call_seed: &str,
+    ) -> UsageDayExportRecord {
+        let hash = sha256_hex(call_seed);
+        coverage_backup_entry(
+            Some(key),
+            timestamp,
+            turn_no,
+            Some(&format!("copilot-app:{key}:app:call:{hash}")),
+            Some(&format!("source={key};call={hash}")),
+        )
+    }
+
+    #[test]
+    fn copilot_app_import_keeps_disjoint_granularity_history_in_both_orders() {
+        let key = "deadbeef";
+        let aggregates = vec![coverage_agg_backup_record(
+            Some(key),
+            "2026-07-23T12:00:00Z",
+            1,
+        )];
+        let calls = vec![
+            coverage_call_backup_record(key, "2026-07-24T09:00:00Z", 2, "api-2"),
+            coverage_call_backup_record(key, "2026-07-24T10:00:00Z", 3, "api-3"),
+        ];
+        let expected = vec![
+            ("2026-07-23".to_string(), 110),
+            ("2026-07-24".to_string(), 220),
+        ];
+        // Order 1: 7/23 turn aggregates first, 7/24 per-call history second.
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let agg_batch = import_usage_day_entries(
+            &mut conn,
+            "copilot",
+            "2026-07-23",
+            aggregates.clone(),
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        assert_eq!((agg_batch.imported, agg_batch.skipped_duplicates), (1, 0));
+        let call_batch = import_usage_day_entries(
+            &mut conn,
+            "copilot",
+            "2026-07-24",
+            calls.clone(),
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            (call_batch.imported, call_batch.skipped_duplicates),
+            (2, 0),
+            "calls from another turn are disjoint history, not duplicates"
+        );
+        assert_eq!(cli_daily_totals(&conn, "app"), expected);
+        // Order 2: per-call history first, turn aggregates second.
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let call_batch = import_usage_day_entries(
+            &mut conn,
+            "copilot",
+            "2026-07-24",
+            calls,
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        assert_eq!((call_batch.imported, call_batch.skipped_duplicates), (2, 0));
+        let agg_batch = import_usage_day_entries(
+            &mut conn,
+            "copilot",
+            "2026-07-23",
+            aggregates,
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            (agg_batch.imported, agg_batch.skipped_duplicates),
+            (1, 0),
+            "an aggregate from another turn is disjoint history, not a duplicate"
+        );
+        assert_eq!(cli_daily_totals(&conn, "app"), expected);
+    }
+
+    #[test]
+    fn copilot_app_import_still_dedupes_overlapping_turn_coverage() {
+        let key = "deadbeef";
+        let aggregates = vec![coverage_agg_backup_record(
+            Some(key),
+            "2026-07-23T12:00:00Z",
+            1,
+        )];
+        let calls = vec![coverage_call_backup_record(
+            key,
+            "2026-07-23T12:00:00Z",
+            1,
+            "api-1",
+        )];
+        for (first, second) in [(aggregates.clone(), calls.clone()), (calls, aggregates)] {
+            let mut conn = Connection::open_in_memory().unwrap();
+            init_db(&conn).unwrap();
+            import_usage_day_entries(
+                &mut conn,
+                "copilot",
+                "2026-07-23",
+                first,
+                UsageImportMetadata::default(),
+            )
+            .unwrap();
+            let summary = import_usage_day_entries(
+                &mut conn,
+                "copilot",
+                "2026-07-23",
+                second,
+                UsageImportMetadata::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                (
+                    summary.imported,
+                    summary.skipped_duplicates,
+                    summary.skipped_conflicts
+                ),
+                (0, 1, 0),
+                "two granularities covering the same turn must keep one representation"
+            );
+            assert_eq!(
+                cli_daily_totals(&conn, "app"),
+                vec![("2026-07-23".to_string(), 110)]
+            );
+        }
+    }
+
+    #[test]
+    fn copilot_app_import_reports_conflict_when_turn_is_undecidable() {
+        let key = "deadbeef";
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let call_batch = import_usage_day_entries(
+            &mut conn,
+            "copilot",
+            "2026-07-23",
+            vec![coverage_call_backup_record(
+                key,
+                "2026-07-23T12:00:00Z",
+                1,
+                "api-1",
+            )],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        assert_eq!((call_batch.imported, call_batch.skipped_duplicates), (1, 0));
+        // A legacy aggregate without a usable turn cannot be proven to overlap
+        // or to be disjoint: it must be reported as a conflict, never as a
+        // duplicate and never silently imported.
+        let conflict_batch = import_usage_day_entries(
+            &mut conn,
+            "copilot",
+            "2026-07-23",
+            vec![coverage_agg_backup_record(
+                Some(key),
+                "2026-07-23T12:00:00Z",
+                0,
+            )],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        assert_eq!(conflict_batch.imported, 0);
+        assert_eq!(
+            conflict_batch.skipped_duplicates, 0,
+            "an unprovable record is not a duplicate"
+        );
+        assert_eq!(conflict_batch.skipped_conflicts, 1);
+        assert_eq!(
+            conflict_batch.total,
+            conflict_batch.imported
+                + conflict_batch.skipped_duplicates
+                + conflict_batch.skipped_conflicts,
+            "the batch accounting must stay complete"
+        );
+        assert_eq!(
+            cli_daily_totals(&conn, "app"),
+            vec![("2026-07-23".to_string(), 110)],
+            "usage must stay exactly one copy"
+        );
+        let rollback =
+            rollback_usage_import_batch(&mut conn, "copilot", &conflict_batch.batch_id).unwrap();
+        assert_eq!(
+            rollback.removed_records, 0,
+            "conflicting records never enter the batch"
+        );
+        assert_eq!(
+            cli_daily_totals(&conn, "app"),
+            vec![("2026-07-23".to_string(), 110)],
+            "the imported copy must survive the revocation"
+        );
+        // Even when a provable overlap also exists in the family, an
+        // unplaceable claim must win: the verdict stays a conflict and the
+        // record must not be miscounted as a duplicate.
+        seed_app_row(
+            &conn,
+            &SeedAppRow {
+                source_key: key,
+                session_id: "app",
+                turn_no: 0,
+                date: "2026-07-23",
+                timestamp: "2026-07-23T12:00:00Z",
+                model: "B",
+                agent: None,
+                duration_ms: 1,
+                usage_identity: "",
+                import_source_id: "copilot-app:legacy:app:0",
+                tokens_input: 5,
+                tokens_output: 5,
+                tokens_cache_read: 5,
+                tokens_cache_write: 0,
+                tokens_reasoning: 0,
+            },
+        );
+        let mixed = import_usage_day_entries(
+            &mut conn,
+            "copilot",
+            "2026-07-23",
+            vec![coverage_call_backup_record(
+                key,
+                "2026-07-23T12:00:00Z",
+                1,
+                "api-1",
+            )],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                mixed.imported,
+                mixed.skipped_duplicates,
+                mixed.skipped_conflicts
+            ),
+            (0, 0, 1),
+            "an unplaceable family claim must beat a provable overlap"
+        );
+    }
+
+    #[test]
+    fn copilot_app_import_dedupes_keyless_aggregate_against_keyed_per_calls_in_both_orders() {
+        let key = "deadbeef";
+        let aggregates = vec![coverage_agg_backup_record(None, "2026-07-23T12:00:00Z", 1)];
+        let calls = vec![coverage_call_backup_record(
+            key,
+            "2026-07-23T12:00:00Z",
+            1,
+            "api-1",
+        )];
+        // Both orders must agree: a key-less legacy aggregate and the keyed
+        // per-call rows of the same call are the same usage (same session is
+        // the same source), so exactly one representation may be imported.
+        for (first, second) in [(aggregates.clone(), calls.clone()), (calls, aggregates)] {
+            let mut conn = Connection::open_in_memory().unwrap();
+            init_db(&conn).unwrap();
+            import_usage_day_entries(
+                &mut conn,
+                "copilot",
+                "2026-07-23",
+                first,
+                UsageImportMetadata::default(),
+            )
+            .unwrap();
+            let summary = import_usage_day_entries(
+                &mut conn,
+                "copilot",
+                "2026-07-23",
+                second,
+                UsageImportMetadata::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                (summary.imported, summary.skipped_duplicates),
+                (0, 1),
+                "the key-less representation must still dedupe the same call"
+            );
+            assert_eq!(
+                cli_daily_totals(&conn, "app"),
+                vec![("2026-07-23".to_string(), 110)]
+            );
+        }
+    }
+
+    #[test]
+    fn copilot_app_keyless_aggregate_does_not_block_disjoint_keyed_calls() {
+        let key = "deadbeef";
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // A key-less aggregate claims turn 1 only; the keyed calls live in
+        // turn 2. The weak source-key match must not degenerate into a
+        // family-wide veto over disjoint history.
+        let agg_batch = import_usage_day_entries(
+            &mut conn,
+            "copilot",
+            "2026-07-23",
+            vec![coverage_agg_backup_record(None, "2026-07-23T12:00:00Z", 1)],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        assert_eq!((agg_batch.imported, agg_batch.skipped_duplicates), (1, 0));
+        let call_batch = import_usage_day_entries(
+            &mut conn,
+            "copilot",
+            "2026-07-23",
+            vec![coverage_call_backup_record(
+                key,
+                "2026-07-23T12:05:00Z",
+                2,
+                "api-2",
+            )],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            (call_batch.imported, call_batch.skipped_duplicates),
+            (1, 0),
+            "a disjoint turn must import normally"
+        );
+        assert_eq!(
+            cli_daily_totals(&conn, "app"),
+            vec![("2026-07-23".to_string(), 220)]
+        );
+    }
+
+    #[test]
+    fn copilot_app_takeover_defers_to_keyless_imported_aggregate() {
+        let mut f = AppReviewFixture::new(&["app"]);
+        f.write("app", &[cli_usage_fixture(1, "2026-07-23T12:00:00Z")]);
+        let key = test_copilot_source_key(&f.root);
+        // A key-less legacy aggregate of the same call is still a revocable
+        // claim on the family's usage: the local per-call takeover must defer
+        // until the batch is revoked.
+        let summary = import_usage_day_entries(
+            &mut f.conn,
+            "copilot",
+            "2026-07-23",
+            vec![coverage_agg_backup_record(None, "2026-07-23T12:00:00Z", 1)],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        assert_eq!(summary.imported, 1);
+        f.sync();
+        assert_eq!(
+            cli_daily_totals(&f.conn, "app"),
+            vec![("2026-07-23".to_string(), 110)],
+            "a key-less imported aggregate must still defer the local takeover"
+        );
+        let local: i64 = f
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries WHERE import_batch_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            local, 0,
+            "the takeover must stay deferred while the batch lives"
+        );
+        assert!(
+            !load_sync_state_for_prefix(&f.conn, "copilot-app-transcript")
+                .contains_key(&format!("copilot-app-transcript:{key}:app")),
+            "the deferred takeover must not finalize a fingerprint"
+        );
+    }
+
+    #[test]
+    fn copilot_app_per_call_import_never_doubles_with_sqlite_fallback_aggregates() {
+        let mut f = AppReviewFixture::new(&["app"]);
+        f.write("app", &[cli_usage_fixture(1, "2026-07-23T12:00:00Z")]);
+        f.sync();
+        let per_call_backup = export_usage_day_entries(&f.conn, "copilot", "2026-07-23").unwrap();
+        assert_eq!(per_call_backup.len(), 1);
+        let key = test_copilot_source_key(&f.root);
+        let pending_key = format!("sync:copilot_app_transcript:pending:{key}::app");
+        // Restore onto the same source with only the session store left: no
+        // event file and no transcript fingerprint, so the session falls back
+        // to SQLite aggregation while the imported per-call backup holds the
+        // family representation.
+        f.conn.execute("DELETE FROM usage_entries", []).unwrap();
+        f.conn.execute("DELETE FROM sync_state", []).unwrap();
+        fs::remove_file(f.root.join("session-state/app/events.jsonl")).unwrap();
+        f.native(1, "app", "2026-07-23T12:00:00Z", Some(0), None);
+        let batch = import_usage_day_entries(
+            &mut f.conn,
+            "copilot",
+            "2026-07-23",
+            per_call_backup,
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        assert_eq!(batch.imported, 1);
+        assert_eq!(
+            cli_daily_totals(&f.conn, "app"),
+            vec![("2026-07-23".to_string(), 110)]
+        );
+        f.sync();
+        assert_eq!(
+            cli_daily_totals(&f.conn, "app"),
+            vec![("2026-07-23".to_string(), 110)],
+            "the SQLite fallback must never double the imported per-call backup"
+        );
+        assert!(
+            load_sync_state_for_prefix(&f.conn, "sync:copilot_app_transcript:pending")
+                .contains_key(&pending_key),
+            "a deferred fallback rebuild must keep a durable pending marker"
+        );
+        f.sync();
+        assert_eq!(
+            cli_daily_totals(&f.conn, "app"),
+            vec![("2026-07-23".to_string(), 110)],
+            "repeating the sync must stay idempotent"
+        );
+        // Revoking the batch releases the family representation; the pending
+        // marker preserves the re-synchronizable state so the deferred turn
+        // rebuilds from the session store exactly once.
+        rollback_usage_import_batch(&mut f.conn, "copilot", &batch.batch_id).unwrap();
+        f.sync();
+        assert_eq!(
+            cli_daily_totals(&f.conn, "app"),
+            vec![("2026-07-23".to_string(), 110)]
+        );
+        let aggregates: i64 = f
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries WHERE import_source_id LIKE 'copilot-app:%:0:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let calls: i64 = f
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries WHERE import_source_id LIKE '%:call:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            (aggregates, calls),
+            (1, 0),
+            "after the revocation the usage must live in exactly one fallback aggregate"
+        );
+        assert!(
+            !load_sync_state_for_prefix(&f.conn, "sync:copilot_app_transcript:pending")
+                .contains_key(&pending_key),
+            "the rebuilt turn must clear its pending marker"
+        );
+    }
+
+    #[test]
+    fn copilot_app_fallback_defers_to_local_per_call_rows() {
+        let mut f = AppReviewFixture::new(&["app"]);
+        let key = test_copilot_source_key(&f.root);
+        let pending_key = format!("sync:copilot_app_transcript:pending:{key}::app");
+        // A local (non-batch) per-call row holds the family representation just
+        // like an imported one; the fallback must defer to it as well.
+        seed_app_row(
+            &f.conn,
+            &SeedAppRow {
+                source_key: &key,
+                session_id: "app",
+                turn_no: 1,
+                date: "2026-07-23",
+                timestamp: "2026-07-23T12:00:00Z",
+                model: "B",
+                agent: None,
+                duration_ms: 50,
+                usage_identity: &format!("source={key};call=abc123"),
+                import_source_id: &format!("copilot-app:{key}:app:call:abc123"),
+                tokens_input: 20,
+                tokens_output: 10,
+                tokens_cache_read: 80,
+                tokens_cache_write: 0,
+                tokens_reasoning: 0,
+            },
+        );
+        f.native(1, "app", "2026-07-23T12:00:00Z", Some(0), None);
+        f.sync();
+        assert_eq!(
+            cli_daily_totals(&f.conn, "app"),
+            vec![("2026-07-23".to_string(), 110)],
+            "the fallback must never double a local per-call row"
+        );
+        assert!(
+            load_sync_state_for_prefix(&f.conn, "sync:copilot_app_transcript:pending")
+                .contains_key(&pending_key),
+            "a deferred fallback rebuild must keep a durable pending marker"
+        );
+    }
+
+    #[test]
+    fn copilot_app_forced_rescan_keeps_rows_when_native_source_shrinks() {
+        let mut f = AppReviewFixture::new(&["app"]);
+        let key = test_copilot_source_key(&f.root);
+        let pending_key = format!("sync:copilot_app_transcript:pending:{key}::app");
+        // A previously written turn aggregate of 220 tokens; the native source
+        // later shrinks to 110 (App-side pruning or an older store restore).
+        seed_app_row(
+            &f.conn,
+            &SeedAppRow {
+                source_key: &key,
+                session_id: "app",
+                turn_no: 1,
+                date: "2026-07-23",
+                timestamp: "2026-07-23T12:00:00Z",
+                model: "B",
+                agent: None,
+                duration_ms: 50,
+                usage_identity: "agent=6d61696e;model=42",
+                import_source_id: &format!("copilot-app:{key}:app:0:main:42"),
+                tokens_input: 40,
+                tokens_output: 20,
+                tokens_cache_read: 160,
+                tokens_cache_write: 0,
+                tokens_reasoning: 0,
+            },
+        );
+        f.conn
+            .execute(
+                "INSERT OR REPLACE INTO sync_state VALUES (?, 0, 0)",
+                params![pending_key],
+            )
+            .unwrap();
+        f.native(1, "app", "2026-07-23T12:00:00Z", Some(0), None);
+        f.sync();
+        assert_eq!(
+            cli_daily_totals(&f.conn, "app"),
+            vec![("2026-07-23".to_string(), 220)],
+            "a shrunk native source must not overwrite the stored usage"
+        );
+        assert!(
+            load_sync_state_for_prefix(&f.conn, "sync:copilot_app_transcript:pending")
+                .contains_key(&pending_key),
+            "an unproven rebuild must keep its pending marker"
+        );
+        // Non-vacuous leg: once the native source covers the stored usage
+        // again the rebuild proceeds and converges.
+        f.native(2, "app", "2026-07-23T12:01:00Z", Some(0), None);
+        f.sync();
+        assert_eq!(
+            cli_daily_totals(&f.conn, "app"),
+            vec![("2026-07-23".to_string(), 220)]
+        );
+        assert_eq!(
+            f.rows("app").len(),
+            1,
+            "the covered rebuild must converge on one row"
+        );
+        assert!(
+            !load_sync_state_for_prefix(&f.conn, "sync:copilot_app_transcript:pending")
+                .contains_key(&pending_key),
+            "a covered rebuild must clear its pending marker"
+        );
+    }
+
+    #[test]
+    fn copilot_app_forced_rescan_keeps_legacy_merged_rows_when_native_shrinks() {
+        let mut f = AppReviewFixture::new(&["app"]);
+        let key = test_copilot_source_key(&f.root);
+        let pending_key = format!("sync:copilot_app_transcript:pending:{key}::app");
+        // Legacy 3-segment whole-turn row of 220 tokens against a native source
+        // that shrank to 110: the legacy cleanup must not delete it either.
+        seed_app_row(
+            &f.conn,
+            &SeedAppRow {
+                source_key: &key,
+                session_id: "app",
+                turn_no: 1,
+                date: "2026-07-23",
+                timestamp: "2026-07-23T12:00:00Z",
+                model: "B",
+                agent: None,
+                duration_ms: 50,
+                usage_identity: "",
+                import_source_id: &format!("copilot-app:{key}:app:0"),
+                tokens_input: 40,
+                tokens_output: 20,
+                tokens_cache_read: 160,
+                tokens_cache_write: 0,
+                tokens_reasoning: 0,
+            },
+        );
+        f.conn
+            .execute(
+                "INSERT OR REPLACE INTO sync_state VALUES (?, 0, 0)",
+                params![pending_key],
+            )
+            .unwrap();
+        f.native(1, "app", "2026-07-23T12:00:00Z", Some(0), None);
+        f.sync();
+        assert_eq!(
+            cli_daily_totals(&f.conn, "app"),
+            vec![("2026-07-23".to_string(), 220)],
+            "a shrunk native source must not delete the legacy merged row"
+        );
+        assert!(
+            load_sync_state_for_prefix(&f.conn, "sync:copilot_app_transcript:pending")
+                .contains_key(&pending_key),
+            "an unproven rebuild must keep its pending marker"
+        );
+    }
+
+    #[test]
+    fn copilot_app_aggregate_import_never_doubles_with_sqlite_fallback_aggregates() {
+        // Key-less legacy aggregate: without the family defer the fallback
+        // writes a second representation of the same turn (220 total).
+        {
+            let mut f = AppReviewFixture::new(&["app"]);
+            let key = test_copilot_source_key(&f.root);
+            let pending_key = format!("sync:copilot_app_transcript:pending:{key}::app");
+            let batch = import_usage_day_entries(
+                &mut f.conn,
+                "copilot",
+                "2026-07-23",
+                vec![coverage_agg_backup_record(None, "2026-07-23T12:00:00Z", 1)],
+                UsageImportMetadata::default(),
+            )
+            .unwrap();
+            assert_eq!(batch.imported, 1);
+            f.native(1, "app", "2026-07-23T12:00:00Z", Some(0), None);
+            f.sync();
+            assert_eq!(
+                cli_daily_totals(&f.conn, "app"),
+                vec![("2026-07-23".to_string(), 110)],
+                "the SQLite fallback must never double an imported aggregate"
+            );
+            assert!(
+                load_sync_state_for_prefix(&f.conn, "sync:copilot_app_transcript:pending")
+                    .contains_key(&pending_key),
+                "a deferred fallback rebuild must keep a durable pending marker"
+            );
+            let surviving: i64 = f
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM usage_entries WHERE import_batch_id IS NOT NULL",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(surviving, 1, "the imported row must stay revocable");
+            rollback_usage_import_batch(&mut f.conn, "copilot", &batch.batch_id).unwrap();
+            f.sync();
+            assert_eq!(
+                cli_daily_totals(&f.conn, "app"),
+                vec![("2026-07-23".to_string(), 110)],
+                "revoking the batch must let the fallback rebuild the turn once"
+            );
+            assert!(
+                !load_sync_state_for_prefix(&f.conn, "sync:copilot_app_transcript:pending")
+                    .contains_key(&pending_key)
+            );
+        }
+        // Keyed 5-segment aggregate: the fallback upsert shares its identity
+        // keys, so without the defer it would silently replace the batch row
+        // and break its revocability.
+        {
+            let mut f = AppReviewFixture::new(&["app"]);
+            let key = test_copilot_source_key(&f.root);
+            let batch = import_usage_day_entries(
+                &mut f.conn,
+                "copilot",
+                "2026-07-23",
+                vec![app_aggregate_backup_record(&key)],
+                UsageImportMetadata::default(),
+            )
+            .unwrap();
+            assert_eq!(batch.imported, 1);
+            f.native(1, "app", "2026-07-23T12:00:00Z", Some(0), None);
+            f.sync();
+            let surviving: i64 = f
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM usage_entries WHERE import_batch_id IS NOT NULL",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                surviving, 1,
+                "the fallback must never replace an imported batch row"
+            );
+            assert_eq!(
+                cli_daily_totals(&f.conn, "app"),
+                vec![("2026-07-23".to_string(), 110)]
+            );
+            let rollback =
+                rollback_usage_import_batch(&mut f.conn, "copilot", &batch.batch_id).unwrap();
+            assert_eq!(
+                rollback.removed_records, 1,
+                "the revocation must still remove exactly the imported row"
+            );
+        }
+    }
+
+    #[test]
+    fn app_transcript_missing_or_shrinking_file_retains_imported_call_identities() {
+        let mut f = AppReviewFixture::new(&["app"]);
+        let events = vec![
+            cli_usage_fixture(1, "2026-07-23T12:00:00Z"),
+            cli_usage_fixture(2, "2026-07-23T12:01:00Z"),
+        ];
+        f.write("app", &events);
+        f.sync();
+        let original = f.rows("app");
+        f.write("app", &events[..1]);
+        f.sync();
+        assert_eq!(f.rows("app"), original);
+        fs::remove_file(f.root.join("session-state/app/events.jsonl")).unwrap();
+        f.sync();
+        assert_eq!(f.rows("app"), original);
+        f.write("app", &events);
+        f.sync();
+        let restored: Vec<_> = f
+            .rows("app")
+            .into_iter()
+            .map(|(_, identity, turn, total)| (identity, turn, total))
+            .collect();
+        let expected: Vec<_> = original
+            .into_iter()
+            .map(|(_, identity, turn, total)| (identity, turn, total))
+            .collect();
+        assert_eq!(restored, expected);
+    }
+
+    #[test]
+    fn app_transcript_registry_readd_restores_unchanged_source() {
+        let mut f = AppReviewFixture::new(&["app"]);
+        f.write("app", &[cli_usage_fixture(1, "2026-07-23T12:00:00Z")]);
+        f.sync();
+        let registry = Connection::open(f.root.join("data.db")).unwrap();
+        registry
+            .execute("DELETE FROM sessions WHERE id='app'", [])
+            .unwrap();
+        f.sync();
+        assert!(f.rows("app").is_empty());
+        registry
+            .execute("INSERT INTO sessions (id) VALUES ('app')", [])
+            .unwrap();
+        f.sync();
+        assert_eq!(f.rows("app").len(), 1);
+        drop(registry);
+    }
+
+    #[test]
+    fn app_transcript_does_not_reclassify_cli_sessions() {
+        let mut f = AppReviewFixture::new(&["app"]);
+        let event = cli_usage_fixture(1, "2026-07-23T12:00:00Z");
+        f.write("app", std::slice::from_ref(&event));
+        f.write("cli", &[event]);
+        f.sync();
+        sync_copilot_cli_agent_usage_logs_from(&mut f.conn, &f.root).unwrap();
+        let kinds: Vec<(String, String)> = f
+            .conn
+            .prepare("SELECT session_id,source_kind FROM usage_entries ORDER BY session_id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ("app".into(), "copilot-app".into()),
+                ("cli".into(), "copilot-cli".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn app_review_total_repair_is_source_scoped_and_handles_legacy_without_new_events() {
+        let mut f = AppReviewFixture::new(&["app"]);
+        f.native(1, "app", "2026-07-23T12:00:00Z", Some(0), None);
+        f.sync();
+        f.conn
+            .execute(
+                "UPDATE usage_entries SET tokens_total=119,delta_total=119",
+                [],
+            )
+            .unwrap();
+        f.conn.execute("INSERT INTO usage_entries (assistant_type,source_kind,source_dir_key,session_id,timestamp,date,turn_no,tokens_input,tokens_output,tokens_total,delta_total) VALUES ('copilot','copilot-app','foreign','foreign','2026-07-23T12:00:00Z','2026-07-23',1,100,10,119,119)",[]).unwrap();
+        seed_cli_hook_row(&f.conn, "cli", 119);
+        f.sync();
+        assert_eq!(f.rows("app")[0].3, 110);
+        let foreign: i64 = f
+            .conn
+            .query_row(
+                "SELECT delta_total FROM usage_entries WHERE session_id='foreign'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(foreign, 119);
+        assert_eq!(cli_daily_totals(&f.conn, "cli")[0].1, 119);
+    }
+
+    #[test]
+    fn app_transcript_turns_keep_session_detail_usage() {
+        let base = temp_jsonl_path("app-transcript-turns").with_extension("");
+        fs::create_dir_all(&base).unwrap();
+        let store = build_cli_reconciler_fixture(&base, &["app"], &[]);
+        insert_cli_event(
+            &store,
+            CliEventIdentity {
+                id: 1,
+                session_id: "app",
+                model: "B",
+                agent_id: None,
+                initiator: None,
+            },
+            CliEventTokens {
+                input: 100,
+                output: 10,
+                cache_read: 80,
+                cache_write: 0,
+                reasoning: 0,
+                duration_ms: 50,
+            },
+            "2026-07-23T12:00:00Z",
+        );
+        insert_cli_event(
+            &store,
+            CliEventIdentity {
+                id: 2,
+                session_id: "app",
+                model: "B",
+                agent_id: None,
+                initiator: None,
+            },
+            CliEventTokens {
+                input: 100,
+                output: 10,
+                cache_read: 80,
+                cache_write: 0,
+                reasoning: 0,
+                duration_ms: 50,
+            },
+            "2026-07-23T12:01:00Z",
+        );
+        store.execute("UPDATE assistant_usage_events SET turn_index=1, reasoning_effort='medium' WHERE id=2", []).unwrap();
+        let event =
+            |kind: &str, content: &str| serde_json::json!({"type":kind,"data":{"content":content}});
+        write_cli_usage_fixture(
+            &base,
+            "app",
+            &[
+                event("user.message", "first"),
+                cli_usage_fixture(1, "2026-07-23T12:00:00Z"),
+                event("assistant.message", "reply one"),
+                event("user.message", "second"),
+                cli_usage_fixture(2, "2026-07-23T12:01:00Z"),
+                cli_usage_fixture(3, "2026-07-23T12:02:00Z"),
+                event("assistant.message", "reply two"),
+            ],
+        );
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        sync_copilot_app_usage_logs_from(&mut conn, &base).unwrap();
+        let totals: Vec<(u32,u64)> = conn.prepare("SELECT turn_no,SUM(delta_total) FROM usage_entries GROUP BY turn_no ORDER BY turn_no").unwrap().query_map([], |r|Ok((r.get(0)?,r.get(1)?))).unwrap().map(Result::unwrap).collect();
+        assert_eq!(totals, vec![(1, 110), (2, 220)]);
+        let effort: String = conn
+            .query_row(
+                "SELECT reasoning_effort FROM usage_entries WHERE timestamp='2026-07-23T12:01:00Z'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(effort, "medium");
+        let entries = totals
+            .into_iter()
+            .map(|(turn, total)| {
+                (
+                    turn,
+                    (
+                        TokenStats {
+                            total,
+                            input: 0,
+                            output: 0,
+                            cache_read: None,
+                            cache_write: None,
+                            cache_write_5m: None,
+                            cache_write_1h: None,
+                            reasoning: None,
+                        },
+                        "B".into(),
+                    ),
+                )
+            })
+            .collect();
+        let mut timeline = Vec::new();
+        crate::timeline::parse_copilot_timeline_filtered(
+            BufReader::new(File::open(base.join("session-state/app/events.jsonl")).unwrap()),
+            &entries,
+            &mut timeline,
+            &mut HashMap::new(),
+            None,
+            None,
+        );
+        let replies: Vec<_> = timeline
+            .into_iter()
+            .filter_map(|item| {
+                if let crate::timeline::TimelineItem::AgentReply {
+                    turn_no,
+                    tokens: Some(tokens),
+                    ..
+                } = item
+                {
+                    Some((turn_no, tokens.total))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(replies, vec![(1, 110), (2, 220)]);
+        drop(store);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn app_transcript_only_isolated_sources_without_sqlite() {
+        let base = temp_jsonl_path("app-transcript-sources").with_extension("");
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        for name in ["a", "b"] {
+            let root = base.join(name);
+            fs::create_dir_all(&root).unwrap();
+            create_copilot_app_registry(&root, &["same"]);
+            write_cli_usage_fixture(
+                &root,
+                "same",
+                &[cli_usage_fixture(1, "2026-07-23T12:00:00Z")],
+            );
+            for _ in 0..2 {
+                sync_copilot_app_usage_logs_from(&mut conn, &root).unwrap();
+            }
+        }
+        assert_eq!(cli_daily_totals(&conn, "same")[0].1, 220);
+        let sources: i64 = conn.query_row("SELECT COUNT(DISTINCT source_dir_key) FROM usage_entries WHERE source_kind='copilot-app'", [], |r| r.get(0)).unwrap();
+        assert_eq!(sources, 2);
+        fs::remove_dir_all(base).unwrap();
+    }
+
     #[test]
     fn cli_reconciler_preserves_call_ids_for_identical_times_and_on_append() {
         let base = temp_jsonl_path("cli-stable-call-ids").with_extension("");
@@ -15557,6 +20270,339 @@ mod tests {
             cli_daily_totals(&conn, sid),
             vec![("2026-07-23".into(), 330)]
         );
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    /// Replies that mounted usage, rebuilt inline like
+    /// `app_transcript_turns_keep_session_detail_usage`: rows group by their
+    /// persisted `turn_no` and the filtered timeline joins them per reply.
+    fn cli_review_replies(
+        conn: &Connection,
+        events: &Path,
+        row_session_id: &str,
+        agent: Option<&str>,
+    ) -> Vec<(u32, u64)> {
+        let entries: HashMap<u32, (TokenStats, String)> = conn
+            .prepare(
+                "SELECT turn_no, SUM(delta_total) FROM usage_entries
+                 WHERE session_id = ? GROUP BY turn_no",
+            )
+            .unwrap()
+            .query_map([row_session_id], |r| {
+                Ok((r.get::<_, u32>(0)?, r.get::<_, u64>(1)?))
+            })
+            .unwrap()
+            .map(|row| {
+                let (turn, total) = row.unwrap();
+                (
+                    turn,
+                    (
+                        TokenStats {
+                            total,
+                            input: 0,
+                            output: 0,
+                            cache_read: None,
+                            cache_write: None,
+                            cache_write_5m: None,
+                            cache_write_1h: None,
+                            reasoning: None,
+                        },
+                        "B".to_string(),
+                    ),
+                )
+            })
+            .collect();
+        let mut timeline = Vec::new();
+        crate::timeline::parse_copilot_timeline_filtered(
+            BufReader::new(File::open(events).unwrap()),
+            &entries,
+            &mut timeline,
+            &mut HashMap::new(),
+            agent,
+            None,
+        );
+        timeline
+            .into_iter()
+            .filter_map(|item| match item {
+                crate::timeline::TimelineItem::AgentReply {
+                    turn_no,
+                    tokens: Some(tokens),
+                    ..
+                } => Some((turn_no, tokens.total)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The transcript fingerprint an older build (with
+    /// `copilot::PARSER_VERSION = 2`) would have stored for `path`.
+    fn legacy_cli_fingerprint(path: &Path) -> (u64, i64) {
+        use std::hash::{Hash, Hasher};
+        let meta = fs::metadata(path).unwrap();
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        2u32.hash(&mut hash);
+        meta.modified().unwrap().hash(&mut hash);
+        (meta.len(), (hash.finish() & i64::MAX as u64) as i64)
+    }
+
+    #[test]
+    fn cli_review_call_rows_carry_filtered_turns_for_empty_id_streams() {
+        // (thread PRRT_kwDOTOgsec6yUXNI) `73bdb9a` normalized empty-`agentId`
+        // prompt+reply pairs into shared events, so this CLI stream reaches
+        // turn two. The CLI writer must persist the filtered turns or every
+        // reply after the first renders without usage.
+        let base = temp_jsonl_path("cli-review-empty-id-turns").with_extension("");
+        let sid = "cli-empty-id";
+        let empty_id = |kind: &str, ts: &str| {
+            let mut event = app_text_at(kind, ts);
+            event["agentId"] = serde_json::json!("");
+            event
+        };
+        write_cli_usage_fixture(
+            &base,
+            sid,
+            &[
+                empty_id("user.message", "2026-07-23T12:00:00Z"),
+                cli_usage_fixture(1, "2026-07-23T12:00:05Z"),
+                empty_id("assistant.message", "2026-07-23T12:00:10Z"),
+                app_text_at("user.message", "2026-07-23T12:01:00Z"),
+                cli_usage_fixture(2, "2026-07-23T12:01:05Z"),
+                app_text_at("assistant.message", "2026-07-23T12:01:10Z"),
+            ],
+        );
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        sync_copilot_cli_agent_usage_logs_from(&mut conn, &base).unwrap();
+        let turns: Vec<i64> = conn
+            .prepare("SELECT turn_no FROM usage_entries WHERE session_id = ? ORDER BY timestamp")
+            .unwrap()
+            .query_map([sid], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(turns, vec![1, 2], "CLI 逐筆用量必須寫入過濾後回合");
+        let events = base.join("session-state").join(sid).join("events.jsonl");
+        assert_eq!(
+            cli_review_replies(&conn, &events, sid, None),
+            vec![(1, 110), (2, 110)],
+            "每個回覆必須掛到同回合用量"
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn cli_review_native_only_subagent_call_uses_filtered_turns() {
+        // (thread PRRT_kwDOTOgsec6yUXNI) `merge_calls` appends SQLite-only
+        // sub-agent calls with the parent's `turn_index + 1`, but the drawer
+        // joins their usage on the sub-agent's own filtered timeline. The CLI
+        // row builder must derive that turn like the App side: here the call
+        // follows both child replies, so the parent counter says 3 and the
+        // old synthetic hard-code says 1 while the filtered turn is 2.
+        let base = temp_jsonl_path("cli-review-native-subagent-turns").with_extension("");
+        let sid = "cli-sub-turns";
+        fs::create_dir_all(&base).unwrap();
+        let store = build_cli_reconciler_fixture(&base, &[], &[sid]);
+        let child_reply = |ts: Option<&str>| {
+            let mut event = match ts {
+                Some(ts) => app_text_at("assistant.message", ts),
+                None => app_text("assistant.message"),
+            };
+            event["agentId"] = serde_json::json!("child");
+            event
+        };
+        write_cli_usage_fixture(
+            &base,
+            sid,
+            &[
+                app_text_at("user.message", "2026-07-23T12:00:00Z"),
+                child_reply(Some("2026-07-23T12:00:10Z")),
+                app_text_at("user.message", "2026-07-23T12:00:20Z"),
+                // The untimed reply still decides the call's turn because no
+                // definitely-later reply spans a second candidate.
+                child_reply(None),
+            ],
+        );
+        insert_cli_event(
+            &store,
+            CliEventIdentity {
+                id: 3,
+                session_id: sid,
+                model: "B",
+                agent_id: Some("child"),
+                initiator: Some("sub-agent"),
+            },
+            CliEventTokens {
+                input: 100,
+                output: 10,
+                cache_read: 80,
+                cache_write: 0,
+                reasoning: 0,
+                duration_ms: 50,
+            },
+            "2026-07-23T12:00:30Z",
+        );
+        store
+            .execute(
+                "UPDATE assistant_usage_events SET turn_index=2 WHERE id=3",
+                [],
+            )
+            .unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        sync_copilot_cli_agent_usage_logs_from(&mut conn, &base).unwrap();
+        let rows: Vec<(i64, Option<String>)> = conn
+            .prepare(
+                "SELECT turn_no, agent_role FROM usage_entries
+                 WHERE session_id = ? ORDER BY timestamp",
+            )
+            .unwrap()
+            .query_map([format!("{sid}__child")], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            rows,
+            vec![(2, Some("sub-agent".to_string()))],
+            "SQLite-only 子 Agent 呼叫必須寫入子 Agent 過濾後回合"
+        );
+        let events = base.join("session-state").join(sid).join("events.jsonl");
+        assert_eq!(
+            cli_review_replies(&conn, &events, &format!("{sid}__child"), Some("child")),
+            vec![(2, 110)],
+            "用量必須掛到子 Agent 第 2 個回覆而非錯置到第 1 個"
+        );
+        drop(store);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn cli_review_parser_version_bump_resyncs_unchanged_sessions() {
+        // (thread PRRT_kwDOTOgsec6yUXNI) Rows written before this fix keep
+        // `turn_no = 1` and predate `2543627`'s SQLite initiator recovery.
+        // `copilot_cli_transcript_fingerprint` hashes
+        // `copilot::PARSER_VERSION`, so the bump must invalidate every stored
+        // `copilot-cli-transcript:*` fingerprint once and rebuild unchanged
+        // sessions — without touching `sync:copilot_cli_agents:pending:*`.
+        let base = temp_jsonl_path("cli-review-fingerprint-resync").with_extension("");
+        let sid = "cli-resync";
+        fs::create_dir_all(&base).unwrap();
+        let store = build_cli_reconciler_fixture(&base, &[], &[sid]);
+        let dedicated = |kind: &str, ts: &str| {
+            let mut event = app_text_at(kind, ts);
+            event["agentId"] = serde_json::json!("child");
+            event
+        };
+        let mut first = cli_usage_fixture(1, "2026-07-23T12:00:05Z");
+        first["agentId"] = serde_json::json!("child");
+        let mut second = cli_usage_fixture(2, "2026-07-23T12:01:05Z");
+        second["agentId"] = serde_json::json!("child");
+        write_cli_usage_fixture(
+            &base,
+            sid,
+            &[
+                app_text_at("user.message", "2026-07-23T12:00:00Z"),
+                first,
+                dedicated("assistant.message", "2026-07-23T12:00:10Z"),
+                app_text_at("user.message", "2026-07-23T12:01:00Z"),
+                second,
+                dedicated("assistant.message", "2026-07-23T12:01:10Z"),
+            ],
+        );
+        // The paired SQLite rows carry `initiator='sub-agent'` while the
+        // transcript records carry none: only `merge_calls` can recover it.
+        for (id, ts) in [(1i64, "2026-07-23T12:00:05Z"), (2, "2026-07-23T12:01:05Z")] {
+            insert_cli_event(
+                &store,
+                CliEventIdentity {
+                    id,
+                    session_id: sid,
+                    model: "B",
+                    agent_id: Some("child"),
+                    initiator: Some("sub-agent"),
+                },
+                CliEventTokens {
+                    input: 100,
+                    output: 10,
+                    cache_read: 80,
+                    cache_write: 0,
+                    reasoning: 0,
+                    duration_ms: 50,
+                },
+                ts,
+            );
+        }
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let source = encode_hex(
+            crate::config::absolute_root(&base)
+                .as_os_str()
+                .as_encoded_bytes(),
+        );
+        let state_key = format!("copilot-cli-transcript:{source}:{sid}");
+        let other_pending = format!("sync:copilot_cli_agents:pending:{source}::other-session");
+        let rows = |conn: &Connection| -> Vec<(i64, Option<String>)> {
+            conn.prepare("SELECT turn_no, agent_role FROM usage_entries WHERE session_id = ? ORDER BY timestamp")
+                .unwrap()
+                .query_map([format!("{sid}__child")], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        sync_copilot_cli_agent_usage_logs_from(&mut conn, &base).unwrap();
+        let rebuilt = vec![
+            (1, Some("sub-agent".to_string())),
+            (2, Some("sub-agent".to_string())),
+        ];
+        assert_eq!(rows(&conn), rebuilt);
+        // Simulate rows persisted by an old build. The stored fingerprint
+        // still matches, so an unchanged session must stay untouched.
+        conn.execute("UPDATE usage_entries SET turn_no=1, agent_role=NULL", [])
+            .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO sync_state VALUES (?, 0, 0)",
+            [&other_pending],
+        )
+        .unwrap();
+        sync_copilot_cli_agent_usage_logs_from(&mut conn, &base).unwrap();
+        assert_eq!(
+            rows(&conn),
+            vec![(1, None), (1, None)],
+            "指紋相符時未變更的 session 不得重建"
+        );
+        // The pre-upgrade build hashed `PARSER_VERSION = 2` into the same
+        // fingerprint slot; after the bump it can never match again.
+        let legacy =
+            legacy_cli_fingerprint(&base.join("session-state").join(sid).join("events.jsonl"));
+        let stored: (u64, i64) = conn
+            .query_row(
+                "SELECT last_synced_size, last_synced_time FROM sync_state WHERE filename = ?",
+                [&state_key],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_ne!(stored, legacy, "升版後舊指紋必須失效");
+        conn.execute(
+            "INSERT OR REPLACE INTO sync_state VALUES (?, ?, ?)",
+            params![state_key, legacy.0, legacy.1],
+        )
+        .unwrap();
+        sync_copilot_cli_agent_usage_logs_from(&mut conn, &base).unwrap();
+        assert_eq!(
+            rows(&conn),
+            rebuilt,
+            "失效指紋後未變更的 session 必須重建並補回 SQLite initiator"
+        );
+        let pending: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state WHERE filename = ?",
+                [&other_pending],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 1, "pending 標記不得被指紋失效波及");
+        sync_copilot_cli_agent_usage_logs_from(&mut conn, &base).unwrap();
+        assert_eq!(rows(&conn), rebuilt, "重建必須收斂");
+        drop(store);
         fs::remove_dir_all(base).unwrap();
     }
 
@@ -20032,5 +25078,678 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// Regression for code review comment 4403291365 (thread
+    /// PRRT_kwDOTOgsec6xOCAC): a standalone session whose id happens to equal
+    /// a Copilot App synthetic sub-agent id (`<parent>__<agent>`) must stay
+    /// separate from that sub-agent in `SessionIdentity::from_entry`, in the
+    /// grouping that feeds the daily summary, and in the per-turn detail
+    /// queries. Before the fix both rows merged into one session
+    /// (100 + 900 = 1000) and the detail page could not select the
+    /// sub-agent alone.
+    #[test]
+    fn copilot_app_standalone_session_colliding_with_synthetic_child_stays_separate() {
+        use crate::session_identity::SessionIdentity;
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // Standalone session literally named `a__b`: 1 call, 100 input tokens.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, model, usage_identity,
+                tokens_input, tokens_output, tokens_total,
+                delta_input, delta_output, delta_total
+             ) VALUES (
+                'copilot', 'copilot-app', 'aa', '2026-07-20T10:00:00Z', '2026-07-20',
+                'a__b', 1, 'gpt-5', 'source=aa;call=0001',
+                100, 10, 110,
+                100, 10, 110
+             )",
+            [],
+        )
+        .unwrap();
+        // Session `a` with sub-agent `b` stored under the synthetic id `a__b`
+        // (parent_session_id = 'a'): 1 call, 900 input tokens.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, model, usage_identity,
+                tokens_input, tokens_output, tokens_total,
+                delta_input, delta_output, delta_total,
+                parent_session_id, agent_nickname
+             ) VALUES (
+                'copilot', 'copilot-app', 'aa', '2026-07-20T10:00:30Z', '2026-07-20',
+                'a__b', 1, 'gpt-5', 'source=aa;call=0002',
+                900, 90, 990,
+                900, 90, 990,
+                'a', 'b'
+             )",
+            [],
+        )
+        .unwrap();
+
+        let records = get_usage_entries_by_date(&conn, "2026-07-20", "copilot").unwrap();
+        assert_eq!(records.len(), 2);
+        let standalone_record = records
+            .iter()
+            .find(|row| row.record.entry.parent_session_id.is_none())
+            .expect("應存在獨立 session a__b 的資料列");
+        let child_record = records
+            .iter()
+            .find(|row| row.record.entry.parent_session_id.is_some())
+            .expect("應存在 session a 的子 Agent b 資料列");
+
+        // 1) SessionIdentity::from_entry must yield two distinct keys.
+        let standalone_identity = SessionIdentity::from_entry(
+            &standalone_record.assistant_type,
+            &standalone_record.record.entry,
+        );
+        let child_identity =
+            SessionIdentity::from_entry(&child_record.assistant_type, &child_record.record.entry);
+        assert_ne!(
+            standalone_identity, child_identity,
+            "獨立 session a__b 與 session a 的子 Agent b 必須是兩個不同的 session 身分"
+        );
+
+        // 2) The grouping that feeds the daily summary must list two sessions
+        // (`aggregate_usage_details` pushes one SessionSummary per group and
+        // reports summary.total_sessions = sessions_map.len()).
+        let sessions_map = crate::reporting::group_sessions(
+            records
+                .iter()
+                .map(|row| (&row.record.entry, row.assistant_type.as_str())),
+        );
+        assert_eq!(
+            sessions_map.len(),
+            2,
+            "每日彙總必須分開列出兩個 session，而不是合併成單一 session"
+        );
+        let mut totals: Vec<u64> = sessions_map
+            .values()
+            .map(|group| {
+                group
+                    .entries
+                    .iter()
+                    .filter_map(|entry| entry.delta_tokens.as_ref().map(|tokens| tokens.input))
+                    .sum()
+            })
+            .collect();
+        totals.sort();
+        assert_eq!(totals, vec![100, 900], "兩組回合用量不得互相合併");
+
+        // 3) The detail page must be able to select each row-set alone with
+        // the parent-scoped queries (added by this fix — no API parameter
+        // could express this selection before).
+        let child_turns = get_session_turns_token_stats_in_parent_scope(
+            &conn,
+            "copilot",
+            "a__b",
+            Some("copilot-app"),
+            Some("aa"),
+            ParentSessionScope::ChildOf("a"),
+        )
+        .unwrap();
+        assert_eq!(
+            child_turns.get(&1).unwrap().0.input,
+            900,
+            "子 Agent 選取必須只回傳自己的 900 tokens"
+        );
+        let root_turns = get_session_turns_token_stats_in_parent_scope(
+            &conn,
+            "copilot",
+            "a__b",
+            Some("copilot-app"),
+            Some("aa"),
+            ParentSessionScope::RootOnly,
+        )
+        .unwrap();
+        assert_eq!(
+            root_turns.get(&1).unwrap().0.input,
+            100,
+            "獨立 session 選取必須只回傳自己的 100 tokens"
+        );
+        let child_lookup = get_session_assistant_and_transcript_in_parent_scope(
+            &conn,
+            "copilot",
+            "a__b",
+            Some("copilot-app"),
+            Some("aa"),
+            ParentSessionScope::ChildOf("a"),
+        )
+        .unwrap();
+        assert_eq!(
+            child_lookup.parent_session_id.as_deref(),
+            Some("a"),
+            "詳細頁必須能單獨選取子 Agent"
+        );
+        assert_eq!(
+            child_lookup
+                .load_data_in_parent_scope(&conn, "a__b", ParentSessionScope::ChildOf("a"))
+                .unwrap()
+                .turn_stats
+                .get(&1)
+                .unwrap()
+                .0
+                .input,
+            900,
+            "子 Agent 詳細頁回合用量不得混入獨立 session 的 100 tokens"
+        );
+    }
+
+    #[test]
+    fn root_only_parent_scope_reaches_legacy_empty_parent_rows() {
+        // Rows persisted before empty-parent normalization store `''` for
+        // "no parent" (Codex `parent_thread_id: ""` / imported records). The
+        // frontend sends `parent_session_id=''` for such a session and
+        // `session_details` maps that to `RootOnly`; the scope must keep
+        // matching `''` rows (thread PRRT_kwDOTOgsec6yUKGs: clicking such a
+        // session used to 404) so they stay reachable before/without the
+        // one-time repair migration.
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, timestamp, date, session_id,
+                turn_no, parent_session_id, delta_input, delta_output, delta_total
+             ) VALUES ('codex', 'legacy', '2026-07-10T12:00:00Z', '2026-07-10',
+                'legacy-empty-parent', 1, '', 100, 0, 100)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, timestamp, date, session_id,
+                turn_no, parent_session_id, delta_input, delta_output, delta_total
+             ) VALUES ('codex', 'legacy', '2026-07-10T12:00:00Z', '2026-07-10',
+                'real-child', 1, 'real-parent', 900, 0, 900)",
+            [],
+        )
+        .unwrap();
+
+        let lookup = get_session_assistant_and_transcript_in_parent_scope(
+            &conn,
+            "codex",
+            "legacy-empty-parent",
+            Some("legacy"),
+            None,
+            ParentSessionScope::RootOnly,
+        )
+        .expect("RootOnly 必須命中以 '' 存放的既有無父層列");
+        assert_eq!(
+            lookup.parent_session_id, None,
+            "既有 '' 父層列在身分面上應呈現為無父層"
+        );
+
+        let turns = get_session_turns_token_stats_in_parent_scope(
+            &conn,
+            "codex",
+            "legacy-empty-parent",
+            Some("legacy"),
+            None,
+            ParentSessionScope::RootOnly,
+        )
+        .unwrap();
+        assert_eq!(
+            turns.get(&1).unwrap().0.input,
+            100,
+            "詳情頁回合用量必須查得到既有 '' 父層列"
+        );
+
+        // A real child must NOT leak into the root scope while the legacy
+        // `''` rows are being matched.
+        assert!(
+            get_session_assistant_and_transcript_in_parent_scope(
+                &conn,
+                "codex",
+                "real-child",
+                Some("legacy"),
+                None,
+                ParentSessionScope::RootOnly,
+            )
+            .is_err(),
+            "RootOnly 不得吞下真正的子層列"
+        );
+    }
+
+    /// Regression for review thread PRRT_kwDOTOgsec6yUXND: a standalone
+    /// session literally named `a__main` and session `a`'s agent `main`
+    /// (synthetic id `a__main`, `parent_session_id = 'a'`) share
+    /// (session_id, turn_no, usage_identity) in the fallback rebuild. The
+    /// storage unique key must include the normalized parent so
+    /// `INSERT OR REPLACE` never deletes one family's row before grouping can
+    /// tell them apart.
+    #[test]
+    fn sync_copilot_app_usage_logs_keeps_dunder_main_standalone_and_subagent_rows_distinct() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let old_app_dir = std::env::var("COPILOT_APP_DIR").ok();
+
+        let base_dir = temp_jsonl_path("copilot-app-dunder-main").with_extension("");
+        let app_dir = base_dir.join("copilot-app");
+        fs::create_dir_all(&app_dir).unwrap();
+        let store = create_test_copilot_session_store(&app_dir);
+        // Session `a`'s agent `main` (synthetic `a__main`, parent = `a`).
+        store
+            .execute(
+                "INSERT INTO assistant_usage_events
+                    (id, session_id, turn_index, model, agent_id, initiator,
+                     input_tokens, output_tokens,
+                     cache_read_tokens, cache_write_tokens,
+                     reasoning_tokens, duration_ms, reasoning_effort, created_at)
+                 VALUES (1, 'a', 0, 'm', 'main', 'sub-agent',
+                         100, 0, 0, 0, 0, 100, 'medium', '2026-07-20 10:00:00')",
+                [],
+            )
+            .unwrap();
+        // Standalone session literally named `a__main` (no parent).
+        store
+            .execute(
+                "INSERT INTO assistant_usage_events
+                    (id, session_id, turn_index, model, agent_id, initiator,
+                     input_tokens, output_tokens,
+                     cache_read_tokens, cache_write_tokens,
+                     reasoning_tokens, duration_ms, reasoning_effort, created_at)
+                 VALUES (2, 'a__main', 0, 'm', NULL, NULL,
+                         200, 0, 0, 0, 0, 100, 'medium', '2026-07-20 10:01:00')",
+                [],
+            )
+            .unwrap();
+        drop(store);
+        create_copilot_app_registry_from_events(&app_dir);
+
+        std::env::set_var("COPILOT_APP_DIR", &app_dir);
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+
+        let rows: Vec<(Option<String>, i64)> = conn
+            .prepare(
+                "SELECT parent_session_id, tokens_input
+                 FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'
+                 ORDER BY tokens_input",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![(Some("a".to_string()), 100), (None, 200)],
+            "獨立 session a__main 與 session a 的 agent main 必須兩列並存（各自保留 200 / 100 tokens）"
+        );
+
+        if let Some(value) = old_app_dir {
+            std::env::set_var("COPILOT_APP_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_APP_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    /// Same collision on the import path (thread PRRT_kwDOTOgsec6yUXND): two
+    /// exported rows differing only in `parent_session_id` share the dedup
+    /// key, so `INSERT OR IGNORE` used to count the second one as a duplicate
+    /// and silently drop real usage from the batch.
+    #[test]
+    fn import_usage_day_entries_keeps_imported_parent_collision_pair() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let mut standalone = sample_import_record();
+        standalone.entry.session_id = "a__main".to_string();
+        standalone.entry.turn_no = 1;
+        standalone.entry.model = Some("m".to_string());
+        standalone.entry.model_id = Some("m".to_string());
+        standalone.entry.parent_session_id = None;
+        standalone.entry.agent_nickname = None;
+        standalone.entry.tokens = Some(TokenStats {
+            input: 200,
+            output: 0,
+            cache_read: Some(0),
+            cache_write: None,
+            cache_write_5m: None,
+            cache_write_1h: None,
+            reasoning: None,
+            total: 200,
+        });
+        standalone.import_source_id = Some("import-parent-collision-standalone".to_string());
+
+        let mut child = standalone.clone();
+        child.entry.parent_session_id = Some("a".to_string());
+        child.entry.tokens = Some(TokenStats {
+            input: 100,
+            output: 0,
+            cache_read: Some(0),
+            cache_write: None,
+            cache_write_5m: None,
+            cache_write_1h: None,
+            reasoning: None,
+            total: 100,
+        });
+        child.import_source_id = Some("import-parent-collision-child".to_string());
+
+        let summary = import_usage_day_entries(
+            &mut conn,
+            "copilot",
+            "2026-07-10",
+            vec![standalone.clone(), child.clone()],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        assert_eq!(summary.imported, 2, "兩筆真實用量都必須入庫");
+        assert_eq!(summary.skipped_duplicates, 0, "不同父層家族不得互相判重");
+
+        let rows: Vec<(Option<String>, i64)> = conn
+            .prepare(
+                "SELECT parent_session_id, tokens_input
+                 FROM usage_entries
+                 WHERE session_id = 'a__main'
+                 ORDER BY tokens_input",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![(Some("a".to_string()), 100), (None, 200)],
+            "碰撞對必須以父層分家各自保存"
+        );
+
+        // 同家族去重仍須成立（REPLACE/IGNORE 消費者審計的「同家族 dedup ✓」
+        // 不變量）：以不同 import_source_id 重匯入同一對列，兩列都落在既有
+        // 家族鍵上 → 全數判重、不得累積第二份。退化成裸 parent_session_id
+        // （SQLite NULL 互異）會讓無父列失去主鍵去重、於此轉紅。
+        let mut standalone_reimport = standalone.clone();
+        standalone_reimport.import_source_id =
+            Some("import-parent-collision-standalone-reimport".to_string());
+        let mut child_reimport = child.clone();
+        child_reimport.import_source_id =
+            Some("import-parent-collision-child-reimport".to_string());
+        let summary = import_usage_day_entries(
+            &mut conn,
+            "copilot",
+            "2026-07-10",
+            vec![standalone_reimport, child_reimport],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        assert_eq!(summary.imported, 0, "同家族重匯入必須全數判重");
+        assert_eq!(summary.skipped_duplicates, 2);
+
+        let total_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries WHERE session_id = 'a__main'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(total_rows, 2, "重匯入不得累積重複列");
+    }
+
+    /// Recovery path for already-clobbered data (thread PRRT_kwDOTOgsec6yUXND):
+    /// a pre-fix database holds only one survivor per colliding (turn, model).
+    /// The one-time recovery migration must clear the App fallback cursor (and
+    /// transcript fingerprints) at startup so the next sync re-aggregates every
+    /// turn and restores the lost rows under the fixed unique key.
+    #[test]
+    fn copilot_app_parent_collision_recovery_rescan_restores_lost_rows() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let old_app_dir = std::env::var("COPILOT_APP_DIR").ok();
+
+        let base_dir = temp_jsonl_path("copilot-app-parent-recovery").with_extension("");
+        let app_dir = base_dir.join("copilot-app");
+        fs::create_dir_all(&app_dir).unwrap();
+        let store = create_test_copilot_session_store(&app_dir);
+        for (id, session_id, turn_index, agent, input, created_at) in [
+            (1i64, "a", 0i64, Some("main"), 100i64, "2026-07-20 10:00:00"),
+            (2, "a__main", 0, None, 200, "2026-07-20 10:01:00"),
+            (3, "a__main", 1, None, 50, "2026-07-20 10:02:00"),
+            (4, "a", 1, Some("main"), 300, "2026-07-20 10:03:00"),
+        ] {
+            store
+                .execute(
+                    "INSERT INTO assistant_usage_events
+                        (id, session_id, turn_index, model, agent_id, initiator,
+                         input_tokens, output_tokens,
+                         cache_read_tokens, cache_write_tokens,
+                         reasoning_tokens, duration_ms, reasoning_effort, created_at)
+                     VALUES (?, ?, ?, 'm', ?, ?, ?, 0, 0, 0, 0, 100, 'medium', ?)",
+                    params![id, session_id, turn_index, agent, agent, input, created_at],
+                )
+                .unwrap();
+        }
+        drop(store);
+        create_copilot_app_registry_from_events(&app_dir);
+
+        std::env::set_var("COPILOT_APP_DIR", &app_dir);
+        let source_key = test_copilot_source_key(&app_dir);
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // Simulate the pre-fix damage: each colliding (turn, model) kept only
+        // its last writer — turn 1 lost the child row, turn 2 lost the
+        // standalone row — and the fallback cursor already passed every event.
+        let usage_identity = format!("agent={};model={}", encode_hex(b"main"), encode_hex(b"m"));
+        for (turn_no, parent, tokens, session_id, index_session, index_turn) in [
+            (1i64, None, 200i64, "a__main", "a__main", 0i64),
+            (2, Some("a"), 300, "a__main", "a", 1),
+        ] {
+            conn.execute(
+                "INSERT INTO usage_entries (
+                    assistant_type, source_kind, source_dir_key, usage_identity,
+                    timestamp, date, session_id, turn_no, model,
+                    tokens_input, tokens_output, tokens_cache_read, tokens_total,
+                    delta_input, delta_output, delta_cache_read, delta_total,
+                    import_source_id, parent_session_id, agent_nickname
+                 ) VALUES ('copilot', 'copilot-app', ?, ?,
+                    '2026-07-20T10:00:00Z', '2026-07-20',
+                    ?, ?, 'm', ?, 0, 0, ?, ?, 0, 0, ?, ?, ?, ?)",
+                params![
+                    source_key,
+                    usage_identity,
+                    session_id,
+                    turn_no,
+                    tokens,
+                    tokens,
+                    tokens,
+                    tokens,
+                    format!(
+                        "copilot-app:{source_key}:{index_session}:{index_turn}:main:{}",
+                        encode_hex(b"m")
+                    ),
+                    parent,
+                    parent.map(|_| "main".to_string()),
+                ],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES (?, 0, 0)",
+            params![format!(
+                "{}{}::2026-07-20 10:03:00::4",
+                COPILOT_APP_CURSOR_PREFIX, source_key
+            )],
+        )
+        .unwrap();
+        // 還原成修復前的 sync_state：升級當下資料庫並無 recovery 標記
+        // （init_db 會於空表時先寫入標記，此處模擬「修復尚未跑過」的既有庫）。
+        conn.execute(
+            "DELETE FROM sync_state WHERE filename = ?",
+            params!["migration:copilot_parent_collision_recovery_v1"],
+        )
+        .unwrap();
+
+        // 升級後首次啟動：init_db 掛載的一次性 recovery 清掉 fallback cursor
+        // 與 transcript 指紋，強制全歷史重聚合。
+        init_db(&conn).unwrap();
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+
+        let rows: Vec<(Option<String>, i64, i64)> = conn
+            .prepare(
+                "SELECT parent_session_id, turn_no, tokens_input
+                 FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'
+                 ORDER BY turn_no, tokens_input",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (Some("a".to_string()), 1, 100),
+                (None, 1, 200),
+                (None, 2, 50),
+                (Some("a".to_string()), 2, 300),
+            ],
+            "重掃必須復原被 REPLACE 吞掉的兩列（每回合兩個父層家族並存）"
+        );
+
+        if let Some(value) = old_app_dir {
+            std::env::set_var("COPILOT_APP_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_APP_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    /// Claim B repair (thread PRRT_kwDOTOgsec6yUXNe): rows persisted after the
+    /// first (`feca7c9`) one-time normalization can still carry whitespace-only
+    /// or padded `parent_session_id` values. The v2 migration (NEW sync_state
+    /// key) must trim + collapse blanks exactly like `SessionIdentity`, so the
+    /// rows stop appearing in summaries yet 404-ing in details (RootOnly only
+    /// reaches `IS NULL`/`''`, never `'  '`). One-shot: rows written after the
+    /// marker survives untouched.
+    #[test]
+    fn parent_session_id_normalization_migration_v2_repairs_post_migration_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // v1 正規化遷移已跑過（模擬 feca7c9 之後才落盤的雜值）。
+        conn.execute(
+            "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES (?, 1, 0)",
+            params![PARENT_SESSION_NORMALIZATION_MIGRATION_KEY],
+        )
+        .unwrap();
+        // 還原成修復前的 sync_state：升級當下資料庫並無 v2 標記
+        // （init_db 會先寫入標記，此處模擬「修復尚未跑過」的既有庫）。
+        conn.execute(
+            "DELETE FROM sync_state WHERE filename = ?",
+            params!["migration:parent_session_id_normalization_v2"],
+        )
+        .unwrap();
+        for (session_id, parent) in [
+            ("s-pad", Some(" a ")),
+            ("s-blank", Some("  ")),
+            ("s-empty", Some("")),
+            ("s-ok", Some("ok")),
+            ("s-null", None),
+        ] {
+            conn.execute(
+                "INSERT INTO usage_entries (
+                    assistant_type, source_kind, timestamp, date, session_id,
+                    turn_no, parent_session_id, delta_input, delta_output, delta_total
+                 ) VALUES ('codex', 'codex-cli', '2026-07-10T12:00:00Z', '2026-07-10',
+                    ?, 1, ?, 100, 0, 100)",
+                params![session_id, parent],
+            )
+            .unwrap();
+        }
+
+        // Claim B 症狀：純空白父層列在 RootOnly 詳情查詢 404（清單卻看得到）。
+        assert!(
+            get_session_assistant_and_transcript_in_parent_scope(
+                &conn,
+                "codex",
+                "s-blank",
+                Some("codex-cli"),
+                None,
+                ParentSessionScope::RootOnly,
+            )
+            .is_err(),
+            "修復前：純空白父層列在 RootOnly 詳情查詢必須 404（症狀成立）"
+        );
+
+        // 升級後首次啟動：init_db 掛載的 v2 遷移修復 v1 之後落盤的雜值。
+        init_db(&conn).unwrap();
+
+        let parents: Vec<(String, Option<String>)> = conn
+            .prepare(
+                "SELECT session_id, parent_session_id FROM usage_entries
+                 WHERE session_id LIKE 's-%' ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(
+            parents,
+            vec![
+                ("s-pad".to_string(), Some("a".to_string())),
+                ("s-blank".to_string(), None),
+                ("s-empty".to_string(), None),
+                ("s-ok".to_string(), Some("ok".to_string())),
+                ("s-null".to_string(), None),
+            ],
+            "v2 遷移必須 trim 包覆空白、把純空白／空字串折成無父層"
+        );
+
+        let lookup = get_session_assistant_and_transcript_in_parent_scope(
+            &conn,
+            "codex",
+            "s-blank",
+            Some("codex-cli"),
+            None,
+            ParentSessionScope::RootOnly,
+        )
+        .expect("修復後：純空白父層列必須能被 RootOnly 詳情查詢命中");
+        assert_eq!(lookup.parent_session_id, None);
+
+        let marker: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = ?)",
+                params!["migration:parent_session_id_normalization_v2"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(marker, "v2 遷移必須寫入一次性 sync_state 標記");
+
+        // 一次性證明：標記生效後才落盤的雜值不得被再次改寫。
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, timestamp, date, session_id,
+                turn_no, parent_session_id, delta_input, delta_output, delta_total
+             ) VALUES ('codex', 'codex-cli', '2026-07-10T12:00:00Z', '2026-07-10',
+                's-late', 1, '  b  ', 100, 0, 100)",
+            [],
+        )
+        .unwrap();
+        init_db(&conn).unwrap();
+        let late_parent: Option<String> = conn
+            .query_row(
+                "SELECT parent_session_id FROM usage_entries WHERE session_id = 's-late'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            late_parent.as_deref(),
+            Some("  b  "),
+            "遷移是一次性行為：標記生效後的新列不得被改寫"
+        );
     }
 }
