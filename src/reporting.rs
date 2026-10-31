@@ -222,15 +222,69 @@ fn is_per_call_import_source(source_kind: Option<&str>, import_source_id: &str) 
         .is_some_and(|rest| rest.contains(PER_CALL_IMPORT_SOURCE_MARKER))
 }
 
+/// `%Y-%m-%d` 日期段形狀（只檢查形狀、不驗證曆法），用於辨識 legacy CLI
+/// 每日聚合 ID 的日期段。
+fn is_utc_date_shape(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[..4].iter().all(u8::is_ascii_digit)
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[8..].iter().all(u8::is_ascii_digit)
+}
+
+/// 用量列所在 UTC 日。寫入契約保證 `date` 欄 == `timestamp[..10]`（v3 日桶、
+/// v4 逐次呼叫列、匯入列三者一致），顯示端直接取時間戳前 10 碼即可，無需
+/// 另行 plumbing `date` 欄。
+fn entry_day(entry: &UsageEntry) -> Option<&str> {
+    entry.timestamp.get(..10)
+}
+
+/// legacy CLI 每日聚合判別（review PRRT_kwDOTOgsec6yUXNs）：三重閘門，缺一
+/// 即非每日聚合——
+/// (1) 來源種類是 `copilot-cli`；
+/// (2) ID 落在 `copilot-cli-agents:` 命名空間且無 `:call:` 標記（非逐次呼叫列）；
+/// (3) ID 形狀閘門：dcad888 寫入契約
+///     `copilot-cli-agents:{source_key}:{session_id}:{YYYY-MM-DD}:{agent_segment}:{model_identity}`
+///     （每 UTC 日、agent、model 一列的每日總量，turn 恆為合成值 1）由右側
+///     解析，右起第 3 段須為 `%Y-%m-%d` 日期段；由右解析可容忍 session_id
+///     含 `:`（日期段恆為右起第 3 段）。
+/// f71a97c 時代的 per-agent 彙總 ID（`{key}:{sid}:{agent}:{model}`，無日期段）
+/// 與 Hook session 累積快照（ID NULL）都落回 Split：它們的覆蓋本來就跨日期，
+/// 套用日期切分會在「累積列＋他日呼叫」場景反向雙計。
+fn is_legacy_cli_daily_aggregate(
+    source_kind: Option<&str>,
+    import_source_id: Option<&str>,
+) -> bool {
+    let Some(rest) = import_source_id.and_then(|id| id.strip_prefix("copilot-cli-agents:")) else {
+        return false;
+    };
+    if source_kind != Some("copilot-cli") || rest.contains(PER_CALL_IMPORT_SOURCE_MARKER) {
+        return false;
+    }
+    let segments: Vec<&str> = rest.rsplitn(4, ':').collect();
+    segments.len() == 4 && is_utc_date_shape(segments[2])
+}
+
 /// 非逐次呼叫列的覆蓋認領（review PRRT_kwDOTOgsec6yUKGR），形狀鏡像
 /// `db::classify_copilot_app_coverage_claim`：`copilot-app:{key}:{sid}:{turn}`
 /// 三段式 ID（sid 為本組 session）認領整個回合；其他形狀只認領自己的
 /// (turn, model) 桶（欄位取自 `UsageEntry`，不解析 ID）。回合 0 無法放置於
 /// 回合空間，保守落在桶級認領（匯入端對此判定為 Conflict，顯示端無拒絕語意）。
+/// legacy CLI 每日聚合（三重閘門全過）另認領 (date, model) 日桶（review
+/// PRRT_kwDOTOgsec6yUXNs）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AggregateCoverageClaim {
     WholeTurn(u32),
     Split(u32, Option<String>),
+    /// legacy CLI 每日聚合：認領整個 (UTC 日, model) 日桶。刻意不含 turn——
+    /// CLI 各列 turn 恆為合成值 1，每日聚合本身是跨回合的日總量，回合維度
+    /// 對重疊判定無意義且有害（會把他日的 turn 1 呼叫列誤判成同覆蓋）。
+    DayTotal {
+        date: String,
+        model: Option<String>,
+    },
 }
 
 fn aggregate_coverage_claim(
@@ -243,6 +297,14 @@ fn aggregate_coverage_claim(
             if segments.len() == 3 && segments[1] == entry.session_id.as_str() {
                 return AggregateCoverageClaim::WholeTurn(entry.turn_no);
             }
+        }
+    }
+    if is_legacy_cli_daily_aggregate(entry.source_kind.as_deref(), import_source_id) {
+        if let Some(date) = entry_day(entry) {
+            return AggregateCoverageClaim::DayTotal {
+                date: date.to_string(),
+                model: entry.model.clone(),
+            };
         }
     }
     AggregateCoverageClaim::Split(entry.turn_no, entry.model.clone())
@@ -284,8 +346,11 @@ fn entry_duration_ms(entry: &UsageEntry) -> f64 {
 /// 範圍的聚合列讓位不計（呼叫優先防雙計——`copilot-cli` 匯入不經覆蓋裁決，
 /// 同覆蓋並存是合法狀態），不重疊的聚合列按認領加總；同認領重複列取最新一
 /// 筆（同一覆蓋的快照殘影，絕不疊加），WholeTurn 認領吸收同回合 Split 認領
-/// （同回合雙表示）。1448fc7 的「混和群組固定以逐次呼叫列加總為準」收斂為
-/// 「同覆蓋範圍以逐次呼叫列為準、不重疊聚合按覆蓋另計」。
+/// （同回合雙表示）。legacy CLI 每日聚合以 (date, model) 日桶認領（review
+/// PRRT_kwDOTOgsec6yUXNs）：對呼叫列的重疊判定只看 (date, model)、不看
+/// turn，與呼叫列同日同 model 讓位、不相交日期皆計。1448fc7 的「混和群組
+/// 固定以逐次呼叫列加總為準」收斂為「同覆蓋範圍以逐次呼叫列為準、不重疊
+/// 聚合按覆蓋另計」。
 /// 沒有逐次呼叫列的分組（舊聚合列、Codex 每列皆為 session 累積值等）維持
 /// 「取最新一筆」的累積值語意。
 pub(crate) fn session_duration_ms<'a>(
@@ -296,8 +361,12 @@ pub(crate) fn session_duration_ms<'a>(
     let mut per_call_duration = 0.0;
     // 呼叫列已覆蓋的 (turn, model) 桶。重疊判定必須到桶級：同回合跨模型的
     // 聚合列是合法的不重疊歷史（`db::copilot_app_claims_overlap` 同語意），
-    // 回合級連坐會把這類聚合列誤丟而少計。
+    // 回合級連坐會把這類聚合列誤丟而少計。App 認領鍵刻意保持無日期：整回合
+    // 聚合掛 MIN(created_at)、合法跨午夜（db.rs 匯入裁決註解「日期不進鍵」）。
     let mut covered_buckets: HashSet<(u32, Option<String>)> = HashSet::new();
+    // 呼叫列已覆蓋的 (日, model) 日桶：DayTotal 認領的重疊判定只看此鍵，
+    // 不含 turn（CLI 呼叫列 turn 恆為合成值 1，回合維度對日桶判定無意義）。
+    let mut covered_day_models: HashSet<(String, Option<String>)> = HashSet::new();
     for &(entry, import_source_id) in &entries {
         if import_source_id
             .is_some_and(|id| is_per_call_import_source(entry.source_kind.as_deref(), id))
@@ -305,6 +374,9 @@ pub(crate) fn session_duration_ms<'a>(
             per_call_rows += 1;
             per_call_duration += entry_duration_ms(entry);
             covered_buckets.insert((entry.turn_no, entry.model.clone()));
+            if let Some(day) = entry_day(entry) {
+                covered_day_models.insert((day.to_string(), entry.model.clone()));
+            }
         }
     }
     if per_call_rows == 0 {
@@ -314,6 +386,7 @@ pub(crate) fn session_duration_ms<'a>(
     }
     let mut whole_turn_claims: HashMap<u32, &UsageEntry> = HashMap::new();
     let mut split_claims: HashMap<(u32, Option<String>), &UsageEntry> = HashMap::new();
+    let mut day_claims: HashMap<(String, Option<String>), &UsageEntry> = HashMap::new();
     for &(entry, import_source_id) in &entries {
         if import_source_id
             .is_some_and(|id| is_per_call_import_source(entry.source_kind.as_deref(), id))
@@ -329,6 +402,9 @@ pub(crate) fn session_duration_ms<'a>(
             AggregateCoverageClaim::Split(turn, model) => {
                 covered_buckets.contains(&(*turn, model.clone()))
             }
+            AggregateCoverageClaim::DayTotal { date, model } => {
+                covered_day_models.contains(&(date.clone(), model.clone()))
+            }
         };
         if overlaps_calls {
             continue;
@@ -339,6 +415,9 @@ pub(crate) fn session_duration_ms<'a>(
             }
             AggregateCoverageClaim::Split(turn, model) => {
                 keep_latest(&mut split_claims, (turn, model), entry);
+            }
+            AggregateCoverageClaim::DayTotal { date, model } => {
+                keep_latest(&mut day_claims, (date, model), entry);
             }
         }
     }
@@ -351,6 +430,12 @@ pub(crate) fn session_duration_ms<'a>(
         if !whole_turn_claims.contains_key(turn) {
             total += entry_duration_ms(entry);
         }
+    }
+    // DayTotal 與 WholeTurn／Split 互不吸收：CLI 組的認領空間與 App／累積
+    // 形狀天然隔離（分組身分含 source_kind），同組僅在偽造資料時可達、超出
+    // 既有信任模型（同 97fb098 A-5/B-5 先例）。
+    for entry in day_claims.values() {
+        total += entry_duration_ms(entry);
     }
     total as u64
 }
@@ -1152,6 +1237,335 @@ mod tests {
             ]),
             4100
         );
+    }
+
+    #[test]
+    fn session_duration_ms_keeps_legacy_cli_daily_aggregate_beside_other_date_calls() {
+        // legacy CLI 每日聚合（migration:copilot_cli_daily_usage_v3 形狀）是
+        // UTC 日總量、turn 恆為合成值 1，與他日逐次呼叫列（turn 亦為 1）的
+        // 覆蓋不相交，必須合計 3600ms（review PRRT_kwDOTOgsec6yUXNs：
+        // (turn, model) 認領鍵不含日期，07-23 的每日總量會被誤判與 07-24 的
+        // 呼叫同覆蓋而整列丟棄、只剩 100ms）。反序輸入重跑同斷言：兩圈職責
+        // 分離，結果必須與輸入順序無關。
+        let daily = duration_entry_with_source(
+            1,
+            "2026-07-23T09:00:00Z",
+            3500.0,
+            Some("copilot-cli"),
+            "gpt-5",
+        );
+        let call = duration_entry_with_source(
+            1,
+            "2026-07-24T08:00:00Z",
+            100.0,
+            Some("copilot-cli"),
+            "gpt-5",
+        );
+        let daily_id = "copilot-cli-agents:aa:duration-session:2026-07-23:main:aa3";
+        let call_id = "copilot-cli-agents:aa:duration-session:call:h1";
+
+        assert_eq!(
+            session_duration_ms([(&daily, Some(daily_id)), (&call, Some(call_id))]),
+            3600
+        );
+        assert_eq!(
+            session_duration_ms([(&call, Some(call_id)), (&daily, Some(daily_id))]),
+            3600
+        );
+    }
+
+    #[test]
+    fn session_duration_ms_sums_legacy_cli_daily_aggregates_across_dates() {
+        // 多日每日聚合各自認領不同 (日, model) 日桶、皆不與他日呼叫重疊：
+        // 3500（07-23）+ 400（07-24）+ 100 呼叫（07-25）= 4000ms。
+        let first_day = duration_entry_with_source(
+            1,
+            "2026-07-23T09:00:00Z",
+            3500.0,
+            Some("copilot-cli"),
+            "gpt-5",
+        );
+        let second_day = duration_entry_with_source(
+            1,
+            "2026-07-24T09:00:00Z",
+            400.0,
+            Some("copilot-cli"),
+            "gpt-5",
+        );
+        let call = duration_entry_with_source(
+            1,
+            "2026-07-25T08:00:00Z",
+            100.0,
+            Some("copilot-cli"),
+            "gpt-5",
+        );
+
+        assert_eq!(
+            session_duration_ms([
+                (
+                    &first_day,
+                    Some("copilot-cli-agents:aa:duration-session:2026-07-23:main:aa3")
+                ),
+                (
+                    &second_day,
+                    Some("copilot-cli-agents:aa:duration-session:2026-07-24:main:aa3")
+                ),
+                (
+                    &call,
+                    Some("copilot-cli-agents:aa:duration-session:call:h1")
+                ),
+            ]),
+            4000
+        );
+    }
+
+    #[test]
+    fn session_duration_ms_keeps_latest_duplicate_legacy_cli_daily_aggregate() {
+        // 同 (日, model) 的重複每日聚合＝同一日桶的快照／重寫殘影，取最新一
+        // 筆、絕不疊加：3500/4000ms 兩列同日 + 他日呼叫 100ms = 4100ms。
+        let stale = duration_entry_with_source(
+            1,
+            "2026-07-23T09:00:00Z",
+            3500.0,
+            Some("copilot-cli"),
+            "gpt-5",
+        );
+        let fresh = duration_entry_with_source(
+            1,
+            "2026-07-23T10:00:00Z",
+            4000.0,
+            Some("copilot-cli"),
+            "gpt-5",
+        );
+        let call = duration_entry_with_source(
+            1,
+            "2026-07-24T08:00:00Z",
+            100.0,
+            Some("copilot-cli"),
+            "gpt-5",
+        );
+
+        assert_eq!(
+            session_duration_ms([
+                (
+                    &stale,
+                    Some("copilot-cli-agents:aa:duration-session:2026-07-23:main:aa3")
+                ),
+                (
+                    &fresh,
+                    Some("copilot-cli-agents:aa:duration-session:2026-07-23:main:bb4")
+                ),
+                (
+                    &call,
+                    Some("copilot-cli-agents:aa:duration-session:call:h1")
+                ),
+            ]),
+            4100
+        );
+    }
+
+    #[test]
+    fn session_duration_ms_prefers_cli_calls_over_same_day_daily_aggregate() {
+        // 同 (日, model) 重疊 → 釘死的「同覆蓋呼叫優先」讓位矩陣格：每日聚合
+        // 覆蓋當日全部歷史、呼叫只覆蓋其中一段，取大者／相加皆違反「metric
+        // 加總不用來證明覆蓋」禁則，保守少計 100ms 為刻意取捨。
+        let daily = duration_entry_with_source(
+            1,
+            "2026-07-23T09:00:00Z",
+            3500.0,
+            Some("copilot-cli"),
+            "gpt-5",
+        );
+        let call = duration_entry_with_source(
+            1,
+            "2026-07-23T10:00:00Z",
+            100.0,
+            Some("copilot-cli"),
+            "gpt-5",
+        );
+
+        assert_eq!(
+            session_duration_ms([
+                (
+                    &daily,
+                    Some("copilot-cli-agents:aa:duration-session:2026-07-23:main:aa3")
+                ),
+                (
+                    &call,
+                    Some("copilot-cli-agents:aa:duration-session:call:h1")
+                ),
+            ]),
+            100
+        );
+    }
+
+    #[test]
+    fn session_duration_ms_ignores_non_daily_cli_aggregate_shapes() {
+        // 三重閘門缺一即退回 Split 語意（維持 97fb098 既有行為）：(a) f71a97c
+        // per-agent 彙總 ID 無日期段（覆蓋跨日期，日期切分會與呼叫列雙計）；
+        // (b) 來源種類不是 copilot-cli（App 回合制覆蓋維持無日期）；(c) Hook
+        // 累積快照無 ID。三者的 (turn, model) 桶都與呼叫列重疊 → 保守讓位
+        // 100ms，絕不可變成 3600ms。
+        let f71a97c_row = duration_entry_with_source(
+            1,
+            "2026-07-23T09:00:00Z",
+            3500.0,
+            Some("copilot-cli"),
+            "gpt-5",
+        );
+        let hook_row = duration_entry_with_source(
+            1,
+            "2026-07-23T09:00:00Z",
+            3500.0,
+            Some("copilot-cli"),
+            "gpt-5",
+        );
+        let app_row = duration_entry_with_source(
+            1,
+            "2026-07-23T09:00:00Z",
+            3500.0,
+            Some("copilot-app"),
+            "gpt-5",
+        );
+        let cli_call = duration_entry_with_source(
+            1,
+            "2026-07-24T08:00:00Z",
+            100.0,
+            Some("copilot-cli"),
+            "gpt-5",
+        );
+        let app_call = duration_entry_with_source(
+            1,
+            "2026-07-24T08:00:00Z",
+            100.0,
+            Some("copilot-app"),
+            "gpt-5",
+        );
+
+        assert_eq!(
+            session_duration_ms([
+                (
+                    &f71a97c_row,
+                    Some("copilot-cli-agents:aa:duration-session:main:aa3")
+                ),
+                (
+                    &cli_call,
+                    Some("copilot-cli-agents:aa:duration-session:call:h1")
+                ),
+            ]),
+            100,
+            "f71a97c 彙總 ID 無日期段，須落回 Split 而非 DayTotal"
+        );
+        assert_eq!(
+            session_duration_ms([
+                (
+                    &app_row,
+                    Some("copilot-app:aa:duration-session:2026-07-23:main:aa3")
+                ),
+                (&app_call, Some("copilot-app:aa:duration-session:call:h9")),
+            ]),
+            100,
+            "來源種類不是 copilot-cli，v3 形狀 ID 不得變 DayTotal（App 語意維持）"
+        );
+        assert_eq!(
+            session_duration_ms([
+                (&hook_row, None),
+                (
+                    &cli_call,
+                    Some("copilot-cli-agents:aa:duration-session:call:h1")
+                )
+            ]),
+            100,
+            "Hook 累積快照無 ID，須落回 Split 而非 DayTotal"
+        );
+    }
+
+    #[test]
+    fn session_duration_ms_keeps_legacy_cli_cumulative_shapes_latest_only() {
+        // 無逐次呼叫列的分組維持 1448fc7 累積值 latest-only 契約：f71a97c
+        // per-agent 彙總與 Hook 累積快照各取最新一筆，絕不按日疊加。
+        let stale_f71a97c = duration_entry_with_source(
+            1,
+            "2026-07-23T09:00:00Z",
+            3500.0,
+            Some("copilot-cli"),
+            "gpt-5",
+        );
+        let fresh_f71a97c = duration_entry_with_source(
+            1,
+            "2026-07-23T10:00:00Z",
+            4000.0,
+            Some("copilot-cli"),
+            "gpt-5",
+        );
+        let stale_hook = duration_entry_with_source(
+            1,
+            "2026-07-23T09:00:00Z",
+            3500.0,
+            Some("copilot-cli"),
+            "gpt-5",
+        );
+        let fresh_hook = duration_entry_with_source(
+            1,
+            "2026-07-23T10:00:00Z",
+            4000.0,
+            Some("copilot-cli"),
+            "gpt-5",
+        );
+
+        assert_eq!(
+            session_duration_ms([
+                (
+                    &stale_f71a97c,
+                    Some("copilot-cli-agents:aa:duration-session:main:aa3")
+                ),
+                (
+                    &fresh_f71a97c,
+                    Some("copilot-cli-agents:aa:duration-session:main:bb4")
+                ),
+            ]),
+            4000
+        );
+        assert_eq!(
+            session_duration_ms([(&stale_hook, None), (&fresh_hook, None)]),
+            4000
+        );
+    }
+
+    #[test]
+    fn session_durations_by_identity_keeps_legacy_cli_daily_aggregate_across_dates() {
+        // 月報模型明細／日報 session 明細實際路徑：07-23 每日聚合 3500ms +
+        // 07-24 呼叫 100ms 同分組合計 3600ms（修正前只剩呼叫的 100ms）。
+        let daily = duration_entry_with_source(
+            1,
+            "2026-07-23T09:00:00Z",
+            3500.0,
+            Some("copilot-cli"),
+            "gpt-5",
+        );
+        let call = duration_entry_with_source(
+            1,
+            "2026-07-24T08:00:00Z",
+            100.0,
+            Some("copilot-cli"),
+            "gpt-5",
+        );
+
+        let durations = session_durations_by_identity([
+            (
+                &daily,
+                "copilot",
+                Some("copilot-cli-agents:aa:duration-session:2026-07-23:main:aa3"),
+            ),
+            (
+                &call,
+                "copilot",
+                Some("copilot-cli-agents:aa:duration-session:call:h1"),
+            ),
+        ]);
+
+        let identity = SessionIdentity::from_entry("copilot", &daily);
+        assert_eq!(durations.get(&identity).copied(), Some(3600));
     }
 
     #[test]
