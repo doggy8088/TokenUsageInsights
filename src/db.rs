@@ -344,6 +344,14 @@ const COPILOT_CLI_AGENT_CURSOR_PREFIX: &str = "sync:copilot_cli_agents:";
 /// event arrives, without forcing already-valid sessions to roll back.
 const COPILOT_CLI_AGENT_PENDING_PREFIX: &str = "sync:copilot_cli_agents:pending:";
 
+/// Durable marker for Copilot App sessions whose transcript reconciliation has
+/// not completed yet (review comment 4403291310). Mirrors
+/// [`COPILOT_CLI_AGENT_PENDING_PREFIX`] so the SQLite fallback can force a full
+/// native-history rescan once the event file disappears instead of leaving the
+/// session permanently uncovered. Stored without a trailing separator so the
+/// prefix also works with [`load_sync_state_for_prefix`] (which appends `:%`).
+const COPILOT_APP_TRANSCRIPT_PENDING_PREFIX: &str = "sync:copilot_app_transcript:pending";
+
 /// Versioned, root-scoped repair key (canonical source key is appended).
 /// Upgrades scan all CLI sessions regardless of older SQLite cursors. Each
 /// session is replaced atomically with per-call rows; failed
@@ -2448,6 +2456,154 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
     sync_copilot_app_usage_logs_from(conn, &crate::paths::copilot_app_dir())
 }
 
+/// Per-sub-agent turn boundaries of the agent's filtered timeline view.
+///
+/// The detail page numbers each agent's replies with its own filtered counter
+/// (see `timeline::parse_copilot_timeline_filtered`): prompts share a turn and
+/// the first nonempty reply after a prompt closes it. Usage joins those replies
+/// strictly by that number, so a SQLite-only sub-agent call must not keep the
+/// parent session's `turn_index + 1` (review comment 4403291628).
+struct AgentFilteredTurns {
+    /// `(timestamp, turn_no)` of every nonempty reply, in stream order.
+    replies: Vec<(Option<chrono::DateTime<chrono::Utc>>, u32)>,
+    /// Turn counter after the last reply, for calls that follow every reply.
+    end_turn: u32,
+}
+
+impl AgentFilteredTurns {
+    /// A call belongs to the next reply of the agent's filtered timeline — the
+    /// same forward attribution `copilot::read_calls` derives from the stream.
+    fn turn_at(&self, ts: chrono::DateTime<chrono::Utc>) -> u32 {
+        self.replies
+            .iter()
+            .find(|(reply_ts, _)| reply_ts.is_some_and(|reply_ts| reply_ts >= ts))
+            .map(|(_, turn)| *turn)
+            .unwrap_or(self.end_turn)
+    }
+}
+
+/// Replay each sub-agent's filtered timeline from the shared events file to
+/// learn its per-reply turn numbers. Mirrors the keep and numbering rules of
+/// `timeline::parse_copilot_timeline_filtered` with `agent_filter = Some(a)`:
+/// shared prompts (no `agentId`) and the agent's own prompts open a turn, and
+/// the agent's first nonempty reply closes it.
+fn copilot_filtered_agent_turns(
+    path: &Path,
+    should_cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<HashMap<String, AgentFilteredTurns>, String> {
+    struct AgentState {
+        next: u32,
+        pending_prompt: bool,
+        replies: Vec<(Option<chrono::DateTime<chrono::Utc>>, u32)>,
+    }
+    let file = File::open(path).map_err(|e| format!("讀取 Copilot 事件檔失敗: {e}"))?;
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    let mut states: HashMap<String, AgentState> = HashMap::new();
+    let mut shared_prompt_seen = false;
+    loop {
+        if should_cancel() {
+            return Err("Copilot 同步已取消".into());
+        }
+        line.clear();
+        if reader.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
+            break;
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event: serde_json::Value =
+            serde_json::from_str(&line).map_err(|_| "Copilot 事件檔包含無效 JSON".to_string())?;
+        let kind = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let agent = event
+            .get("agentId")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+        let ts = event
+            .get("timestamp")
+            .and_then(|v| v.as_str())
+            .and_then(|raw| crate::copilot::parse_timestamp(raw).ok());
+        match (kind, agent) {
+            ("user.message" | "USER_PROMPT", None) => {
+                shared_prompt_seen = true;
+                for state in states.values_mut() {
+                    state.pending_prompt = true;
+                }
+            }
+            ("user.message" | "USER_PROMPT", Some(agent)) => {
+                states
+                    .entry(agent.to_owned())
+                    .or_insert_with(|| AgentState {
+                        next: 1,
+                        pending_prompt: shared_prompt_seen,
+                        replies: Vec::new(),
+                    })
+                    .pending_prompt = true;
+            }
+            ("assistant.message" | "ASSISTANT_REPLY", Some(agent)) => {
+                let content = event
+                    .get("payload")
+                    .or_else(|| event.get("data"))
+                    .and_then(|p| p.get("content"))
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("");
+                if content.is_empty() {
+                    continue;
+                }
+                let state = states
+                    .entry(agent.to_owned())
+                    .or_insert_with(|| AgentState {
+                        next: 1,
+                        pending_prompt: shared_prompt_seen,
+                        replies: Vec::new(),
+                    });
+                state.replies.push((ts, state.next));
+                if state.pending_prompt {
+                    state.next = state.next.checked_add(1).ok_or("Copilot 回合數超出範圍")?;
+                    state.pending_prompt = false;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(states
+        .into_iter()
+        .map(|(agent, state)| {
+            (
+                agent,
+                AgentFilteredTurns {
+                    replies: state.replies,
+                    end_turn: state.next,
+                },
+            )
+        })
+        .collect())
+}
+
+/// True for a merged call that exists only in `assistant_usage_events` and
+/// belongs to a sub-agent: `merge_calls` appends those unchanged with the
+/// parent's `turn_index + 1`, while paired calls carry `event:` identities.
+fn is_native_only_subagent_call(call: &crate::copilot::Call) -> bool {
+    call.agent_id.is_some() && call.identity.starts_with("sqlite:")
+}
+
+/// Filtered-timeline turn for a merged call that needs derivation; `None` for
+/// paired calls and main-agent calls, which keep their existing turns.
+fn native_only_subagent_turn(
+    call: &crate::copilot::Call,
+    turns: &HashMap<String, AgentFilteredTurns>,
+) -> Option<u32> {
+    if !is_native_only_subagent_call(call) {
+        return None;
+    }
+    let agent = call.agent_id.as_deref()?;
+    Some(match turns.get(agent) {
+        Some(boundaries) => boundaries.turn_at(call.timestamp),
+        // The agent has no filtered events at all; its timeline starts at one.
+        None => 1,
+    })
+}
+
 /// Rebuild registered App sessions from complete per-call sources, independently
 /// of the legacy SQLite cursor. Failed reads leave both rows and state intact.
 fn sync_copilot_app_transcripts(
@@ -2525,27 +2681,46 @@ fn sync_copilot_app_transcripts(
             if before != copilot_cli_transcript_fingerprint(&path)? {
                 return Err("Copilot App 事件檔在讀取時變更".into());
             }
+            // (review comment 4403291628) `merge_calls` appends SQLite-only
+            // sub-agent calls unchanged, so they would keep the PARENT
+            // session's `turn_index + 1`, while the detail page joins their
+            // usage on the sub-agent's own filtered timeline, whose numbering
+            // restarts at one. Re-derive those turns from the agent's filtered
+            // replies and event timestamps; paired calls keep their
+            // event-derived turns and main-agent calls keep `turn_index + 1`
+            // (they match the main timeline).
+            let subagent_turns = if calls.iter().any(is_native_only_subagent_call) {
+                Some(copilot_filtered_agent_turns(&path, should_cancel)?)
+            } else {
+                None
+            };
             let rows: Vec<_> = calls
                 .into_iter()
-                .map(|r| CopilotCliUsageRow {
-                    session_id: sid.to_string(),
-                    call_identity: r.identity,
-                    turn_no: r.turn_no.unwrap_or(1),
-                    native_identity: r.native_identity,
-                    reasoning_effort: r.reasoning_effort,
-                    ts: r
-                        .timestamp
-                        .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
-                    model: r.model,
-                    agent_id: r.agent_id,
-                    initiator: r.initiator,
-                    cwd: cwd.clone(),
-                    input_tokens: r.metrics.input.saturating_sub(r.metrics.cache_read),
-                    output_tokens: r.metrics.output,
-                    cache_read: r.metrics.cache_read,
-                    cache_write: r.metrics.cache_write,
-                    reasoning: r.metrics.reasoning,
-                    duration_ms: r.metrics.duration_ms,
+                .map(|r| {
+                    let turn_no = subagent_turns
+                        .as_ref()
+                        .and_then(|turns| native_only_subagent_turn(&r, turns))
+                        .unwrap_or(r.turn_no.unwrap_or(1));
+                    CopilotCliUsageRow {
+                        session_id: sid.to_string(),
+                        call_identity: r.identity,
+                        turn_no,
+                        native_identity: r.native_identity,
+                        reasoning_effort: r.reasoning_effort,
+                        ts: r
+                            .timestamp
+                            .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
+                        model: r.model,
+                        agent_id: r.agent_id,
+                        initiator: r.initiator,
+                        cwd: cwd.clone(),
+                        input_tokens: r.metrics.input.saturating_sub(r.metrics.cache_read),
+                        output_tokens: r.metrics.output,
+                        cache_read: r.metrics.cache_read,
+                        cache_write: r.metrics.cache_write,
+                        reasoning: r.metrics.reasoning,
+                        duration_ms: r.metrics.duration_ms,
+                    }
                 })
                 .collect();
             if should_cancel() {
@@ -2704,6 +2879,59 @@ fn sync_copilot_app_usage_logs_from_with_cancel(
         .map_err(|e| e.to_string())?;
     let authoritative_registry = app_session_ids.clone();
     let managed = load_sync_state_for_prefix(conn, "copilot-app-transcript");
+    // (review comment 4403291310) Transcript reconciliation failures used to be
+    // log-only: the session stayed excluded from the SQLite fallback while the
+    // global cursor advanced past its native calls, so once its event file was
+    // removed the unprocessed usage became unreachable. Record every
+    // registered session whose transcript has not been reconciled with a
+    // durable pending marker (mirroring `COPILOT_CLI_AGENT_PENDING_PREFIX`) so
+    // the fallback can force a full native-history rescan once it owns the
+    // session. Reconciled sessions and sessions that left the registry drop
+    // their marker again, so an unchanged source always converges.
+    let pending_prefix = format!("{COPILOT_APP_TRANSCRIPT_PENDING_PREFIX}:{source_key}::");
+    let pending_states = load_sync_state_for_prefix(conn, COPILOT_APP_TRANSCRIPT_PENDING_PREFIX);
+    let mut pending_session_ids: HashSet<String> = HashSet::new();
+    for filename in pending_states.keys() {
+        if let Some(sid) = filename.strip_prefix(&pending_prefix) {
+            if authoritative_registry.contains(sid) {
+                pending_session_ids.insert(sid.to_owned());
+            } else {
+                conn.execute(
+                    "DELETE FROM sync_state WHERE filename = ?",
+                    params![filename],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
+    }
+    for sid in &authoritative_registry {
+        if !crate::session_files::is_safe_session_id(sid) {
+            continue;
+        }
+        let state_key = format!("copilot-app-transcript:{source_key}:{sid}");
+        let pending_key = format!("{pending_prefix}{sid}");
+        if managed.contains_key(&state_key) {
+            if pending_session_ids.remove(sid) {
+                conn.execute(
+                    "DELETE FROM sync_state WHERE filename = ?",
+                    params![pending_key],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        } else if app_dir
+            .join("session-state")
+            .join(sid)
+            .join("events.jsonl")
+            .exists()
+            && pending_session_ids.insert(sid.clone())
+        {
+            conn.execute(
+                "INSERT OR REPLACE INTO sync_state VALUES (?, 0, 0)",
+                params![pending_key],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+    }
     let app_session_ids: HashSet<String> = app_session_ids
         .into_iter()
         .filter(|sid| {
@@ -2716,10 +2944,25 @@ fn sync_copilot_app_usage_logs_from_with_cancel(
         })
         .collect();
     let existing_app_session_ids = query_copilot_app_session_ids(conn, &source_key)?;
-    let reconciliation_session_ids: Vec<String> = app_session_ids
+    let mut reconciliation_session_ids: Vec<String> = app_session_ids
         .difference(&existing_app_session_ids)
         .cloned()
         .collect();
+    // (review comment 4403291310) A session whose transcript reconciliation
+    // failed keeps its pending marker; once the fallback owns it (event file
+    // gone), re-aggregate its complete native history even when older rows
+    // exist and the global cursor already passed its events — otherwise the
+    // session ends up permanently outside both collectors.
+    // `forced_recovery_ids` tracks the markers to clear once the rebuild runs.
+    let mut forced_recovery_ids: Vec<String> = Vec::new();
+    for sid in &app_session_ids {
+        if pending_session_ids.contains(sid) {
+            if !reconciliation_session_ids.contains(sid) {
+                reconciliation_session_ids.push(sid.clone());
+            }
+            forced_recovery_ids.push(sid.clone());
+        }
+    }
     let stale_app_session_ids: Vec<String> = existing_app_session_ids
         .difference(&authoritative_registry)
         .cloned()
@@ -2855,6 +3098,7 @@ fn sync_copilot_app_usage_logs_from_with_cancel(
     // Add all turns for registry sessions which do not yet have an App row.
     // This is the history-based reconciliation path for events whose cursor
     // was already advanced before data.db.sessions contained the session.
+    let mut recovered_pending_ids: Vec<String> = Vec::new();
     if !reconciliation_session_ids.is_empty() {
         let mut reconciliation_stmt = session_store
             .prepare(
@@ -2870,11 +3114,28 @@ fn sync_copilot_app_usage_logs_from_with_cancel(
                     Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
                 })
                 .map_err(|e| format!("執行 Copilot App reconciliation 查詢失敗: {}", e))?;
+            let mut native_turns = 0usize;
             for row in rows {
                 let turn =
                     row.map_err(|e| format!("讀取 Copilot App reconciliation turn 失敗: {}", e))?;
+                native_turns += 1;
                 if touched_set.insert(turn.clone()) {
                     touched_turns.push(turn);
+                }
+            }
+            // (review comment 4403291310) A forced-recovery session without
+            // native events has nothing left to rebuild: clear its marker now.
+            // Sessions with native turns clear theirs inside the rebuild
+            // transaction below, so a failed write keeps retrying instead.
+            if forced_recovery_ids.contains(session_id) {
+                if native_turns == 0 {
+                    conn.execute(
+                        "DELETE FROM sync_state WHERE filename = ?",
+                        params![format!("{pending_prefix}{session_id}")],
+                    )
+                    .map_err(|e| e.to_string())?;
+                } else {
+                    recovered_pending_ids.push(session_id.clone());
                 }
             }
         }
@@ -3235,6 +3496,18 @@ fn sync_copilot_app_usage_logs_from_with_cancel(
             let _ = tx.rollback();
             return Ok(());
         }
+    }
+
+    // (review comment 4403291310) The forced full-history rebuild commits
+    // together with its rows: clear its pending markers so an unchanged source
+    // converges instead of rescanning on every sync. A rollback keeps the
+    // markers so the rebuild is retried on the next sync.
+    for session_id in &recovered_pending_ids {
+        tx.execute(
+            "DELETE FROM sync_state WHERE filename = ?",
+            params![format!("{pending_prefix}{session_id}")],
+        )
+        .map_err(|e| e.to_string())?;
     }
 
     if should_cancel() {
@@ -16942,6 +17215,150 @@ mod tests {
         );
         f.sync();
         assert_eq!(f.replies("app", None), vec![(1, 110), (2, 110)]);
+        assert_eq!(f.replies("app__child", Some("child")), vec![(1, 110)]);
+    }
+
+    fn app_text_at(kind: &str, ts: &str) -> serde_json::Value {
+        let mut event = app_text(kind);
+        event["timestamp"] = serde_json::json!(ts);
+        event
+    }
+
+    #[test]
+    fn transcript_failure_records_pending_and_rebuilds_native_history_after_file_removal() {
+        let mut f = AppReviewFixture::new(&["app"]);
+        let key = encode_hex(
+            f.root
+                .canonicalize()
+                .unwrap()
+                .as_os_str()
+                .as_encoded_bytes(),
+        );
+        let pending_key = format!("sync:copilot_app_transcript:pending:{key}::app");
+        // Older aggregates keep the session out of the plain reconciliation set.
+        f.conn
+            .execute(
+                "INSERT INTO usage_entries (
+                    assistant_type, source_kind, source_dir_key, usage_identity,
+                    timestamp, date, session_id, turn_no,
+                    tokens_input, tokens_output, tokens_total,
+                    delta_input, delta_output, delta_total,
+                    import_source_id
+                 ) VALUES ('copilot', 'copilot-app', ?1, '', '2026-07-20T00:00:00Z',
+                    '2026-07-20', 'app', 1, 1, 0, 1, 1, 0, 1, ?2)",
+                params![key, format!("copilot-app:{key}:app:0")],
+            )
+            .unwrap();
+        f.native(1, "app", "2026-07-23T12:00:00Z", Some(0), None);
+        f.native(2, "app", "2026-07-23T12:01:00Z", Some(1), None);
+        // A line without a trailing newline deterministically fails transcript
+        // reconciliation ("事件檔仍在寫入") for an unchanged source.
+        let events = f
+            .root
+            .join("session-state")
+            .join("app")
+            .join("events.jsonl");
+        fs::create_dir_all(events.parent().unwrap()).unwrap();
+        fs::write(&events, "{\"type\":\"session.info\"}").unwrap();
+        f.sync();
+        assert!(
+            load_sync_state_for_prefix(&f.conn, "sync:copilot_app_transcript:pending")
+                .contains_key(&pending_key),
+            "failed transcript reconciliation must leave a durable pending marker"
+        );
+        fs::remove_file(&events).unwrap();
+        f.sync();
+        {
+            let states: Vec<String> = f
+                .conn
+                .prepare("SELECT filename FROM sync_state")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            let native: Vec<(String, i64, i64)> = f
+                .store
+                .as_ref()
+                .unwrap()
+                .prepare("SELECT session_id,turn_index,id FROM assistant_usage_events")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            let rows: Vec<(String, i64, i64)> = f
+                .conn
+                .prepare("SELECT session_id,turn_no,delta_total FROM usage_entries")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            eprintln!("DEBUG states={states:?} native={native:?} rows={rows:?}");
+        }
+        let rebuilt: (i64, i64) = f
+            .conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(delta_total), 0) FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(rebuilt, (2, 220));
+        assert!(
+            !load_sync_state_for_prefix(&f.conn, "sync:copilot_app_transcript:pending")
+                .contains_key(&pending_key),
+            "a completed rebuild must clear the pending marker"
+        );
+        let changes = f
+            .conn
+            .query_row::<i64, _, _>("SELECT total_changes()", [], |r| r.get(0))
+            .unwrap();
+        f.sync();
+        assert_eq!(
+            f.conn
+                .query_row::<i64, _, _>("SELECT total_changes()", [], |r| r.get(0))
+                .unwrap(),
+            changes,
+            "an unchanged source must converge instead of rescanning forever"
+        );
+    }
+
+    #[test]
+    fn sqlite_only_subagent_call_uses_child_filtered_turn() {
+        let mut f = AppReviewFixture::new(&["app"]);
+        let mut child_reply = app_text_at("assistant.message", "2026-07-23T12:02:10Z");
+        child_reply["agentId"] = serde_json::json!("child");
+        // SQLite-only sub-agent call: the parent session's turn_index is 2
+        // (turn 3) but the child's filtered timeline only has one reply.
+        f.native(3, "app", "2026-07-23T12:02:00Z", Some(2), Some("child"));
+        f.write(
+            "app",
+            &[
+                app_text_at("user.message", "2026-07-23T12:00:00Z"),
+                app_text_at("assistant.message", "2026-07-23T12:00:10Z"),
+                app_text_at("user.message", "2026-07-23T12:01:00Z"),
+                app_text_at("assistant.message", "2026-07-23T12:01:10Z"),
+                app_text_at("user.message", "2026-07-23T12:01:50Z"),
+                child_reply,
+            ],
+        );
+        f.sync();
+        let turns: Vec<i64> = f
+            .conn
+            .prepare(
+                "SELECT turn_no FROM usage_entries
+                 WHERE session_id = 'app__child' AND parent_session_id = 'app'
+                 ORDER BY turn_no",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(turns, vec![1]);
         assert_eq!(f.replies("app__child", Some("child")), vec![(1, 110)]);
     }
 
