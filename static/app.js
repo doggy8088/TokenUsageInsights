@@ -1,4 +1,4 @@
-import i18n from './i18n.js?v=39';
+import i18n from './i18n.js?v=40';
 import {
   aggregateDailyTokenCandles,
   calculateCandleViewport,
@@ -2203,19 +2203,6 @@ function activateAssistantWithoutReload(assistant) {
   fetchPricingRules();
 }
 
-// Import conflict label (records whose overlap could not be proven are not
-// imported and must be surfaced separately from duplicates).
-function importConflictLabel(count) {
-  const labels = {
-    'zh-TW': `衝突未匯入 ${count} 筆`,
-    'zh-CN': `冲突未导入 ${count} 笔`,
-    en: `Skipped ${count} conflicting records`,
-    ja: `競合 ${count} 件をスキップ`,
-    ko: `충돌 ${count}건 건너뜀`,
-  };
-  return labels[currentLang] || labels.en;
-}
-
 async function executePendingUsageImport() {
   if (!pendingUsageImport || !updateUsageImportValidation()) return;
 
@@ -2268,7 +2255,7 @@ async function executePendingUsageImport() {
       msg = `${msg}; ${t('usage_import_skipped').replace('{skipped}', String(skipped))}`;
     }
     if (conflicts > 0) {
-      msg = `${msg}; ${importConflictLabel(conflicts)}`;
+      msg = `${msg}; ${t('usage_import_conflicts').replace('{conflicts}', String(conflicts))}`;
     }
     showNotification(msg, 'success');
     document.getElementById('usage-import-modal')?.classList.remove('active');
@@ -2361,7 +2348,7 @@ function renderUsageImportHistory(batches, assistant) {
             ${escapeHtml(t('import_history_counts')
               .replace('{imported}', String(batch?.imported ?? 0))
               .replace('{total}', String(batch?.total ?? 0))
-              .replace('{skipped}', String(batch?.skipped_duplicates ?? 0)))}${Number(batch?.skipped_conflicts ?? 0) > 0 ? ` · ${escapeHtml(importConflictLabel(Number(batch?.skipped_conflicts ?? 0)))}` : ''}<br>
+              .replace('{skipped}', String(batch?.skipped_duplicates ?? 0)))}${Number(batch?.skipped_conflicts ?? 0) > 0 ? ` · ${escapeHtml(t('usage_import_conflicts').replace('{conflicts}', String(batch?.skipped_conflicts ?? 0)))}` : ''}<br>
             ${escapeHtml(createdAt)}
             ${rolledBack ? ` · ${escapeHtml(t('import_removed_records').replace('{count}', String(batch?.removed_records ?? 0)))}` : ''}
           </div>
