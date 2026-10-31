@@ -247,12 +247,17 @@ fn entry_day(entry: &UsageEntry) -> Option<&str> {
 /// (2) ID 落在 `copilot-cli-agents:` 命名空間且無 `:call:` 標記（非逐次呼叫列）；
 /// (3) ID 形狀閘門：dcad888 寫入契約
 ///     `copilot-cli-agents:{source_key}:{session_id}:{YYYY-MM-DD}:{agent_segment}:{model_identity}`
-///     （每 UTC 日、agent、model 一列的每日總量，turn 恆為合成值 1）由右側
-///     解析，右起第 3 段須為 `%Y-%m-%d` 日期段；由右解析可容忍 session_id
-///     含 `:`（日期段恆為右起第 3 段）。
+///     （每 UTC 日、agent、model 一列的每日總量，turn 恆為合成值 1）。
+///     日期段的位置不固定在右起第 3 段：`agent_segment` 依契約原樣嵌入、可能
+///     含 `:`（如 `vendor:builder`），會把日期段往左擠，`session_id` 含 `:`亦
+///     同理。因此掃描右側片段找日期形狀段（其右至少要有 agent 與 model 兩段
+///     尾巴），並以契約的 model 尾段收斂形狀（`encode_hex` 輸出＝偶數長 hex；
+///     model 缺漏時契約值為空字串）。
 /// f71a97c 時代的 per-agent 彙總 ID（`{key}:{sid}:{agent}:{model}`，無日期段）
 /// 與 Hook session 累積快照（ID NULL）都落回 Split：它們的覆蓋本來就跨日期，
-/// 套用日期切分會在「累積列＋他日呼叫」場景反向雙計。
+/// 套用日期切分會在「累積列＋他日呼叫」場景反向雙計。既有邊界：f71a97c 形狀
+/// 的 `session_id` 若恰好是日期形狀且 model 尾段合乎契約，與舊實作一樣會誤判
+/// （ID 形狀本身無法區分兩者）。
 fn is_legacy_cli_daily_aggregate(
     source_kind: Option<&str>,
     import_source_id: Option<&str>,
@@ -263,8 +268,14 @@ fn is_legacy_cli_daily_aggregate(
     if source_kind != Some("copilot-cli") || rest.contains(PER_CALL_IMPORT_SOURCE_MARKER) {
         return false;
     }
-    let segments: Vec<&str> = rest.rsplitn(4, ':').collect();
-    segments.len() == 4 && is_utc_date_shape(segments[2])
+    let segments: Vec<&str> = rest.rsplit(':').collect();
+    let model_tail_is_contract_hex =
+        segments[0].len().is_multiple_of(2) && segments[0].chars().all(|c| c.is_ascii_hexdigit());
+    model_tail_is_contract_hex
+        && segments
+            .iter()
+            .enumerate()
+            .any(|(i, segment)| i >= 2 && is_utc_date_shape(segment))
 }
 
 /// 非逐次呼叫列的覆蓋認領（review PRRT_kwDOTOgsec6yUKGR），形狀鏡像
@@ -1261,7 +1272,7 @@ mod tests {
             Some("copilot-cli"),
             "gpt-5",
         );
-        let daily_id = "copilot-cli-agents:aa:duration-session:2026-07-23:main:aa3";
+        let daily_id = "copilot-cli-agents:aa:duration-session:2026-07-23:main:42";
         let call_id = "copilot-cli-agents:aa:duration-session:call:h1";
 
         assert_eq!(
@@ -1304,11 +1315,11 @@ mod tests {
             session_duration_ms([
                 (
                     &first_day,
-                    Some("copilot-cli-agents:aa:duration-session:2026-07-23:main:aa3")
+                    Some("copilot-cli-agents:aa:duration-session:2026-07-23:main:42")
                 ),
                 (
                     &second_day,
-                    Some("copilot-cli-agents:aa:duration-session:2026-07-24:main:aa3")
+                    Some("copilot-cli-agents:aa:duration-session:2026-07-24:main:42")
                 ),
                 (
                     &call,
@@ -1349,11 +1360,11 @@ mod tests {
             session_duration_ms([
                 (
                     &stale,
-                    Some("copilot-cli-agents:aa:duration-session:2026-07-23:main:aa3")
+                    Some("copilot-cli-agents:aa:duration-session:2026-07-23:main:42")
                 ),
                 (
                     &fresh,
-                    Some("copilot-cli-agents:aa:duration-session:2026-07-23:main:bb4")
+                    Some("copilot-cli-agents:aa:duration-session:2026-07-23:main:43")
                 ),
                 (
                     &call,
@@ -1388,7 +1399,7 @@ mod tests {
             session_duration_ms([
                 (
                     &daily,
-                    Some("copilot-cli-agents:aa:duration-session:2026-07-23:main:aa3")
+                    Some("copilot-cli-agents:aa:duration-session:2026-07-23:main:42")
                 ),
                 (
                     &call,
@@ -1446,7 +1457,7 @@ mod tests {
             session_duration_ms([
                 (
                     &f71a97c_row,
-                    Some("copilot-cli-agents:aa:duration-session:main:aa3")
+                    Some("copilot-cli-agents:aa:duration-session:main:42")
                 ),
                 (
                     &cli_call,
@@ -1533,6 +1544,88 @@ mod tests {
     }
 
     #[test]
+    fn session_duration_ms_keeps_legacy_cli_daily_aggregate_with_colon_bearing_agent() {
+        // dcad888 寫入契約把 agent_id_segment 原樣嵌入 ID、可能含 ':'（如
+        // `vendor:builder`）：日期段會被擠到右起第 4+ 段，形狀閘門仍須辨識為
+        // 每日聚合——2026-07-23 的 3500ms 日總量與 2026-07-24 的 100ms 呼叫
+        // 覆蓋不相交，合計 3600ms（右起第 3 段硬編碼會整列讓位成 100ms）。
+        let daily = duration_entry_with_source(
+            1,
+            "2026-07-23T09:00:00Z",
+            3500.0,
+            Some("copilot-cli"),
+            "gpt-5",
+        );
+        let call = duration_entry_with_source(
+            1,
+            "2026-07-24T08:00:00Z",
+            100.0,
+            Some("copilot-cli"),
+            "gpt-5",
+        );
+        let daily_id = "copilot-cli-agents:aa:duration-session:2026-07-23:vendor:builder:42";
+        let call_id = "copilot-cli-agents:aa:duration-session:call:h1";
+
+        assert_eq!(
+            session_duration_ms([(&daily, Some(daily_id)), (&call, Some(call_id))]),
+            3600
+        );
+    }
+
+    #[test]
+    fn session_duration_ms_date_gate_requires_date_left_of_agent_and_contract_model_tail() {
+        // 形狀閘門的兩個邊界（缺一即落回 Split 語意、同覆蓋保守讓位 100ms）：
+        // (a) 日期形狀段在 agent 位置（右起第 2 段）不得認列——f71a97c 形狀
+        //     `{key}:{sid}:{date-like agent}:{model}` 沒有日期段契約；
+        // (b) model 尾段不合 dcad888 契約（encode_hex＝偶數長 hex）不得認列，
+        //     自由格式 ID 的雜散日期形狀段（此處是日期形狀的 session_id）不入
+        //     日桶。
+        let daily_like = duration_entry_with_source(
+            1,
+            "2026-07-23T09:00:00Z",
+            3500.0,
+            Some("copilot-cli"),
+            "gpt-5",
+        );
+        let call = duration_entry_with_source(
+            1,
+            "2026-07-24T08:00:00Z",
+            100.0,
+            Some("copilot-cli"),
+            "gpt-5",
+        );
+
+        assert_eq!(
+            session_duration_ms([
+                (
+                    &daily_like,
+                    Some("copilot-cli-agents:aa:duration-session:2026-07-23:42")
+                ),
+                (
+                    &call,
+                    Some("copilot-cli-agents:aa:duration-session:call:h1")
+                ),
+            ]),
+            100,
+            "日期形狀段在 agent 位置（右起第 2 段）不得認列"
+        );
+        assert_eq!(
+            session_duration_ms([
+                (
+                    &daily_like,
+                    Some("copilot-cli-agents:aa:2026-07-23:main:aa3")
+                ),
+                (
+                    &call,
+                    Some("copilot-cli-agents:aa:duration-session:call:h1")
+                ),
+            ]),
+            100,
+            "model 尾段不合 hex 契約不得認列"
+        );
+    }
+
+    #[test]
     fn session_durations_by_identity_keeps_legacy_cli_daily_aggregate_across_dates() {
         // 月報模型明細／日報 session 明細實際路徑：07-23 每日聚合 3500ms +
         // 07-24 呼叫 100ms 同分組合計 3600ms（修正前只剩呼叫的 100ms）。
@@ -1555,7 +1648,7 @@ mod tests {
             (
                 &daily,
                 "copilot",
-                Some("copilot-cli-agents:aa:duration-session:2026-07-23:main:aa3"),
+                Some("copilot-cli-agents:aa:duration-session:2026-07-23:main:42"),
             ),
             (
                 &call,
