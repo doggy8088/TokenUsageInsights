@@ -76,6 +76,36 @@ export function sessionSearchDataFingerprint(rows, rawUsageEntryCount) {
   ]);
 }
 
+// 搜尋重跑排程狀態機：對同一查詢保留執行中的請求，資料變動（指紋成長）
+// 只標記待重跑，於完成後合併成恰好一次重跑——避免即時刷新在整日掃描完成
+// 前反覆取消重啟（掃描 > 刷新間隔時零完成、搜尋永久載入中，且後端
+// spawn_blocking 掃描不受 fetch 取消影響而持續浪費，comment 4433863686）。
+// 僅「資料變動」走此保留＋合併路徑；query／context 變更仍由 app.js 沿用
+// abort＋重啟（scheduleSessionPromptSearch／resetSessionPromptSearch 送
+// 'reset' 歸零）。事件：'data-changed'（指紋成長）| 'run-started' |
+// 'run-completed' | 'reset'。回傳 { inFlight, dirty, startRun }：
+// startRun 是唯一決策輸出，呼叫端照表執行；N 次 data-changed 在執行中
+// 收斂成 dirty 布林值，完成後至多一次重跑（無重跑佇列）。
+export function nextSessionSearchRunState(state, event) {
+  const inFlight = Boolean(state?.inFlight);
+  const dirty = Boolean(state?.dirty);
+  switch (event) {
+    case 'data-changed':
+      // 執行中：不中斷、只標記待重跑；閒置：立即重跑（與資料變更即重跑的
+      // 原本語意相同）。
+      return { inFlight, dirty: dirty || inFlight, startRun: !inFlight };
+    case 'run-started':
+      // 掃描自當下資料起算：啟動即清除 dirty（先前變更已由本次掃描涵蓋）。
+      return { inFlight: true, dirty: false, startRun: false };
+    case 'run-completed':
+      // 完成後合併處理：套用本次結果後，累積的資料變更併成恰好一次重跑。
+      return { inFlight: false, dirty: false, startRun: dirty };
+    default:
+      // 'reset'：query／context 變更或輸入清空，狀態歸零待新意圖重建。
+      return { inFlight: false, dirty: false, startRun: false };
+  }
+}
+
 export function parentSessionIdentityKey(session, sessions) {
   if (!session?.parent_session_id) return null;
   // 父層通常是主／獨立 session（Copilot 合成 `<parent>__<agent>` 約定），

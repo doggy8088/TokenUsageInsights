@@ -6,16 +6,17 @@ import {
   calculateMovingAverageTrend,
   calculateMovingAverageViewportTrend,
   getChartDataPointX,
-} from './chart-utils.js?v=13';
+} from './chart-utils.js?v=14';
 import {
   buildSessionParentIndex,
   compareSessionRows,
   filterEntriesBySessionIdentity,
   matchesSessionIdentity,
+  nextSessionSearchRunState,
   sessionIdentityKey,
   sessionSearchDataFingerprint,
   sessionSearchMatchKey,
-} from './session-utils.js?v=8';
+} from './session-utils.js?v=9';
 import { parseUsageTimestamp } from './time-utils.js?v=1';
 
 // Globals
@@ -362,6 +363,9 @@ let currentSessionSearchUnavailable = 0;
 let currentSessionSearchState = 'idle';
 let sessionSearchDebounceTimer = null;
 let sessionSearchAbortController = null;
+// 搜尋重跑排程狀態：資料變更保留執行中的請求、標記 dirty 待完成後合併
+// 成恰好一次重跑（決策見 session-utils 的 nextSessionSearchRunState）。
+let sessionSearchRunState = { inFlight: false, dirty: false };
 let currentSessionCwdFilter = '';
 let currentSessionHomeDir = '';
 let sessionCwdFilterFromUrl = false;
@@ -3303,7 +3307,14 @@ function renderDashboard(data) {
 
   // 7. 渲染 Session 列表
   if (shouldRefreshSearch) {
-    scheduleSessionPromptSearch(currentSessionSearchQuery, { immediate: true });
+    // 資料變更不取消執行中的搜尋：只標記待重跑，於完成後合併成恰好一次
+    // 重跑；僅閒置時才立即重跑（comment 4433863686）。
+    sessionSearchRunState = nextSessionSearchRunState(sessionSearchRunState, 'data-changed');
+    if (sessionSearchRunState.startRun) {
+      scheduleSessionPromptSearch(currentSessionSearchQuery, { immediate: true });
+    } else {
+      sortAndRenderSessionTable();
+    }
   } else {
     sortAndRenderSessionTable();
   }
@@ -4287,6 +4298,7 @@ function resetSessionPromptSearch() {
   currentSessionSearchUnavailable = 0;
   currentSessionSearchState = 'idle';
   currentSessionSearchDataFingerprint = '';
+  sessionSearchRunState = nextSessionSearchRunState(sessionSearchRunState, 'reset');
 
   const input = document.getElementById('session-search-input');
   if (input) input.value = '';
@@ -4503,6 +4515,10 @@ function getSearchFilteredSessions() {
 function scheduleSessionPromptSearch(value, { immediate = false } = {}) {
   const query = String(value || '').trim();
 
+  // 排程即新意圖（query／context 變更或資料驅動重跑）：沿用既有 abort＋
+  // 重啟語意，狀態機一併歸零，避免被中止的舊 run 殘留 dirty／inFlight。
+  sessionSearchRunState = nextSessionSearchRunState(sessionSearchRunState, 'reset');
+
   if (sessionSearchDebounceTimer) {
     clearTimeout(sessionSearchDebounceTimer);
     sessionSearchDebounceTimer = null;
@@ -4537,6 +4553,7 @@ function scheduleSessionPromptSearch(value, { immediate = false } = {}) {
 }
 
 async function executeSessionPromptSearch(query, searchContext) {
+  sessionSearchRunState = nextSessionSearchRunState(sessionSearchRunState, 'run-started');
   const controller = new AbortController();
   sessionSearchAbortController = controller;
   const date = currentUsageData?.date;
@@ -4584,6 +4601,15 @@ async function executeSessionPromptSearch(query, searchContext) {
     if (sessionSearchAbortController === controller) {
       sessionSearchAbortController = null;
     }
+  }
+
+  // 完成後合併處理：執行期間累積的資料變更（dirty）合併成恰好一次重跑，
+  // 而非每筆變更各取消重啟一次（comment 4433863686）。AbortError 與
+  // stale（query／context 已變更）的提前回傳不經過這裡：那些路徑已由
+  // scheduleSessionPromptSearch／resetSessionPromptSearch 歸零狀態機。
+  sessionSearchRunState = nextSessionSearchRunState(sessionSearchRunState, 'run-completed');
+  if (sessionSearchRunState.startRun) {
+    scheduleSessionPromptSearch(query, { immediate: true });
   }
 }
 

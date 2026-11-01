@@ -6,6 +6,7 @@ import {
   compareSessionRows,
   filterEntriesBySessionIdentity,
   matchesSessionIdentity,
+  nextSessionSearchRunState,
   parentSessionIdentityKey,
   rootSessionIdentityKey,
   sessionIdentityKey,
@@ -727,4 +728,46 @@ test('search data fingerprint stays stable across row order and refresh with gro
     sessionSearchDataFingerprint(rows, 3),
     sessionSearchDataFingerprint(shuffled, 3),
   );
+});
+
+test('data change during an in-flight search keeps the request instead of aborting and restarting', () => {
+  // 無條件重啟回歸鎖（comment 4433863686）：執行中收到 data-changed 不得
+  // 產生任何取消／重啟遷移（startRun），只標記 dirty 待完成後合併處理。
+  // 還原成「指紋一變就 abort＋重啟」時此測試立即 RED。
+  const running = nextSessionSearchRunState(null, 'run-started');
+  const afterChange = nextSessionSearchRunState(running, 'data-changed');
+
+  assert.equal(afterChange.inFlight, true);
+  assert.equal(afterChange.startRun, false);
+  assert.equal(afterChange.dirty, true);
+});
+
+test('repeated data changes coalesce into exactly one rerun after the run completes', () => {
+  // 執行期間 N 次資料變更必須收斂成恰好一次重跑（無限長的變更序列也只
+  // 會排程一次），且重跑完成後不得再自行排程（防無限重跑）。
+  let state = nextSessionSearchRunState(null, 'run-started');
+  let scheduledRestarts = 0;
+
+  for (let change = 0; change < 3; change += 1) {
+    state = nextSessionSearchRunState(state, 'data-changed');
+    if (state.startRun) scheduledRestarts += 1;
+    assert.equal(state.startRun, false);
+    assert.equal(state.inFlight, true);
+  }
+  assert.equal(state.dirty, true);
+
+  state = nextSessionSearchRunState(state, 'run-completed');
+  if (state.startRun) scheduledRestarts += 1;
+  assert.equal(state.startRun, true);
+  assert.equal(state.inFlight, false);
+  assert.equal(state.dirty, false);
+  assert.equal(scheduledRestarts, 1);
+
+  // 重跑啟動後於乾淨狀態完成 → 閒置，不得再排程。
+  state = nextSessionSearchRunState(state, 'run-started');
+  state = nextSessionSearchRunState(state, 'run-completed');
+  assert.equal(state.startRun, false);
+  assert.equal(state.inFlight, false);
+  assert.equal(state.dirty, false);
+  assert.equal(scheduledRestarts, 1);
 });
