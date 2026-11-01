@@ -1,3 +1,4 @@
+use crate::copilot::event_body;
 use crate::db::{parse_cursor_timestamp, TokenStats};
 use crate::grok::{display_model_name, timestamp_to_rfc3339, value_to_text, UNKNOWN_MODEL};
 use serde::Serialize;
@@ -422,7 +423,7 @@ pub fn parse_copilot_timeline_filtered(
         match event_type {
             // 舊格式
             "session_meta" | "SESSION_STARTED" => {
-                let p = payload.or(data);
+                let p = event_body(payload, data);
                 if let Some(p) = p {
                     if let Some(v) = p.get("cli_version") {
                         metadata.insert("copilot_version".to_string(), v.clone());
@@ -447,7 +448,7 @@ pub fn parse_copilot_timeline_filtered(
             }
             // 新格式: session.start
             "session.start" => {
-                if let Some(p) = data.or(payload) {
+                if let Some(p) = event_body(data, payload) {
                     if let Some(v) = p.get("copilotVersion") {
                         metadata.insert("copilot_version".to_string(), v.clone());
                     }
@@ -480,7 +481,7 @@ pub fn parse_copilot_timeline_filtered(
                 });
             }
             "user.message" | "USER_PROMPT" => {
-                let p = payload.or(data);
+                let p = event_body(payload, data);
                 if let Some(p) = p {
                     let content = p
                         .get("content")
@@ -498,7 +499,7 @@ pub fn parse_copilot_timeline_filtered(
                 }
             }
             "assistant.message" | "ASSISTANT_REPLY" => {
-                let p = payload.or(data);
+                let p = event_body(payload, data);
                 if let Some(p) = p {
                     let content = p
                         .get("content")
@@ -577,7 +578,7 @@ pub fn parse_copilot_timeline_filtered(
                 }
             }
             "tool.call" | "TOOL_CALL" => {
-                let p = payload.or(data);
+                let p = event_body(payload, data);
                 if let Some(p) = p {
                     let call_id = p
                         .get("id")
@@ -611,7 +612,7 @@ pub fn parse_copilot_timeline_filtered(
                 }
             }
             "tool.response" | "TOOL_RESPONSE" => {
-                let p = payload.or(data);
+                let p = event_body(payload, data);
                 if let Some(p) = p {
                     let call_id = p
                         .get("id")
@@ -657,7 +658,7 @@ pub fn parse_copilot_timeline_filtered(
             }
             // 新格式: tool.execution_start（若 assistant.message toolRequests 已建立此 call_id，跳過）
             "tool.execution_start" => {
-                if let Some(p) = data.or(payload) {
+                if let Some(p) = event_body(data, payload) {
                     let call_id = p
                         .get("toolCallId")
                         .and_then(|i| i.as_str())
@@ -691,7 +692,7 @@ pub fn parse_copilot_timeline_filtered(
             }
             // 新格式: tool.execution_complete
             "tool.execution_complete" => {
-                if let Some(p) = data.or(payload) {
+                if let Some(p) = event_body(data, payload) {
                     let call_id = p
                         .get("toolCallId")
                         .and_then(|i| i.as_str())
@@ -737,7 +738,7 @@ pub fn parse_copilot_timeline_filtered(
             // top-level `agentId`; the filter above ensures only the matching
             // subagent view (or, for the main view, none of them) reaches here.
             "subagent.started" => {
-                let p = data.or(payload);
+                let p = event_body(data, payload);
                 let display = p
                     .and_then(|p| p.get("agentDisplayName"))
                     .and_then(|v| v.as_str())
@@ -1917,6 +1918,83 @@ mod tests {
             reply_turn_usage(&timeline),
             vec![(1, Some(110)), (2, Some(220))],
             "空 Agent ID 的提示必須推進回合，讓回覆掛到自己的用量"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn explicit_null_payload_reply_advances_the_same_turn_on_import_and_timeline() {
+        // (review 4433863670) 同一事件形狀必須在兩側同推進：typed 匯入端把明確
+        // `payload: null` 視同缺欄 → 退回非空 `data.content` → 回覆推進回合；
+        // 時間軸的 `Value::get("payload")` 對明確 null 回 `Some(Null)`，若仍「優先
+        // payload」就會丟掉回覆、回合卡住，後續呼叫的用量再也掛不到同回合回覆。
+        let events = [
+            r#"{"type":"user.message","data":{"content":"q"},"timestamp":"2026-07-23T12:00:00Z"}"#,
+            r#"{"type":"assistant.message","payload":null,"data":{"content":"hello"},"timestamp":"2026-07-23T12:00:01Z"}"#,
+            r#"{"type":"session.usage_record","id":"u-next","timestamp":"2026-07-23T12:00:02Z","data":{"usage":{"model":"A","inputTokens":100,"outputTokens":10,"cacheReadTokens":0,"reasoningTokens":0,"duration":5,"accounting":{"sourceSessionId":"s","usageId":"u-next","sequence":1}}}}"#,
+            r#"{"type":"user.message","data":{"content":"q2"},"timestamp":"2026-07-23T12:00:03Z"}"#,
+            r#"{"type":"session.usage_record","id":"u-2","timestamp":"2026-07-23T12:00:04Z","data":{"usage":{"model":"A","inputTokens":200,"outputTokens":20,"cacheReadTokens":0,"reasoningTokens":0,"duration":5,"accounting":{"sourceSessionId":"s","usageId":"u-2","sequence":2}}}}"#,
+            r#"{"type":"assistant.message","data":{"content":"world"},"timestamp":"2026-07-23T12:00:05Z"}"#,
+        ];
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "token-insights-cross-side-null-{}-{}.jsonl",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(
+            &path,
+            events
+                .iter()
+                .map(|line| format!("{line}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        // 匯入端：明確 null 的回覆仍推進回合，u-next 因此落在回合 2（未推進則為 1）。
+        let calls = crate::copilot::read_calls(&path, "s", &|| false).unwrap();
+        let call_turns: Vec<Option<u32>> = calls.iter().map(|c| c.turn_no).collect();
+        assert_eq!(
+            call_turns,
+            vec![Some(2), Some(2)],
+            "匯入端已推進過明確 null 的回覆"
+        );
+        // 以匯入端的回合編號建立回合用量對照表，驗證時間軸側的掛載一致。
+        let mut turn_total: HashMap<u32, u64> = HashMap::new();
+        for call in &calls {
+            *turn_total.entry(call.turn_no.unwrap()).or_default() +=
+                call.metrics.input + call.metrics.output;
+        }
+        let db_entries: HashMap<u32, (TokenStats, String)> = turn_total
+            .into_iter()
+            .map(|(turn, total)| (turn, (timeline_stats(total), "A".to_string())))
+            .collect();
+        let file = File::open(&path).unwrap();
+        let mut timeline = Vec::new();
+        let mut metadata = HashMap::new();
+        parse_copilot_timeline_filtered(
+            BufReader::new(file),
+            &db_entries,
+            &mut timeline,
+            &mut metadata,
+            None,
+            None,
+        );
+        let replies: Vec<(String, u32)> = timeline
+            .iter()
+            .filter_map(|item| match item {
+                TimelineItem::AgentReply { reply, turn_no, .. } => Some((reply.clone(), *turn_no)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            replies,
+            vec![("hello".to_string(), 1), ("world".to_string(), 2)],
+            "時間軸必須記錄明確 null 的回覆並與匯入端同步推進回合"
+        );
+        assert_eq!(
+            reply_turn_usage(&timeline),
+            vec![(1, None), (2, Some(330))],
+            "呼叫用量必須掛到同回合的回覆"
         );
         let _ = fs::remove_file(path);
     }

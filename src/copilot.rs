@@ -123,6 +123,22 @@ fn nonempty_content<'de, D: serde::Deserializer<'de>>(d: D) -> Result<bool, D::E
     d.deserialize_any(Content)
 }
 
+// The shared body precedence for Copilot events (review 4433863670): an
+// explicit `"payload": null` means "no payload" and falls back to the other
+// side — the same rule `Option<Data>` encodes on the typed import path, where
+// a null `payload` deserializes to `None` and `unwrap_or(&data)` reads `data`.
+// Keeping one helper pins both sides to identical explicit-null precedence.
+// `payload`-first callers pass `(payload, data)`; new-format `data`-first
+// callers pass `(data, payload)` — the parameter order is the precedence.
+pub(crate) fn event_body<'a>(
+    first: Option<&'a Value>,
+    second: Option<&'a Value>,
+) -> Option<&'a Value> {
+    first
+        .filter(|v| !v.is_null())
+        .or_else(|| second.filter(|v| !v.is_null()))
+}
+
 // Mirror the filtered timeline: consecutive prompts share a turn; the first
 // nonempty reply after a prompt advances the next reply. Each agent starts its
 // own filtered counter at one, even if first invoked on a later parent turn.
@@ -720,6 +736,21 @@ mod tests {
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0].native_identity, None);
         assert_eq!(merged[1].identity, "sqlite:far");
+    }
+
+    #[test]
+    fn event_body_falls_back_to_data_when_payload_is_explicit_null() {
+        // (review 4433863670) 明確 `payload: null` 視同缺欄退回 `data`；參數序即
+        // 優先序，新格式 data 優先的呼叫端以 (data, payload) 反轉。
+        let body = json!({"content":"hi"});
+        let explicit_null = Value::Null;
+        let payload = json!({"content":"from payload"});
+        assert_eq!(event_body(Some(&explicit_null), Some(&body)), Some(&body));
+        assert_eq!(event_body(None, Some(&body)), Some(&body));
+        assert_eq!(event_body(Some(&payload), Some(&body)), Some(&payload));
+        assert_eq!(event_body(Some(&body), Some(&explicit_null)), Some(&body));
+        assert_eq!(event_body(Some(&body), Some(&payload)), Some(&body));
+        assert_eq!(event_body(Some(&explicit_null), None), None);
     }
 
     #[test]
