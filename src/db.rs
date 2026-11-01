@@ -248,6 +248,16 @@ const COPILOT_PARENT_COLLISION_RECOVERY_KEY: &str =
 /// 已消費的一次性標記擋住、永遠不跑。
 const PARENT_SESSION_NORMALIZATION_MIGRATION_V2_KEY: &str =
     "migration:parent_session_id_normalization_v2";
+/// 一次性父層正規化 v3（PRRT_kwDOTOgsec6yVxcH）：v1/v2 的 SQL `TRIM` 只去除
+/// 一般空格，tab／NBSP 等 Unicode 空白包覆的舊列原樣穿過，摘要層 Rust `trim`
+/// 分組顯示 `parent`、詳情層 `parent_session_id = 'parent'` 精確比對卻漏列
+/// （純 tab 父層分組為 root 但 `RootOnly` 不認）。SQL 方案不可行——`TRIM`
+/// 不認 Unicode 空白、`REPLACE` 鏈涵蓋不到 NBSP／U+3000——v3 以 Rust
+/// `trim`（與 `SessionIdentity`／寫入邊界完全同語意）在 Rust 迴圈內正規化
+/// 存量列，並處理正規化觸發的唯一鍵碰撞折疊。獨立於 v1/v2 的 sync_state
+/// key：沿用舊 key 會被已消費的一次性標記擋住、永遠不跑。
+const PARENT_SESSION_NORMALIZATION_MIGRATION_V3_KEY: &str =
+    "migration:parent_session_id_normalization_v3";
 const CODEX_CLI_SOURCE_KIND: &str = "codex-cli";
 const CODEX_DESKTOP_SOURCE_KIND: &str = "codex-desktop";
 const CODEX_OTHER_SOURCE_KIND: &str = "codex-other";
@@ -1431,8 +1441,10 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
     // 執行，且不與 App sync 入口的 legacy cursor 升級路徑互相干擾）：
     // - 父層碰撞復原（PRRT_kwDOTOgsec6yUXND）
     // - 父層正規化 v2（PRRT_kwDOTOgsec6yUXNe）
+    // - 父層正規化 v3（PRRT_kwDOTOgsec6yVxcH，Unicode 空白＋碰撞折疊）
     run_copilot_parent_collision_recovery_migration(conn)?;
     run_parent_session_id_normalization_migration_v2(conn)?;
+    run_parent_session_id_normalization_migration_v3(conn)?;
 
     Ok(())
 }
@@ -2357,6 +2369,166 @@ fn run_parent_session_id_normalization_migration_v2(conn: &Connection) -> Result
         println!(
             "✅ 遷移：父層正規化 v2——修正 {} 列空白／padded 父層",
             repaired
+        );
+    }
+    Ok(())
+}
+
+/// 一次性父層正規化 v3（PRRT_kwDOTOgsec6yVxcH）：以 Rust `trim`（Unicode
+/// White_Space，含 tab／換行／NBSP／U+3000）正規化所有已存
+/// `parent_session_id`，折空 → NULL，與寫入邊界
+/// [`normalize_parent_session_id`]／摘要分組 [`crate::session_identity`]／
+/// 詳情 `push_parent_filter` 的精確比對統一為單一語意。v1/v2 的 SQL `TRIM`
+/// 只去一般空格（SQLite 實測：`'\tparent\t'`／`'\t\t'`／NBSP 原樣穿過），
+/// SQL 端無法補救——`REPLACE` 鏈涵蓋不到 Unicode 空白——因此在 Rust 迴圈內
+/// 正規化，詳情查詢路徑隨之免改（存量皆 canonical 後精確比對即同鍵）。
+///
+/// UNIQUE 碰撞折疊（必要）：兩個唯一索引
+/// （`uidx_assistant_source_session_turn`／`uidx_assistant_source_dir_session_turn`）
+/// 的鍵含「SQL-TRIM 後的父層」，`'\tparent\t'` 與 `'parent'` 是相異鍵、可
+/// 並存；正規化後同鍵必撞 UNIQUE。遷移以單一交易預解碰撞：同
+/// (assistant_type, source_kind, source_dir_key, session_id, turn_no,
+/// usage_identity, 正規化父層) 的折疊衝突沿用 `usage_entry_order` 的「快照
+/// 取最新」語意 ((turn_no, timestamp) 最大者、id 決勝保證確定性) 留一列、
+/// 刪被折列，總量絕不雙計。索引鍵其餘欄位皆為原值比對、與分組鍵一一對應，
+/// 無跨組碰撞可能。掛載於 `init_db` 尾端（索引每啟動 DROP+CREATE，存量鍵
+/// 變更自帶重建）與 Codex 同步遷移鏈；sync_state 標記守門、標記最後寫入，
+/// 冪等且一次性。
+fn run_parent_session_id_normalization_migration_v3(conn: &Connection) -> Result<(), String> {
+    let migration_done: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = ?)",
+            params![PARENT_SESSION_NORMALIZATION_MIGRATION_V3_KEY],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    if migration_done {
+        return Ok(());
+    }
+
+    #[derive(Debug)]
+    struct StoredParentRow {
+        id: i64,
+        turn_no: i64,
+        timestamp: String,
+        parent_session_id: Option<String>,
+        normalized: Option<String>,
+    }
+    // 正規化後的儲存唯一鍵：(assistant_type, source_kind, source_dir_key,
+    // session_id, turn_no, usage_identity, 正規化父層折成 '' 代表無父)。
+    // source_dir_key 為 NULL 的列屬前綴索引、非 NULL 的屬來源目錄索引，
+    // 以 Option 分組恰好對應「同一索引內才可能撞鍵」的語意。
+    type StorageKey = (String, String, Option<String>, String, i64, String, String);
+
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|error| format!("父層正規化 v3 遷移 BEGIN 失敗: {error}"))?;
+
+    // 全表單次掃描：碰撞組的另一方可能是已 canonical 的乾淨列（如乾淨
+    // 'parent' 與 '\tparent\t'），只掃髒列會漏折。
+    let mut groups: HashMap<StorageKey, Vec<StoredParentRow>> = HashMap::new();
+    {
+        let mut stmt = tx
+            .prepare(
+                "SELECT id, assistant_type, source_kind, source_dir_key, session_id, turn_no,
+                        usage_identity, parent_session_id, timestamp
+                 FROM usage_entries",
+            )
+            .map_err(|error| format!("準備讀取父層正規化資料失敗: {error}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, String>(8)?,
+                ))
+            })
+            .map_err(|error| format!("讀取父層正規化資料失敗: {error}"))?;
+        for row in rows {
+            let (
+                id,
+                assistant_type,
+                source_kind,
+                source_dir_key,
+                session_id,
+                turn_no,
+                usage_identity,
+                parent_session_id,
+                timestamp,
+            ) = row.map_err(|error| format!("解析父層正規化資料失敗: {error}"))?;
+            let normalized = normalize_parent_session_id(parent_session_id.clone());
+            let fold_parent_key = normalized.clone().unwrap_or_default();
+            groups
+                .entry((
+                    assistant_type,
+                    source_kind,
+                    source_dir_key,
+                    session_id,
+                    turn_no,
+                    usage_identity,
+                    fold_parent_key,
+                ))
+                .or_default()
+                .push(StoredParentRow {
+                    id,
+                    turn_no,
+                    timestamp,
+                    parent_session_id,
+                    normalized,
+                });
+        }
+    }
+
+    let mut normalized_rows = 0usize;
+    let mut folded_rows = 0usize;
+    for members in groups.into_values() {
+        // keep-latest：(turn_no, timestamp) 最大者存活（`usage_entry_order`
+        // 同語意），id 決勝讓結果與輸入／HashMap 迭代順序無關。
+        let Some(winner) = members.iter().max_by(|left, right| {
+            (left.turn_no, &left.timestamp, left.id).cmp(&(
+                right.turn_no,
+                &right.timestamp,
+                right.id,
+            ))
+        }) else {
+            continue;
+        };
+        for member in &members {
+            if member.id == winner.id {
+                continue;
+            }
+            tx.execute("DELETE FROM usage_entries WHERE id = ?", params![member.id])
+                .map_err(|error| format!("折疊父層正規化同鍵重複列失敗: {error}"))?;
+            folded_rows += 1;
+        }
+        if winner.parent_session_id != winner.normalized {
+            tx.execute(
+                "UPDATE usage_entries SET parent_session_id = ? WHERE id = ?",
+                params![winner.normalized, winner.id],
+            )
+            .map_err(|error| format!("修正 Unicode 空白父層資料失敗: {error}"))?;
+            normalized_rows += 1;
+        }
+    }
+
+    tx.execute(
+        "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time) VALUES (?, 1, 0)",
+        params![PARENT_SESSION_NORMALIZATION_MIGRATION_V3_KEY],
+    )
+    .map_err(|error| format!("寫入父層正規化 v3 遷移狀態失敗: {error}"))?;
+    tx.commit()
+        .map_err(|error| format!("父層正規化 v3 遷移 COMMIT 失敗: {error}"))?;
+    if normalized_rows > 0 || folded_rows > 0 {
+        println!(
+            "✅ 遷移：父層正規化 v3——trim {} 列 Unicode 空白父層、折疊 {} 列同鍵重複",
+            normalized_rows, folded_rows
         );
     }
     Ok(())
@@ -5705,6 +5877,7 @@ fn sync_codex_usage_logs_from_with_cancel(
     run_codex_rollout_identity_migration(conn)?;
     run_parent_session_id_normalization_migration(conn)?;
     run_parent_session_id_normalization_migration_v2(conn)?;
+    run_parent_session_id_normalization_migration_v3(conn)?;
 
     let mut transcripts = Vec::new();
     for root in roots {
@@ -25920,5 +26093,261 @@ mod tests {
             Some("  b  "),
             "遷移是一次性行為：標記生效後的新列不得被改寫"
         );
+    }
+
+    /// Claim B 修復（thread PRRT_kwDOTOgsec6yVxcH）：v1/v2 的 SQL `TRIM` 只去
+    /// 一般空格，tab／NBSP 包覆的舊列原樣穿過——摘要層 Rust `trim` 分組顯示
+    /// `parent`、詳情 `ChildOf("parent")` 精確比對卻漏列；純 tab 父層分組為
+    /// root 但 `RootOnly` 不認（清單看得到、詳情 404）。v3 遷移以 Rust 語意
+    /// （與 `SessionIdentity`／寫入邊界完全同基準）正規化存量列後，摘要吐出
+    /// 的身分鍵必須能被詳情路徑解析，root 謂詞語意也必須一致。
+    #[test]
+    fn parent_session_id_normalization_migration_v3_trims_unicode_whitespace_for_summary_and_details(
+    ) {
+        use crate::session_identity::SessionIdentity;
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // 模擬升級前既有庫：v1/v2 已跑過（SQL TRIM 只修空格），v3 不存在。
+        conn.execute(
+            "DELETE FROM sync_state WHERE filename = ?",
+            params![PARENT_SESSION_NORMALIZATION_MIGRATION_V3_KEY],
+        )
+        .unwrap();
+        for (session_id, parent) in [
+            ("s-tab", Some("\tparent\t")),
+            ("s-nbsp", Some("\u{a0}parent\u{a0}")),
+            ("s-blank-tab", Some("\t\t")),
+            ("s-clean", Some("parent")),
+        ] {
+            conn.execute(
+                "INSERT INTO usage_entries (
+                    assistant_type, source_kind, timestamp, date, session_id,
+                    turn_no, parent_session_id, delta_input, delta_output, delta_total
+                 ) VALUES ('codex', 'codex-cli', '2026-07-10T12:00:00Z', '2026-07-10',
+                    ?, 1, ?, 100, 0, 100)",
+                params![session_id, parent],
+            )
+            .unwrap();
+        }
+
+        // 評論的兩個故障鏈（修復前症狀）：'\tparent\t' 列被 ChildOf("parent")
+        // 漏列、'\t\t' 列分組為 root 卻不被 RootOnly 認領。
+        assert!(
+            get_session_assistant_and_transcript_in_parent_scope(
+                &conn,
+                "codex",
+                "s-tab",
+                Some("codex-cli"),
+                None,
+                ParentSessionScope::ChildOf("parent"),
+            )
+            .is_err(),
+            "修復前：tab 包覆父層列必須被 ChildOf(\"parent\") 漏列（症狀成立）"
+        );
+        assert!(
+            get_session_assistant_and_transcript_in_parent_scope(
+                &conn,
+                "codex",
+                "s-blank-tab",
+                Some("codex-cli"),
+                None,
+                ParentSessionScope::RootOnly,
+            )
+            .is_err(),
+            "修復前：純 tab 父層列必須被 RootOnly 漏列（症狀成立）"
+        );
+
+        // 升級後首次啟動：init_db 掛載的 v3 遷移以 Rust trim 正規化存量列。
+        init_db(&conn).unwrap();
+
+        let stored: Vec<(String, Option<String>)> = conn
+            .prepare(
+                "SELECT session_id, parent_session_id FROM usage_entries
+                 WHERE session_id LIKE 's-%' ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(
+            stored,
+            vec![
+                ("s-tab".to_string(), Some("parent".to_string())),
+                ("s-nbsp".to_string(), Some("parent".to_string())),
+                ("s-blank-tab".to_string(), None),
+                ("s-clean".to_string(), Some("parent".to_string())),
+            ],
+            "v3 必須以 Rust trim 正規化 tab／NBSP 包覆父層、把純空白折成無父層"
+        );
+
+        // 摘要層：分組身分鍵（daily handler 輸出的就是這個值）顯示 trim 後的
+        // 父層，且該鍵必須能被詳情路徑解析（round-trip 一致性）。
+        let day_rows = get_usage_entries_by_date(&conn, "2026-07-10", "codex").unwrap();
+        let summary_parent = |session_id: &str| {
+            day_rows
+                .iter()
+                .find(|row| row.record.entry.session_id == session_id)
+                .map(|row| {
+                    SessionIdentity::from_entry(&row.assistant_type, &row.record.entry)
+                        .parent_session_id
+                })
+                .unwrap_or_else(|| panic!("摘要必須包含 {session_id}"))
+        };
+        assert_eq!(
+            summary_parent("s-tab"),
+            Some("parent".to_string()),
+            "摘要顯示 trim 後的父層（'\tparent\t' → 'parent'）"
+        );
+        assert_eq!(summary_parent("s-nbsp"), Some("parent".to_string()));
+        assert_eq!(
+            summary_parent("s-blank-tab"),
+            None,
+            "純空白父層與無父層同組（empty == absent 不變量）"
+        );
+
+        for session_id in ["s-tab", "s-nbsp"] {
+            let lookup = get_session_assistant_and_transcript_in_parent_scope(
+                &conn,
+                "codex",
+                session_id,
+                Some("codex-cli"),
+                None,
+                ParentSessionScope::ChildOf("parent"),
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "摘要身分鍵必須能被 ChildOf(\"parent\") 詳情路徑解析 ({session_id}): {error}"
+                )
+            });
+            assert_eq!(lookup.parent_session_id.as_deref(), Some("parent"));
+            assert!(
+                get_session_assistant_and_transcript_in_parent_scope(
+                    &conn,
+                    "codex",
+                    session_id,
+                    Some("codex-cli"),
+                    None,
+                    ParentSessionScope::RootOnly,
+                )
+                .is_err(),
+                "{session_id} 是 child，不得落進 RootOnly"
+            );
+        }
+        let root_lookup = get_session_assistant_and_transcript_in_parent_scope(
+            &conn,
+            "codex",
+            "s-blank-tab",
+            Some("codex-cli"),
+            None,
+            ParentSessionScope::RootOnly,
+        )
+        .expect("純空白父層折成 NULL 後必須被 RootOnly 認領");
+        assert_eq!(root_lookup.parent_session_id, None);
+
+        let marker: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = ?)",
+                params![PARENT_SESSION_NORMALIZATION_MIGRATION_V3_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(marker, "v3 遷移必須寫入一次性 sync_state 標記");
+
+        // 一次性證明：標記生效後才落盤的雜值不得被再次改寫（與 v2 同契約）。
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, timestamp, date, session_id,
+                turn_no, parent_session_id, delta_input, delta_output, delta_total
+             ) VALUES ('codex', 'codex-cli', '2026-07-10T12:00:00Z', '2026-07-10',
+                's-late', 1, '  b  ', 100, 0, 100)",
+            [],
+        )
+        .unwrap();
+        init_db(&conn).unwrap();
+        let late_parent: Option<String> = conn
+            .query_row(
+                "SELECT parent_session_id FROM usage_entries WHERE session_id = 's-late'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            late_parent.as_deref(),
+            Some("  b  "),
+            "遷移是一次性行為：標記生效後的新列不得被改寫"
+        );
+    }
+
+    /// Claim B 碰撞折疊（thread PRRT_kwDOTOgsec6yVxcH）：正規化把
+    /// `'\tparent\t'` 折成 `'parent'` 後與既有乾淨列同佔一個儲存唯一鍵
+    /// （(assistant_type, source_kind, [source_dir_key], session_id, turn_no,
+    /// usage_identity, 正規化父層)）。兩列並存是 SQL-TRIM 索引鍵下的合法狀態，
+    /// 遷移必須以單一交易確定性折一列（沿用 `usage_entry_order`「取最新一
+    /// 筆」）、刪被折列，總量絕不雙計。
+    #[test]
+    fn parent_session_id_normalization_migration_v3_folds_colliding_rows_keep_latest() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "DELETE FROM sync_state WHERE filename = ?",
+            params![PARENT_SESSION_NORMALIZATION_MIGRATION_V3_KEY],
+        )
+        .unwrap();
+        // 同 (codex, codex-cli, s-fold, turn 1, '') 的兩列只差父層空白：
+        // 索引鍵 '\tparent\t' ≠ 'parent' → 可合法並存。
+        for (timestamp, parent, delta_total) in [
+            ("2026-07-10T09:00:00Z", "parent", 111_i64),
+            ("2026-07-10T10:00:00Z", "\tparent\t", 222_i64),
+        ] {
+            conn.execute(
+                "INSERT INTO usage_entries (
+                    assistant_type, source_kind, timestamp, date, session_id,
+                    turn_no, parent_session_id, delta_input, delta_output, delta_total
+                 ) VALUES ('codex', 'codex-cli', ?, '2026-07-10', 's-fold', 1, ?, 0, ?, ?)",
+                params![timestamp, parent, delta_total, delta_total],
+            )
+            .unwrap();
+        }
+        let before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries WHERE session_id = 's-fold'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(before, 2, "遷移前兩列依 SQL-TRIM 唯一鍵合法並存");
+
+        // 升級後首次啟動：v3 遷移折疊同鍵列。
+        init_db(&conn).unwrap();
+
+        let rows: Vec<(Option<String>, String, i64)> = conn
+            .prepare(
+                "SELECT parent_session_id, timestamp, delta_total
+                 FROM usage_entries WHERE session_id = 's-fold'",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![(
+                Some("parent".to_string()),
+                "2026-07-10T10:00:00Z".to_string(),
+                222
+            )],
+            "同鍵折疊留最新一筆（usage_entry_order 的 (turn_no, timestamp) 語意）"
+        );
+        let total: i64 = conn
+            .query_row(
+                "SELECT SUM(delta_total) FROM usage_entries WHERE session_id = 's-fold'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(total, 222, "被折列不得計入總量（絕不雙計）");
     }
 }
