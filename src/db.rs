@@ -256,6 +256,9 @@ const PARENT_SESSION_NORMALIZATION_MIGRATION_V2_KEY: &str =
 /// `trim`（與 `SessionIdentity`／寫入邊界完全同語意）在 Rust 迴圈內正規化
 /// 存量列，並處理正規化觸發的唯一鍵碰撞折疊。獨立於 v1/v2 的 sync_state
 /// key：沿用舊 key 會被已消費的一次性標記擋住、永遠不跑。
+/// v3 之名亦涵蓋 `session_id` 正規化（PRRT_kwDOTOgsec6yV-qI）：此 key 隨
+/// PR #74 首發、未出現於任何發佈 build（v1.6.2 tag 不含 539408d），在同一個
+/// one-shot 內擴充不會被已消費的標記擋住，也不會造成雙重遷移。
 const PARENT_SESSION_NORMALIZATION_MIGRATION_V3_KEY: &str =
     "migration:parent_session_id_normalization_v3";
 const CODEX_CLI_SOURCE_KIND: &str = "codex-cli";
@@ -589,6 +592,17 @@ pub(crate) fn normalize_parent_session_id(parent: Option<String>) -> Option<Stri
     parent
         .map(|parent| parent.trim().to_string())
         .filter(|parent| !parent.is_empty())
+}
+
+/// Normalize a persisted `session_id` with the same trim semantics as
+/// [`normalize_parent_session_id`] (Rust `trim`, Unicode White_Space).
+/// `usage_entries.session_id` is `TEXT NOT NULL`, so "absent" is spelled `''`:
+/// the frontend `sessionIdentityKey` folds `''` and absent into one key via
+/// `|| ''`, so an all-whitespace id collapses into that single absent bucket
+/// instead of surviving as an invisible session (review thread
+/// PRRT_kwDOTOgsec6yV-qI).
+fn normalize_session_id(session_id: &str) -> String {
+    session_id.trim().to_string()
 }
 
 /// Directory resolution helpers
@@ -1441,7 +1455,8 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
     // 執行，且不與 App sync 入口的 legacy cursor 升級路徑互相干擾）：
     // - 父層碰撞復原（PRRT_kwDOTOgsec6yUXND）
     // - 父層正規化 v2（PRRT_kwDOTOgsec6yUXNe）
-    // - 父層正規化 v3（PRRT_kwDOTOgsec6yVxcH，Unicode 空白＋碰撞折疊）
+    // - 身分正規化 v3（PRRT_kwDOTOgsec6yVxcH／PRRT_kwDOTOgsec6yV-qI，
+    //   session＋父層 Unicode 空白＋碰撞折疊＋匯入保護）
     run_copilot_parent_collision_recovery_migration(conn)?;
     run_parent_session_id_normalization_migration_v2(conn)?;
     run_parent_session_id_normalization_migration_v3(conn)?;
@@ -2374,9 +2389,16 @@ fn run_parent_session_id_normalization_migration_v2(conn: &Connection) -> Result
     Ok(())
 }
 
-/// 一次性父層正規化 v3（PRRT_kwDOTOgsec6yVxcH）：以 Rust `trim`（Unicode
-/// White_Space，含 tab／換行／NBSP／U+3000）正規化所有已存
-/// `parent_session_id`，折空 → NULL，與寫入邊界
+/// 一次性身分正規化 v3（PRRT_kwDOTOgsec6yVxcH；本趟擴充涵蓋 `session_id`，
+/// PRRT_kwDOTOgsec6yV-qI）：以 Rust `trim`（Unicode White_Space，含 tab／
+/// 換行／NBSP／U+3000）正規化所有已存 `session_id` 與 `parent_session_id`，
+/// 折空 → 缺席（parent 折 NULL；session 折 `''`——`session_id TEXT NOT NULL`
+/// 不能存 NULL，`''` 即「缺席」的儲存拼法，前端 `sessionIdentityKey` 的
+/// `|| ''` 兩者同鍵，empty==absent 不變量一致），trim 後相等的自我引用
+/// （正規化 parent == 正規化 session）折成無父層（parser 的自我引用偵測即
+/// 比對 trim 後形態，db/codex.rs；session 正規化會把 raw 不相等、trim 相等
+/// 的殘留自我引用壓成字面 self-parent，不同趟折掉會再拆一次父子身分），
+/// 與寫入邊界
 /// [`normalize_parent_session_id`]／摘要分組 [`crate::session_identity`]／
 /// 詳情 `push_parent_filter` 的精確比對統一為單一語意。v1/v2 的 SQL `TRIM`
 /// 只去一般空格（SQLite 實測：`'\tparent\t'`／`'\t\t'`／NBSP 原樣穿過），
@@ -2386,12 +2408,43 @@ fn run_parent_session_id_normalization_migration_v2(conn: &Connection) -> Result
 /// UNIQUE 碰撞折疊（必要）：兩個唯一索引
 /// （`uidx_assistant_source_session_turn`／`uidx_assistant_source_dir_session_turn`）
 /// 的鍵含「SQL-TRIM 後的父層」，`'\tparent\t'` 與 `'parent'` 是相異鍵、可
-/// 並存；正規化後同鍵必撞 UNIQUE。遷移以單一交易預解碰撞：同
-/// (assistant_type, source_kind, source_dir_key, session_id, turn_no,
-/// usage_identity, 正規化父層) 的折疊衝突沿用 `usage_entry_order` 的「快照
+/// 並存；`'\tchild\t'`／`'  child  '` 與 `'child'` 的 raw session_id 亦是相異
+/// 鍵。遷移以單一交易預解碰撞，折疊鍵為含正規化 session_id 的完整儲存鍵：
+/// 同 (assistant_type, source_kind, source_dir_key, 正規化 session_id,
+/// turn_no, usage_identity, 正規化父層) 的折疊衝突沿用 `usage_entry_order` 的「快照
 /// 取最新」語意 ((turn_no, timestamp) 最大者、id 決勝保證確定性) 留一列、
 /// 刪被折列，總量絕不雙計。索引鍵其餘欄位皆為原值比對、與分組鍵一一對應，
-/// 無跨組碰撞可能。掛載於 `init_db` 尾端（索引每啟動 DROP+CREATE，存量鍵
+/// 無跨組碰撞可能。執行序刻意「先全部 DELETE、再全部 UPDATE」：索引在
+/// `init_db` 先於本遷移重建、UNIQUE 即時生效，先更後刪會在中途撞鍵。
+///
+/// 為何 `session_id` 必須原地正規化（只升版 parser key 重解析不夠）：
+/// pre-8237419 parser 落盤未 trim 的 session_id，而 539408d 的父層正規化把
+/// 引用它的 parent 單側改成 trim 形態；孤兒列（transcript 已刪）、匯入列
+/// （purge 保護 5793-5834）、部分解析列與 `codex:claude:%` cursor 對應列都
+/// 沒有重解析來源，`session_id = parent_session_id` 等值連結、
+/// `ChildOf`／`RootOnly` 謂詞與詳情頁全部永久失準。原地正規化不依賴檔案
+/// 存在，孤兒／匯入／部分解析一次到位，之後無須任何重解析。
+///
+/// 匯入保護（與 purge 契約同先例——匯入列永不被本地同步刪除；同時收斂
+/// 539408d 折疊會刪匯入列的既有衝突）：匯入列（`import_source_id`／
+/// `import_batch_id` 任一非 NULL）在折疊組內恆為存活者，同鍵本機列全部折
+/// 掉。組內恰好一個匯入列 → 正規化該存活者（匯入保護是「不刪」不是「不
+/// 修」）。組內兩個以上匯入列（匯入×匯入碰撞）→ 整組不做正規化、原樣保
+/// 留：任何子集正規化都可能與已是 canonical 拼法的同組 sibling 撞 UNIQUE，
+/// 而匯入列不可刪列讓位——原樣保留是零刪失、零撞鍵的唯一選擇，代價是該極
+/// 罕見角落維持 trim 前拼法（匯入端身分比對已改 trim 容錯，re-import 判重
+/// 不受影響，見 `import_usage_day_entries`）。
+///
+/// 同趟搬移 `cursor_session_metadata.session_id`（(source_id, session_id)
+/// 主鍵）：它與 `usage_entries.session_id` 以精確等值連結（src/db/cursor.rs
+/// 的 cwd 回填與 legacy 去除），只動一邊會拆散既有配對；PK 碰撞以 rowid
+/// 最大者存活（該表無 turn／時間戳，以寫入先後作為 keep-latest 類比）。
+///
+/// 不改寫的 id 載體欄位（已確認非 session 身分引用）：`import_source_id`
+/// （匯入溯源鍵，re-import 判重與批次撤銷依據）、`usage_identity` 與
+/// `transcript_path`（Codex rollout 來源定位鍵，purge 以檔名比對）、
+/// `cursor_model_signatures.source_id`（Cursor state DB 來源鍵，非 session）。
+/// 掛載於 `init_db` 尾端（索引每啟動 DROP+CREATE，存量鍵
 /// 變更自帶重建）與 Codex 同步遷移鏈；sync_state 標記守門、標記最後寫入，
 /// 冪等且一次性。
 fn run_parent_session_id_normalization_migration_v3(conn: &Connection) -> Result<(), String> {
@@ -2408,15 +2461,27 @@ fn run_parent_session_id_normalization_migration_v3(conn: &Connection) -> Result
     }
 
     #[derive(Debug)]
-    struct StoredParentRow {
+    struct StoredIdentityRow {
         id: i64,
         turn_no: i64,
         timestamp: String,
+        session_id: String,
+        normalized_session_id: String,
         parent_session_id: Option<String>,
-        normalized: Option<String>,
+        normalized_parent_session_id: Option<String>,
+        imported: bool,
     }
+
+    impl StoredIdentityRow {
+        fn needs_rewrite(&self) -> bool {
+            self.session_id != self.normalized_session_id
+                || self.parent_session_id != self.normalized_parent_session_id
+        }
+    }
+
     // 正規化後的儲存唯一鍵：(assistant_type, source_kind, source_dir_key,
-    // session_id, turn_no, usage_identity, 正規化父層折成 '' 代表無父)。
+    // 正規化 session_id（折空 → '' 即缺席桶）, turn_no, usage_identity,
+    // 正規化父層折成 '' 代表無父)。
     // source_dir_key 為 NULL 的列屬前綴索引、非 NULL 的屬來源目錄索引，
     // 以 Option 分組恰好對應「同一索引內才可能撞鍵」的語意。
     type StorageKey = (String, String, Option<String>, String, i64, String, String);
@@ -2426,16 +2491,17 @@ fn run_parent_session_id_normalization_migration_v3(conn: &Connection) -> Result
         .map_err(|error| format!("父層正規化 v3 遷移 BEGIN 失敗: {error}"))?;
 
     // 全表單次掃描：碰撞組的另一方可能是已 canonical 的乾淨列（如乾淨
-    // 'parent' 與 '\tparent\t'），只掃髒列會漏折。
-    let mut groups: HashMap<StorageKey, Vec<StoredParentRow>> = HashMap::new();
+    // 'parent' 與 '\tparent\t'、乾淨 'child' 與 '  child  '），只掃髒列會漏折。
+    let mut groups: HashMap<StorageKey, Vec<StoredIdentityRow>> = HashMap::new();
     {
         let mut stmt = tx
             .prepare(
                 "SELECT id, assistant_type, source_kind, source_dir_key, session_id, turn_no,
-                        usage_identity, parent_session_id, timestamp
+                        usage_identity, parent_session_id, timestamp,
+                        import_source_id, import_batch_id
                  FROM usage_entries",
             )
-            .map_err(|error| format!("準備讀取父層正規化資料失敗: {error}"))?;
+            .map_err(|error| format!("準備讀取身分正規化資料失敗: {error}"))?;
         let rows = stmt
             .query_map([], |row| {
                 Ok((
@@ -2448,9 +2514,11 @@ fn run_parent_session_id_normalization_migration_v3(conn: &Connection) -> Result
                     row.get::<_, String>(6)?,
                     row.get::<_, Option<String>>(7)?,
                     row.get::<_, String>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
                 ))
             })
-            .map_err(|error| format!("讀取父層正規化資料失敗: {error}"))?;
+            .map_err(|error| format!("讀取身分正規化資料失敗: {error}"))?;
         for row in rows {
             let (
                 id,
@@ -2462,36 +2530,84 @@ fn run_parent_session_id_normalization_migration_v3(conn: &Connection) -> Result
                 usage_identity,
                 parent_session_id,
                 timestamp,
-            ) = row.map_err(|error| format!("解析父層正規化資料失敗: {error}"))?;
-            let normalized = normalize_parent_session_id(parent_session_id.clone());
-            let fold_parent_key = normalized.clone().unwrap_or_default();
+                import_source_id,
+                import_batch_id,
+            ) = row.map_err(|error| format!("解析身分正規化資料失敗: {error}"))?;
+            let normalized_session_id = normalize_session_id(&session_id);
+            let mut normalized_parent_session_id =
+                normalize_parent_session_id(parent_session_id.clone());
+            // trim 相等的自我引用 == 無父層（同 parser 自我引用偵測語意）：
+            // 必須先折成無父層再進折疊分組，否則同一列的 root 形態與
+            // self-parent 形態會被拆成兩個身分。
+            if normalized_parent_session_id.as_deref() == Some(normalized_session_id.as_str()) {
+                normalized_parent_session_id = None;
+            }
+            let fold_parent_key = normalized_parent_session_id.clone().unwrap_or_default();
+            let imported = import_source_id.is_some() || import_batch_id.is_some();
             groups
                 .entry((
                     assistant_type,
                     source_kind,
                     source_dir_key,
-                    session_id,
+                    normalized_session_id.clone(),
                     turn_no,
                     usage_identity,
                     fold_parent_key,
                 ))
                 .or_default()
-                .push(StoredParentRow {
+                .push(StoredIdentityRow {
                     id,
                     turn_no,
                     timestamp,
+                    session_id,
+                    normalized_session_id,
                     parent_session_id,
-                    normalized,
+                    normalized_parent_session_id,
+                    imported,
                 });
         }
     }
 
+    // 兩階段寫入：先刪全部被折列、再更新存活者（交易內 UNIQUE 即時生效，
+    // 交錯更刪會在中途撞鍵；折疊鍵即正規化後鍵，跨組不可能互相撞）。
+    let mut deletions: Vec<i64> = Vec::new();
+    let mut rewrites: Vec<(i64, String, Option<String>)> = Vec::new();
     let mut normalized_rows = 0usize;
     let mut folded_rows = 0usize;
+    let mut skipped_imported_groups = 0usize;
     for members in groups.into_values() {
-        // keep-latest：(turn_no, timestamp) 最大者存活（`usage_entry_order`
-        // 同語意），id 決勝讓結果與輸入／HashMap 迭代順序無關。
-        let Some(winner) = members.iter().max_by(|left, right| {
+        let (mut imported, locals): (Vec<StoredIdentityRow>, Vec<StoredIdentityRow>) =
+            members.into_iter().partition(|member| member.imported);
+        if !imported.is_empty() {
+            // 匯入列恆為存活者（purge 契約同先例）：同鍵本機列全部折掉。
+            for member in locals {
+                deletions.push(member.id);
+                folded_rows += 1;
+            }
+            if imported.len() == 1 {
+                // 唯一匯入列不與任何人撞鍵，照常正規化（保護的是「不刪」）。
+                let survivor = imported.pop().expect("匯入列長度已確認為 1");
+                if survivor.needs_rewrite() {
+                    rewrites.push((
+                        survivor.id,
+                        survivor.normalized_session_id,
+                        survivor.normalized_parent_session_id,
+                    ));
+                    normalized_rows += 1;
+                }
+            } else {
+                // 匯入×匯入碰撞：整組原樣保留（見上方 doc：任何子集正規化
+                // 都可能與 canonical 拼法的 sibling 撞 UNIQUE，而匯入列不可
+                // 刪列讓位）。
+                skipped_imported_groups += 1;
+            }
+            continue;
+        }
+
+        // 純本機組沿用 keep-latest：(turn_no, timestamp) 最大者存活
+        // （`usage_entry_order` 同語意），id 決勝讓結果與輸入／HashMap 迭代
+        // 順序無關。
+        let Some(winner) = locals.iter().max_by(|left, right| {
             (left.turn_no, &left.timestamp, left.id).cmp(&(
                 right.turn_no,
                 &right.timestamp,
@@ -2500,22 +2616,109 @@ fn run_parent_session_id_normalization_migration_v3(conn: &Connection) -> Result
         }) else {
             continue;
         };
-        for member in &members {
-            if member.id == winner.id {
+        let winner_id = winner.id;
+        let rewrite = winner.needs_rewrite().then(|| {
+            (
+                winner.id,
+                winner.normalized_session_id.clone(),
+                winner.normalized_parent_session_id.clone(),
+            )
+        });
+        for member in locals {
+            if member.id == winner_id {
                 continue;
             }
-            tx.execute("DELETE FROM usage_entries WHERE id = ?", params![member.id])
-                .map_err(|error| format!("折疊父層正規化同鍵重複列失敗: {error}"))?;
+            deletions.push(member.id);
             folded_rows += 1;
         }
-        if winner.parent_session_id != winner.normalized {
-            tx.execute(
-                "UPDATE usage_entries SET parent_session_id = ? WHERE id = ?",
-                params![winner.normalized, winner.id],
-            )
-            .map_err(|error| format!("修正 Unicode 空白父層資料失敗: {error}"))?;
+        if let Some(rewrite) = rewrite {
+            rewrites.push(rewrite);
             normalized_rows += 1;
         }
+    }
+
+    for id in deletions {
+        tx.execute("DELETE FROM usage_entries WHERE id = ?", params![id])
+            .map_err(|error| format!("折疊身分正規化同鍵重複列失敗: {error}"))?;
+    }
+    for (id, normalized_session_id, normalized_parent_session_id) in rewrites {
+        tx.execute(
+            "UPDATE usage_entries SET session_id = ?, parent_session_id = ? WHERE id = ?",
+            params![normalized_session_id, normalized_parent_session_id, id],
+        )
+        .map_err(|error| format!("修正 Unicode 空白 session／父層資料失敗: {error}"))?;
+    }
+
+    // cursor_session_metadata.session_id 與 usage_entries.session_id 精確等值
+    // 連結（src/db/cursor.rs 的 cwd 回填與 legacy 去除），必須同趟搬移；PK
+    // (source_id, session_id) 碰撞以 rowid 最大者存活（該表無 turn／時間戳，
+    // 以寫入先後作為 keep-latest 類比）。
+    #[derive(Debug)]
+    struct StoredCursorMetadataRow {
+        rowid: i64,
+        session_id: String,
+        normalized_session_id: String,
+    }
+    let mut metadata_groups: HashMap<(String, String), Vec<StoredCursorMetadataRow>> =
+        HashMap::new();
+    {
+        let mut stmt = tx
+            .prepare("SELECT rowid, source_id, session_id FROM cursor_session_metadata")
+            .map_err(|error| format!("準備讀取 Cursor session 中繼資料失敗: {error}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                let session_id: String = row.get(2)?;
+                Ok((
+                    row.get::<_, String>(1)?,
+                    StoredCursorMetadataRow {
+                        rowid: row.get(0)?,
+                        normalized_session_id: normalize_session_id(&session_id),
+                        session_id,
+                    },
+                ))
+            })
+            .map_err(|error| format!("讀取 Cursor session 中繼資料失敗: {error}"))?;
+        for row in rows {
+            let (source_id, metadata_row) =
+                row.map_err(|error| format!("解析 Cursor session 中繼資料失敗: {error}"))?;
+            metadata_groups
+                .entry((source_id, metadata_row.normalized_session_id.clone()))
+                .or_default()
+                .push(metadata_row);
+        }
+    }
+    let mut metadata_deletions: Vec<i64> = Vec::new();
+    let mut metadata_rewrites: Vec<(i64, String)> = Vec::new();
+    for members in metadata_groups.into_values() {
+        let Some(winner) = members.iter().max_by_key(|member| member.rowid) else {
+            continue;
+        };
+        let winner_rowid = winner.rowid;
+        let rewrite = (winner.session_id != winner.normalized_session_id)
+            .then(|| (winner.rowid, winner.normalized_session_id.clone()));
+        for member in members {
+            if member.rowid == winner_rowid {
+                continue;
+            }
+            metadata_deletions.push(member.rowid);
+        }
+        if let Some(rewrite) = rewrite {
+            metadata_rewrites.push(rewrite);
+        }
+    }
+    for rowid in metadata_deletions {
+        tx.execute(
+            "DELETE FROM cursor_session_metadata WHERE rowid = ?",
+            params![rowid],
+        )
+        .map_err(|error| format!("折疊 Cursor session 中繼資料同鍵重複列失敗: {error}"))?;
+    }
+    for (rowid, normalized_session_id) in metadata_rewrites {
+        tx.execute(
+            "UPDATE cursor_session_metadata SET session_id = ? WHERE rowid = ?",
+            params![normalized_session_id, rowid],
+        )
+        .map_err(|error| format!("修正 Cursor session 中繼資料空白 session 失敗: {error}"))?;
     }
 
     tx.execute(
@@ -2525,10 +2728,10 @@ fn run_parent_session_id_normalization_migration_v3(conn: &Connection) -> Result
     .map_err(|error| format!("寫入父層正規化 v3 遷移狀態失敗: {error}"))?;
     tx.commit()
         .map_err(|error| format!("父層正規化 v3 遷移 COMMIT 失敗: {error}"))?;
-    if normalized_rows > 0 || folded_rows > 0 {
+    if normalized_rows > 0 || folded_rows > 0 || skipped_imported_groups > 0 {
         println!(
-            "✅ 遷移：父層正規化 v3——trim {} 列 Unicode 空白父層、折疊 {} 列同鍵重複",
-            normalized_rows, folded_rows
+            "✅ 遷移：身分正規化 v3——trim {} 列 session／父層空白、折疊 {} 列同鍵重複、{} 個匯入碰撞組原樣保留",
+            normalized_rows, folded_rows, skipped_imported_groups
         );
     }
     Ok(())
@@ -8228,11 +8431,14 @@ pub fn import_usage_day_entries(
             .map(str::trim)
             .filter(|kind| !kind.is_empty() && *kind != "legacy");
         if assistant == "codex" && exported_source_kind.is_none() && !usage_identity.is_empty() {
+            // Session 身分比對 trim 容錯（PRRT_kwDOTOgsec6yV-qI）：v3 身分
+            // 正規化把存量列改成 canonical 拼法後，匯出檔裡的原始拼法不能再
+            // 以精確等值找本機列——邊緣空白不構成不同 session。
             let local_source_kind: Option<String> = tx
                 .query_row(
                     "SELECT source_kind FROM usage_entries
                      WHERE assistant_type = 'codex'
-                       AND session_id = ?
+                       AND session_id IN (?, ?)
                        AND turn_no = ?
                        AND usage_identity <> ''
                        AND usage_identity = ?
@@ -8241,6 +8447,7 @@ pub fn import_usage_day_entries(
                      LIMIT 1",
                     params![
                         entry.session_id,
+                        normalize_session_id(&entry.session_id),
                         entry.turn_no as i64,
                         usage_identity.as_str()
                     ],
@@ -8259,6 +8466,12 @@ pub fn import_usage_day_entries(
         }
         let source_id = match normalized_id {
             Some(source_id) => {
+                // Session 身分等值自 v3 身分正規化起採 trim 容錯
+                // （PRRT_kwDOTOgsec6yV-qI）：正規化把存量匯入列改成 canonical
+                // 拼法，同一筆匯出記錄再匯入時檔案端仍是原始拼法；精確等值會
+                // 誤判「同 source id 掛到不同身分」→ 加後綴重新插入 → 同一筆
+                // 用量雙計。比對「raw 拼法或 Rust trim 拼法」恰好涵蓋遷移後的
+                // canonical 列與匯入×匯入碰撞組原樣保留的 raw 列。
                 let conflicts_with_existing_identity: i64 = tx
                     .query_row(
                         "SELECT EXISTS (
@@ -8269,9 +8482,9 @@ pub fn import_usage_day_entries(
                               AND NOT (
                                   source_kind = ?3
                                   AND source_dir_key IS ?4
-                                  AND session_id = ?5
-                                  AND turn_no = ?6
-                                  AND usage_identity = ?7
+                                  AND session_id IN (?5, ?6)
+                                  AND turn_no = ?7
+                                  AND usage_identity = ?8
                               )
                         )",
                         params![
@@ -8280,6 +8493,7 @@ pub fn import_usage_day_entries(
                             source_kind,
                             entry.source_dir_key.as_deref(),
                             entry.session_id,
+                            normalize_session_id(&entry.session_id),
                             entry.turn_no as i64,
                             usage_identity,
                         ],
@@ -26349,5 +26563,616 @@ mod tests {
             )
             .unwrap();
         assert_eq!(total, 222, "被折列不得計入總量（絕不雙計）");
+    }
+
+    /// PRRT_kwDOTOgsec6yV-qI 升級情境夾具：「已同步舊資料」的既有庫形狀——
+    /// `migration:codex_session_identity_v10` 標記已記錄（硬編字面值模擬發布
+    /// build 的資料庫；用常數會跟著本 PR 升版種錯）、大小不變的 codex cursor
+    /// （`codex_transcript_needs_sync` 對它永遠回 false）、pre-8237419 落盤的
+    /// 未 trim session_id 列、孤兒列（transcript 已刪）、匯入碰撞組與本地同鍵
+    /// 碰撞列。`migration:parent_session_id_normalization_v3` 標記刻意拔掉＝
+    /// 新 build 第一次啟動（該 key 隨 PR #74 首發，未出現於任何發佈 build，
+    /// 不存在「已記錄舊語意」的 v4 情境）。回傳 (連線, 夾具根目錄)。
+    fn seed_untrimmed_session_identity_upgrade_fixture() -> (Connection, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "codex-session-identity-upgrade-{}-{}",
+            std::process::id(),
+            TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let sessions_dir = root.join("sessions").join("2026").join("07").join("10");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        // 健在檔：cursor 大小 = 檔案目前大小 → 同步永遠略過（修復不得依賴
+        // 重解析）。檔內 token 數刻意與 D1 列（777）不同——若同步真的重解析，
+        // D1 會被 purge＋reinsert 換成 990，斷言即可察覺。
+        let live_path = sessions_dir.join("rollout-2026-07-10T10-00-00-fileone.jsonl");
+        let live_content = r#"{"timestamp":"2026-07-10T10:00:00.000Z","type":"session_meta","payload":{"session_id":"fileone","id":"fileone","cwd":"/tmp/project","cli_version":"0.142.5","model":"gpt-5.5"}}
+{"timestamp":"2026-07-10T10:00:01.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":900,"cached_input_tokens":0,"output_tokens":90,"reasoning_output_tokens":0,"total_tokens":990},"last_token_usage":{"input_tokens":900,"cached_input_tokens":0,"output_tokens":90,"reasoning_output_tokens":0,"total_tokens":990},"model_context_window":258400}}}
+"#;
+        fs::write(&live_path, live_content).unwrap();
+        // 孤兒列的來源檔：磁碟上不存在，purge／重解析永遠到不了它。
+        let deleted_path = sessions_dir.join("rollout-2026-07-10T09-00-00-gone.jsonl");
+        let deleted_path_text = deleted_path.to_string_lossy().to_string();
+        let live_path_text = live_path.to_string_lossy().to_string();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "DELETE FROM sync_state WHERE filename = ?",
+            params![PARENT_SESSION_NORMALIZATION_MIGRATION_V3_KEY],
+        )
+        .unwrap();
+        // 其餘一次性標記照發布 build 的形狀補齊：不補的話
+        // `run_codex_source_kind_migration` 等會在首次同步順手清 cursor／改寫
+        // 列，資料就不再代表「標記已消費、只剩大小不變略過」的升級現實。
+        conn.execute(
+            "INSERT INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES ('migration:codex_session_identity_v10', 1, 0), (?, 1, 0), (?, 1, 0), (?, 1, 0)",
+            params![
+                CODEX_SOURCE_KIND_MIGRATION_KEY,
+                CODEX_ROLLOUT_IDENTITY_MIGRATION_KEY,
+                PARENT_SESSION_NORMALIZATION_MIGRATION_KEY
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES (?, ?, 0)",
+            params![
+                format!("codex:{}", portable_relative_path(&root, &live_path)),
+                fs::metadata(&live_path).unwrap().len() as i64
+            ],
+        )
+        .unwrap();
+
+        // 測試夾具逐列可讀性優先：10 個參數恰好是種子列全部可變欄位，
+        // 拆 struct 反而讓列形狀難以一眼比對（同 sync_codex_transcript 先例）。
+        #[allow(clippy::too_many_arguments)]
+        fn seed_row(
+            conn: &Connection,
+            session_id: &str,
+            parent_session_id: Option<&str>,
+            turn_no: i64,
+            timestamp: &str,
+            delta_total: i64,
+            transcript_path: Option<&str>,
+            usage_identity: &str,
+            import_source_id: Option<&str>,
+            import_batch_id: Option<&str>,
+        ) {
+            conn.execute(
+                "INSERT INTO usage_entries (
+                    assistant_type, source_kind, usage_identity, timestamp, date, session_id,
+                    transcript_path, turn_no, parent_session_id,
+                    delta_input, delta_output, delta_total,
+                    import_source_id, import_batch_id
+                 ) VALUES ('codex', 'codex-cli', ?, ?, '2026-07-10', ?, ?, ?, ?, ?, 0, ?, ?, ?)",
+                params![
+                    usage_identity,
+                    timestamp,
+                    session_id,
+                    transcript_path,
+                    turn_no,
+                    parent_session_id,
+                    delta_total,
+                    delta_total,
+                    import_source_id,
+                    import_batch_id
+                ],
+            )
+            .unwrap();
+        }
+
+        // A1/A2：孤兒列——同一個 child session 的兩個 raw 拼法（t1/t2 不同
+        // 回合，正規化後同屬一個 session、不互撞），parent 亦未 trim。
+        seed_row(
+            &conn,
+            "  child  ",
+            Some("  parent  "),
+            1,
+            "2026-07-10T09:00:00Z",
+            100,
+            Some(&deleted_path_text),
+            "",
+            None,
+            None,
+        );
+        seed_row(
+            &conn,
+            " child ",
+            Some("parent"),
+            2,
+            "2026-07-10T09:30:00Z",
+            60,
+            Some(&deleted_path_text),
+            "",
+            None,
+            None,
+        );
+        // B：引用列——trim 過的 parent 引用 "child"（539408d 之後的形狀）。
+        seed_row(
+            &conn,
+            "grand",
+            Some("child"),
+            1,
+            "2026-07-10T09:05:00Z",
+            50,
+            None,
+            "",
+            None,
+            None,
+        );
+        // C：全空白 session id → 折進缺席桶；C2：全空白引用 → 折無父層。
+        seed_row(
+            &conn,
+            "\t\t",
+            None,
+            7,
+            "2026-07-10T09:20:00Z",
+            33,
+            None,
+            "",
+            None,
+            None,
+        );
+        seed_row(
+            &conn,
+            "blankref",
+            Some("\t\t"),
+            1,
+            "2026-07-10T09:25:00Z",
+            11,
+            None,
+            "",
+            None,
+            None,
+        );
+        // L3/L4：本地同鍵碰撞（同 session 同回合的兩個拼法）→ keep-latest 折一列。
+        seed_row(
+            &conn,
+            "  foldme  ",
+            Some("  parent  "),
+            3,
+            "2026-07-10T10:00:00Z",
+            7,
+            None,
+            "",
+            None,
+            None,
+        );
+        seed_row(
+            &conn,
+            "foldme",
+            Some("parent"),
+            3,
+            "2026-07-10T11:00:00Z",
+            9,
+            None,
+            "",
+            None,
+            None,
+        );
+        // I1/I2：匯入×匯入碰撞（兩個匯入列 trim 後同鍵）→ 整組原樣保留。
+        seed_row(
+            &conn,
+            "  imp  ",
+            None,
+            5,
+            "2026-07-10T12:00:00Z",
+            20,
+            None,
+            "",
+            Some("legacy-imp-1"),
+            Some("batch-1"),
+        );
+        seed_row(
+            &conn,
+            "imp",
+            None,
+            5,
+            "2026-07-10T13:00:00Z",
+            30,
+            None,
+            "",
+            Some("legacy-imp-2"),
+            Some("batch-1"),
+        );
+        // D1：live 檔的已同步列（usage_identity 指向該 rollout）。
+        seed_row(
+            &conn,
+            "fileone",
+            None,
+            1,
+            "2026-07-10T10:00:01Z",
+            777,
+            Some(&live_path_text),
+            &codex_rollout_identity(&live_path_text).unwrap(),
+            None,
+            None,
+        );
+
+        (conn, root)
+    }
+
+    /// 升級復原（PRRT_kwDOTOgsec6yV-qI）：v3 一次性遷移同趟把 session_id 以
+    /// Rust trim 正規化後，孤兒／匯入／部分解析／大小不變略過的舊列不需要
+    /// 任何重解析，`session_id = parent_session_id` 等值連結與
+    /// `ChildOf`／`RootOnly` 謂詞即恢復。修復還原（只留 parent 正規化）時：
+    /// child 的兩個 raw 拼法分裂成兩個 session、引用列連不回本體、同鍵碰撞
+    /// 不折、全空白 id 不進缺席桶——各斷言逐一轉紅。
+    #[test]
+    fn parent_session_id_normalization_migration_v3_unifies_untrimmed_session_identity_on_upgrade()
+    {
+        use crate::session_identity::SessionIdentity;
+
+        let (mut conn, root) = seed_untrimmed_session_identity_upgrade_fixture();
+
+        // 升級後首次啟動：init_db 掛載的 v3 遷移同趟正規化 session_id。
+        init_db(&conn).unwrap();
+
+        // (1) 身分統一：同一 session 的所有 raw 拼法只顯示一個 session。
+        let spellings: Vec<String> = conn
+            .prepare(
+                "SELECT DISTINCT session_id FROM usage_entries
+                 WHERE TRIM(session_id) = 'child' ORDER BY session_id",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            spellings,
+            vec!["child".to_string()],
+            "child 的 raw 拼法必須統一成 canonical id（分組只顯示一個 session）"
+        );
+
+        // 摘要層分組（SessionIdentity）：child 家族只剩單一身分。
+        let day_rows = get_usage_entries_by_date(&conn, "2026-07-10", "codex").unwrap();
+        let child_identities: std::collections::HashSet<(String, Option<String>)> = day_rows
+            .iter()
+            .filter(|row| row.record.entry.session_id.trim() == "child")
+            .map(|row| {
+                let identity = SessionIdentity::from_entry(&row.assistant_type, &row.record.entry);
+                (identity.session_id, identity.parent_session_id)
+            })
+            .collect();
+        let mut expected_child_identities = std::collections::HashSet::new();
+        expected_child_identities.insert(("child".to_string(), Some("parent".to_string())));
+        assert_eq!(
+            child_identities, expected_child_identities,
+            "分組後 child 必須是單一身分（不再顯示為獨立 session）"
+        );
+
+        // (2) 精確等值連結復原：引用列的 parent 接得回 child 本體列。
+        let linked: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM usage_entries c
+                    JOIN usage_entries p ON c.parent_session_id = p.session_id
+                    WHERE c.session_id = 'grand' AND c.parent_session_id = 'child')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            linked,
+            "parent_session_id = session_id 等值連結必須接回 child 本體列"
+        );
+
+        // (3) API 層：ChildOf("child") 找得到引用列；child 本體以
+        // ChildOf("parent") 命中（詳情不再 404）、RootOnly 排除。
+        get_session_assistant_and_transcript_in_parent_scope(
+            &conn,
+            "codex",
+            "grand",
+            Some("codex-cli"),
+            None,
+            ParentSessionScope::ChildOf("child"),
+        )
+        .expect("ChildOf(\"child\") 必須命中引用列 grand");
+        get_session_assistant_and_transcript_in_parent_scope(
+            &conn,
+            "codex",
+            "child",
+            Some("codex-cli"),
+            None,
+            ParentSessionScope::ChildOf("parent"),
+        )
+        .expect("child 本體列必須以 ChildOf(\"parent\") 命中（詳情不得 404）");
+        assert!(
+            get_session_assistant_and_transcript_in_parent_scope(
+                &conn,
+                "codex",
+                "child",
+                Some("codex-cli"),
+                None,
+                ParentSessionScope::RootOnly,
+            )
+            .is_err(),
+            "child 有父層，RootOnly 必須排除它"
+        );
+
+        // (4) 孤兒列保留且身分修復（transcript 已刪、無從重解析）。
+        let orphan: (String, i64) = conn
+            .query_row(
+                "SELECT session_id, delta_total FROM usage_entries WHERE delta_total = 100",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            orphan,
+            ("child".to_string(), 100),
+            "孤兒列必須保留且身分修復（不能只靠重解析）"
+        );
+
+        // (5) 匯入×匯入碰撞組原樣保留（零刪失；trim 前拼法維持不動）。
+        let imported_rows: Vec<(String, i64)> = conn
+            .prepare(
+                "SELECT session_id, delta_total FROM usage_entries
+                 WHERE import_batch_id = 'batch-1' ORDER BY import_source_id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            imported_rows,
+            vec![("  imp  ".to_string(), 20), ("imp".to_string(), 30)],
+            "匯入×匯入碰撞組必須原樣保留（skip 正規化、零刪失）"
+        );
+
+        // (6) 本地同鍵碰撞 keep-latest 折一列、總量絕不雙計。
+        let folded: (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(delta_total), 0) FROM usage_entries
+                 WHERE TRIM(session_id) = 'foldme'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            folded,
+            (1, 9),
+            "同鍵碰撞沿用 keep-latest 只留最新一筆，被折列不得計入總量"
+        );
+
+        // (7) empty==absent：全空白 session id 折進缺席桶（session_id 是
+        // NOT NULL 欄位，'' 即「缺席」的儲存拼法，前端 sessionIdentityKey 的
+        // `|| ''` 兩者同鍵）；全空白引用折無父層。
+        let blank: (String, Option<String>) = conn
+            .query_row(
+                "SELECT session_id, parent_session_id FROM usage_entries WHERE turn_no = 7",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            blank,
+            ("".to_string(), None),
+            "全空白 session id 必須折成缺席桶 ''"
+        );
+        let blank_ref: Option<String> = conn
+            .query_row(
+                "SELECT parent_session_id FROM usage_entries WHERE session_id = 'blankref'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            blank_ref, None,
+            "全空白引用必須折成無父層（empty == absent）"
+        );
+
+        // 一次性標記最後寫入。
+        let marker: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = ?)",
+                params![PARENT_SESSION_NORMALIZATION_MIGRATION_V3_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(marker, "v3 遷移必須寫入一次性 sync_state 標記");
+
+        // (8) 修復不得依賴重解析：大小不變的 cursor 使同步略過 live 檔，
+        // 同步後全部狀態不得回歸（D1 的 777 不被換成檔內的 990）。
+        sync_codex_usage_logs_from(&mut conn, std::slice::from_ref(&root)).unwrap();
+        let spellings_after: Vec<String> = conn
+            .prepare(
+                "SELECT DISTINCT session_id FROM usage_entries
+                 WHERE TRIM(session_id) = 'child' ORDER BY session_id",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            spellings_after,
+            vec!["child".to_string()],
+            "同步（大小不變略過）後身分不得回歸"
+        );
+        let imported_after: Vec<(String, i64)> = conn
+            .prepare(
+                "SELECT session_id, delta_total FROM usage_entries
+                 WHERE import_batch_id = 'batch-1' ORDER BY import_source_id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            imported_after,
+            vec![("  imp  ".to_string(), 20), ("imp".to_string(), 30)],
+            "同步不得動到匯入列"
+        );
+        let live_row: i64 = conn
+            .query_row(
+                "SELECT delta_total FROM usage_entries WHERE session_id = 'fileone'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            live_row, 777,
+            "大小不變的 rollout 必須被同步略過（修復不依賴重解析）"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// 匯入保護與殘留自我引用（PRRT_kwDOTOgsec6yV-qI）：折疊絕不刪匯入列——
+    /// 匯入×本機碰撞時匯入列存活（即使本機列較新）並照常正規化、匯入×匯入
+    /// 碰撞整組原樣保留；trim 相等的殘留自我引用折成無父層；
+    /// `cursor_session_metadata` 的 session 與用量列同趟搬移（精確等值連結
+    /// 不拆散）；遷移後同一筆匯出記錄再匯入仍判重（身分比對 trim 容錯，不因
+    /// canonical 拼法誤判衝突而加後綴重插雙計）。
+    #[test]
+    fn parent_session_id_normalization_migration_v3_import_protection_self_reference_and_metadata()
+    {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "DELETE FROM sync_state WHERE filename = ?",
+            params![PARENT_SESSION_NORMALIZATION_MIGRATION_V3_KEY],
+        )
+        .unwrap();
+
+        // re-import 判重前置：匯入一筆 padded session 的舊匯出記錄（pre-fix
+        // 匯入端把 entry.session_id 原樣落庫）。
+        let mut record = sample_import_record();
+        record.entry.session_id = "  impdup  ".to_string();
+        record.import_source_id = Some("reimport-record".to_string());
+        let first = import_usage_day_entries(
+            &mut conn,
+            "codex",
+            "2026-07-10",
+            vec![record.clone()],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        assert_eq!(first.imported, 1);
+
+        // I3（匯入，08:00 較舊）× L5（本地，08:30 較新）trim 後同鍵碰撞；
+        // S1：raw 不相等、trim 相等的殘留自我引用（session "  self  " 的
+        // parent 是 "self"）；U/M：cursor 用量列與 cursor_session_metadata 的
+        // padded 配對，metadata 另加一個 canonical 拼法列構成 PK 碰撞。
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, timestamp, date, session_id,
+                turn_no, parent_session_id, delta_input, delta_output, delta_total,
+                import_source_id, import_batch_id
+             ) VALUES ('codex', 'codex-cli', '2026-07-10T08:00:00Z', '2026-07-10', '  kid  ',
+                1, NULL, 0, 40, 40, 'kid-imp', 'batch-2'),
+                ('codex', 'codex-cli', '2026-07-10T08:30:00Z', '2026-07-10', 'kid',
+                1, NULL, 0, 60, 60, NULL, NULL),
+                ('codex', 'codex-cli', '2026-07-10T07:00:00Z', '2026-07-10', '  self  ',
+                2, 'self', 0, 15, 15, NULL, NULL),
+                ('cursor', 'cursor-kv', '2026-07-10T06:00:00Z', '2026-07-10', '  curs  ',
+                1, NULL, 0, 5, 5, NULL, NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO cursor_session_metadata (source_id, session_id, cwd) VALUES
+                ('cs1', 'curs', NULL),
+                ('cs1', '  curs  ', '/tmp/w')",
+            [],
+        )
+        .unwrap();
+
+        // 升級後首次啟動。
+        init_db(&conn).unwrap();
+
+        // (1) 匯入×本機碰撞：匯入列恆為存活者（keep-latest 讓本機列贏也不算
+        // 數）且照常正規化；同鍵本機列折掉。
+        let kid_rows: Vec<(String, i64)> = conn
+            .prepare(
+                "SELECT session_id, delta_total FROM usage_entries
+                 WHERE TRIM(session_id) = 'kid' ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            kid_rows,
+            vec![("kid".to_string(), 40)],
+            "匯入列恆為存活者（不刪、照常正規化），同鍵本機列折掉"
+        );
+
+        // (2) 殘留自我引用折成無父層。
+        let self_row: (String, Option<String>) = conn
+            .query_row(
+                "SELECT session_id, parent_session_id FROM usage_entries WHERE delta_total = 15",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            self_row,
+            ("self".to_string(), None),
+            "trim 相等的殘留自我引用必須折成無父層"
+        );
+
+        // (3) cursor_session_metadata 與用量列同趟搬移；PK 碰撞以 rowid 最大
+        // 者存活（保留其 cwd）。
+        let cursor_row: String = conn
+            .query_row(
+                "SELECT session_id FROM usage_entries WHERE assistant_type = 'cursor'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            cursor_row, "curs",
+            "cursor 用量列的 session 必須同趟正規化（連結不拆散）"
+        );
+        let metadata_rows: Vec<(String, String, Option<String>)> = conn
+            .prepare(
+                "SELECT source_id, session_id, cwd FROM cursor_session_metadata
+                 WHERE source_id = 'cs1'",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            metadata_rows,
+            vec![(
+                "cs1".to_string(),
+                "curs".to_string(),
+                Some("/tmp/w".to_string())
+            )],
+            "metadata session 必須同趟搬移並折疊 PK 碰撞（rowid 最大者存活）"
+        );
+
+        // (4) 遷移後同一筆匯出記錄再匯入仍判重（不得因 canonical 拼法誤判
+        // 身分衝突而加後綴重插雙計）。
+        let second = import_usage_day_entries(
+            &mut conn,
+            "codex",
+            "2026-07-10",
+            vec![record],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            (second.imported, second.skipped_duplicates),
+            (0, 1),
+            "re-import 必須判重（身分比對 trim 容錯）"
+        );
+        let reimported: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries WHERE import_source_id = 'reimport-record'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reimported, 1, "同一筆匯出記錄不得被重插成兩列雙計");
     }
 }
