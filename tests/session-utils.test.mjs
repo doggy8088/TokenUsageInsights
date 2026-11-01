@@ -8,6 +8,7 @@ import {
   matchesSessionIdentity,
   nextSessionSearchDisplayState,
   nextSessionSearchRunState,
+  nextSessionSearchSearchedFingerprint,
   parentSessionIdentityKey,
   rootSessionIdentityKey,
   sessionIdentityKey,
@@ -837,4 +838,90 @@ test('run completion swaps search results atomically with no empty intermediate 
   );
   assert.equal(keptAfterFail.matches, v3);
   assert.equal(keptAfterFail.status, 'complete');
+});
+
+test('search failure invalidates the searched-data fingerprint so the next identical-data refresh retries', () => {
+  // 失敗死結回歸鎖（comment 4434003880）：背景重跑失敗保留舊命中後，
+  // run-completed（dirty=false）不會再排程，若「已搜尋」指紋仍記著這次資料，
+  // 同資料的自動刷新永不觸發搜尋——舊命中集合凍結、新符合 session 永久隱藏。
+  // 失敗必須使指紋標記失效（''＝既有「未搜尋」哨兵），顯示原樣不動，下次
+  // 資料刷新視為未搜尋而重試。
+  const rows = [
+    {
+      assistant_type: 'copilot',
+      source_kind: 'copilot-app',
+      source_dir_key: 'aa',
+      session_id: 'root',
+      max_turn_no: 1,
+      parent_session_id: '',
+      total_tokens: 110,
+      duration_ms: 500,
+    },
+  ];
+  const fingerprint = sessionSearchDataFingerprint(rows, 1);
+  const keptMatches = new Set(['session-a', 'session-b']);
+
+  // 失敗當下顯示原樣保留（round-7 語意）：舊命中與 'complete' 續顯，
+  // 指紋失效不得動到顯示層。
+  const display = nextSessionSearchDisplayState(
+    { matches: keptMatches, status: 'complete' },
+    { type: 'fail', background: true },
+  );
+  assert.equal(display.matches, keptMatches);
+  assert.equal(display.status, 'complete');
+
+  // renderDashboard 已記錄 F1（先記後搜）→ 失敗使標記失效。
+  let searched = nextSessionSearchSearchedFingerprint('', { type: 'searched', fingerprint });
+  assert.equal(searched, fingerprint);
+  searched = nextSessionSearchSearchedFingerprint(searched, { type: 'fail' });
+  assert.equal(searched, '');
+
+  // 下一次 renderDashboard 的比對（nextSearchFingerprint !== 標記）必為真 →
+  // 重試；同資料的自動刷新（指紋跨刷新穩定）也仍觸發。
+  assert.notEqual(searched, fingerprint);
+  assert.notEqual(
+    searched,
+    sessionSearchDataFingerprint(rows.map(row => ({ ...row })), 1),
+  );
+});
+
+test('searched fingerprint marker advances only on successful completion and never on failure', () => {
+  // 標記遷移邊界鎖（comment 4434003880）：'fail' 不得記錄新值、也不得保留舊值
+  // （保留＝同資料永不再試的死結復活）；失效語意只屬於失敗路徑——失敗後下一次
+  // 'searched' 記錄必須正常前進到新指紋，'reset' 仍歸零、未知事件原樣保留。
+  const fixture = {
+    assistant_type: 'codex',
+    source_kind: 'cli',
+    source_dir_key: 'aa',
+    session_id: 'a',
+    parent_session_id: '',
+  };
+  const f1 = sessionSearchDataFingerprint([
+    { ...fixture, max_turn_no: 1, total_tokens: 100, duration_ms: 400 },
+  ], 1);
+  const f2 = sessionSearchDataFingerprint([
+    { ...fixture, max_turn_no: 2, total_tokens: 250, duration_ms: 900 },
+  ], 2);
+
+  // fail 不得記錄、也不得保留（任意前狀態皆失效為 ''）。
+  assert.equal(nextSessionSearchSearchedFingerprint(f1, { type: 'fail' }), '');
+  assert.equal(nextSessionSearchSearchedFingerprint('', { type: 'fail' }), '');
+
+  // fail → searched(F2) 後 marker=F2。
+  const searched = nextSessionSearchSearchedFingerprint(
+    nextSessionSearchSearchedFingerprint(f1, { type: 'fail' }),
+    { type: 'searched', fingerprint: f2 },
+  );
+  assert.equal(searched, f2);
+
+  // 成功記錄不得被本修正誤傷成清空；reset 歸零；未知事件原樣保留。
+  assert.equal(
+    nextSessionSearchSearchedFingerprint(f1, { type: 'searched', fingerprint: f2 }),
+    f2,
+  );
+  assert.equal(nextSessionSearchSearchedFingerprint(searched, { type: 'reset' }), '');
+  assert.equal(
+    nextSessionSearchSearchedFingerprint(searched, { type: 'unknown' }),
+    searched,
+  );
 });

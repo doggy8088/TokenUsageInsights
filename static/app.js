@@ -14,6 +14,7 @@ import {
   matchesSessionIdentity,
   nextSessionSearchDisplayState,
   nextSessionSearchRunState,
+  nextSessionSearchSearchedFingerprint,
   sessionIdentityKey,
   sessionSearchDataFingerprint,
   sessionSearchMatchKey,
@@ -3185,7 +3186,13 @@ function renderDashboard(data) {
   const nextSearchFingerprint = sessionSearchDataFingerprint(allSessions, rawUsageEntryCount);
   const shouldRefreshSearch = currentSessionSearchQuery
     && nextSearchFingerprint !== currentSessionSearchDataFingerprint;
-  currentSessionSearchDataFingerprint = nextSearchFingerprint;
+  // 「已搜尋」指紋記錄維持在 render（先記後搜是同資料重複渲染不重跑的
+  // dedupe 基準）；搜尋失敗時由 executeSessionPromptSearch 的 catch 經純
+  // 函式失效成 ''，讓下次資料刷新視為未搜尋而重試（comment 4434003880）。
+  currentSessionSearchDataFingerprint = nextSessionSearchSearchedFingerprint(
+    currentSessionSearchDataFingerprint,
+    { type: 'searched', fingerprint: nextSearchFingerprint },
+  );
   currentSessions = [...allSessions];
   // 每次 master sessions 更新即預建父層／根節點索引（無篩選時下游建樹
   // 直接重用；衍生陣列由呼叫端重建，見 sessionParentIndexFor）。
@@ -4299,7 +4306,10 @@ function resetSessionPromptSearch() {
   currentSessionSearchMatches = null;
   currentSessionSearchUnavailable = 0;
   currentSessionSearchState = 'idle';
-  currentSessionSearchDataFingerprint = '';
+  currentSessionSearchDataFingerprint = nextSessionSearchSearchedFingerprint(
+    currentSessionSearchDataFingerprint,
+    { type: 'reset' },
+  );
   sessionSearchRunState = nextSessionSearchRunState(sessionSearchRunState, 'reset');
 
   const input = document.getElementById('session-search-input');
@@ -4624,6 +4634,15 @@ async function executeSessionPromptSearch(query, searchContext, { background = f
     // 背景重跑失敗保留既有結果與 'complete'（舊命中仍較未過濾正確）並照常
     // 發錯誤通知；首跑失敗維持現狀 null+'error'。
     applySessionSearchDisplayState({ type: 'fail', background });
+    // 失敗使「已搜尋」指紋失效（顯示結果原樣不動）：下次資料刷新視為未搜尋
+    // 而重試，避免 run-completed（dirty=false）後同資料永不重搜、舊命中集合
+    // 凍結、新符合 session 永久隱藏（comment 4434003880）。重試時機是下次
+    // 資料刷新而非立即重試：持續性故障下最多每個刷新週期一次重試＋一顆
+    // session_search_failed toast，無緊密重試迴圈。
+    currentSessionSearchDataFingerprint = nextSessionSearchSearchedFingerprint(
+      currentSessionSearchDataFingerprint,
+      { type: 'fail' },
+    );
     sortAndRenderSessionTable();
     showNotification(t('session_search_failed'), 'error');
   } finally {

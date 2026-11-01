@@ -76,6 +76,28 @@ export function sessionSearchDataFingerprint(rows, rawUsageEntryCount) {
   ]);
 }
 
+// 「已搜尋」資料指紋標記遷移（純函式，comment 4434003880）：標記記錄目前
+// 搜尋狀態已涵蓋／已記錄的資料指紋（renderDashboard 先記後搜，是同資料重複
+// 渲染不重跑的 dedupe 基準），'' 是既有的「未搜尋」哨兵（resetSessionPromptSearch
+// 同值；sessionSearchDataFingerprint 永回非空字串，'' 保證下個 render 的比對
+// 必為「未搜尋」）。事件：
+//   { type: 'searched', fingerprint } — 記錄本次涵蓋的資料指紋。
+//   { type: 'fail' } — 搜尋失敗：顯示結果原樣不動，但標記失效為 ''，讓下次
+//     資料刷新視為未搜尋而重試——失敗死結：run-completed（dirty=false）後
+//     同資料的自動刷新不再觸發搜尋，舊命中集合凍結、新符合 session 永久隱藏。
+//   { type: 'reset' } — query／context 變更或輸入清空：歸零。
+export function nextSessionSearchSearchedFingerprint(searched, event) {
+  switch (event?.type) {
+    case 'searched':
+      return event.fingerprint ?? searched;
+    case 'fail':
+    case 'reset':
+      return '';
+    default:
+      return searched;
+  }
+}
+
 // 搜尋重跑排程狀態機：對同一查詢保留執行中的請求，資料變動（指紋成長）
 // 只標記待重跑，於完成後合併成恰好一次重跑——避免即時刷新在整日掃描完成
 // 前反覆取消重啟（掃描 > 刷新間隔時零完成、搜尋永久載入中，且後端
