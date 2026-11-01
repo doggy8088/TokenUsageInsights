@@ -3124,7 +3124,9 @@ impl AgentFilteredTurns {
 /// learn its per-reply turn numbers. Mirrors the keep and numbering rules of
 /// `timeline::parse_copilot_timeline_filtered` with `agent_filter = Some(a)`:
 /// shared prompts (no `agentId`) and the agent's own prompts open a turn, and
-/// the agent's first nonempty reply closes it.
+/// the agent's first nonempty reply closes it. Only prompts with an event body
+/// open a turn — body-less prompts leave the replay untouched, exactly like
+/// the timeline's `event_body` gate (review 4433948800).
 fn copilot_filtered_agent_turns(
     path: &Path,
     should_cancel: &(dyn Fn() -> bool + Sync),
@@ -3162,13 +3164,24 @@ fn copilot_filtered_agent_turns(
             .and_then(|v| v.as_str())
             .and_then(|raw| crate::copilot::parse_timestamp(raw).ok());
         match (kind, agent) {
-            ("user.message" | "USER_PROMPT", None) => {
+            // (review 4433948800) Prompt arms run only for prompts with an
+            // event body: the filtered timeline drops body-less prompts via
+            // `event_body`, so a body-less prompt must leave the replay
+            // untouched instead of arming a phantom turn boundary that
+            // renumbers every later reply.
+            ("user.message" | "USER_PROMPT", None)
+                if crate::copilot::event_body(event.get("payload"), event.get("data"))
+                    .is_some() =>
+            {
                 shared_prompt_seen = true;
                 for state in states.values_mut() {
                     state.pending_prompt = true;
                 }
             }
-            ("user.message" | "USER_PROMPT", Some(agent)) => {
+            ("user.message" | "USER_PROMPT", Some(agent))
+                if crate::copilot::event_body(event.get("payload"), event.get("data"))
+                    .is_some() =>
+            {
                 states
                     .entry(agent.to_owned())
                     .or_insert_with(|| AgentState {
@@ -19291,6 +19304,67 @@ mod tests {
         let reply_turns: Vec<u32> = child.replies.iter().map(|(_, turn)| *turn).collect();
         assert_eq!(reply_turns, vec![1, 2]);
         assert_eq!(child.end_turn, 3);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn copilot_filtered_agent_turns_ignores_bodyless_prompts_like_the_filtered_timeline() {
+        // (review 4433948800) A prompt without an event body never opens a
+        // turn in the filtered timeline (`event_body` drops it). If the replay
+        // still advances on the event type alone, the agent's second reply is
+        // numbered 2 while the timeline numbers it 1, and the sub-agent
+        // drawer's per-reply usage joins onto the wrong replies. The replay
+        // must be identical with and without the body-less prompt lines.
+        let dir = std::env::temp_dir().join(format!(
+            "token-usage-insights-bodyless-prompt-turns-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("events.jsonl");
+        let bodyless_prompt = |ts: &str| {
+            let mut event = app_text_at("user.message", ts);
+            event["payload"] = serde_json::Value::Null;
+            event["data"] = serde_json::Value::Null;
+            event["agentId"] = serde_json::json!("child");
+            event
+        };
+        let mut first_reply = app_text_at("assistant.message", "2026-07-23T12:00:05Z");
+        first_reply["agentId"] = serde_json::json!("child");
+        let mut second_reply = app_text_at("assistant.message", "2026-07-23T12:00:10Z");
+        second_reply["agentId"] = serde_json::json!("child");
+        let write = |events: &[serde_json::Value]| {
+            let lines = events
+                .iter()
+                .map(|event| event.to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            fs::write(&path, lines).unwrap();
+        };
+        write(&[
+            bodyless_prompt("2026-07-23T12:00:00Z"),
+            first_reply.clone(),
+            second_reply.clone(),
+        ]);
+        let with_bodyless = copilot_filtered_agent_turns(&path, &|| false).unwrap();
+        let child = with_bodyless
+            .get("child")
+            .expect("child agent turns present");
+        let reply_turns: Vec<u32> = child.replies.iter().map(|(_, turn)| *turn).collect();
+        assert_eq!(
+            reply_turns,
+            vec![1, 1],
+            "無主體提示不得開回合：第二個回覆的編號必須與時間軸一致"
+        );
+        assert_eq!(child.end_turn, 1);
+        // 對照：完全沒有無主體提示時的重放必須逐項相同（回合重放不受它們影響）。
+        write(&[first_reply, second_reply]);
+        let without_bodyless = copilot_filtered_agent_turns(&path, &|| false).unwrap();
+        let baseline = without_bodyless
+            .get("child")
+            .expect("child agent turns present");
+        assert_eq!(child.replies, baseline.replies);
+        assert_eq!(child.end_turn, baseline.end_turn);
         let _ = fs::remove_dir_all(&dir);
     }
 

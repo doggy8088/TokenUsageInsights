@@ -2000,6 +2000,71 @@ mod tests {
     }
 
     #[test]
+    fn bodyless_prompt_does_not_open_a_turn_and_trailing_usage_stays_on_the_reply_turn() {
+        // (review 4433948800) `{"type":"user.message","payload":null}` 沒有事件
+        // 主體：時間軸（參照語意）不記錄也不開回合。匯入端若仍憑事件類型開回合，
+        // 用量會被推到時間軸未使用的回合 2，回覆掛不到自己的用量（repro-r7 實測）。
+        // 兩側必須同為回合 1，用量掛到回覆 1。
+        let events = [
+            r#"{"type":"user.message","payload":null,"timestamp":"2026-07-23T12:00:00Z"}"#,
+            r#"{"type":"assistant.message","data":{"content":"hi"},"timestamp":"2026-07-23T12:00:10Z"}"#,
+            r#"{"type":"session.usage_record","id":"u1","timestamp":"2026-07-23T12:00:20Z","data":{"usage":{"model":"A","inputTokens":100,"outputTokens":10,"cacheReadTokens":0,"reasoningTokens":0,"duration":5,"accounting":{"sourceSessionId":"s","usageId":"u1","sequence":1}}}}"#,
+        ];
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "token-insights-cross-side-bodyless-{}-{}.jsonl",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(
+            &path,
+            events
+                .iter()
+                .map(|line| format!("{line}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        // 匯入端：無主體提示不得開回合，用量留在回覆的回合 1（開回合會變成 2）。
+        let calls = crate::copilot::read_calls(&path, "s", &|| false).unwrap();
+        assert_eq!(
+            calls.iter().map(|call| call.turn_no).collect::<Vec<_>>(),
+            vec![Some(1)],
+            "無主體提示不得把用量推到回合 2"
+        );
+        // 以匯入端的回合編號建立回合用量對照表，驗證時間軸側掛載一致。
+        let db_entries = HashMap::from([(1u32, (timeline_stats(110), "A".to_string()))]);
+        let file = File::open(&path).unwrap();
+        let mut timeline = Vec::new();
+        let mut metadata = HashMap::new();
+        parse_copilot_timeline_filtered(
+            BufReader::new(file),
+            &db_entries,
+            &mut timeline,
+            &mut metadata,
+            None,
+            None,
+        );
+        let replies: Vec<(String, u32)> = timeline
+            .iter()
+            .filter_map(|item| match item {
+                TimelineItem::AgentReply { reply, turn_no, .. } => Some((reply.clone(), *turn_no)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            replies,
+            vec![("hi".to_string(), 1)],
+            "時間軸不記錄無主體提示，回覆留在回合 1"
+        );
+        assert_eq!(
+            reply_turn_usage(&timeline),
+            vec![(1, Some(110))],
+            "用量必須掛到同回合的回覆（匯入回合 1 == 時間軸回合 1）"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn empty_agent_id_prompt_in_subagent_view_advances_the_filtered_turn() {
         // The subagent drawer mirrors `copilot_filtered_agent_turns`, where an
         // empty agent id is shared context: two shared prompts with one child

@@ -9,7 +9,7 @@ use std::path::Path;
 
 // Parser/reconciliation revision, hashed into the Copilot CLI/App transcript
 // fingerprints: bumping it re-syncs every unchanged session exactly once.
-pub(crate) const PARSER_VERSION: u32 = 4;
+pub(crate) const PARSER_VERSION: u32 = 5;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) struct Metrics {
@@ -142,6 +142,10 @@ pub(crate) fn event_body<'a>(
 // Mirror the filtered timeline: consecutive prompts share a turn; the first
 // nonempty reply after a prompt advances the next reply. Each agent starts its
 // own filtered counter at one, even if first invoked on a later parent turn.
+// A prompt counts only when its event body is present (`payload`/`data`
+// non-null, the same rule the timeline applies through `event_body`): a
+// body-less prompt is invisible in the timeline and must never open a turn
+// here either (review 4433948800).
 #[derive(Clone)]
 struct TurnState {
     next: u32,
@@ -159,8 +163,10 @@ impl TurnState {
 struct Event {
     #[serde(rename = "type")]
     kind: String,
-    #[serde(default)]
-    data: Data,
+    // `Option<Data>` makes an explicit `"data": null` and a missing `data` key
+    // indistinguishable, matching `event_body`'s explicit-null rule on the
+    // Value-based sides (review 4433948800).
+    data: Option<Data>,
     payload: Option<Data>,
     timestamp: Option<String>,
     id: Option<String>,
@@ -198,7 +204,13 @@ pub(crate) fn read_calls(
         }
         let event: Event =
             serde_json::from_str(&line).map_err(|_| "Copilot 事件檔包含無效 JSON".to_string())?;
-        let is_prompt = matches!(event.kind.as_str(), "user.message" | "USER_PROMPT");
+        // A prompt opens a turn only when its event body is present — the same
+        // `payload`/`data` non-null rule the filtered timeline applies through
+        // `event_body`. Classifying by type alone lets `{"type":"user.message",
+        // "payload":null}` push usage onto a turn the timeline never uses, so
+        // the reply cannot attach its usage (review 4433948800).
+        let is_prompt = matches!(event.kind.as_str(), "user.message" | "USER_PROMPT")
+            && (event.payload.is_some() || event.data.is_some());
         // One empty-`agentId` rule for prompt classification, the entry key,
         // and usage attribution: an empty id is the shared timeline (`None`).
         let agent = event.agent_id.filter(|id| !id.is_empty());
@@ -222,7 +234,11 @@ pub(crate) fn read_calls(
             state.pending = true;
         }
         if matches!(event.kind.as_str(), "assistant.message" | "ASSISTANT_REPLY")
-            && event.payload.as_ref().unwrap_or(&event.data).content
+            && event
+                .payload
+                .as_ref()
+                .or(event.data.as_ref())
+                .is_some_and(|data| data.content)
             && state.pending
         {
             state.next = state.next.checked_add(1).ok_or("Copilot 回合數超出範圍")?;
@@ -231,7 +247,10 @@ pub(crate) fn read_calls(
         if event.kind != "session.usage_record" {
             continue;
         }
-        let usage = event.data.usage.ok_or("Copilot usage record 缺少 usage")?;
+        let usage = event
+            .data
+            .and_then(|data| data.usage)
+            .ok_or("Copilot usage record 缺少 usage")?;
         let accounting = &usage["accounting"];
         // Subagents have independent accounting session IDs even though their
         // events are embedded in the parent's transcript. Keep that identity
@@ -751,6 +770,65 @@ mod tests {
         assert_eq!(event_body(Some(&body), Some(&explicit_null)), Some(&body));
         assert_eq!(event_body(Some(&body), Some(&payload)), Some(&body));
         assert_eq!(event_body(Some(&explicit_null), None), None);
+    }
+
+    #[test]
+    fn bodyless_prompt_event_shapes_do_not_open_import_turns() {
+        // (review 4433948800) 主體缺席的提示（明確 null、缺欄、兩側皆 null）在
+        // 時間軸完全不可見、不開回合；匯入端不得只憑事件類型把用量推到回合 2，
+        // 否則回覆掛不到自己的用量（repro-r7 實測：匯入回合 2 vs 時間軸回合 1）。
+        for prompt in [
+            json!({"type":"user.message","payload":null}),
+            json!({"type":"user.message"}),
+            json!({"type":"user.message","payload":null,"data":null}),
+        ] {
+            let label = prompt.to_string();
+            let rows = read(
+                &[
+                    prompt,
+                    json!({"type":"assistant.message","data":{"content":"hi"}}),
+                    event("u1", "2026-07-22T10:00:10Z"),
+                ],
+                "",
+                false,
+            )
+            .unwrap();
+            assert_eq!(
+                rows[0].turn_no,
+                Some(1),
+                "無主體提示不得開回合，用量須留在回覆的回合 1: {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn body_prompt_still_opens_a_turn_and_advances_after_reply() {
+        // 回歸守衛（防過度收斂）：有主體的提示照舊開回合。主體存在與內容無關
+        // （時間軸連空主體的 `"data":{}` 都記錄為提示），且明確 null 的 `payload`
+        // 退回 `data` 側的既有優先序不變（review 4433863670）。
+        for prompt in [
+            json!({"type":"user.message","payload":{"content":"q"}}),
+            json!({"type":"user.message","data":{"content":"q"}}),
+            json!({"type":"user.message","payload":null,"data":{"content":"q"}}),
+            json!({"type":"user.message","data":{}}),
+        ] {
+            let label = prompt.to_string();
+            let rows = read(
+                &[
+                    prompt,
+                    json!({"type":"assistant.message","data":{"content":"hi"}}),
+                    event("u1", "2026-07-22T10:00:10Z"),
+                ],
+                "",
+                false,
+            )
+            .unwrap();
+            assert_eq!(
+                rows[0].turn_no,
+                Some(2),
+                "有主體提示必須開回合並在回覆後推進: {label}"
+            );
+        }
     }
 
     #[test]
