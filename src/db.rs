@@ -225,7 +225,16 @@ pub struct UsageImportRollbackSummary {
     pub removed_records: usize,
 }
 
-const CODEX_PARSER_MIGRATION_KEY: &str = "migration:codex_session_identity_v9";
+/// Codex parser 遷移的一次性閘門 key（review PRRT_kwDOTOgsec6yVxbk）：parser
+/// 語意修正後**必須升版**，否則已消費的舊標記＋per-file 大小 cursor 會封死
+/// 重解析——feca7c9 之前舊 parser 的 `.map(...).or(parent_session_id)` 對
+/// `Some("")` 不走 `.or`，後到的空白 `parent_thread_id` 把真實父層覆寫成空
+/// 值，而 v1/v2 正規化遷移只會把 `''` 折成 NULL、無法還原（父層只存在 raw
+/// transcript）。v9→v10 重新武裝既有的「清除 `codex:%` cursor → 全量重解析」
+/// 一次性機制，讓受影響列經現在正確的「空 == 欄位缺席」parser
+/// （`db/codex.rs`）從 transcript 復原父層。升版代價是每個使用者一次性 Codex
+/// 全量重聚合（purge＋reinsert 不觸碰 import 列）。
+const CODEX_PARSER_MIGRATION_KEY: &str = "migration:codex_session_identity_v10";
 const CODEX_SOURCE_KIND_MIGRATION_KEY: &str = "migration:codex_source_kind_v1";
 const CODEX_ROLLOUT_IDENTITY_MIGRATION_KEY: &str = "migration:codex_rollout_identity_v1";
 const PARENT_SESSION_NORMALIZATION_MIGRATION_KEY: &str =
@@ -13220,6 +13229,166 @@ mod tests {
             )
             .unwrap();
         assert_eq!(unrelated_cursor, 123);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// PRRT_kwDOTOgsec6yVxbk 升級情境夾具：重現「舊 parser 把真實父層覆寫成
+    /// 空值＋v9 標記已消費＋cursor 大小不變」的既有庫狀態，再執行升級後的首次
+    /// 同步。transcript 的兩個 `session_meta` 精確重現 feca7c9 承認的覆寫 bug
+    /// （後到的 `parent_thread_id: ""` 令 `.map(...).or(parent)` 不走 `.or`、
+    /// 真實父層被抹掉）；種入列帶**硬編 v9 字面值**標記（模擬已發布版本使用者
+    /// 的資料庫——修復後 `CODEX_PARSER_MIGRATION_KEY` 已是 v10，用常數會種錯）、
+    /// 當前大小的 cursor，以及 v1/v2 遷移把 `''` 折成 NULL 之後的孤兒列。回傳
+    /// (連線, 夾具根目錄)。
+    fn seed_v9_user_with_clobbered_parent_and_sync() -> (Connection, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "codex-parent-recovery-{}-{}",
+            std::process::id(),
+            TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let sessions_dir = root.join("sessions").join("2026").join("07").join("10");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        let path = sessions_dir.join("rollout-2026-07-10T03-45-00-child.jsonl");
+        let content = r#"{"timestamp":"2026-07-10T03:45:00.000Z","type":"session_meta","payload":{"session_id":"child","id":"child","parent_thread_id":"parent","cwd":"/tmp/project","cli_version":"0.142.5","model":"gpt-5.5"}}
+{"timestamp":"2026-07-10T03:45:00.500Z","type":"session_meta","payload":{"session_id":"child","id":"child","parent_thread_id":"","cwd":"/tmp/project","cli_version":"0.142.5","model":"gpt-5.5"}}
+{"timestamp":"2026-07-10T03:45:01.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110},"last_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110},"model_context_window":258400}}}
+"#;
+        fs::write(&path, content).unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // 升級前狀態一：v9 標記已被舊版本的一次性遷移消費（df87b83/8237419
+        // 的 parser 修正都未升版此 key，真實使用者資料庫已帶 v9 標記）。同
+        // 一批既有庫還持有其他更早消費的一次性標記（v1.1.3 時代起）——若不
+        // 種它們，`run_codex_source_kind_migration` 首次執行會順手清掉
+        // `codex:sessions/%` cursor，重解析就與 parser 遷移升版無關、mutation
+        // 失去敏感度。
+        conn.execute(
+            "INSERT INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES ('migration:codex_session_identity_v9', 1, 0),
+                    (?, 1, 0), (?, 1, 0), (?, 1, 0)",
+            params![
+                CODEX_SOURCE_KIND_MIGRATION_KEY,
+                CODEX_ROLLOUT_IDENTITY_MIGRATION_KEY,
+                PARENT_SESSION_NORMALIZATION_MIGRATION_KEY
+            ],
+        )
+        .unwrap();
+        // 升級前狀態二：cursor 大小 = 檔案目前大小 → codex_transcript_needs_sync
+        // 對「大小不變＋列已存在」的檔案直接跳過，父層永久卡死。
+        let state_key = format!("codex:{}", portable_relative_path(&root, &path));
+        conn.execute(
+            "INSERT INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES (?, ?, 0)",
+            params![state_key, fs::metadata(&path).unwrap().len() as i64],
+        )
+        .unwrap();
+        // 升級前狀態三：舊 parser 落盤的孤兒列——真實父層被空白
+        // parent_thread_id 覆寫成 ''、v1/v2 正規化再折成 NULL，DB 內已無父層
+        // 任何來源（usage_identity 不含父層）。
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, usage_identity, timestamp, date, session_id,
+                transcript_path, turn_no, parent_session_id,
+                tokens_input, tokens_output, tokens_total,
+                delta_input, delta_output, delta_total
+             ) VALUES ('codex', 'codex-cli', ?, '2026-07-10T03:45:01.000Z', '2026-07-10', 'child',
+                ?, 1, NULL, 100, 10, 110, 100, 10, 110)",
+            params![
+                codex_rollout_identity(&path.to_string_lossy()).unwrap(),
+                path.to_string_lossy()
+            ],
+        )
+        .unwrap();
+
+        sync_codex_usage_logs_from(&mut conn, std::slice::from_ref(&root)).unwrap();
+        (conn, root)
+    }
+
+    /// 升級復原（PRRT_kwDOTOgsec6yVxbk）：升版
+    /// `CODEX_PARSER_MIGRATION_KEY`（v9→v10）重新武裝既有的「清除 `codex:%`
+    /// cursor → 全量重解析」一次性機制，讓被舊 parser 覆寫的父層從 raw
+    /// transcript 經現在「空 == 欄位缺席」的 parser 復原。修復還原（key 回
+    /// v9）時種入的標記被視為已消費 → 不清 cursor → 不重解析 → 父層維持
+    /// NULL、斷言轉紅。
+    #[test]
+    fn codex_parser_migration_v10_recovers_clobbered_parent_on_upgrade() {
+        let (mut conn, root) = seed_v9_user_with_clobbered_parent_and_sync();
+
+        let rows: Vec<(Option<String>, i64)> = conn
+            .prepare(
+                "SELECT parent_session_id, tokens_total
+                 FROM usage_entries
+                 WHERE assistant_type = 'codex' AND session_id = 'child'
+                 ORDER BY turn_no",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![(Some("parent".to_string()), 110)],
+            "重解析必須從 transcript 復原父層，且 purge＋reinsert 不損用量（匯入列不受影響）"
+        );
+
+        let marker: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = ?)",
+                params![CODEX_PARSER_MIGRATION_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(marker, "重解析後必須寫入升版後的一次性標記（冪等回復）");
+
+        // 冪等：再次同步為增量 no-op，不得再改寫已復原的父層。
+        sync_codex_usage_logs_from(&mut conn, std::slice::from_ref(&root)).unwrap();
+        let parent_after: Option<String> = conn
+            .query_row(
+                "SELECT parent_session_id FROM usage_entries
+                 WHERE assistant_type = 'codex' AND session_id = 'child'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(parent_after.as_deref(), Some("parent"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// 復原後果鎖（PRRT_kwDOTOgsec6yVxbk）：孤兒子 session「被顯示成獨立
+    /// session」的機制面就是 `ChildOf("parent")` 漏列＋`RootOnly` 誤收。復原
+    /// 後兩個父層範圍謂詞必須把 child 歸回父層組；修復還原時孤兒列落進
+    /// RootOnly／ChildOf 漏列 → 兩個斷言皆轉紅。
+    #[test]
+    fn codex_parent_recovery_reclassifies_child_of_and_root_only_scopes() {
+        let (conn, root) = seed_v9_user_with_clobbered_parent_and_sync();
+
+        let child = get_session_assistant_and_transcript_in_parent_scope(
+            &conn,
+            "codex",
+            "child",
+            None,
+            None,
+            ParentSessionScope::ChildOf("parent"),
+        )
+        .expect("復原後 ChildOf(\"parent\") 必須命中 child 列");
+        assert_eq!(child.parent_session_id.as_deref(), Some("parent"));
+
+        assert!(
+            get_session_assistant_and_transcript_in_parent_scope(
+                &conn,
+                "codex",
+                "child",
+                None,
+                None,
+                ParentSessionScope::RootOnly,
+            )
+            .is_err(),
+            "復原後 child 不得落進 RootOnly（不得再被顯示成獨立 session）"
+        );
+
         fs::remove_dir_all(root).unwrap();
     }
 
