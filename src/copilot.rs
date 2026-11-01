@@ -9,7 +9,7 @@ use std::path::Path;
 
 // Parser/reconciliation revision, hashed into the Copilot CLI/App transcript
 // fingerprints: bumping it re-syncs every unchanged session exactly once.
-pub(crate) const PARSER_VERSION: u32 = 3;
+pub(crate) const PARSER_VERSION: u32 = 4;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) struct Metrics {
@@ -365,28 +365,45 @@ pub(crate) fn merge_calls(
         }
     }
     let mut edges = Vec::new();
+    let mut stolen_edges = Vec::new();
     let mut degree = vec![0usize; transcript.len()];
     for call in &remaining {
-        let nearby: Vec<usize> = candidates
+        let mut nearby = Vec::new();
+        let mut stolen = Vec::new();
+        for i in candidates
             .get(&Signature::from(call))
             .into_iter()
             .flatten()
             .copied()
-            .filter(|i| {
-                !matched[*i]
-                    && (transcript[*i].timestamp - call.timestamp)
-                        .num_microseconds()
-                        .is_some_and(|delta| delta.unsigned_abs() <= 1_000_000)
-            })
-            .collect();
-        for i in &nearby {
-            degree[*i] += 1;
+        {
+            let within_window = (transcript[i].timestamp - call.timestamp)
+                .num_microseconds()
+                .is_some_and(|delta| delta.unsigned_abs() <= 1_000_000);
+            if !within_window {
+                continue;
+            }
+            if matched[i] {
+                // (review 4433863665) A window candidate consumed by an exact
+                // match stays a conflict signal: it was this call's near
+                // representation too, so an empty remaining set no longer
+                // proves the call is independent of the event file.
+                stolen.push(i);
+            } else {
+                nearby.push(i);
+                degree[i] += 1;
+            }
         }
         edges.push(nearby);
+        stolen_edges.push(stolen);
     }
-    for (call, nearby) in remaining.into_iter().zip(edges) {
+    for ((call, nearby), stolen) in remaining.into_iter().zip(edges).zip(stolen_edges) {
         match nearby.as_slice() {
-            [] => transcript.push(call),
+            // Only an untouched window proves an independent SQLite-only call.
+            // Without the `stolen` guard an exact hit can consume another
+            // call's only near candidate and this arm appends a phantom
+            // SQLite-only row, double-counting the same usage (review
+            // 4433863665).
+            [] if stolen.is_empty() => transcript.push(call),
             [i] if degree[*i] == 1 => {
                 transcript[*i].native_identity = Some(call.identity.clone());
                 if transcript[*i].initiator.is_none() {
@@ -627,6 +644,82 @@ mod tests {
         );
         assert!(merge_calls(vec![a.clone(), b], vec![middle.clone()]).is_err());
         assert!(merge_calls(vec![a], vec![middle.clone(), middle]).is_err());
+    }
+
+    #[test]
+    fn exact_hit_must_not_orphan_the_only_window_candidate_of_another_native_call() {
+        // (review 4433863665) 事件檔 0ms/+750ms、SQLite −750ms/0ms、同 signature：
+        // exact 拿走 e0 後，sqlite:1 唯一的一秒內候選已被消耗，不得再附加成幽靈
+        // SQLite-only 列（同一呼叫計兩次、總量 +50%）；衝突時必須保留原資料待重試。
+        let mut e0 = call("2026-07-22T10:00:00Z");
+        e0.identity = "event:e0".into();
+        let mut e1 = e0.clone();
+        e1.identity = "event:e1".into();
+        e1.timestamp = parse_timestamp("2026-07-22T10:00:00.750Z").unwrap();
+        let mut n1 = e0.clone();
+        n1.identity = "sqlite:1".into();
+        n1.timestamp = parse_timestamp("2026-07-22T09:59:59.250Z").unwrap();
+        n1.turn_no = None;
+        let mut n2 = e0.clone();
+        n2.identity = "sqlite:2".into();
+        n2.turn_no = None;
+        // 與 native 迭代順序無關，兩種排序都必須拒絕配對。
+        for natives in [vec![n1.clone(), n2.clone()], vec![n2.clone(), n1.clone()]] {
+            let result = merge_calls(vec![e0.clone(), e1.clone()], natives);
+            assert!(
+                result.is_err(),
+                "exact 消耗唯一候選後不得附加獨立 SQLite-only 列，實得 {} 列",
+                result.as_ref().map(Vec::len).unwrap_or(0)
+            );
+            assert!(result.unwrap_err().contains("保留原資料待重試"));
+        }
+        // 重試：來源資料可解析（SQLite 時間補正為各自 exact 對應）→ 1:1 合併、無雙計。
+        n1.timestamp = e1.timestamp;
+        let merged = merge_calls(vec![e0.clone(), e1.clone()], vec![n1, n2]).unwrap();
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].native_identity.as_deref(), Some("sqlite:2"));
+        assert_eq!(merged[1].native_identity.as_deref(), Some("sqlite:1"));
+        assert_eq!(merged.iter().map(|c| c.metrics.input).sum::<u64>(), 200);
+    }
+
+    #[test]
+    fn stolen_window_candidate_does_not_block_distinct_safe_pairing() {
+        // 同 review 4433863665 場景的變體：exact 仍消耗 e0，但 sqlite:1 另有互異的
+        // 安全候選 e1（Δ950ms）→ 兩筆呼叫各有安全候選，必須照常 1:1 合併，不得過度衝突。
+        let mut e0 = call("2026-07-22T10:00:00Z");
+        e0.identity = "event:e0".into();
+        let mut e1 = e0.clone();
+        e1.identity = "event:e1".into();
+        e1.timestamp = parse_timestamp("2026-07-22T10:00:00.200Z").unwrap();
+        let mut n1 = e0.clone();
+        n1.identity = "sqlite:1".into();
+        n1.timestamp = parse_timestamp("2026-07-22T09:59:59.250Z").unwrap();
+        n1.turn_no = None;
+        let mut n2 = e0.clone();
+        n2.identity = "sqlite:2".into();
+        n2.turn_no = None;
+        for natives in [vec![n1.clone(), n2.clone()], vec![n2.clone(), n1.clone()]] {
+            let merged = merge_calls(vec![e0.clone(), e1.clone()], natives).unwrap();
+            assert_eq!(merged.len(), 2);
+            assert_eq!(merged[0].native_identity.as_deref(), Some("sqlite:2"));
+            assert_eq!(merged[1].native_identity.as_deref(), Some("sqlite:1"));
+            assert_eq!(merged.iter().map(|c| c.metrics.input).sum::<u64>(), 200);
+        }
+    }
+
+    #[test]
+    fn far_sqlite_only_call_still_appends_without_any_window_candidate() {
+        // 真的沒有任何秒內候選（含被 exact 消耗者）的 SQLite 呼叫仍是獨立呼叫，
+        // 必須照舊附加成 SQLite-only 列，衝突守衛不得一律拒絕。
+        let a = call("2026-07-22T10:00:00Z");
+        let mut far = a.clone();
+        far.identity = "sqlite:far".into();
+        far.timestamp = parse_timestamp("2026-07-22T10:00:02Z").unwrap();
+        far.turn_no = None;
+        let merged = merge_calls(vec![a.clone()], vec![far]).unwrap();
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].native_identity, None);
+        assert_eq!(merged[1].identity, "sqlite:far");
     }
 
     #[test]
