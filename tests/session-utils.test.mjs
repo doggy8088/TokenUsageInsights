@@ -925,3 +925,61 @@ test('searched fingerprint marker advances only on successful completion and nev
     searched,
   );
 });
+
+test('background failure without completed results transitions to error instead of keeping loading', () => {
+  // debounce 翻轉死結回歸鎖（comment 4434003894）：首搜 250ms debounce 期間的
+  // 資料刷新把該次搜尋翻成 background: true，此時尚無已完成結果、狀態是
+  // 'loading'；失敗不得保留 'loading'（畫面永久「搜尋中…」＋未過濾清單、且
+  // 無任何在飛請求），必須轉既有 'error' 渲染（過濾旁路＋一般計數＋既有
+  // toast，零新增 i18n 鍵）。還原成以 background 為閘門時此測試立即 RED。
+  const failed = nextSessionSearchDisplayState(
+    { matches: null, status: 'loading' },
+    { type: 'fail', background: true },
+  );
+  assert.equal(failed.matches, null);
+  assert.equal(failed.status, 'error');
+
+  // 'error' 經背景重試再失敗（仍無完成結果）維持 'error'，不得回 'loading'。
+  const refailed = nextSessionSearchDisplayState(failed, { type: 'fail', background: true });
+  assert.equal(refailed.matches, null);
+  assert.equal(refailed.status, 'error');
+
+  // 前景（非背景）首跑失敗維持既有 null+'error'。
+  const foregroundFail = nextSessionSearchDisplayState(
+    { matches: null, status: 'loading' },
+    { type: 'fail', background: false },
+  );
+  assert.equal(foregroundFail.matches, null);
+  assert.equal(foregroundFail.status, 'error');
+});
+
+test('background failure with completed results keeps the completed matches visible', () => {
+  // keep-scope 守護（comment 4434003894）：「失敗保留現狀」只屬於已有完成結果
+  // 的背景重跑——閘門過度修正成「背景失敗一律 error」時此測試立即 RED（同時
+  // 守護 round-7 不變量：dirty 重跑期間完成命中與篩選狀態續顯）。
+  const v1 = new Set(['session-a', 'session-b']);
+  const kept = nextSessionSearchDisplayState(
+    { matches: v1, status: 'complete' },
+    { type: 'fail', background: true },
+  );
+  assert.equal(kept.matches, v1);
+  assert.equal(kept.status, 'complete');
+
+  // 空命中集合也是有效結果（'complete' 與 matches Set 同時成立），同樣保留。
+  const emptyMatches = new Set();
+  const keptEmpty = nextSessionSearchDisplayState(
+    { matches: emptyMatches, status: 'complete' },
+    { type: 'fail', background: true },
+  );
+  assert.equal(keptEmpty.matches, emptyMatches);
+  assert.equal(keptEmpty.status, 'complete');
+
+  // 閘門形狀鎖定：background 是保留的必要條件，前景失敗即使有完成結果也照
+  // clear-and-load 語意轉 null+'error'。
+  const foreground = nextSessionSearchDisplayState(
+    { matches: v1, status: 'complete' },
+    { type: 'fail', background: false },
+  );
+  assert.equal(foreground.matches, null);
+  assert.equal(foreground.status, 'error');
+});

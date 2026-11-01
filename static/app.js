@@ -6,7 +6,7 @@ import {
   calculateMovingAverageTrend,
   calculateMovingAverageViewportTrend,
   getChartDataPointX,
-} from './chart-utils.js?v=15';
+} from './chart-utils.js?v=16';
 import {
   buildSessionParentIndex,
   compareSessionRows,
@@ -18,7 +18,7 @@ import {
   sessionIdentityKey,
   sessionSearchDataFingerprint,
   sessionSearchMatchKey,
-} from './session-utils.js?v=10';
+} from './session-utils.js?v=11';
 import { parseUsageTimestamp } from './time-utils.js?v=1';
 
 // Globals
@@ -4631,8 +4631,10 @@ async function executeSessionPromptSearch(query, searchContext, { background = f
     }
 
     console.error('搜尋 USER 提示詞失敗:', error);
-    // 背景重跑失敗保留既有結果與 'complete'（舊命中仍較未過濾正確）並照常
-    // 發錯誤通知；首跑失敗維持現狀 null+'error'。
+    // 已有完成結果的背景重跑失敗保留既有命中與 'complete'（舊命中仍較未過濾
+    // 正確）；無完成結果的失敗（首跑、或首搜 debounce 期間被資料刷新翻成背景）
+    // 轉既有 null+'error'，不得凍結 'loading'（comment 4434003894）。無論
+    // 哪種失敗都照常發錯誤通知。
     applySessionSearchDisplayState({ type: 'fail', background });
     // 失敗使「已搜尋」指紋失效（顯示結果原樣不動）：下次資料刷新視為未搜尋
     // 而重試，避免 run-completed（dirty=false）後同資料永不重搜、舊命中集合

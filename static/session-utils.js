@@ -140,8 +140,11 @@ export function nextSessionSearchRunState(state, event) {
 //     原子替換（掃描 > 資料更新間隔時不再永久顯示搜尋中＋未過濾清單）。
 //   { type: 'complete', matches } — 成功完成：以新命中原子替換（單步、
 //     無空集合中間態，dirty 與否不影響可見性）。
-//   { type: 'fail', background } — 失敗：背景重跑保留既有結果與狀態；
-//     首跑回 null+'error'。
+//   { type: 'fail', background } — 失敗：僅「已有完成結果（status 'complete'）的
+//     背景重跑」保留既有命中與狀態（舊命中仍較未過濾正確）；其餘失敗（首跑、
+//     或無完成結果的背景失敗——例如首搜 250ms debounce 期間被資料刷新翻成
+//     背景）回 null+'error'，沿用既有 'error' 渲染、不得凍結 'loading'
+//     （comment 4434003894）。
 export function nextSessionSearchDisplayState(state, event) {
   switch (event?.type) {
     case 'new-intent':
@@ -151,7 +154,7 @@ export function nextSessionSearchDisplayState(state, event) {
     case 'complete':
       return { matches: event.matches, status: 'complete' };
     case 'fail':
-      return event.background
+      return event.background && state?.status === 'complete'
         ? state
         : { matches: null, status: 'error' };
     default:
