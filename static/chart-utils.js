@@ -1,4 +1,4 @@
-import { sessionIdentityKey } from './session-utils.js?v=7';
+import { sessionIdentityKey } from './session-utils.js?v=8';
 import { parseUsageTimestamp } from './time-utils.js?v=1';
 
 export function normalizeEntryTokenParts(entry) {

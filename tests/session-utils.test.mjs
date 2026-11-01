@@ -655,3 +655,76 @@ test('search data fingerprint changes when max_turn_no changes', () => {
     sessionSearchDataFingerprint(grown),
   );
 });
+
+test('search data fingerprint changes when same-turn usage grows with max_turn_no unchanged', () => {
+  // 同回合（第一則回覆前）追加符合搜尋詞的 prompt 與用量：session 身分六欄
+  // 與 max_turn_no 全不變，只有用量總量／耗時與 raw usage 列數成長。
+  // 指紋必須察覺這種成長並觸發搜尋重跑（comment 4433781467）。
+  const before = [
+    {
+      assistant_type: 'codex',
+      source_kind: 'codex-cli',
+      source_dir_key: null,
+      session_id: 'same-turn',
+      max_turn_no: 1,
+      parent_session_id: '',
+      total_tokens: 110,
+      duration_ms: 500,
+    },
+  ];
+  const after = [{ ...before[0], total_tokens: 220, duration_ms: 1500 }];
+
+  assert.notEqual(
+    sessionSearchDataFingerprint(before, 1),
+    sessionSearchDataFingerprint(after, 2),
+  );
+  // 每個單調訊號都必須各自觸發重跑：用量成長、raw 列數成長。
+  assert.notEqual(
+    sessionSearchDataFingerprint(before, 1),
+    sessionSearchDataFingerprint(after, 1),
+  );
+  assert.notEqual(
+    sessionSearchDataFingerprint(before, 1),
+    sessionSearchDataFingerprint(before, 2),
+  );
+});
+
+test('search data fingerprint stays stable across row order and refresh with growth markers', () => {
+  const rows = [
+    {
+      assistant_type: 'copilot',
+      source_kind: 'copilot-app',
+      source_dir_key: 'aa',
+      session_id: 'root',
+      max_turn_no: 1,
+      parent_session_id: '',
+      total_tokens: 110,
+      duration_ms: 500,
+    },
+    {
+      assistant_type: 'copilot',
+      source_kind: 'copilot-app',
+      source_dir_key: 'aa',
+      session_id: 'root__agent-1',
+      max_turn_no: 1,
+      parent_session_id: 'root',
+      total_tokens: 220,
+      duration_ms: 1500,
+    },
+  ];
+  const refreshed = rows.map(row => ({ ...row }));
+  const shuffled = [rows[1], rows[0]].map(row => ({ ...row }));
+
+  assert.equal(
+    sessionSearchDataFingerprint(rows, 3),
+    sessionSearchDataFingerprint(refreshed, 3),
+  );
+  assert.equal(
+    sessionSearchDataFingerprint(rows, 3),
+    sessionSearchDataFingerprint(rows, 3),
+  );
+  assert.equal(
+    sessionSearchDataFingerprint(rows, 3),
+    sessionSearchDataFingerprint(shuffled, 3),
+  );
+});

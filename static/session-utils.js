@@ -49,9 +49,18 @@ export function sessionSearchMatchKey(session) {
 // 搜尋重跑門檻的資料指紋：必須涵蓋 sessionSearchMatchKey 的完整鍵空間
 // （含 parent_session_id），否則父層單獨變更時指紋不變、搜尋不重跑，
 // 舊命中鍵無法匹配新列。既有 5 元維持裸欄位（parity）；父層正規化
-// empty==absent 鏡像 sessionIdentityKey。
-export function sessionSearchDataFingerprint(rows) {
-  return JSON.stringify(
+// empty==absent 鏡像 sessionIdentityKey。另納入單調成長訊號——每 session
+// 的 total_tokens／duration_ms 與當日 raw usage 列數（rawUsageEntryCount）：
+// 同回合（max_turn_no 不變）追加 prompt＋用量時身分六欄全不變，只有這三者
+// 隨用量列追加而變動，讓 renderDashboard 重跑搜尋、不再以舊命中集合隱藏
+// 已匹配的 session（comment 4433781467）。三者皆為單調彙整值，在列序
+// 打亂／重複刷新相同資料時保持穩定。殘餘缺口：只改 transcript 文字且
+// 零用量列變動的編輯前端無法察覺，需 server 端 transcript 修訂標記
+// （如 mtime＋size 或內容 hash）才能涵蓋。
+export function sessionSearchDataFingerprint(rows, rawUsageEntryCount) {
+  const rawEntryCount = Number(rawUsageEntryCount) || 0;
+  return JSON.stringify([
+    rawEntryCount,
     (rows || [])
       .map(session => [
         session.assistant_type,
@@ -60,9 +69,11 @@ export function sessionSearchDataFingerprint(rows) {
         session.session_id,
         session.max_turn_no,
         session?.parent_session_id || '',
+        session?.total_tokens || 0,
+        session?.duration_ms || 0,
       ])
-      .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)))
-  );
+      .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))),
+  ]);
 }
 
 export function parentSessionIdentityKey(session, sessions) {

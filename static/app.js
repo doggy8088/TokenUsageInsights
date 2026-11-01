@@ -6,7 +6,7 @@ import {
   calculateMovingAverageTrend,
   calculateMovingAverageViewportTrend,
   getChartDataPointX,
-} from './chart-utils.js?v=12';
+} from './chart-utils.js?v=13';
 import {
   buildSessionParentIndex,
   compareSessionRows,
@@ -15,7 +15,7 @@ import {
   sessionIdentityKey,
   sessionSearchDataFingerprint,
   sessionSearchMatchKey,
-} from './session-utils.js?v=7';
+} from './session-utils.js?v=8';
 import { parseUsageTimestamp } from './time-utils.js?v=1';
 
 // Globals
@@ -3176,7 +3176,8 @@ function renderDashboard(data) {
     }
     currentSessionSearchContext = nextSearchContext;
   }
-  const nextSearchFingerprint = sessionSearchDataFingerprint(allSessions);
+  const rawUsageEntryCount = Array.isArray(data.raw_entries) ? data.raw_entries.length : 0;
+  const nextSearchFingerprint = sessionSearchDataFingerprint(allSessions, rawUsageEntryCount);
   const shouldRefreshSearch = currentSessionSearchQuery
     && nextSearchFingerprint !== currentSessionSearchDataFingerprint;
   currentSessionSearchDataFingerprint = nextSearchFingerprint;
