@@ -1755,7 +1755,7 @@ fn get_copilot_session_name(copilot_dir: &Path, session_id: &str) -> Option<Stri
             .unwrap_or("");
         match event_type {
             "user.message" | "USER_PROMPT" => {
-                let payload = event.get("payload").or_else(|| event.get("data"));
+                let payload = crate::copilot::event_body(event.get("payload"), event.get("data"));
                 if let Some(content) = payload
                     .and_then(|payload| payload.get("content"))
                     .and_then(|content| content.as_str())
@@ -3179,9 +3179,7 @@ fn copilot_filtered_agent_turns(
                     .pending_prompt = true;
             }
             ("assistant.message" | "ASSISTANT_REPLY", Some(agent)) => {
-                let content = event
-                    .get("payload")
-                    .or_else(|| event.get("data"))
+                let content = crate::copilot::event_body(event.get("payload"), event.get("data"))
                     .and_then(|p| p.get("content"))
                     .and_then(|c| c.as_str())
                     .unwrap_or("");
@@ -19256,6 +19254,72 @@ mod tests {
             f.replies("app__child", Some("child")),
             vec![(1, 110), (2, 110)]
         );
+    }
+
+    #[test]
+    fn copilot_filtered_agent_turns_counts_explicit_null_payload_replies() {
+        // (review comment 4433863670) The db-side filtered turn counter must
+        // apply the same explicit-null precedence as `event_body`, or replies
+        // with `payload: null` next to non-empty `data.content` never advance
+        // turns here while the import and timeline sides advance them.
+        let dir = std::env::temp_dir().join(format!(
+            "token-usage-insights-null-payload-turns-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("events.jsonl");
+        let mut prompt = app_text_at("user.message", "2026-07-23T12:00:00Z");
+        prompt["agentId"] = serde_json::json!("child");
+        let mut null_reply = app_text_at("assistant.message", "2026-07-23T12:00:10Z");
+        null_reply["payload"] = serde_json::Value::Null;
+        null_reply["agentId"] = serde_json::json!("child");
+        let mut second_prompt = app_text_at("user.message", "2026-07-23T12:01:00Z");
+        second_prompt["agentId"] = serde_json::json!("child");
+        let mut second_null_reply = app_text_at("assistant.message", "2026-07-23T12:01:10Z");
+        second_null_reply["payload"] = serde_json::Value::Null;
+        second_null_reply["agentId"] = serde_json::json!("child");
+        let lines = [prompt, null_reply, second_prompt, second_null_reply]
+            .iter()
+            .map(|event| event.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&path, lines).unwrap();
+
+        let turns = copilot_filtered_agent_turns(&path, &|| false).unwrap();
+        let child = turns.get("child").expect("child agent turns present");
+        let reply_turns: Vec<u32> = child.replies.iter().map(|(_, turn)| *turn).collect();
+        assert_eq!(reply_turns, vec![1, 2]);
+        assert_eq!(child.end_turn, 3);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn copilot_session_name_observes_explicit_null_payload_prompt() {
+        // Same explicit-null precedence must hold for the display-name
+        // heuristic, or a `payload: null` prompt is invisible there.
+        let copilot_dir = std::env::temp_dir().join(format!(
+            "token-usage-insights-null-payload-name-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&copilot_dir);
+        let log = copilot_dir
+            .join("session-state")
+            .join("copilot-session")
+            .join("events.jsonl");
+        fs::create_dir_all(log.parent().unwrap()).unwrap();
+        fs::write(
+            &log,
+            r#"{"type":"user.message","payload":null,"data":{"content":"Null payload prompt"}}
+{"type":"assistant.message","data":{"content":"Reply"}}
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            get_copilot_session_name(&copilot_dir, "copilot-session").as_deref(),
+            Some("Null payload prompt")
+        );
+        let _ = fs::remove_dir_all(&copilot_dir);
     }
 
     #[test]
