@@ -6,6 +6,7 @@ import {
   compareSessionRows,
   filterEntriesBySessionIdentity,
   matchesSessionIdentity,
+  nextSessionSearchDisplayState,
   nextSessionSearchRunState,
   parentSessionIdentityKey,
   rootSessionIdentityKey,
@@ -770,4 +771,70 @@ test('repeated data changes coalesce into exactly one rerun after the run comple
   assert.equal(state.inFlight, false);
   assert.equal(state.dirty, false);
   assert.equal(scheduledRestarts, 1);
+});
+
+test('background rerun keeps completed matches and filter state visible until the replacement run completes', () => {
+  // 可見性回歸鎖（comment 4433948840）：完成+dirty 的重跑排程不得清空剛取得
+  // 的命中或切回 'loading'——清空發生在排程當下，完成渲染在同一個 JS task
+  // 內即被覆寫，掃描 > 資料更新間隔時使用者永遠只看到搜尋中＋未過濾清單。
+  // 還原成 clear-and-load 重跑時此測試立即 RED。
+  const v1 = new Set(['session-a', 'session-b']);
+  const v2 = new Set(['session-a', 'session-c']);
+
+  let display = nextSessionSearchDisplayState(
+    { matches: null, status: 'idle' },
+    { type: 'new-intent', hasQuery: true },
+  );
+  assert.equal(display.matches, null);
+  assert.equal(display.status, 'loading');
+
+  display = nextSessionSearchDisplayState(display, { type: 'complete', matches: v1 });
+  assert.equal(display.matches, v1);
+  assert.equal(display.status, 'complete');
+
+  // 完成+dirty → 背景重跑排程：命中（同參照、非 null／空）與 'complete'
+  // 原樣續顯，篩選狀態維持可見。
+  const kept = nextSessionSearchDisplayState(display, { type: 'background-rerun' });
+  assert.equal(kept.matches, v1);
+  assert.equal(kept.matches.size, 2);
+  assert.equal(kept.status, 'complete');
+
+  // 新結果直到成功完成才接手可見狀態。
+  display = nextSessionSearchDisplayState(kept, { type: 'complete', matches: v2 });
+  assert.equal(display.matches, v2);
+  assert.equal(display.status, 'complete');
+});
+
+test('run completion swaps search results atomically with no empty intermediate state', () => {
+  // 原子替換回歸鎖（comment 4433948840）：'complete' 必須單步自舊命中直上新
+  // 命中，任何遷移都不得回 null／空集合（clear-then-set 變異在此測試 RED）。
+  const v1 = new Set(['session-a']);
+  const v2 = new Set(['session-a', 'session-b']);
+  const v3 = new Set(['session-b']);
+
+  // dirty 重跑待排時的完成：單步直上 V2，無空集合中間態。
+  const swapped = nextSessionSearchDisplayState(
+    { matches: v1, status: 'complete' },
+    { type: 'complete', matches: v2 },
+  );
+  assert.equal(swapped.matches, v2);
+  assert.equal(swapped.status, 'complete');
+
+  // complete(V2) → background-rerun → complete(V3) 全程每一步皆持完整集合。
+  const kept = nextSessionSearchDisplayState(swapped, { type: 'background-rerun' });
+  assert.notEqual(kept.matches, null);
+  assert.equal(kept.matches.size, 2);
+  assert.equal(kept.status, 'complete');
+
+  const reswapped = nextSessionSearchDisplayState(kept, { type: 'complete', matches: v3 });
+  assert.equal(reswapped.matches, v3);
+  assert.equal(reswapped.status, 'complete');
+
+  // 背景重跑失敗同樣不得掏空可見結果（保留既有命中與 'complete'）。
+  const keptAfterFail = nextSessionSearchDisplayState(
+    reswapped,
+    { type: 'fail', background: true },
+  );
+  assert.equal(keptAfterFail.matches, v3);
+  assert.equal(keptAfterFail.status, 'complete');
 });

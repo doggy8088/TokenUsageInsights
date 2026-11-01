@@ -106,6 +106,37 @@ export function nextSessionSearchRunState(state, event) {
   }
 }
 
+// 搜尋可見狀態生命週期（純函式，comment 4433948840）：state = { matches,
+// status }，status ∈ 'idle' | 'loading' | 'complete' | 'error'。清空發生在
+// 「排程」當下而非完成後，故事件含 'background-rerun'／'new-intent' 以鎖住
+// 「背景重跑期間已完成結果續顯」。事件與語意：
+//   { type: 'new-intent', hasQuery } — query／context 變更、輸入清空：
+//     clear-and-load（新查詢的舊命中無意義），hasQuery 決定 'loading' 或
+//     'idle'。
+//   { type: 'background-rerun' } — 同查詢、資料驅動的背景重跑：原樣保留
+//     命中與 'complete'，不清空、不切 'loading'，篩選狀態續用至新結果
+//     原子替換（掃描 > 資料更新間隔時不再永久顯示搜尋中＋未過濾清單）。
+//   { type: 'complete', matches } — 成功完成：以新命中原子替換（單步、
+//     無空集合中間態，dirty 與否不影響可見性）。
+//   { type: 'fail', background } — 失敗：背景重跑保留既有結果與狀態；
+//     首跑回 null+'error'。
+export function nextSessionSearchDisplayState(state, event) {
+  switch (event?.type) {
+    case 'new-intent':
+      return { matches: null, status: event.hasQuery ? 'loading' : 'idle' };
+    case 'background-rerun':
+      return state;
+    case 'complete':
+      return { matches: event.matches, status: 'complete' };
+    case 'fail':
+      return event.background
+        ? state
+        : { matches: null, status: 'error' };
+    default:
+      return state;
+  }
+}
+
 export function parentSessionIdentityKey(session, sessions) {
   if (!session?.parent_session_id) return null;
   // 父層通常是主／獨立 session（Copilot 合成 `<parent>__<agent>` 約定），
