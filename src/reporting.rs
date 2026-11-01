@@ -234,11 +234,18 @@ fn is_utc_date_shape(segment: &str) -> bool {
         && bytes[8..].iter().all(u8::is_ascii_digit)
 }
 
-/// 用量列所在 UTC 日。寫入契約保證 `date` 欄 == `timestamp[..10]`（v3 日桶、
-/// v4 逐次呼叫列、匯入列三者一致），顯示端直接取時間戳前 10 碼即可，無需
-/// 另行 plumbing `date` 欄。
+/// 用量列所在 UTC 日。寫入契約保證 `date` 欄 == **已 trim** 時間戳的前 10 碼
+/// （v3 日桶、v4 逐次呼叫列、匯入列三者一致：匯入端
+/// `entry_date_from_timestamp` 先 trim 再取日期、原值入庫），顯示端取日必須
+/// 同語意先 trim 再取前 10 碼——合法的前置空白列（如 `" 2026-07-23T..."`）
+/// 未 trim 直接切片會得到垃圾日鍵 `" 2026-07-2"`，使每日聚合的
+/// `DayTotal{(date, model)}` 與逐次呼叫列的 `covered_day_models` 鍵錯開、
+/// 重疊判定失效、同日歷史被聚合＋呼叫雙計（review PRRT_kwDOTOgsec6yVxb_）。
+/// NBSP 等多字節 Unicode 空白佔多位元組，固定寬度切片受害更嚴重。寫入端
+/// 刻意不 trim 時間戳：`build_usage_entry_import_source_id` 把原值雜湊進去重
+/// 簽章，改動已存值會使 export→re-import 簽章漂移、舊列重複入庫。
 fn entry_day(entry: &UsageEntry) -> Option<&str> {
-    entry.timestamp.get(..10)
+    entry.timestamp.trim().get(..10)
 }
 
 /// legacy CLI 每日聚合判別（review PRRT_kwDOTOgsec6yUXNs）：三重閘門，缺一
@@ -1407,6 +1414,113 @@ mod tests {
                 ),
             ]),
             100
+        );
+    }
+
+    #[test]
+    fn entry_day_trims_padded_timestamps_before_date_slice() {
+        // 匯入端 `entry_date_from_timestamp` 先 trim 再取日期、原值入庫；顯示
+        // 端 `entry_day` 必須同語意。合法的前置空白時間戳未 trim 直接切前 10
+        // bytes 會得到垃圾日鍵（" 2026-07-23T..." → " 2026-07-2"、NBSP 版因
+        // 多字節空白連日期形狀都保不住），(date, model) 日桶認領與呼叫列覆蓋
+        // 鍵隨之錯開（review PRRT_kwDOTOgsec6yVxb_）。乾淨列 trim 是恆等
+        // 變換，行為不變。
+        let clean = duration_entry_with_source(
+            1,
+            "2026-07-23T10:00:00Z",
+            100.0,
+            Some("copilot-cli"),
+            "gpt-5",
+        );
+        let space_padded = duration_entry_with_source(
+            1,
+            " 2026-07-23T10:00:00Z",
+            100.0,
+            Some("copilot-cli"),
+            "gpt-5",
+        );
+        let tab_padded = duration_entry_with_source(
+            1,
+            "\t2026-07-23T10:00:00Z",
+            100.0,
+            Some("copilot-cli"),
+            "gpt-5",
+        );
+        let nbsp_padded = duration_entry_with_source(
+            1,
+            "\u{a0}2026-07-23T10:00:00Z",
+            100.0,
+            Some("copilot-cli"),
+            "gpt-5",
+        );
+
+        assert_eq!(entry_day(&clean), Some("2026-07-23"));
+        assert_eq!(
+            entry_day(&space_padded),
+            Some("2026-07-23"),
+            "前置空白時間戳取日必須與匯入端同語意（未 trim 會得 \" 2026-07-2\"）"
+        );
+        assert_eq!(entry_day(&tab_padded), Some("2026-07-23"));
+        assert_eq!(
+            entry_day(&nbsp_padded),
+            Some("2026-07-23"),
+            "NBSP 是多字節 Unicode 空白，固定寬度切片受害更深"
+        );
+    }
+
+    #[test]
+    fn session_duration_ms_prefers_cli_calls_over_padded_same_day_daily_aggregate() {
+        // 同日每日聚合與逐次呼叫若只有一方時間戳帶前置空白，取日鍵
+        // （" 2026-07-2" vs "2026-07-23"）錯開會讓重疊判定失效、3500+100 雙計
+        // 成 3600ms（review PRRT_kwDOTOgsec6yVxb_）。trim 取日後兩列同鍵，
+        // 回歸同日案例（`..._prefers_cli_calls_over_same_day_daily_aggregate`）
+        // 的覆蓋讓位語意 100ms。鏡像方向（只 pad 呼叫列）同斷言。
+        let padded_daily = duration_entry_with_source(
+            1,
+            " 2026-07-23T09:00:00Z",
+            3500.0,
+            Some("copilot-cli"),
+            "gpt-5",
+        );
+        let clean_call = duration_entry_with_source(
+            1,
+            "2026-07-23T10:00:00Z",
+            100.0,
+            Some("copilot-cli"),
+            "gpt-5",
+        );
+        let clean_daily = duration_entry_with_source(
+            1,
+            "2026-07-23T09:00:00Z",
+            3500.0,
+            Some("copilot-cli"),
+            "gpt-5",
+        );
+        let padded_call = duration_entry_with_source(
+            1,
+            "\t2026-07-23T10:00:00Z",
+            100.0,
+            Some("copilot-cli"),
+            "gpt-5",
+        );
+        let daily_id = "copilot-cli-agents:aa:duration-session:2026-07-23:vendor:builder:42";
+        let call_id = "copilot-cli-agents:aa:duration-session:call:h1";
+
+        assert_eq!(
+            session_duration_ms([
+                (&padded_daily, Some(daily_id)),
+                (&clean_call, Some(call_id)),
+            ]),
+            100,
+            "每日聚合列帶前置空白不得與同日呼叫雙計"
+        );
+        assert_eq!(
+            session_duration_ms([
+                (&clean_daily, Some(daily_id)),
+                (&padded_call, Some(call_id)),
+            ]),
+            100,
+            "呼叫列帶前置空白同樣不得與同日每日聚合雙計"
         );
     }
 
