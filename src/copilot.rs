@@ -2,7 +2,7 @@
 use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -346,6 +346,10 @@ impl From<&Call> for Signature {
     }
 }
 
+/// Index key for the absent-versus-nonzero twin check in `merge_calls`:
+/// (model, agent, timestamp, input, output).
+type TwinKey = (Option<String>, Option<String>, DateTime<Utc>, u64, u64);
+
 /// SQLite has no API identity. Match the two representations one-to-one,
 /// keeping transcript timestamps (including the correct side of midnight).
 /// Refuse ambiguous nearby calls rather than silently double-counting them.
@@ -356,6 +360,23 @@ pub(crate) fn merge_calls(
     let mut candidates: HashMap<Signature, Vec<usize>> = HashMap::new();
     for (index, call) in transcript.iter().enumerate() {
         candidates.entry(call.into()).or_default().push(index);
+    }
+    // (review 4433948817) Index the event-file rows by (time, model, agent,
+    // input, output). When a native call shares that key with an event row but
+    // their `Signature` differs, some metric the event file omitted (parsed as
+    // 0) is non-zero in SQLite — reasoning, cache or duration. The all-or-nothing
+    // `Signature` then misses on both the exact and window gates and the call
+    // would be appended as an independent row, double-counting its whole
+    // input/output. A shared key is the fingerprint of that drift shape.
+    let mut twins: HashSet<TwinKey> = HashSet::new();
+    for call in &transcript {
+        twins.insert((
+            call.model.clone(),
+            call.agent_id.clone(),
+            call.timestamp,
+            call.metrics.input,
+            call.metrics.output,
+        ));
     }
     let mut matched = vec![false; transcript.len()];
     let mut remaining = Vec::new();
@@ -437,8 +458,26 @@ pub(crate) fn merge_calls(
             // Without the `stolen` guard an exact hit can consume another
             // call's only near candidate and this arm appends a phantom
             // SQLite-only row, double-counting the same usage (review
-            // 4433863665).
-            [] if stolen.is_empty() => transcript.push(call),
+            // 4433863665). The `twins` guard extends the same rule to
+            // signature-drifted twins (review 4433948817): a same-time event
+            // row that matches on model/agent/input/output necessarily
+            // disagrees on another metric (equal ones would have matched by
+            // signature), so independence is unproven — keep both sources
+            // intact and retry through the established 保留原資料待重試 path
+            // instead of appending a phantom row. Genuinely independent calls
+            // differ in input/output or time and still append below.
+            [] if stolen.is_empty() => {
+                if twins.contains(&(
+                    call.model.clone(),
+                    call.agent_id.clone(),
+                    call.timestamp,
+                    call.metrics.input,
+                    call.metrics.output,
+                )) {
+                    return Err("Copilot 事件檔與 SQLite 用量無法唯一配對，保留原資料待重試".into());
+                }
+                transcript.push(call)
+            }
             [i] if degree[*i] == 1 => {
                 transcript[*i].native_identity = Some(call.identity.clone());
                 if transcript[*i].initiator.is_none() {
@@ -754,6 +793,76 @@ mod tests {
         let merged = merge_calls(vec![a.clone()], vec![far]).unwrap();
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0].native_identity, None);
+        assert_eq!(merged[1].identity, "sqlite:far");
+    }
+
+    #[test]
+    fn absent_reasoning_tokens_and_nonzero_sqlite_reasoning_must_not_append_independent_row() {
+        // (review 4433948817) 事件檔省略選填指標（解析折 0）而 SQLite 保留非零值：
+        // 即使時間、模型、input/output 與其他指標全等，全指標 `Signature` 仍不同 →
+        // exact 與 ±1 秒窗兩個閘門同時失效 → 不得落附加臂把同一呼叫存成獨立列
+        // （整筆 input/output 雙計並存下幽靈 `:call:` 指紋）。同時間且
+        // model/Agent/input/output 全等的指標不一致候選必須保守重試、保留原資料。
+        for (absent, nonzero) in [("reasoningTokens", 300u64), ("cacheReadTokens", 80)] {
+            let mut usage_event = event("a", "2026-07-22T10:00:00Z");
+            usage_event["data"]["usage"]
+                .as_object_mut()
+                .unwrap()
+                .remove(absent);
+            let transcript = read(&[usage_event], "", false).unwrap();
+            let mut native = transcript[0].clone();
+            native.identity = "sqlite:1".into();
+            native.turn_no = None;
+            if absent == "reasoningTokens" {
+                native.metrics.reasoning = nonzero;
+            } else {
+                native.metrics.cache_read = nonzero;
+            }
+            let result = merge_calls(transcript, vec![native]);
+            assert!(
+                result.is_err(),
+                "省略 {absent} 對 SQLite 非零不得附加獨立列（{absent}={nonzero}）：實得 {} 列、input 總和 {}（真實 100）",
+                result.as_ref().map(Vec::len).unwrap_or(0),
+                result
+                    .as_ref()
+                    .map(|rows| rows.iter().map(|call| call.metrics.input).sum::<u64>())
+                    .unwrap_or(0),
+            );
+            assert!(
+                result.unwrap_err().contains("保留原資料待重試"),
+                "缺欄-vs-非零的同時間候選必須走保守重試路線"
+            );
+        }
+    }
+
+    #[test]
+    fn independent_same_time_calls_with_different_input_output_still_append() {
+        // 防過度重試（同 review 4433948817 邊界）：真正獨立的 SQLite 呼叫照舊附加成
+        // SQLite-only 列。保守重試只針對「同時間、同模型/Agent、input/output 全等但
+        // 指標不一致」的缺欄-vs-非零形態；input/output 不同或無同時間孿生都不算。
+        let a = call("2026-07-22T10:00:00Z");
+        // 同時間但 input/output 不全等 → 判定為不同的呼叫 → 照常附加兩列。
+        let mut same_time = a.clone();
+        same_time.identity = "sqlite:same-time".into();
+        same_time.turn_no = None;
+        same_time.metrics.input = 200;
+        same_time.metrics.output = 20;
+        let merged = merge_calls(vec![a.clone()], vec![same_time]).unwrap();
+        assert_eq!(
+            merged.len(),
+            2,
+            "input/output 不同的同時間呼叫是真正獨立的呼叫"
+        );
+        assert_eq!(merged[0].native_identity, None);
+        assert_eq!(merged[1].identity, "sqlite:same-time");
+        // 指標不全等但沒有同時間孿生（距所有事件列 >1 秒）→ 照舊附加。
+        let mut far = a.clone();
+        far.identity = "sqlite:far".into();
+        far.turn_no = None;
+        far.metrics.reasoning = 300;
+        far.timestamp = parse_timestamp("2026-07-22T10:00:02Z").unwrap();
+        let merged = merge_calls(vec![a], vec![far]).unwrap();
+        assert_eq!(merged.len(), 2, "無同時間孿生的指標不一致呼叫照舊附加");
         assert_eq!(merged[1].identity, "sqlite:far");
     }
 
