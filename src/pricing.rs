@@ -782,7 +782,11 @@ mod tests {
     fn mimo_v2_6_flash_uses_packaged_pricing() {
         let rules = load_pricing_rules();
 
-        for model_name in ["mimo-v2.6-flash", "MiMo-V2.6-Flash", "xiaomi/mimo-v2.6-flash"] {
+        for model_name in [
+            "mimo-v2.6-flash",
+            "MiMo-V2.6-Flash",
+            "xiaomi/mimo-v2.6-flash",
+        ] {
             let cost = calculate_usage_cost(
                 &rules,
                 Some(model_name),
