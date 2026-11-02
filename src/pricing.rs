@@ -755,6 +755,54 @@ mod tests {
     }
 
     #[test]
+    fn mimo_v2_6_pro_uses_packaged_pricing() {
+        let rules = load_pricing_rules();
+
+        for model_name in ["mimo-v2.6-pro", "MiMo-V2.6-Pro", "xiaomi/mimo-v2.6-pro"] {
+            let cost = calculate_usage_cost(
+                &rules,
+                Some(model_name),
+                1_000_000,
+                1_000_000,
+                1_000_000,
+                0,
+                0,
+            )
+            .unwrap_or_else(|error| panic!("{model_name} should have a pricing rule: {error}"));
+
+            // Input 0.435 + cache read 0.0036 + output 0.87 = 1.3086.
+            assert!(
+                (cost - 1.3086).abs() < 1e-12,
+                "unexpected MiMo-V2.6-Pro cost for {model_name}: {cost}"
+            );
+        }
+    }
+
+    #[test]
+    fn mimo_v2_6_flash_uses_packaged_pricing() {
+        let rules = load_pricing_rules();
+
+        for model_name in ["mimo-v2.6-flash", "MiMo-V2.6-Flash", "xiaomi/mimo-v2.6-flash"] {
+            let cost = calculate_usage_cost(
+                &rules,
+                Some(model_name),
+                1_000_000,
+                1_000_000,
+                1_000_000,
+                0,
+                0,
+            )
+            .unwrap_or_else(|error| panic!("{model_name} should have a pricing rule: {error}"));
+
+            // Input 0.14 + cache read 0.0028 + output 0.28 = 0.4228.
+            assert!(
+                (cost - 0.4228).abs() < 1e-12,
+                "unexpected MiMo-V2.6-Flash cost for {model_name}: {cost}"
+            );
+        }
+    }
+
+    #[test]
     fn gpt_6_astra_context_tiers_use_packaged_pricing() {
         let rules = load_pricing_rules();
 
