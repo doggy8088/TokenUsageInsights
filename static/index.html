@@ -63,6 +63,10 @@
             <img class="assistant-logo" src="/static/antigravity.webp" alt="Antigravity" />
             <span class="agent-name-tooltip">Antigravity CLI</span>
           </button>
+          <button class="assistant-badge-btn" data-value="antigravity-ide" title="Antigravity IDE" aria-label="Antigravity IDE">
+            <img class="assistant-logo" src="/static/antigravity.webp" alt="Antigravity IDE" />
+            <span class="agent-name-tooltip">Antigravity IDE</span>
+          </button>
           <button class="assistant-badge-btn" data-value="copilot" title="GitHub Copilot" aria-label="GitHub Copilot">
             <img class="assistant-logo" src="/static/githubcopilot.webp" alt="Copilot" />
             <span class="agent-name-tooltip">GitHub Copilot</span>
@@ -1184,6 +1188,21 @@ conversations/&lt;session-id&gt;.db</code></pre></div>
         </div>
       </div>
 
+      <!-- Antigravity IDE native session data -->
+      <div class="modal-body" id="setup-body-antigravity-ide" style="display: none;">
+        <p class="modal-text" data-i18n="antigravity_ide_setup_modal_intro">本看板直接讀取 Antigravity IDE 的原生會話記錄，不需要設定 Status Line 或安裝收集腳本。</p>
+        <div class="modal-section">
+          <h3 data-i18n="antigravity_ide_source_title">會話記錄位置</h3>
+          <p class="modal-text"><span data-i18n="antigravity_ide_source_path">目前偵測到的資料路徑：</span> <code id="lbl-detected-home-antigravity-ide">~/.gemini/antigravity/conversations</code></p>
+          <div class="code-block-container"><pre><code>conversations/&lt;session-id&gt;.db
+conversation_summaries.db</code></pre></div>
+        </div>
+        <div class="modal-section">
+          <h3 data-i18n="antigravity_ide_cost_title">費用估算與原生資料</h3>
+          <p class="modal-text" data-i18n="antigravity_ide_cost_desc">讀取每次回應的輸入、快取讀取與輸出 Token，並使用會話資料庫的模型資訊估算費用。模型或價格不明時無法可靠估算，不代表免費。</p>
+        </div>
+      </div>
+
       <!-- Status Line Setup Content (Copilot) -->
       <div class="modal-body" id="setup-body-all" style="display: none;">
         <p class="modal-text" data-i18n="all_agents_setup_intro">合併模式會彙總下列本機資料來源；未偵測到的 Agent 不影響其他 Agent 的統計。點選「設定教學」可查看個別 Agent 的啟用方式。</p>
@@ -1536,6 +1555,7 @@ cd TokenUsageInsights</code></pre>
           <select id="usage-import-target-assistant" class="premium-select">
             <option value="" data-i18n="import_target_placeholder">請明確選擇目標 Agent</option>
             <option value="antigravity">Antigravity CLI</option>
+            <option value="antigravity-ide">Antigravity IDE</option>
             <option value="copilot">GitHub Copilot</option>
             <option value="codex">Codex</option>
             <option value="claude">Claude Code</option>

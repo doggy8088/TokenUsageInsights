@@ -103,6 +103,9 @@ const assistantAliasMap = {
   'musecode': 'muse',
   'code-muse': 'muse',
   'code_muse': 'muse',
+  'antigravity-ide': 'antigravity-ide',
+  'antigravity_ide': 'antigravity-ide',
+  'antigravityide': 'antigravity-ide',
   'minimax-code': 'mcode',
   'minimax_code': 'mcode',
   'minimaxcode': 'mcode',
@@ -120,6 +123,16 @@ const assistantMeta = {
     senderName: 'ANTIGRAVITY AGENT',
     highlightColor: '#2fb8c5',
     nameHighlights: ['Antigravity CLI'],
+  },
+  'antigravity-ide': {
+    logo: '/static/antigravity.webp',
+    label: 'Antigravity IDE',
+    shortLabel: 'Antigravity IDE',
+    alt: 'Antigravity IDE',
+    badgeStyle: 'background: rgba(33, 150, 243, 0.13); color: #2196f3; border: 1px solid rgba(33, 150, 243, 0.26); display: inline-flex; align-items: center;',
+    senderName: 'ANTIGRAVITY IDE AGENT',
+    highlightColor: '#2196f3',
+    nameHighlights: ['Antigravity IDE'],
   },
   copilot: {
     logo: '/static/githubcopilot.webp',
@@ -655,6 +668,7 @@ function toggleSidebar() {
 const setupModalTitleKeys = {
   all: 'all_agents_setup_title',
   antigravity: 'setup_modal_title',
+  'antigravity-ide': 'antigravity_ide_setup_modal_title',
   copilot: 'copilot_setup_modal_title',
   codex: 'codex_setup_modal_title',
   claude: 'claude_setup_modal_title',
@@ -683,6 +697,7 @@ function setSetupModalBody(assistant) {
   const bodyIds = {
     all: 'setup-body-all',
     antigravity: 'setup-body-antigravity',
+    'antigravity-ide': 'setup-body-antigravity-ide',
     copilot: 'setup-body-statusline',
     codex: 'setup-body-codex',
     claude: 'setup-body-claude',
@@ -4696,6 +4711,12 @@ function updateSortHeadersUI() {
 // 渲染 Session 列表 Table
 // =========================================================================
 function getSessionSourceBadge(session) {
+  if (session.source_kind === 'antigravity-ide-session' || session.assistant_type === 'antigravity-ide') {
+    return '<span class="badge source-badge" title="Antigravity IDE">IDE</span>';
+  }
+  if (session.source_kind === 'antigravity-session') {
+    return '<span class="badge source-badge" title="Antigravity CLI">CLI</span>';
+  }
   if (session.source_kind === 'vscode-chat') {
     return '<span class="badge source-badge" title="GitHub Copilot in VS Code">VS Code</span>';
   }
@@ -7464,6 +7485,9 @@ async function loadSetupInfo(assistant = currentAssistant) {
     } else if (resolvedAssistant === 'antigravity') {
       const pathLabel = document.getElementById('lbl-detected-home-antigravity');
       if (pathLabel) pathLabel.textContent = abbreviateHomePath(data.antigravity?.data_path || '');
+    } else if (resolvedAssistant === 'antigravity-ide') {
+      const pathLabel = document.getElementById('lbl-detected-home-antigravity-ide');
+      if (pathLabel) pathLabel.textContent = abbreviateHomePath(data.antigravity_ide?.data_path || '');
     } else if (resolvedAssistant === 'copilot') {
       const assistantSetup = data[resolvedAssistant] || {};
       const targetScriptPath = assistantSetup.script_path || '';

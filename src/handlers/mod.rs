@@ -21,6 +21,7 @@ pub use yearly::*;
 pub fn normalize_assistant_name(assistant: &str) -> String {
     let normalized = assistant.trim().to_lowercase();
     match normalized.as_str() {
+        "antigravity-ide" | "antigravity_ide" | "antigravityide" => "antigravity-ide".to_string(),
         "claude-code" | "claude_code" | "claudecode" => "claude".to_string(),
         "cursor" => "cursor".to_string(),
         "gemini" | "gemini-cli" | "gemini_cli" | "geminicli" => "gemini".to_string(),
@@ -49,6 +50,7 @@ pub fn is_supported_assistant(assistant: &str) -> bool {
     matches!(
         normalize_assistant_name(assistant).as_str(),
         "antigravity"
+            | "antigravity-ide"
             | "copilot"
             | "codex"
             | "claude"
@@ -78,6 +80,7 @@ pub struct SetupInfoResponse {
     pub workspace_dir: String,
     pub home_dir: String,
     pub antigravity: AssistantSetupStatus,
+    pub antigravity_ide: AssistantSetupStatus,
     pub copilot: AssistantSetupStatus,
     pub copilot_app: AssistantSetupStatus,
     pub codex: AssistantSetupStatus,

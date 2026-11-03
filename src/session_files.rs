@@ -579,6 +579,12 @@ pub(crate) fn resolve_session_file_path(
             session_id,
             transcript_path_db,
         ),
+        "antigravity-ide" => resolve_hook_transcript(
+            Harness::AntigravityIde,
+            assistant,
+            session_id,
+            transcript_path_db,
+        ),
         "copilot" if source_kind == crate::vscode::SOURCE_KIND => {
             let path = transcript_path_db.ok_or_else(|| {
                 SessionFileError::new(

@@ -94,7 +94,7 @@ fn find_jsonl_files(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct TokenStats {
     pub input: u64,
     pub output: u64,
@@ -554,7 +554,38 @@ pub fn get_antigravity_dir() -> PathBuf {
         return path;
     }
     dirs::home_dir()
-        .map(|h| h.join(".gemini").join("antigravity-cli"))
+        .map(|h| {
+            let cli_dir = h.join(".gemini").join("antigravity-cli");
+            if cli_dir.exists() {
+                cli_dir
+            } else {
+                let agy_dir = h.join(".gemini").join("antigravity");
+                if agy_dir.exists() {
+                    agy_dir
+                } else {
+                    cli_dir
+                }
+            }
+        })
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+pub fn get_antigravity_ide_dir() -> PathBuf {
+    if let Some(path) = crate::paths::env_path("ANTIGRAVITY_IDE_DIR") {
+        return path;
+    }
+    dirs::home_dir()
+        .map(|h| {
+            let agy_dir = h.join(".gemini").join("antigravity");
+            let ide_dir = h.join(".gemini").join("antigravity-ide");
+            if agy_dir.exists() {
+                agy_dir
+            } else if ide_dir.exists() {
+                ide_dir
+            } else {
+                agy_dir
+            }
+        })
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
@@ -1448,6 +1479,10 @@ fn normalize_legacy_claude_usage_entry(entry: &mut UsageEntry) {
 }
 
 fn get_antigravity_session_name(base_dir: &Path, session_id: &str) -> Option<String> {
+    if let Some(title) = crate::antigravity_metadata::read_conversation_title(base_dir, session_id)
+    {
+        return Some(title);
+    }
     let path = base_dir
         .join("brain")
         .join(session_id)
@@ -1518,17 +1553,47 @@ fn get_antigravity_session_name(base_dir: &Path, session_id: &str) -> Option<Str
     metadata.agent_role.or(metadata.agent_type)
 }
 
-/// Native records supersede hook snapshots only for the same source/session.
-fn sync_antigravity_usage_logs_with_cancel(
+pub(crate) fn sync_antigravity_usage_logs_with_cancel(
     conn: &mut Connection,
     root: &Path,
     should_cancel: &(dyn Fn() -> bool + Sync),
 ) -> Result<(), String> {
+    sync_antigravity_like_usage_logs_with_cancel(
+        conn,
+        "antigravity",
+        crate::antigravity::SOURCE_KIND,
+        root,
+        should_cancel,
+    )
+}
+
+pub(crate) fn sync_antigravity_ide_usage_logs_with_cancel(
+    conn: &mut Connection,
+    root: &Path,
+    should_cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<(), String> {
+    sync_antigravity_like_usage_logs_with_cancel(
+        conn,
+        "antigravity-ide",
+        crate::antigravity::IDE_SOURCE_KIND,
+        root,
+        should_cancel,
+    )
+}
+
+fn sync_antigravity_like_usage_logs_with_cancel(
+    conn: &mut Connection,
+    assistant_type: &str,
+    source_kind: &str,
+    root: &Path,
+    should_cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<(), String> {
     let root = crate::config::absolute_root(root);
-    sync_hook_usage_logs_with_cancel(conn, "antigravity", &root, should_cancel)?;
+    if assistant_type == "antigravity" {
+        sync_hook_usage_logs_with_cancel(conn, "antigravity", &root, should_cancel)?;
+    }
     let source_key = encode_hex(root.as_os_str().as_encoded_bytes());
-    let source_kind = crate::antigravity::SOURCE_KIND;
-    let sync_states = load_sync_state_for_prefix(conn, "antigravity");
+    let sync_states = load_sync_state_for_prefix(conn, assistant_type);
     let subagent_descriptors = crate::antigravity_metadata::index_subagent_descriptor_paths(&root);
     for path in crate::antigravity::find_session_files(&root)? {
         if should_cancel() {
@@ -1536,7 +1601,6 @@ fn sync_antigravity_usage_logs_with_cancel(
         }
         let session_id =
             crate::antigravity::session_id(&path).ok_or("無效的 Antigravity session 路徑")?;
-        let transcript = path.to_string_lossy().into_owned();
         let metadata = fs::metadata(&path).map_err(|e| e.to_string())?;
         // Metadata may arrive after the transcript (including in SQLite WAL or
         // parent subagents/<session_id>.json fallback). Include all source
@@ -1565,20 +1629,21 @@ fn sync_antigravity_usage_logs_with_cancel(
             (fingerprint.finish() & i64::MAX as u64) as i64
         };
         let state_key =
-            source_sync_key("antigravity", &root, &portable_relative_path(&root, &path));
+            source_sync_key(assistant_type, &root, &portable_relative_path(&root, &path));
         let legacy_rows: bool = conn
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM usage_entries WHERE assistant_type = 'antigravity'
-             AND source_kind = 'legacy' AND session_id = ? AND transcript_path = ?)",
-                params![session_id, transcript],
+                "SELECT EXISTS(SELECT 1 FROM usage_entries WHERE assistant_type = ?1
+             AND source_kind = 'legacy' AND session_id = ?2)",
+                params![assistant_type, session_id],
                 |row| row.get(0),
             )
             .map_err(|e| e.to_string())?;
         if sync_states.get(&state_key) == Some(&(metadata.len(), modified)) && !legacy_rows {
             continue;
         }
-        // Wait for the writer to finish its last line before replacing a snapshot.
-        if metadata.len() > 0 {
+        // Wait for the writer to finish its last line before replacing a snapshot (JSONL only).
+        let is_jsonl = path.extension().and_then(|e| e.to_str()) == Some("jsonl");
+        if is_jsonl && metadata.len() > 0 {
             let mut file = File::open(&path).map_err(|e| e.to_string())?;
             file.seek(SeekFrom::End(-1)).map_err(|e| e.to_string())?;
             let mut byte = [0];
@@ -1587,13 +1652,17 @@ fn sync_antigravity_usage_logs_with_cancel(
                 continue;
             }
         }
-        let mut entries = match crate::antigravity::parse_session(&path) {
-            Ok(entries) => entries,
-            Err(error) => {
-                eprintln!("解析 Antigravity session {} 失敗: {error}", path.display());
-                continue;
-            }
-        };
+        let mut entries =
+            match crate::antigravity::parse_session_with_source_kind(&path, source_kind) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    eprintln!(
+                        "解析 {assistant_type} session {} 失敗: {error}",
+                        path.display()
+                    );
+                    continue;
+                }
+            };
         // Old transcripts may lack usage entirely. Preserve their hook records.
         if entries.is_empty() {
             continue;
@@ -1611,16 +1680,21 @@ fn sync_antigravity_usage_logs_with_cancel(
         if should_cancel() {
             return Ok(());
         }
+        let display_name = if assistant_type == "antigravity-ide" {
+            "Antigravity IDE"
+        } else {
+            "Antigravity"
+        };
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         tx.execute(
-            "DELETE FROM usage_entries WHERE assistant_type = 'antigravity' AND session_id = ?
-             AND ((source_kind = ? AND source_dir_key = ?)
-                  OR (source_kind = 'legacy' AND transcript_path = ?))",
-            params![session_id, source_kind, source_key, transcript],
+            "DELETE FROM usage_entries WHERE assistant_type = ?1 AND session_id = ?2
+             AND ((source_kind = ?3 AND source_dir_key = ?4)
+                  OR source_kind = 'legacy')",
+            params![assistant_type, session_id, source_kind, source_key,],
         )
         .map_err(|e| e.to_string())?;
-        register_usage_source_directory(&tx, "antigravity", source_kind, &source_key, &root)?;
-        insert_usage_entries(&tx, "antigravity", "Antigravity", &entries)?;
+        register_usage_source_directory(&tx, assistant_type, source_kind, &source_key, &root)?;
+        insert_usage_entries(&tx, assistant_type, display_name, &entries)?;
         tx.execute(
             "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time) VALUES (?, ?, ?)",
             params![state_key, metadata.len() as i64, modified],
@@ -1694,11 +1768,16 @@ pub(crate) fn hook_transcript_path(
     if !crate::session_files::is_safe_session_id(session_id) {
         return None;
     }
-    let paths = if assistant == "antigravity" {
-        vec![base_dir
-            .join("brain")
-            .join(session_id)
-            .join(".system_generated/logs/transcript_full.jsonl")]
+    let paths = if assistant == "antigravity" || assistant == "antigravity-ide" {
+        vec![
+            base_dir
+                .join("conversations")
+                .join(format!("{session_id}.db")),
+            base_dir
+                .join("brain")
+                .join(session_id)
+                .join(".system_generated/logs/transcript_full.jsonl"),
+        ]
     } else {
         vec![
             base_dir
@@ -1859,17 +1938,17 @@ fn sync_hook_usage_logs_with_cancel(
                 for entry in &parsed_entries {
                     // Once native usage is authoritative, hook updates must not
                     // reintroduce totals while a transcript is being written or
-                    // temporarily unreadable. Matching the path isolates roots.
+                    // temporarily unreadable.
                     if assistant_type == "antigravity" {
                         let native_exists: bool = tx
                             .query_row(
                                 "SELECT EXISTS(SELECT 1 FROM usage_entries
-                             WHERE assistant_type = 'antigravity' AND source_kind = ?
-                             AND session_id = ? AND transcript_path = ?)",
+                             WHERE assistant_type = 'antigravity' AND source_kind IN (?, ?)
+                             AND session_id = ?)",
                                 params![
                                     crate::antigravity::SOURCE_KIND,
+                                    crate::antigravity::IDE_SOURCE_KIND,
                                     entry.session_id,
-                                    entry.transcript_path.as_deref()
                                 ],
                                 |row| row.get(0),
                             )
@@ -2349,6 +2428,7 @@ fn source_sync_key(assistant: &str, root: &Path, relative_path: &str) -> String 
     let root = crate::config::absolute_root(root);
     let primary = match assistant {
         "antigravity" => get_antigravity_dir(),
+        "antigravity-ide" => get_antigravity_ide_dir(),
         "copilot" => get_copilot_dir(),
         "claude" => get_claude_dir(),
         "cursor" => get_cursor_dir(),
@@ -5669,6 +5749,7 @@ fn sync_configured_sources_with_cancel(
     for harness in [
         Harness::Cursor,
         Harness::Antigravity,
+        Harness::AntigravityIde,
         Harness::Copilot,
         Harness::Vscode,
         Harness::CopilotApp,
@@ -5723,6 +5804,9 @@ fn sync_configured_sources_with_cancel(
                 ),
                 Harness::Antigravity => {
                     sync_antigravity_usage_logs_with_cancel(conn, root, should_cancel)
+                }
+                Harness::AntigravityIde => {
+                    sync_antigravity_ide_usage_logs_with_cancel(conn, root, should_cancel)
                 }
                 Harness::Copilot => {
                     sync_hook_usage_logs_with_cancel(conn, "copilot", root, should_cancel)

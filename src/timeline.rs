@@ -302,6 +302,230 @@ pub fn parse_antigravity_timeline(
     );
 }
 
+pub fn parse_antigravity_db_timeline(
+    path: &std::path::Path,
+    db_entries: &HashMap<u32, (TokenStats, String)>,
+    timeline: &mut Vec<TimelineItem>,
+    metadata: &mut HashMap<String, serde_json::Value>,
+) {
+    let Ok(conn) =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+    else {
+        synthesize_antigravity_timeline(db_entries, timeline, metadata);
+        return;
+    };
+
+    let mut stmt = match conn
+        .prepare("SELECT idx, step_type, metadata, step_payload FROM steps ORDER BY idx ASC")
+    {
+        Ok(s) => s,
+        Err(_) => {
+            synthesize_antigravity_timeline(db_entries, timeline, metadata);
+            return;
+        }
+    };
+
+    let mut turn_no = 0;
+    let mut step_rows = Vec::new();
+    if let Ok(rows) = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, Option<Vec<u8>>>(2)?,
+            row.get::<_, Option<Vec<u8>>>(3)?,
+        ))
+    }) {
+        for r in rows.flatten() {
+            step_rows.push(r);
+        }
+    }
+
+    if step_rows.is_empty() {
+        synthesize_antigravity_timeline(db_entries, timeline, metadata);
+        return;
+    }
+
+    let mut added_agent_replies = 0;
+    for (_idx, step_type, meta_blob, payload_blob) in step_rows {
+        let mut timestamp = String::new();
+        if let Some(ref mb) = meta_blob {
+            if let Some(wires) = crate::antigravity_metadata::decode_protobuf(mb) {
+                for (num, wire) in wires {
+                    if num == 1 {
+                        if let crate::antigravity_metadata::ProtobufWire::Bytes(b) = wire {
+                            if let Some((ts, _)) =
+                                crate::antigravity_metadata::parse_protobuf_timestamp(b)
+                            {
+                                timestamp = ts;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if step_type == 14 {
+            // User prompt
+            let mut prompt_text = String::new();
+            if let Some(ref pb) = payload_blob {
+                if let Some(wires) = crate::antigravity_metadata::decode_protobuf(pb) {
+                    for (num, wire) in wires {
+                        if num == 19 {
+                            if let crate::antigravity_metadata::ProtobufWire::Bytes(b) = wire {
+                                if let Some(sub_wires) =
+                                    crate::antigravity_metadata::decode_protobuf(b)
+                                {
+                                    for (snum, swire) in sub_wires {
+                                        if snum == 2 {
+                                            if let crate::antigravity_metadata::ProtobufWire::Bytes(
+                                                sb,
+                                            ) = swire
+                                            {
+                                                if let Ok(s) = std::str::from_utf8(sb) {
+                                                    prompt_text = s.to_string();
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if !prompt_text.is_empty() {
+                timeline.push(TimelineItem::UserPrompt {
+                    timestamp,
+                    prompt: prompt_text,
+                    context: None,
+                    turn_no: turn_no + 1,
+                });
+            }
+        } else if step_type == 15 {
+            // Model response
+            turn_no += 1;
+            let (tokens, model) = db_entries
+                .get(&turn_no)
+                .cloned()
+                .unwrap_or_else(|| (TokenStats::default(), "Unknown".to_string()));
+
+            let mut reasoning = None;
+            let reply = String::new();
+
+            if let Some(ref pb) = payload_blob {
+                if let Some(wires) = crate::antigravity_metadata::decode_protobuf(pb) {
+                    for (num, wire) in wires {
+                        if num == 20 {
+                            if let crate::antigravity_metadata::ProtobufWire::Bytes(b) = wire {
+                                if let Some(sub_wires) =
+                                    crate::antigravity_metadata::decode_protobuf(b)
+                                {
+                                    for (snum, swire) in sub_wires {
+                                        if snum == 7 {
+                                            if let crate::antigravity_metadata::ProtobufWire::Bytes(
+                                                sb,
+                                            ) = swire
+                                            {
+                                                if let Some(inner_wires) =
+                                                    crate::antigravity_metadata::decode_protobuf(sb)
+                                                {
+                                                    for (in_num, in_wire) in inner_wires {
+                                                        if in_num == 7 {
+                                                            if let crate::antigravity_metadata::ProtobufWire::Bytes(in_b) = in_wire {
+                                                                if let Ok(s) = std::str::from_utf8(in_b) {
+                                                                    reasoning = Some(s.to_string());
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            timeline.push(TimelineItem::AgentReply {
+                timestamp,
+                reply,
+                reasoning,
+                turn_no,
+                model: model.clone(),
+                tokens: Some(tokens),
+                duration_ms: None,
+                reasoning_effort: None,
+            });
+            metadata.insert(
+                "selected_model".to_string(),
+                serde_json::Value::String(model),
+            );
+            added_agent_replies += 1;
+        } else if step_type == 8 {
+            // Tool call
+            let mut tool_name = "tool".to_string();
+            if let Some(ref mb) = meta_blob {
+                if let Some(wires) = crate::antigravity_metadata::decode_protobuf(mb) {
+                    for (num, wire) in wires {
+                        if num == 30 {
+                            if let crate::antigravity_metadata::ProtobufWire::Bytes(b) = wire {
+                                if let Ok(s) = std::str::from_utf8(b) {
+                                    tool_name = s.to_string();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            timeline.push(TimelineItem::ToolStep {
+                timestamp,
+                tool_name,
+                arguments: serde_json::json!({}),
+                env: None,
+                exit_code: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+                tool_call_id: None,
+                status: "success".to_string(),
+            });
+        }
+    }
+
+    if added_agent_replies == 0 {
+        synthesize_antigravity_timeline(db_entries, timeline, metadata);
+    }
+}
+
+fn synthesize_antigravity_timeline(
+    db_entries: &HashMap<u32, (TokenStats, String)>,
+    timeline: &mut Vec<TimelineItem>,
+    metadata: &mut HashMap<String, serde_json::Value>,
+) {
+    let mut turns: Vec<_> = db_entries.iter().collect();
+    turns.sort_by_key(|(k, _)| *k);
+    for (turn_no, (tokens, model)) in turns {
+        timeline.push(TimelineItem::AgentReply {
+            timestamp: String::new(),
+            reply: String::new(),
+            reasoning: None,
+            turn_no: *turn_no,
+            model: model.clone(),
+            tokens: Some(tokens.clone()),
+            duration_ms: None,
+            reasoning_effort: None,
+        });
+        metadata.insert(
+            "selected_model".to_string(),
+            serde_json::Value::String(model.clone()),
+        );
+    }
+}
+
 /// Backwards-compatible entry point that reconstructs a Copilot CLI timeline
 /// without any agent filtering. Kept as a thin shim so existing callers and
 /// documentation continue to resolve; the Copilot CLI events never carry a

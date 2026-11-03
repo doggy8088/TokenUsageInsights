@@ -88,6 +88,18 @@ pub(crate) fn parse_session_timeline_file(
         return Ok((timeline, metadata));
     }
 
+    if (assistant == "antigravity" || assistant == "antigravity-ide")
+        && filepath.extension().and_then(|e| e.to_str()) == Some("db")
+    {
+        crate::timeline::parse_antigravity_db_timeline(
+            filepath,
+            db_entries,
+            &mut timeline,
+            &mut metadata,
+        );
+        return Ok((timeline, metadata));
+    }
+
     let file = File::open(filepath).map_err(|error| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -96,12 +108,13 @@ pub(crate) fn parse_session_timeline_file(
     })?;
     let reader = BufReader::new(file);
     match assistant {
-        "antigravity" => parse_antigravity_timeline(
+        "antigravity" | "antigravity-ide" => parse_antigravity_timeline(
             reader,
             db_entries,
             &mut timeline,
             &mut metadata,
-            source_kind == crate::antigravity::SOURCE_KIND,
+            source_kind == crate::antigravity::SOURCE_KIND
+                || source_kind == crate::antigravity::IDE_SOURCE_KIND,
         ),
         "copilot" => parse_copilot_timeline_filtered(
             reader,

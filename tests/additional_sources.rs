@@ -206,6 +206,7 @@ async fn startup_and_manual_sync_reload_extra_homes_without_losing_defaults() {
     );
     for tool in [
         "antigravity",
+        "antigravity_ide",
         "copilot",
         "codex",
         "claude",

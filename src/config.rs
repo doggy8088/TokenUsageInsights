@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Harness {
     Antigravity,
+    #[serde(alias = "antigravity-ide")]
+    AntigravityIde,
     Copilot,
     CopilotApp,
     Vscode,
@@ -27,6 +29,7 @@ impl Harness {
         use crate::db;
         Some(match self {
             Self::Antigravity => db::get_antigravity_dir(),
+            Self::AntigravityIde => db::get_antigravity_ide_dir(),
             Self::Copilot => db::get_copilot_dir(),
             Self::CopilotApp => crate::paths::copilot_app_dir(),
             Self::Vscode => return None, // VS Code discovers multiple platform defaults.
@@ -105,6 +108,15 @@ impl SourceConfig {
 
     pub(crate) fn roots(&self, harness: Harness) -> Vec<PathBuf> {
         let mut roots: Vec<_> = harness.primary_root().into_iter().collect();
+        // If AntigravityIde primary root is ~/.gemini/antigravity, also discover ~/.gemini/antigravity-ide if present
+        if harness == Harness::AntigravityIde {
+            if let Some(home) = dirs::home_dir() {
+                let legacy_dir = home.join(".gemini").join("antigravity-ide");
+                if legacy_dir.is_dir() {
+                    roots.push(legacy_dir);
+                }
+            }
+        }
         if let Some(additional) = self.additional_sources.get(&harness) {
             roots.extend(additional.iter().cloned());
         }
@@ -189,6 +201,7 @@ mod tests {
     fn every_harness_accepts_multiple_roots_and_copilot_shares_app_homes() {
         let keys = [
             "antigravity",
+            "antigravity_ide",
             "copilot",
             "copilot_app",
             "vscode",

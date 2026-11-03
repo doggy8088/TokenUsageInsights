@@ -207,6 +207,10 @@ pub async fn get_setup_info(Path(assistant): Path<String>) -> impl IntoResponse 
     let anti_source_script =
         crate::paths::find_resource(&anti_source_relative).unwrap_or(anti_source_relative);
 
+    let anti_ide_dir = source_root(Harness::AntigravityIde, &["conversations", "brain"]);
+    let anti_ide_data_path = antigravity_data_path(&anti_ide_dir);
+    let anti_ide_exists = anti_ide_data_path.is_dir();
+
     let copilot_dir = source_root(Harness::Copilot, &["usage", script_name]);
     let copilot_script = copilot_dir.join(script_name);
     let copilot_source_relative = if cfg!(windows) {
@@ -269,6 +273,18 @@ pub async fn get_setup_info(Path(assistant): Path<String>) -> impl IntoResponse 
                 "antigravity",
                 cfg!(windows),
             ),
+        },
+        antigravity_ide: AssistantSetupStatus {
+            dir_path: anti_ide_dir.to_string_lossy().into_owned(),
+            data_path: anti_ide_data_path.to_string_lossy().into_owned(),
+            exists: anti_ide_exists,
+            script_path: "".to_string(),
+            source_script_path: "".to_string(),
+            settings_path: anti_ide_dir
+                .join("settings.json")
+                .to_string_lossy()
+                .into_owned(),
+            statusline_command: "".to_string(),
         },
         copilot: AssistantSetupStatus {
             dir_path: copilot_dir.to_string_lossy().into_owned(),

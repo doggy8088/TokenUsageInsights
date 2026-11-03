@@ -4,14 +4,29 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AntigravityGeneration {
+    pub generation_id: String,
+    pub step_indices: Vec<u32>,
+    pub model_uid: Option<String>,
+    pub model_name: Option<String>,
+    pub input_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_tokens: u64,
+}
+
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub struct SessionMetadata {
     pub models: HashMap<u32, String>,
     pub cwd: Option<String>,
+    pub title: Option<String>,
     pub parent_session_id: Option<String>,
     pub agent_type: Option<String>,
     pub agent_role: Option<String>,
     pub initial_prompt: Option<String>,
+    pub generations: Vec<AntigravityGeneration>,
+    pub step_timestamps: HashMap<u32, (String, i64)>,
 }
 
 pub(crate) fn is_valid_session_id(value: &str) -> bool {
@@ -39,7 +54,7 @@ fn clean_metadata_prompt(bytes: &[u8]) -> Option<String> {
     Some(text.to_owned())
 }
 
-/// Read original workspace, model, and subagent identities without using current CLI settings.
+/// Read original workspace, model, subagent identities, title, and generations without using current CLI settings.
 pub fn read_session_metadata(root: &Path, session_id: &str) -> rusqlite::Result<SessionMetadata> {
     if !is_valid_session_id(session_id) {
         return Ok(SessionMetadata::default());
@@ -49,6 +64,9 @@ pub fn read_session_metadata(root: &Path, session_id: &str) -> rusqlite::Result<
         Ok(conn) => {
             let mut meta = read_trajectory_metadata(&conn, session_id)?;
             meta.models = read_response_models(&conn)?;
+            meta.title = read_conversation_title(root, session_id);
+            meta.generations = read_generations(&conn)?;
+            meta.step_timestamps = read_step_timestamps(&conn)?;
             meta
         }
         Err(_) if matches!(path.try_exists(), Ok(false)) => {
@@ -244,6 +262,68 @@ fn merge_unique_option<T: PartialEq>(target: &mut Option<T>, unresolved: &mut bo
     }
 }
 
+#[allow(dead_code)]
+pub fn read_session_metadata_from_conn(
+    conn: &Connection,
+    root: &Path,
+    session_id: &str,
+) -> rusqlite::Result<SessionMetadata> {
+    let mut meta = read_trajectory_metadata(conn, session_id)?;
+    meta.models = read_response_models(conn)?;
+    meta.title = read_conversation_title(root, session_id);
+    meta.generations = read_generations(conn)?;
+    meta.step_timestamps = read_step_timestamps(conn)?;
+    Ok(meta)
+}
+
+pub fn read_conversation_title(root: &Path, session_id: &str) -> Option<String> {
+    let path = root.join("conversation_summaries.db");
+    if !path.exists() {
+        return None;
+    }
+    let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+    let mut statement = conn
+        .prepare("PRAGMA table_info(conversation_summaries)")
+        .ok()?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .ok()?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .ok()?;
+    if !columns.iter().any(|c| c == "conversation_id") {
+        return None;
+    }
+    let has_title = columns.iter().any(|c| c == "title");
+    let has_preview = columns.iter().any(|c| c == "preview");
+    if !has_title && !has_preview {
+        return None;
+    }
+    let query = match (has_title, has_preview) {
+        (true, true) => {
+            "SELECT title, preview FROM conversation_summaries WHERE conversation_id = ?1"
+        }
+        (true, false) => "SELECT title, '' FROM conversation_summaries WHERE conversation_id = ?1",
+        (false, true) => {
+            "SELECT '', preview FROM conversation_summaries WHERE conversation_id = ?1"
+        }
+        (false, false) => unreachable!(),
+    };
+    let mut stmt = conn.prepare(query).ok()?;
+    stmt.query_row(rusqlite::params![session_id], |row| {
+        let title: String = row.get(0).unwrap_or_default();
+        let preview: String = row.get(1).unwrap_or_default();
+        if !title.trim().is_empty() {
+            Ok(title.trim().to_string())
+        } else if !preview.trim().is_empty() {
+            Ok(preview.trim().to_string())
+        } else {
+            Ok(String::new())
+        }
+    })
+    .ok()
+    .filter(|s| !s.is_empty())
+}
+
 fn read_trajectory_metadata(
     conn: &Connection,
     session_id: &str,
@@ -408,6 +488,9 @@ fn read_trajectory_metadata(
         } else {
             initial_prompt
         },
+        title: None,
+        generations: Vec::new(),
+        step_timestamps: HashMap::new(),
     })
 }
 
@@ -534,6 +617,201 @@ fn read_response_models(conn: &Connection) -> rusqlite::Result<HashMap<u32, Stri
     Ok(result)
 }
 
+pub fn read_generations(conn: &Connection) -> rusqlite::Result<Vec<AntigravityGeneration>> {
+    let mut statement = conn.prepare("PRAGMA table_info(gen_metadata)")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if !columns.iter().any(|c| c == "data") {
+        return Ok(Vec::new());
+    }
+
+    let has_idx = columns.iter().any(|c| c == "idx");
+    let query = if has_idx {
+        "SELECT data FROM gen_metadata ORDER BY idx ASC"
+    } else {
+        "SELECT data FROM gen_metadata"
+    };
+
+    let mut stmt = conn.prepare(query)?;
+    let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+    let mut generations = Vec::new();
+
+    for row in rows {
+        let blob = row?;
+        let Some(wires) = decode_protobuf(&blob) else {
+            continue;
+        };
+        let mut generation_id = String::new();
+        let mut step_indices = Vec::new();
+        let mut model_uid = None;
+        let mut model_name = None;
+        let mut input_tokens = 0u64;
+        let mut cache_read_tokens = 0u64;
+        let mut output_tokens = 0u64;
+        let mut reasoning_tokens = 0u64;
+        let mut has_usage = false;
+
+        for (num, wire) in wires {
+            match (num, wire) {
+                (4, ProtobufWire::Bytes(b)) => {
+                    if let Ok(s) = std::str::from_utf8(b) {
+                        generation_id = s.to_string();
+                    }
+                }
+                (2, ProtobufWire::Bytes(b)) => {
+                    step_indices = decode_packed_varints(b);
+                }
+                (1, ProtobufWire::Bytes(b)) => {
+                    if let Some(inner_wires) = decode_protobuf(b) {
+                        for (inum, iwire) in inner_wires {
+                            match (inum, iwire) {
+                                (19, ProtobufWire::Bytes(ub)) => {
+                                    if let Ok(s) = std::str::from_utf8(ub) {
+                                        if !s.is_empty()
+                                            && s.len() <= 200
+                                            && s.bytes().all(|c| {
+                                                c.is_ascii_alphanumeric() || b"-_.:/".contains(&c)
+                                            })
+                                        {
+                                            model_uid = Some(s.to_string());
+                                        }
+                                    }
+                                }
+                                (21, ProtobufWire::Bytes(nb)) => {
+                                    if let Ok(s) = std::str::from_utf8(nb) {
+                                        if !s.is_empty() && s.len() <= 200 {
+                                            model_name = Some(s.to_string());
+                                        }
+                                    }
+                                }
+                                (4, ProtobufWire::Bytes(tb)) => {
+                                    if let Some(usage_wires) = decode_protobuf(tb) {
+                                        for (unum, uwire) in usage_wires {
+                                            match (unum, uwire) {
+                                                (2, ProtobufWire::Varint(v)) => {
+                                                    input_tokens = v;
+                                                    has_usage = true;
+                                                }
+                                                (5, ProtobufWire::Varint(v)) => {
+                                                    cache_read_tokens = v;
+                                                    has_usage = true;
+                                                }
+                                                (3, ProtobufWire::Varint(v)) => {
+                                                    output_tokens = v;
+                                                    has_usage = true;
+                                                }
+                                                (10, ProtobufWire::Varint(v)) => {
+                                                    reasoning_tokens = v;
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if has_usage || input_tokens > 0 || output_tokens > 0 || cache_read_tokens > 0 {
+            let resolved_model = model_name
+                .as_deref()
+                .or(model_uid.as_deref())
+                .map(model_label)
+                .map(|s| s.to_string());
+
+            generations.push(AntigravityGeneration {
+                generation_id,
+                step_indices,
+                model_uid,
+                model_name: resolved_model,
+                input_tokens,
+                cache_read_tokens,
+                output_tokens,
+                reasoning_tokens,
+            });
+        }
+    }
+
+    Ok(generations)
+}
+
+pub fn read_step_timestamps(conn: &Connection) -> rusqlite::Result<HashMap<u32, (String, i64)>> {
+    let mut statement = conn.prepare("PRAGMA table_info(steps)")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if !columns.iter().any(|c| c == "metadata") || !columns.iter().any(|c| c == "idx") {
+        return Ok(HashMap::new());
+    }
+
+    let mut stmt = conn.prepare("SELECT idx, metadata FROM steps WHERE metadata IS NOT NULL")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+    })?;
+
+    let mut result = HashMap::new();
+    for row in rows {
+        let (idx, blob) = row?;
+        let Ok(step_idx) = u32::try_from(idx) else {
+            continue;
+        };
+        let Some(wires) = decode_protobuf(&blob) else {
+            continue;
+        };
+        for (num, wire) in wires {
+            if num == 1 {
+                if let ProtobufWire::Bytes(b) = wire {
+                    if let Some((rfc3339, millis)) = parse_protobuf_timestamp(b) {
+                        result.insert(step_idx, (rfc3339, millis));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+pub(crate) fn parse_protobuf_timestamp(bytes: &[u8]) -> Option<(String, i64)> {
+    let fields = decode_protobuf(bytes)?;
+    let mut seconds: Option<i64> = None;
+    let mut nanos: u32 = 0;
+    for (num, wire) in fields {
+        match (num, wire) {
+            (1, ProtobufWire::Varint(s)) => seconds = Some(s as i64),
+            (2, ProtobufWire::Varint(n)) => nanos = n as u32,
+            _ => {}
+        }
+    }
+    let sec = seconds?;
+    let dt = chrono::DateTime::from_timestamp(sec, nanos)?;
+    let rfc3339 = dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let millis = dt.timestamp_millis();
+    Some((rfc3339, millis))
+}
+
+fn decode_packed_varints(bytes: &[u8]) -> Vec<u32> {
+    let mut offset = 0;
+    let mut result = Vec::new();
+    while offset < bytes.len() {
+        if let Some(val) = varint(bytes, &mut offset) {
+            if let Ok(v32) = u32::try_from(val) {
+                result.push(v32);
+            }
+        } else {
+            break;
+        }
+    }
+    result
+}
+
 fn model_label(uid: &str) -> &str {
     // Verified with `agy models`; keep aliases explicit so unknown future models
     // cannot silently inherit an unrelated model's price.
@@ -547,8 +825,20 @@ fn model_label(uid: &str) -> &str {
         "gemini-3.8-flash-high" => "Gemini 3.8 Flash (High)",
         "gemini-3.8-flash-medium" => "Gemini 3.8 Flash (Medium)",
         "gemini-3.8-flash-low" => "Gemini 3.8 Flash (Low)",
+        "gemini-3.7-flash-high" => "Gemini 3.7 Flash (High)",
+        "gemini-3.7-flash-medium" => "Gemini 3.7 Flash (Medium)",
+        "gemini-3.7-flash-low" => "Gemini 3.7 Flash (Low)",
+        "gemini-3.6-flash-high" => "Gemini 3.6 Flash (High)",
+        "gemini-3.6-flash-medium" => "Gemini 3.6 Flash (Medium)",
+        "gemini-3.6-flash-low" => "Gemini 3.6 Flash (Low)",
+        "gemini-3.5-flash-high" => "Gemini 3.5 Flash (High)",
+        "gemini-3.5-flash-medium" => "Gemini 3.5 Flash (Medium)",
+        "gemini-3.5-flash-low" => "Gemini 3.5 Flash (Low)",
         "gemini-flash-demo" => "Gemini 3.7 Flash",
         "gemini-3.8-flash-demo" => "Gemini 3.8 Flash",
+        "gemini-3-flash-a" => "Gemini 3.5 Flash (Medium)",
+        "gemini-3-flash-b" => "Gemini 3.5 Flash (Medium)",
+        "gemini-default" => "Gemini 3.5 Flash (Medium)",
         _ => uid,
     }
 }
@@ -580,9 +870,17 @@ fn varint(bytes: &[u8], offset: &mut usize) -> Option<u64> {
     None
 }
 
-/// Extract length-delimited fields, validating and skipping other wire types.
-/// There is no recursive decoding of untrusted data or allocation from lengths.
-fn protobuf_fields(bytes: &[u8]) -> Option<Vec<(u64, &[u8])>> {
+#[derive(Debug, PartialEq)]
+pub(crate) enum ProtobufWire<'a> {
+    Varint(u64),
+    Bytes(&'a [u8]),
+    #[allow(dead_code)]
+    Fixed64([u8; 8]),
+    #[allow(dead_code)]
+    Fixed32([u8; 4]),
+}
+
+pub(crate) fn decode_protobuf(bytes: &[u8]) -> Option<Vec<(u64, ProtobufWire<'_>)>> {
     let mut offset = 0;
     let mut result = Vec::new();
     while offset < bytes.len() {
@@ -591,22 +889,50 @@ fn protobuf_fields(bytes: &[u8]) -> Option<Vec<(u64, &[u8])>> {
         if field == 0 || field > 0x1fff_ffff {
             return None;
         }
-        let length = match tag & 7 {
+        let wire_type = tag & 7;
+        match wire_type {
             0 => {
-                varint(bytes, &mut offset)?;
-                continue;
+                let v = varint(bytes, &mut offset)?;
+                result.push((field, ProtobufWire::Varint(v)));
             }
-            1 => 8,
-            2 => usize::try_from(varint(bytes, &mut offset)?).ok()?,
-            5 => 4,
+            1 => {
+                let end = offset.checked_add(8)?;
+                let slice = bytes.get(offset..end)?;
+                let mut arr = [0u8; 8];
+                arr.copy_from_slice(slice);
+                result.push((field, ProtobufWire::Fixed64(arr)));
+                offset = end;
+            }
+            2 => {
+                let len = usize::try_from(varint(bytes, &mut offset)?).ok()?;
+                let end = offset.checked_add(len)?;
+                let slice = bytes.get(offset..end)?;
+                result.push((field, ProtobufWire::Bytes(slice)));
+                offset = end;
+            }
+            5 => {
+                let end = offset.checked_add(4)?;
+                let slice = bytes.get(offset..end)?;
+                let mut arr = [0u8; 4];
+                arr.copy_from_slice(slice);
+                result.push((field, ProtobufWire::Fixed32(arr)));
+                offset = end;
+            }
             _ => return None,
-        };
-        let end = offset.checked_add(length)?;
-        let value = bytes.get(offset..end)?;
-        if tag & 7 == 2 {
-            result.push((field, value));
         }
-        offset = end;
+    }
+    Some(result)
+}
+
+/// Extract length-delimited fields, validating and skipping other wire types.
+/// There is no recursive decoding of untrusted data or allocation from lengths.
+fn protobuf_fields(bytes: &[u8]) -> Option<Vec<(u64, &[u8])>> {
+    let wires = decode_protobuf(bytes)?;
+    let mut result = Vec::new();
+    for (field, wire) in wires {
+        if let ProtobufWire::Bytes(b) = wire {
+            result.push((field, b));
+        }
     }
     Some(result)
 }
@@ -889,5 +1215,70 @@ mod tests {
         assert_eq!(metadata.agent_type.as_deref(), Some("self"));
         assert_eq!(metadata.agent_role.as_deref(), Some("Audio Builder Agent"));
         assert_eq!(metadata.cwd.as_deref(), Some("/example/demo"));
+    }
+
+    fn varint_field(number: u64, value: u64) -> Vec<u8> {
+        let mut bytes = encode_varint(number << 3);
+        bytes.extend(encode_varint(value));
+        bytes
+    }
+
+    #[test]
+    fn parses_generations_and_token_stats_from_protobuf() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE gen_metadata(idx INTEGER, data BLOB); CREATE TABLE steps(idx INTEGER, metadata BLOB);").unwrap();
+
+        let mut usage_bytes = Vec::new();
+        usage_bytes.extend(varint_field(2, 1000)); // input
+        usage_bytes.extend(varint_field(5, 200)); // cache_read
+        usage_bytes.extend(varint_field(3, 150)); // output
+        usage_bytes.extend(varint_field(10, 50)); // reasoning
+
+        let mut inner = Vec::new();
+        inner.extend(field(19, b"gemini-3.8-flash-medium"));
+        inner.extend(field(21, b"Gemini 3.8 Flash (Medium)"));
+        inner.extend(field(4, &usage_bytes));
+
+        let mut gen_blob = Vec::new();
+        gen_blob.extend(field(4, b"gen-uuid-1234"));
+        // Packed varints for steps [1, 2]
+        let mut packed_steps = Vec::new();
+        packed_steps.extend(encode_varint(1));
+        packed_steps.extend(encode_varint(2));
+        gen_blob.extend(field(2, &packed_steps));
+        gen_blob.extend(field(1, &inner));
+
+        conn.execute(
+            "INSERT INTO gen_metadata VALUES (0, ?1)",
+            rusqlite::params![gen_blob],
+        )
+        .unwrap();
+
+        // Step timestamp: 1782454505 = 2026-06-26T06:15:05Z
+        let mut ts_bytes = Vec::new();
+        ts_bytes.extend(varint_field(1, 1782454505));
+        ts_bytes.extend(varint_field(2, 0));
+        let step_meta = field(1, &ts_bytes);
+        conn.execute(
+            "INSERT INTO steps VALUES (1, ?1)",
+            rusqlite::params![step_meta],
+        )
+        .unwrap();
+
+        let gens = read_generations(&conn).unwrap();
+        assert_eq!(gens.len(), 1);
+        let gen = &gens[0];
+        assert_eq!(gen.generation_id, "gen-uuid-1234");
+        assert_eq!(gen.step_indices, vec![1, 2]);
+        assert_eq!(gen.model_uid.as_deref(), Some("gemini-3.8-flash-medium"));
+        assert_eq!(gen.model_name.as_deref(), Some("Gemini 3.8 Flash (Medium)"));
+        assert_eq!(gen.input_tokens, 1000);
+        assert_eq!(gen.cache_read_tokens, 200);
+        assert_eq!(gen.output_tokens, 150);
+        assert_eq!(gen.reasoning_tokens, 50);
+
+        let timestamps = read_step_timestamps(&conn).unwrap();
+        assert_eq!(timestamps.len(), 1);
+        assert_eq!(timestamps[&1].0, "2026-06-26T06:15:05Z");
     }
 }

@@ -45,7 +45,7 @@ const HELP_TEXT: &str = r#"Token 戰情室：看板、使用量匯入 / 匯出�
   -v, --target-version <TAG>  指定安裝特定版本標籤（例如 v1.0.0）
 
 共用參數:
-  --agent <name>      助理名稱: antigravity / copilot / codex / claude / cursor / gemini / grok / pi / omp / muse / mcode
+  --agent <name>      助理名稱: antigravity / antigravity-ide / copilot / codex / claude / cursor / gemini / grok / pi / omp / muse / mcode
                      亦可使用 gemini-cli / claude-code / grok-build / minimax-code 等別名，
 
 匯出:
@@ -770,6 +770,7 @@ fn next_update_flag_value(args: &[String], i: &mut usize, flag: &str) -> String 
 fn normalize_assistant_name(assistant: &str) -> String {
     let normalized = assistant.trim().to_lowercase();
     match normalized.as_str() {
+        "antigravity-ide" | "antigravity_ide" | "antigravityide" => "antigravity-ide".to_string(),
         "claude-code" | "claude_code" | "claudecode" => "claude".to_string(),
         "cursor" => "cursor".to_string(),
         "gemini" | "gemini-cli" | "gemini_cli" | "geminicli" => "gemini".to_string(),
@@ -805,6 +806,7 @@ fn is_supported_assistant(assistant: &str) -> bool {
     matches!(
         normalize_assistant_name(assistant).as_str(),
         "antigravity"
+            | "antigravity-ide"
             | "copilot"
             | "codex"
             | "claude"
@@ -868,7 +870,7 @@ fn print_export_help() {
   token-usage-insights export --agent <name> --date YYYY[-MM[-DD]] --out <path>
 
 參數:
-  --agent <name>    助理名稱（antigravity/copilot/codex/claude/cursor/grok/pi/omp/muse/mcode）
+  --agent <name>    助理名稱（antigravity/antigravity-ide/copilot/codex/claude/cursor/gemini/grok/pi/omp/muse/mcode）
   --date <period>     匯出年份、月份或日期
   --out <path>      輸出檔案路徑，不指定則輸出到 stdout
   --help, -h        顯示此說明

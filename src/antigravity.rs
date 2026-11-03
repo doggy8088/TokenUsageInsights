@@ -1,16 +1,18 @@
-//! Antigravity CLI's native, per-response token records. No statusline required.
+//! Antigravity CLI's and IDE's native, per-response token records. No statusline required.
 use crate::antigravity_metadata::{
     apply_subagent_descriptor_fallback, is_valid_session_id, read_session_metadata, SessionMetadata,
 };
 use crate::db::{InitialUserPromptSelector, TokenStats, UsageEntry};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 pub(crate) const SOURCE_KIND: &str = "antigravity-session";
+pub(crate) const IDE_SOURCE_KIND: &str = "antigravity-ide-session";
 // Bump when parsed fields change so unchanged historical sources are re-imported.
-pub(crate) const PARSER_VERSION: u32 = 3;
+pub(crate) const PARSER_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AntigravitySystemMessage {
@@ -141,43 +143,207 @@ pub(crate) fn resolve_subagent_labels(
 }
 
 pub(crate) fn find_session_files(root: &Path) -> Result<Vec<PathBuf>, String> {
-    let brain = root.join("brain");
-    if !brain.exists() {
-        return Ok(Vec::new());
-    }
     let mut files = Vec::new();
-    for entry in fs::read_dir(&brain).map_err(|e| format!("讀取 Antigravity brain 失敗: {e}"))?
-    {
-        let entry = entry.map_err(|e| format!("讀取 Antigravity session 失敗: {e}"))?;
-        if !entry.file_type().map_err(|e| e.to_string())?.is_dir() {
-            continue;
-        }
-        let path = entry
-            .path()
-            .join(".system_generated/logs/transcript_full.jsonl");
-        if path.is_file() {
-            files.push(path);
+    let mut seen_sessions = HashSet::new();
+
+    // 1. Scan brain/*/.system_generated/logs/transcript_full.jsonl (legacy transcripts or test fixtures)
+    let brain = root.join("brain");
+    if brain.is_dir() {
+        if let Ok(entries) = fs::read_dir(&brain) {
+            for entry in entries.flatten() {
+                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    let sess_name = entry.file_name().to_string_lossy().to_string();
+                    let path = entry
+                        .path()
+                        .join(".system_generated/logs/transcript_full.jsonl");
+                    if path.is_file() {
+                        seen_sessions.insert(sess_name);
+                        files.push(path);
+                    }
+                }
+            }
         }
     }
+
+    // 2. Scan conversations/*.db for sessions without transcript_full.jsonl (standard for Antigravity & Antigravity IDE)
+    let conv_dir = root.join("conversations");
+    if conv_dir.is_dir() {
+        if let Ok(entries) = fs::read_dir(&conv_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("db") {
+                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                        if !seen_sessions.contains(stem) {
+                            seen_sessions.insert(stem.to_string());
+                            files.push(path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     files.sort();
     Ok(files)
 }
 
 pub(crate) fn session_id(path: &Path) -> Option<&str> {
-    path.ancestors().nth(3)?.file_name()?.to_str()
+    if path.extension().and_then(|e| e.to_str()) == Some("db") {
+        path.file_stem().and_then(|s| s.to_str())
+    } else {
+        path.ancestors().nth(3)?.file_name()?.to_str()
+    }
 }
 
-/// Only complete JSONL lines are consumed. A malformed completed record is an
-/// error so a partially rebuilt session never replaces previously known usage.
+pub(crate) fn session_root(path: &Path) -> Option<&Path> {
+    if path.extension().and_then(|e| e.to_str()) == Some("db") {
+        path.parent()?.parent()
+    } else {
+        path.ancestors().nth(5)
+    }
+}
+
+#[allow(dead_code)]
 pub(crate) fn parse_session(path: &Path) -> Result<Vec<UsageEntry>, String> {
+    parse_session_with_source_kind(path, SOURCE_KIND)
+}
+
+/// Parse Antigravity session from SQLite database or legacy transcript JSONL.
+/// When SQLite generations are available, they provide exact token metrics from Google.
+pub(crate) fn parse_session_with_source_kind(
+    path: &Path,
+    source_kind: &str,
+) -> Result<Vec<UsageEntry>, String> {
     let session_id = session_id(path).ok_or("無效的 Antigravity transcript 路徑")?;
-    let root = path.ancestors().nth(5);
+    let root = session_root(path);
     let mut metadata = root
-        .map(|root| read_session_metadata(root, session_id))
+        .map(|r| read_session_metadata(r, session_id))
         .transpose()
         .map_err(|e| format!("讀取 Antigravity 會話 metadata 失敗: {e}"))?
         .unwrap_or_default();
-    let file = File::open(path).map_err(|e| e.to_string())?;
+
+    // 1. If generations exist in SQLite database and have token usage, use them directly as ground truth
+    let has_valid_generations = metadata
+        .generations
+        .iter()
+        .any(|g| g.input_tokens > 0 || g.output_tokens > 0 || g.cache_read_tokens > 0);
+    if has_valid_generations {
+        let mut entries = Vec::new();
+        let (agent_nickname, agent_role) = resolve_subagent_labels(&metadata);
+        let session_name = metadata
+            .title
+            .clone()
+            .or_else(|| {
+                metadata
+                    .initial_prompt
+                    .as_deref()
+                    .and_then(prompt_to_session_name)
+            })
+            .or_else(|| agent_role.clone());
+
+        for (turn_idx, gen) in metadata.generations.iter().enumerate() {
+            let turn_no = (turn_idx + 1) as u32;
+
+            let mut timestamp = None;
+            for step_idx in &gen.step_indices {
+                if let Some((ts, _)) = metadata.step_timestamps.get(step_idx) {
+                    timestamp = Some(ts.clone());
+                    break;
+                }
+            }
+            let timestamp = timestamp.unwrap_or_else(|| {
+                fs::metadata(path)
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .map(|t| {
+                        let dt: chrono::DateTime<chrono::Utc> = t.into();
+                        dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                    })
+                    .unwrap_or_else(|| {
+                        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                    })
+            });
+
+            let model = gen
+                .model_name
+                .clone()
+                .or_else(|| gen.model_uid.clone())
+                .unwrap_or_else(|| "Unknown".to_string());
+            let model_id = gen.model_uid.clone().or_else(|| Some(model.clone()));
+
+            let total = gen
+                .input_tokens
+                .checked_add(gen.output_tokens)
+                .and_then(|v| v.checked_add(gen.cache_read_tokens))
+                .filter(|v| *v <= i64::MAX as u64)
+                .unwrap_or(gen.input_tokens + gen.cache_read_tokens + gen.output_tokens);
+
+            let tokens = TokenStats {
+                input: gen.input_tokens,
+                output: gen.output_tokens,
+                cache_read: if gen.cache_read_tokens > 0 {
+                    Some(gen.cache_read_tokens)
+                } else {
+                    None
+                },
+                cache_write: None,
+                cache_write_5m: None,
+                cache_write_1h: None,
+                reasoning: if gen.reasoning_tokens > 0 {
+                    Some(gen.reasoning_tokens)
+                } else {
+                    None
+                },
+                total,
+            };
+
+            entries.push(UsageEntry {
+                timestamp,
+                session_id: session_id.to_owned(),
+                session_name: session_name.clone(),
+                transcript_path: Some(path.to_string_lossy().into_owned()),
+                cwd: metadata.cwd.clone(),
+                version: None,
+                turn_no,
+                model: Some(model),
+                model_id,
+                tokens: Some(tokens.clone()),
+                delta_tokens: Some(tokens),
+                context: None,
+                cost: None,
+                source_kind: Some(source_kind.to_owned()),
+                source_dir_key: None,
+                parent_session_id: metadata.parent_session_id.clone(),
+                agent_nickname: agent_nickname.clone(),
+                agent_role: agent_role.clone(),
+                reasoning_effort: None,
+            });
+        }
+        return Ok(entries);
+    }
+
+    // 2. If path is a JSONL transcript, or if a corresponding transcript exists in brain/, read lines
+    let jsonl_path = if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+        Some(path.to_path_buf())
+    } else if let Some(r) = root {
+        let candidate = r
+            .join("brain")
+            .join(session_id)
+            .join(".system_generated/logs/transcript_full.jsonl");
+        if candidate.is_file() {
+            Some(candidate)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let Some(jsonl_file) = jsonl_path else {
+        return Ok(Vec::new());
+    };
+
+    let file = File::open(&jsonl_file).map_err(|e| e.to_string())?;
     let mut reader = BufReader::new(file);
     let mut entries = Vec::new();
     let mut line = String::new();
@@ -197,8 +363,10 @@ pub(crate) fn parse_session(path: &Path) -> Result<Vec<UsageEntry>, String> {
         if line.trim().is_empty() {
             continue;
         }
-        let event: Value =
-            serde_json::from_str(&line).map_err(|e| format!("Antigravity JSONL 格式錯誤: {e}"))?;
+        let event: Value = match serde_json::from_str(&line) {
+            Ok(event) => event,
+            Err(_) => continue,
+        };
         let step_type = event.get("type").and_then(Value::as_str);
 
         if !name_selector.is_complete() {
@@ -296,7 +464,7 @@ pub(crate) fn parse_session(path: &Path) -> Result<Vec<UsageEntry>, String> {
         entries.push(UsageEntry {
             timestamp,
             session_id: session_id.to_owned(),
-            session_name: None,
+            session_name: metadata.title.clone(),
             transcript_path: Some(path.to_string_lossy().into_owned()),
             cwd: None,
             version: None,
@@ -307,7 +475,7 @@ pub(crate) fn parse_session(path: &Path) -> Result<Vec<UsageEntry>, String> {
             delta_tokens: Some(tokens),
             context: None,
             cost: None,
-            source_kind: Some(SOURCE_KIND.to_owned()),
+            source_kind: Some(source_kind.to_owned()),
             source_dir_key: None,
             parent_session_id: None,
             agent_nickname: None,
@@ -345,4 +513,214 @@ pub(crate) fn parse_session(path: &Path) -> Result<Vec<UsageEntry>, String> {
     }
 
     Ok(entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn temp_test_dir(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "token-usage-insights-antigravity-test-{}-{}",
+            label,
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn parse_session_skips_malformed_json_lines_and_extracts_valid_usage() {
+        let root = temp_test_dir("malformed_json");
+        let session_dir = root
+            .join("brain")
+            .join("test-session-1")
+            .join(".system_generated/logs");
+        fs::create_dir_all(&session_dir).unwrap();
+        let transcript = session_dir.join("transcript_full.jsonl");
+
+        let content = concat!(
+            "{\"step_index\":0,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"created_at\":\"2026-06-29T07:23:22Z\"}\n",
+            "{\"step_index\":1,\"source\":\"MODEL\",\"type\":\"PLANNER_RESPONSE\",\"created_at\":\"2026-06-29T07:23:23Z\",\"input_tokens\":100,\"output_tokens\":20,\"cache_read_tokens\":50,\"model\":\"gemini-2.5-pro\"}\n",
+            "s been modified to include a line number before every line, in the format: <line_number>: <original_line>\n",
+            "{\"step_index\":3,\"source\":\"MODEL\",\"type\":\"PLANNER_RESPONSE\",\"created_at\":\"2026-06-29T07:23:25Z\",\"input_tokens\":200,\"output_tokens\":40,\"cache_read_tokens\":0,\"model\":\"gemini-2.5-pro\"}\n"
+        );
+        fs::write(&transcript, content).unwrap();
+
+        let entries = parse_session(&transcript)
+            .expect("parse_session should succeed despite malformed lines");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].session_id, "test-session-1");
+        assert_eq!(entries[0].turn_no, 1);
+        assert_eq!(entries[0].tokens.as_ref().unwrap().input, 100);
+        assert_eq!(entries[0].tokens.as_ref().unwrap().output, 20);
+        assert_eq!(entries[0].tokens.as_ref().unwrap().cache_read, Some(50));
+        assert_eq!(entries[0].tokens.as_ref().unwrap().total, 170);
+
+        assert_eq!(entries[1].turn_no, 2);
+        assert_eq!(entries[1].tokens.as_ref().unwrap().input, 200);
+        assert_eq!(entries[1].tokens.as_ref().unwrap().output, 40);
+        assert_eq!(entries[1].tokens.as_ref().unwrap().total, 240);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parse_session_skips_unclosed_trailing_line() {
+        let root = temp_test_dir("unclosed_line");
+        let session_dir = root
+            .join("brain")
+            .join("test-session-2")
+            .join(".system_generated/logs");
+        fs::create_dir_all(&session_dir).unwrap();
+        let transcript = session_dir.join("transcript_full.jsonl");
+
+        let mut file = File::create(&transcript).unwrap();
+        writeln!(
+            file,
+            "{{\"step_index\":1,\"source\":\"MODEL\",\"type\":\"PLANNER_RESPONSE\",\"created_at\":\"2026-06-29T07:23:23Z\",\"input_tokens\":50,\"output_tokens\":10,\"model\":\"gemini-2.5-pro\"}}"
+        ).unwrap();
+        // Trailing unclosed line without newline
+        write!(
+            file,
+            "{{\"step_index\":2,\"source\":\"MODEL\",\"type\":\"PLANNER_RESPONSE\",\"created_at\":\"2026-06-29T07:23:24Z\",\"input_tokens\":60"
+        ).unwrap();
+
+        let entries =
+            parse_session(&transcript).expect("parse_session should ignore trailing partial line");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].tokens.as_ref().unwrap().input, 50);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parse_session_fails_on_invalid_token_values() {
+        let root = temp_test_dir("invalid_tokens");
+        let session_dir = root
+            .join("brain")
+            .join("test-session-3")
+            .join(".system_generated/logs");
+        fs::create_dir_all(&session_dir).unwrap();
+        let transcript = session_dir.join("transcript_full.jsonl");
+
+        fs::write(
+            &transcript,
+            "{\"step_index\":1,\"source\":\"MODEL\",\"type\":\"PLANNER_RESPONSE\",\"created_at\":\"2026-06-29T07:23:23Z\",\"input_tokens\":-50,\"output_tokens\":10}\n",
+        ).unwrap();
+
+        let err = parse_session(&transcript).unwrap_err();
+        assert!(err.contains("必須是非負整數"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parse_session_prefers_sqlite_database_when_available() {
+        let root = temp_test_dir("sqlite_session");
+        let conv_dir = root.join("conversations");
+        fs::create_dir_all(&conv_dir).unwrap();
+        let db_path = conv_dir.join("test-db-session.db");
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE gen_metadata(idx INTEGER, data BLOB);
+             CREATE TABLE steps(idx INTEGER, metadata BLOB);
+             CREATE TABLE trajectory_metadata_blob(data BLOB);",
+        )
+        .unwrap();
+
+        // Helper to encode varint and length-delimited field
+        fn encode_varint(mut value: u64) -> Vec<u8> {
+            let mut bytes = Vec::new();
+            while value >= 128 {
+                bytes.push((value as u8 & 127) | 128);
+                value >>= 7;
+            }
+            bytes.push(value as u8);
+            bytes
+        }
+        fn varint_field(num: u64, val: u64) -> Vec<u8> {
+            let mut b = encode_varint(num << 3);
+            b.extend(encode_varint(val));
+            b
+        }
+        fn field(num: u64, val: &[u8]) -> Vec<u8> {
+            let mut b = encode_varint((num << 3) | 2);
+            b.extend(encode_varint(val.len() as u64));
+            b.extend(val);
+            b
+        }
+
+        let mut usage_bytes = Vec::new();
+        usage_bytes.extend(varint_field(2, 500)); // input
+        usage_bytes.extend(varint_field(5, 100)); // cache_read
+        usage_bytes.extend(varint_field(3, 80)); // output
+        usage_bytes.extend(varint_field(10, 25)); // reasoning
+
+        let mut inner = Vec::new();
+        inner.extend(field(19, b"gemini-3.8-flash-high"));
+        inner.extend(field(21, b"Gemini 3.8 Flash (High)"));
+        inner.extend(field(4, &usage_bytes));
+
+        let mut gen_blob = Vec::new();
+        gen_blob.extend(field(4, b"gen-123"));
+        let mut packed_steps = Vec::new();
+        packed_steps.extend(encode_varint(1));
+        gen_blob.extend(field(2, &packed_steps));
+        gen_blob.extend(field(1, &inner));
+
+        conn.execute(
+            "INSERT INTO gen_metadata VALUES (0, ?1)",
+            rusqlite::params![gen_blob],
+        )
+        .unwrap();
+
+        let mut ts_bytes = Vec::new();
+        ts_bytes.extend(varint_field(1, 1782454505)); // 2026-06-26T06:15:05Z
+        let step_meta = field(1, &ts_bytes);
+        conn.execute(
+            "INSERT INTO steps VALUES (1, ?1)",
+            rusqlite::params![step_meta],
+        )
+        .unwrap();
+
+        // Workspace
+        let ws_blob = field(7, b"file:///Users/test/workspace");
+        conn.execute(
+            "INSERT INTO trajectory_metadata_blob VALUES (?1)",
+            rusqlite::params![ws_blob],
+        )
+        .unwrap();
+
+        drop(conn);
+
+        let files = find_session_files(&root).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0], db_path);
+
+        let entries = parse_session(&db_path).expect("parse_session should read sqlite session");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].session_id, "test-db-session");
+        assert_eq!(entries[0].turn_no, 1);
+        assert_eq!(entries[0].model.as_deref(), Some("Gemini 3.8 Flash (High)"));
+        assert_eq!(entries[0].timestamp, "2026-06-26T06:15:05Z");
+        assert_eq!(entries[0].cwd.as_deref(), Some("/Users/test/workspace"));
+        assert_eq!(entries[0].source_kind.as_deref(), Some(SOURCE_KIND));
+
+        let stats = entries[0].tokens.as_ref().unwrap();
+        assert_eq!(stats.input, 500);
+        assert_eq!(stats.cache_read, Some(100));
+        assert_eq!(stats.output, 80);
+        assert_eq!(stats.reasoning, Some(25));
+        assert_eq!(stats.total, 680);
+
+        // Test IDE source kind
+        let ide_entries = parse_session_with_source_kind(&db_path, IDE_SOURCE_KIND).unwrap();
+        assert_eq!(ide_entries[0].source_kind.as_deref(), Some(IDE_SOURCE_KIND));
+
+        let _ = fs::remove_dir_all(&root);
+    }
 }
