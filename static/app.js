@@ -12,8 +12,10 @@ import {
   filterEntriesBySessionIdentity,
   matchesSessionIdentity,
   parentSessionIdentityKey,
+  resolveParentSession,
   sessionIdentityKey,
-} from './session-utils.js?v=4';
+  sortAndGetFlatSessions,
+} from './session-utils.js?v=5';
 import { parseUsageTimestamp } from './time-utils.js?v=1';
 
 // Globals
@@ -4621,57 +4623,6 @@ async function executeSessionPromptSearch(query, searchContext) {
   }
 }
 
-function sortAndGetFlatSessions(sessions, sortCol, sortDir) {
-  const map = new Map();
-  sessions.forEach(s => {
-    map.set(sessionIdentityKey(s), { ...s, children: [] });
-  });
-
-  const nodes = [...map.values()];
-  const roots = [];
-  nodes.forEach(item => {
-    const parentKey = parentSessionIdentityKey(item);
-    const parent = parentKey ? map.get(parentKey) : null;
-    if (parent && parent !== item) {
-      parent.children.push(item);
-    } else {
-      roots.push(item);
-    }
-  });
-
-  const compare = (a, b) => compareSessionRows(a, b, sortCol, sortDir);
-
-  // 排序 Root 節點
-  roots.sort(compare);
-  nodes.sort(compare);
-
-  // 扁平化
-  const flat = [];
-  const visited = new Set();
-  const traverse = (node, depth, parentName) => {
-    const nodeKey = sessionIdentityKey(node);
-    if (visited.has(nodeKey)) return;
-    visited.add(nodeKey);
-    flat.push({
-      ...node,
-      depth,
-      isSubagent: depth > 0 || Boolean(node.parent_session_id),
-      parentName: parentName || node.parent_session_id || null
-    });
-    node.children
-      .sort(compare)
-      .forEach(child => traverse(child, depth + 1, node.session_name));
-  };
-  roots.forEach(r => traverse(r, 0, null));
-  nodes.forEach(node => {
-    if (!visited.has(sessionIdentityKey(node))) {
-      traverse(node, 0, null);
-    }
-  });
-
-  return flat;
-}
-
 function sortAndRenderSessionTable() {
   if (!currentSessions || currentSessions.length === 0) {
     renderSessionTable([]);
@@ -4806,8 +4757,16 @@ function renderSessionTable(sessions) {
 
   // 建立快速查詢 Map 以供 Hover 高亮與樹狀結構查詢
   const sessionsMap = new Map();
+  const bySessionId = new Map();
   sessions.forEach(s => {
-    sessionsMap.set(sessionIdentityKey(s), s);
+    const key = sessionIdentityKey(s);
+    sessionsMap.set(key, s);
+    if (s.session_id) {
+      if (!bySessionId.has(s.session_id)) {
+        bySessionId.set(s.session_id, []);
+      }
+      bySessionId.get(s.session_id).push(s);
+    }
   });
 
   function getRootParentKey(session) {
@@ -4827,11 +4786,11 @@ function renderSessionTable(sessions) {
       positions.set(key, path.length);
       path.push(curr);
 
-      const parentKey = parentSessionIdentityKey(curr);
-      if (!parentKey || !sessionsMap.has(parentKey)) {
+      const parent = resolveParentSession(curr, sessionsMap, bySessionId);
+      if (!parent) {
         return key;
       }
-      curr = sessionsMap.get(parentKey);
+      curr = parent;
     }
 
     return sessionIdentityKey(session);
@@ -4839,10 +4798,12 @@ function renderSessionTable(sessions) {
 
   sessions.forEach(s => {
     const tr = document.createElement('tr');
+    const parentNode = resolveParentSession(s, sessionsMap, bySessionId);
+    const parentKey = parentNode ? sessionIdentityKey(parentNode) : (parentSessionIdentityKey(s) || '');
     tr.setAttribute('data-session-id', s.session_id);
     tr.setAttribute('data-parent-id', s.parent_session_id || '');
     tr.setAttribute('data-session-key', sessionIdentityKey(s));
-    tr.setAttribute('data-parent-key', parentSessionIdentityKey(s) || '');
+    tr.setAttribute('data-parent-key', parentKey);
 
     if (s.isSubagent) {
       tr.classList.add('subagent-row');
@@ -4866,8 +4827,9 @@ function renderSessionTable(sessions) {
     // 依據 depth 縮排會話名稱，並呈現樹狀連接線與子代理標籤
     let nameCellContent = '';
     if (s.isSubagent) {
-      const paddingLeft = s.depth * 16;
-      const connectorLeft = (s.depth - 1) * 16 + 4;
+      const effectiveDepth = s.depth > 0 ? s.depth : 1;
+      const paddingLeft = effectiveDepth * 16;
+      const connectorLeft = (effectiveDepth - 1) * 16 + 4;
       const nickname = s.agent_nickname || '';
       // Subagent 第一列只顯示具實際語意的角色，排除與 Subagent badge 重複的 sub-agent/subagent
       const rawRole = (s.agent_role || '').trim();
@@ -4875,7 +4837,7 @@ function renderSessionTable(sessions) {
       const subagentDisplayName = s.session_name || s.session_id;
       nameCellContent = `
         <div class="session-name-wrapper is-subagent" style="padding-left: ${paddingLeft}px;">
-          ${s.depth > 0 ? `<span class="tree-connector" style="left: ${connectorLeft}px;" aria-hidden="true"></span>` : ''}
+          <span class="tree-connector" style="left: ${connectorLeft}px;" aria-hidden="true"></span>
           <div style="display: flex; flex-wrap: wrap; gap: 4px; align-items: center; margin-bottom: 3px;">
             <span class="badge subagent-badge" title="${escapeHtml(t('subagent_parent_label'))}: ${escapeHtml(s.parentName || '')}">${escapeHtml(t('subagent_label'))}</span>
             ${nameSourceBadge}

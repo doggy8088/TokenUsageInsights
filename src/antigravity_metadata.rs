@@ -461,6 +461,28 @@ fn read_trajectory_metadata(
         }
     }
 
+    // Fall back to parent_references table when trajectory_metadata_blob does not carry field 5
+    if parent_session_id.is_none() {
+        if let Ok(mut stmt) = conn.prepare("SELECT data FROM parent_references ORDER BY idx ASC") {
+            if let Ok(rows) = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0)) {
+                for row in rows.flatten() {
+                    if let Some(fields) = protobuf_fields(&row) {
+                        if let Some(pid_bytes) = bytes_field(&fields, 1) {
+                            if let Ok(pid) = std::str::from_utf8(pid_bytes) {
+                                let pid = pid.trim();
+                                if is_valid_session_id(pid) && pid != session_id {
+                                    parent_session_id = Some(pid.to_string());
+                                    parent_unresolved = false;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     Ok(SessionMetadata {
         models: HashMap::new(),
         cwd: if workspace_unresolved {
@@ -1176,6 +1198,34 @@ mod tests {
         // Self-reference guard: parent_conversation_id == session_id is ignored.
         let self_ref = read_trajectory_metadata(&conn, "parent-session-uuid").unwrap();
         assert!(self_ref.parent_session_id.is_none());
+    }
+
+    #[test]
+    fn reads_parent_session_from_parent_references_when_blob_lacks_it() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE trajectory_metadata_blob(data BLOB);
+             CREATE TABLE parent_references(idx integer, data blob, PRIMARY KEY(idx));",
+        )
+        .unwrap();
+
+        // trajectory_metadata_blob only has workspace
+        let blob = field(7, b"file:///example/project");
+        conn.execute("INSERT INTO trajectory_metadata_blob VALUES (?1)", [&blob])
+            .unwrap();
+
+        // parent_references has tag 1 parent id
+        let mut ref_blob = field(1, b"parent-ref-uuid");
+        ref_blob.extend(field(6, b"child-session-uuid"));
+        conn.execute("INSERT INTO parent_references VALUES (0, ?1)", [&ref_blob])
+            .unwrap();
+
+        let metadata = read_trajectory_metadata(&conn, "child-session-uuid").unwrap();
+        assert_eq!(metadata.cwd.as_deref(), Some("/example/project"));
+        assert_eq!(
+            metadata.parent_session_id.as_deref(),
+            Some("parent-ref-uuid")
+        );
     }
 
     #[test]

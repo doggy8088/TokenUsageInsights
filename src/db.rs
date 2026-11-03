@@ -219,6 +219,7 @@ pub struct UsageImportRollbackSummary {
 const CODEX_PARSER_MIGRATION_KEY: &str = "migration:codex_session_identity_v9";
 const CODEX_SOURCE_KIND_MIGRATION_KEY: &str = "migration:codex_source_kind_v1";
 const CODEX_ROLLOUT_IDENTITY_MIGRATION_KEY: &str = "migration:codex_rollout_identity_v1";
+const PI_SUBAGENT_PARSER_MIGRATION_KEY: &str = "migration:pi_subagent_v2";
 const CODEX_CLI_SOURCE_KIND: &str = "codex-cli";
 const CODEX_DESKTOP_SOURCE_KIND: &str = "codex-desktop";
 const CODEX_OTHER_SOURCE_KIND: &str = "codex-other";
@@ -1397,6 +1398,34 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
         .map_err(|error| format!("記錄 Grok Build parser migration 失敗: {error}"))?;
     }
 
+    run_pi_parser_migration(conn)?;
+
+    Ok(())
+}
+
+pub fn run_pi_parser_migration(conn: &Connection) -> Result<(), String> {
+    let pi_subagent_migration_done: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = ?)",
+            params![PI_SUBAGENT_PARSER_MIGRATION_KEY],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    if !pi_subagent_migration_done {
+        conn.execute(
+            "DELETE FROM sync_state
+             WHERE filename LIKE 'pi:%'
+                OR filename LIKE 'omp:%'",
+            [],
+        )
+        .map_err(|error| format!("清除 Pi/OMP 同步狀態失敗: {error}"))?;
+        conn.execute(
+            "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES (?, 1, 0)",
+            params![PI_SUBAGENT_PARSER_MIGRATION_KEY],
+        )
+        .map_err(|error| format!("記錄 Pi/OMP subagent 遷移失敗: {error}"))?;
+    }
     Ok(())
 }
 
@@ -5441,6 +5470,7 @@ pub(crate) fn sync_pi_usage_logs_with_cancel(
     pi_dir: &Path,
     should_cancel: &(dyn Fn() -> bool + Sync),
 ) -> Result<(), String> {
+    run_pi_parser_migration(conn)?;
     let session_files = crate::pi::find_session_files(pi_dir);
     sync_pi_family_usage_logs(
         conn,
@@ -5463,6 +5493,7 @@ pub(crate) fn sync_omp_usage_logs_with_cancel(
     omp_dir: &Path,
     should_cancel: &(dyn Fn() -> bool + Sync),
 ) -> Result<(), String> {
+    run_pi_parser_migration(conn)?;
     let session_files = crate::omp::find_session_files(omp_dir);
     sync_pi_family_usage_logs(
         conn,
@@ -19076,6 +19107,128 @@ mod tests {
                 "legacy marker should be removed: {legacy_key}"
             );
         }
+    }
+
+    #[test]
+    fn pi_parser_migration_resets_existing_sync_state() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        conn.execute(
+            "DELETE FROM sync_state WHERE filename = ?",
+            params![PI_SUBAGENT_PARSER_MIGRATION_KEY],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES ('pi:agent/sessions/old.jsonl', 1234, 100)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES ('omp:agent/sessions/old.jsonl', 5678, 100)",
+            [],
+        )
+        .unwrap();
+
+        init_db(&conn).unwrap();
+
+        let pi_count: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state WHERE filename LIKE 'pi:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let omp_count: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state WHERE filename LIKE 'omp:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pi_count, 0);
+        assert_eq!(omp_count, 0);
+
+        let migration_done: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = ?)",
+                params![PI_SUBAGENT_PARSER_MIGRATION_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(migration_done);
+    }
+
+    #[test]
+    fn sync_pi_usage_logs_persists_subagents_and_roles() {
+        use std::io::Write;
+        let root = temp_jsonl_path("pi-sync-subagents");
+        let session_dir = root.join("agent").join("sessions").join("--test--");
+        fs::create_dir_all(&session_dir).unwrap();
+
+        let parent_file = session_dir.join("2026-10-14T02-44-37-856Z_parent-pi-1.jsonl");
+        let mut f1 = fs::File::create(&parent_file).unwrap();
+        writeln!(
+            f1,
+            r#"{{"type":"session","version":3,"id":"parent-pi-1","timestamp":"2026-10-14T02:44:37.856Z","cwd":"/repo"}}"#
+        )
+        .unwrap();
+        writeln!(
+            f1,
+            r#"{{"type":"message","id":"m0","message":{{"role":"user","content":[{{"type":"text","text":"Main Prompt"}}]}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            f1,
+            r#"{{"type":"message","id":"m1","message":{{"role":"assistant","content":[{{"type":"text","text":"Hello"}}],"provider":"anthropic","model":"claude-3-7-sonnet","usage":{{"input":100,"output":50,"totalTokens":150}}}}}}"#
+        )
+        .unwrap();
+
+        let sub_dir = session_dir.join("parent-pi-1").join("run-0");
+        fs::create_dir_all(&sub_dir).unwrap();
+        let sub_file = sub_dir.join("session.jsonl");
+        let mut f2 = fs::File::create(&sub_file).unwrap();
+        writeln!(
+            f2,
+            r#"{{"type":"session","version":3,"id":"child-pi-sub","timestamp":"2026-10-14T05:49:40.319Z","cwd":"/repo/sub","parentSession":"{}"}}"#,
+            parent_file.to_string_lossy()
+        )
+        .unwrap();
+        writeln!(
+            f2,
+            r#"{{"type":"session_info","id":"info1","name":"subagent-reviewer-uuid"}}"#
+        )
+        .unwrap();
+        writeln!(
+            f2,
+            r#"{{"type":"message","id":"m0","message":{{"role":"user","content":[{{"type":"text","text":"Task: Review PR"}}]}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            f2,
+            r#"{{"type":"message","id":"m1","message":{{"role":"assistant","content":[{{"type":"text","text":"LGTM"}}],"provider":"anthropic","model":"claude-3-7-sonnet","usage":{{"input":200,"output":100,"totalTokens":300}}}}}}"#
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        sync_pi_usage_logs(&mut conn, &root).unwrap();
+
+        let parent_rows =
+            get_session_turns_token_stats(&conn, "pi", "parent-pi-1", None, None).unwrap();
+        assert_eq!(parent_rows.len(), 1);
+
+        let sub_lookup =
+            get_session_assistant_and_transcript(&conn, "pi", "child-pi-sub", None, None).unwrap();
+        assert_eq!(sub_lookup.parent_session_id.as_deref(), Some("parent-pi-1"));
+        assert_eq!(sub_lookup.agent_nickname.as_deref(), Some("Subagent"));
+        assert_eq!(sub_lookup.agent_role.as_deref(), Some("reviewer"));
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

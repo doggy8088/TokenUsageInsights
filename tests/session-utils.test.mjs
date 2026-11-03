@@ -6,7 +6,9 @@ import {
   filterEntriesBySessionIdentity,
   matchesSessionIdentity,
   parentSessionIdentityKey,
+  resolveParentSession,
   sessionIdentityKey,
+  sortAndGetFlatSessions,
 } from '../static/session-utils.js';
 
 const mixedTimestampSessions = [
@@ -117,3 +119,120 @@ test('raw usage filtering preserves the full session source identity', () => {
 
   assert.deepEqual(filterEntriesBySessionIdentity(entries, sessions), [entries[0]]);
 });
+
+test('sortAndGetFlatSessions nests subagents in a tree structure like Claude Code', () => {
+  const sessions = [
+    {
+      session_id: 'root-1',
+      session_name: 'Main Task',
+      assistant_type: 'gemini',
+      source_kind: 'gemini-cli',
+      timestamp: '2026-10-14 10:00:00',
+    },
+    {
+      session_id: 'sub-1',
+      parent_session_id: 'root-1',
+      session_name: 'Sub Task 1',
+      assistant_type: 'gemini',
+      source_kind: 'gemini-cli',
+      timestamp: '2026-10-14 10:05:00',
+    },
+    {
+      session_id: 'sub-1-1',
+      parent_session_id: 'sub-1',
+      session_name: 'Nested Sub Task',
+      assistant_type: 'gemini',
+      source_kind: 'gemini-cli',
+      timestamp: '2026-10-14 10:10:00',
+    },
+  ];
+
+  const flat = sortAndGetFlatSessions(sessions, 'timestamp', 'desc');
+  assert.equal(flat.length, 3);
+  assert.equal(flat[0].session_id, 'root-1');
+  assert.equal(flat[0].depth, 0);
+  assert.equal(flat[0].isSubagent, false);
+
+  assert.equal(flat[1].session_id, 'sub-1');
+  assert.equal(flat[1].depth, 1);
+  assert.equal(flat[1].isSubagent, true);
+  assert.equal(flat[1].parentName, 'Main Task');
+
+  assert.equal(flat[2].session_id, 'sub-1-1');
+  assert.equal(flat[2].depth, 2);
+  assert.equal(flat[2].isSubagent, true);
+  assert.equal(flat[2].parentName, 'Sub Task 1');
+});
+
+test('sortAndGetFlatSessions matches parent across different source_kind or source_dir_key', () => {
+  const sessions = [
+    {
+      session_id: 'parent-ide',
+      session_name: 'Antigravity IDE Session',
+      assistant_type: 'antigravity-ide',
+      source_kind: 'antigravity-ide-session',
+      source_dir_key: 'dir-a',
+      timestamp: '2026-10-14 09:00:00',
+    },
+    {
+      session_id: 'child-cli',
+      parent_session_id: 'parent-ide',
+      session_name: 'Subagent Worker',
+      assistant_type: 'antigravity',
+      source_kind: 'antigravity-session',
+      source_dir_key: null,
+      timestamp: '2026-10-14 09:05:00',
+    },
+  ];
+
+  const flat = sortAndGetFlatSessions(sessions, 'timestamp', 'desc');
+  assert.equal(flat.length, 2);
+  assert.equal(flat[0].session_id, 'parent-ide');
+  assert.equal(flat[0].depth, 0);
+  assert.equal(flat[1].session_id, 'child-cli');
+  assert.equal(flat[1].depth, 1);
+  assert.equal(flat[1].isSubagent, true);
+  assert.equal(flat[1].parentName, 'Antigravity IDE Session');
+});
+
+test('sortAndGetFlatSessions handles orphan subagents whose parent is absent', () => {
+  const sessions = [
+    {
+      session_id: 'orphan-sub',
+      parent_session_id: 'missing-parent',
+      session_name: 'Detached Worker',
+      assistant_type: 'pi',
+      source_kind: 'pi-session',
+      timestamp: '2026-10-14 11:00:00',
+    },
+  ];
+
+  const flat = sortAndGetFlatSessions(sessions, 'timestamp', 'desc');
+  assert.equal(flat.length, 1);
+  assert.equal(flat[0].session_id, 'orphan-sub');
+  assert.equal(flat[0].isSubagent, true);
+  assert.equal(flat[0].parentName, 'missing-parent');
+});
+
+test('sortAndGetFlatSessions prevents circular references from causing infinite loops', () => {
+  const sessions = [
+    {
+      session_id: 'cycle-a',
+      parent_session_id: 'cycle-b',
+      assistant_type: 'codex',
+      source_kind: 'codex-desktop',
+      timestamp: '2026-10-14 12:00:00',
+    },
+    {
+      session_id: 'cycle-b',
+      parent_session_id: 'cycle-a',
+      assistant_type: 'codex',
+      source_kind: 'codex-desktop',
+      timestamp: '2026-10-14 12:01:00',
+    },
+  ];
+
+  const flat = sortAndGetFlatSessions(sessions, 'timestamp', 'desc');
+  assert.equal(flat.length, 2);
+});
+

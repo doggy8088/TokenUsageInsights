@@ -17,7 +17,8 @@ fn value_as_u64(value: Option<&Value>) -> Option<u64> {
 }
 
 /// Recursively scans for Gemini CLI session files under `<gemini_dir>/tmp/*/chats/*.jsonl`.
-/// Also supports directories that directly contain `chats/*.jsonl` or `*.jsonl`.
+/// Also supports subdirectories for subagent sessions (`chats/<parent_uuid>/*.jsonl`),
+/// direct `<dir>/chats/`, and `<dir>` itself.
 pub(crate) fn find_session_files(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
 
@@ -30,7 +31,7 @@ pub(crate) fn find_session_files(dir: &Path) -> Vec<PathBuf> {
                 if project_dir.is_dir() {
                     let chats_dir = project_dir.join("chats");
                     if chats_dir.is_dir() {
-                        scan_jsonl_in_dir(&chats_dir, &mut files);
+                        scan_jsonl_in_dir(&chats_dir, &mut files, 0);
                     }
                 }
             }
@@ -40,18 +41,21 @@ pub(crate) fn find_session_files(dir: &Path) -> Vec<PathBuf> {
     // 2. Check direct <dir>/chats/
     let direct_chats = dir.join("chats");
     if direct_chats.is_dir() {
-        scan_jsonl_in_dir(&direct_chats, &mut files);
+        scan_jsonl_in_dir(&direct_chats, &mut files, 0);
     }
 
     // 3. Fallback: if dir itself contains session-*.jsonl
-    scan_jsonl_in_dir(dir, &mut files);
+    scan_jsonl_in_dir(dir, &mut files, 0);
 
     files.sort();
     files.dedup();
     files
 }
 
-fn scan_jsonl_in_dir(dir: &Path, files: &mut Vec<PathBuf>) {
+fn scan_jsonl_in_dir(dir: &Path, files: &mut Vec<PathBuf>, depth: usize) {
+    if depth > 3 {
+        return;
+    }
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -62,24 +66,31 @@ fn scan_jsonl_in_dir(dir: &Path, files: &mut Vec<PathBuf>) {
                 .file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or("");
-            if filename.starts_with("session-") || filename.contains("session") {
+            if depth == 0 {
+                if filename.starts_with("session-") || filename.contains("session") {
+                    files.push(path);
+                }
+            } else {
                 files.push(path);
             }
+        } else if path.is_dir() {
+            scan_jsonl_in_dir(&path, files, depth + 1);
         }
     }
 }
 
-/// Attempts to read the original workspace root from `<project_hash>/.project_root`.
+/// Attempts to read the original workspace root by checking for `.project_root` up the directory tree.
 pub(crate) fn read_project_root(session_path: &Path) -> Option<String> {
-    // Expected structure: .../<project_hash>/chats/session-*.jsonl
-    let chats_dir = session_path.parent()?;
-    let project_dir = chats_dir.parent()?;
-    let project_root_file = project_dir.join(".project_root");
-    if let Ok(content) = fs::read_to_string(&project_root_file) {
-        let trimmed = content.trim();
-        if !trimmed.is_empty() {
-            return Some(trimmed.to_string());
+    let mut curr = session_path.parent();
+    while let Some(dir) = curr {
+        let project_root_file = dir.join(".project_root");
+        if let Ok(content) = fs::read_to_string(&project_root_file) {
+            let trimmed = content.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
         }
+        curr = dir.parent();
     }
     None
 }
@@ -132,6 +143,7 @@ pub(crate) fn extract_prompt_from_content(content: &Value) -> Option<String> {
         if !trimmed.is_empty()
             && !trimmed.starts_with("<session_context>")
             && !trimmed.starts_with("<hook_context>")
+            && !trimmed.starts_with("<loaded_context>")
         {
             return Some(trimmed.to_string());
         }
@@ -143,9 +155,63 @@ pub(crate) fn extract_prompt_from_content(content: &Value) -> Option<String> {
                 if !trimmed.is_empty()
                     && !trimmed.starts_with("<session_context>")
                     && !trimmed.starts_with("<hook_context>")
+                    && !trimmed.starts_with("<loaded_context>")
                 {
                     return Some(trimmed.to_string());
                 }
+            }
+        }
+    }
+    None
+}
+
+pub(crate) fn format_session_prompt_title(prompt: &str) -> String {
+    let target = if let Some(start) = prompt.find("<objective>") {
+        let after = &prompt[start + 11..];
+        if let Some(end) = after.find("</objective>") {
+            &after[..end]
+        } else {
+            after
+        }
+    } else {
+        prompt
+    };
+    for line in target.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(role) = line.strip_prefix("Role:") {
+            let role = role.trim();
+            if !role.is_empty() {
+                return role.chars().take(100).collect();
+            }
+        }
+        if let Some(task) = line.strip_prefix("Task:") {
+            let task = task.trim();
+            if !task.is_empty() {
+                return task.chars().take(100).collect();
+            }
+        }
+        return line.chars().take(100).collect();
+    }
+    prompt
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .take(100)
+        .collect()
+}
+
+pub(crate) fn extract_role_from_prompt(prompt: &str) -> Option<String> {
+    for line in prompt.lines() {
+        let trimmed = line.trim();
+        if let Some(role) = trimmed.strip_prefix("Role:") {
+            let role = role.trim();
+            if !role.is_empty() {
+                return Some(role.chars().take(50).collect());
             }
         }
     }
@@ -173,7 +239,31 @@ pub(crate) fn parse_session_usage_file(path: &Path) -> Result<Vec<UsageEntry>, S
     let mut session_id = fallback_id.clone();
     let mut session_name: Option<String> = None;
     let cwd_opt = read_project_root(path);
+    let mut subagent_cwd: Option<String> = None;
     let transcript_path = path.to_string_lossy().into_owned();
+
+    // Check directory layout for subagent: chats/<parent_session_id>/<subagent_id>.jsonl
+    let mut parent_session_id: Option<String> = None;
+    let mut is_subagent = false;
+    let mut agent_role: Option<String> = None;
+
+    if let Some(parent_dir) = path.parent() {
+        if parent_dir
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            == Some("chats")
+        {
+            let p_name = parent_dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            if !p_name.is_empty() && p_name != "chats" {
+                parent_session_id = Some(p_name.to_string());
+                is_subagent = true;
+            }
+        }
+    }
 
     let mut turn_order: Vec<String> = Vec::new();
     let mut turn_map: HashMap<String, GeminiTurnRecord> = HashMap::new();
@@ -181,12 +271,17 @@ pub(crate) fn parse_session_usage_file(path: &Path) -> Result<Vec<UsageEntry>, S
     let mut process_message = |msg: &Value| {
         let msg_type = msg.get("type").and_then(Value::as_str).unwrap_or("");
 
-        if msg_type == "user" && session_name.is_none() {
+        if msg_type == "user" {
             if let Some(content) = msg.get("content") {
                 if let Some(prompt) = extract_prompt_from_content(content) {
-                    let first_line = prompt.lines().next().unwrap_or("").trim();
-                    if !first_line.is_empty() {
-                        session_name = Some(first_line.chars().take(100).collect());
+                    if session_name.is_none() {
+                        let title = format_session_prompt_title(&prompt);
+                        if !title.is_empty() {
+                            session_name = Some(title);
+                        }
+                    }
+                    if agent_role.is_none() {
+                        agent_role = extract_role_from_prompt(&prompt);
                     }
                 }
             }
@@ -245,10 +340,35 @@ pub(crate) fn parse_session_usage_file(path: &Path) -> Result<Vec<UsageEntry>, S
             continue;
         };
 
-        // Extract session ID from header if present
+        // Extract session ID and kind from header if present
         if let Some(sid) = obj.get("sessionId").and_then(Value::as_str) {
             if !sid.is_empty() {
                 session_id = sid.to_string();
+            }
+        }
+        if let Some(kind) = obj.get("kind").and_then(Value::as_str) {
+            if kind == "subagent" {
+                is_subagent = true;
+            }
+        }
+        if let Some(pid) = obj
+            .get("parentSessionId")
+            .or_else(|| obj.get("parentId"))
+            .and_then(Value::as_str)
+        {
+            let trimmed_pid = pid.trim();
+            if !trimmed_pid.is_empty() {
+                parent_session_id = Some(trimmed_pid.to_string());
+                is_subagent = true;
+            }
+        }
+        if subagent_cwd.is_none() {
+            if let Some(dirs) = obj.get("directories").and_then(Value::as_array) {
+                if let Some(d) = dirs.first().and_then(Value::as_str) {
+                    if !d.trim().is_empty() {
+                        subagent_cwd = Some(d.trim().to_string());
+                    }
+                }
             }
         }
 
@@ -269,6 +389,13 @@ pub(crate) fn parse_session_usage_file(path: &Path) -> Result<Vec<UsageEntry>, S
         return Ok(Vec::new());
     }
 
+    let effective_cwd = cwd_opt.or(subagent_cwd);
+    let (sub_parent_id, agent_nickname, sub_role) = if is_subagent {
+        (parent_session_id, Some("Subagent".to_string()), agent_role)
+    } else {
+        (None, None, None)
+    };
+
     let mut entries = Vec::with_capacity(turn_order.len());
     for (idx, id) in turn_order.into_iter().enumerate() {
         let Some(record) = turn_map.remove(&id) else {
@@ -286,7 +413,7 @@ pub(crate) fn parse_session_usage_file(path: &Path) -> Result<Vec<UsageEntry>, S
             session_id: session_id.clone(),
             session_name: session_name.clone().or_else(|| Some(session_id.clone())),
             transcript_path: Some(transcript_path.clone()),
-            cwd: cwd_opt.clone(),
+            cwd: effective_cwd.clone(),
             version: None,
             turn_no,
             model: Some(record.model.clone()),
@@ -297,9 +424,9 @@ pub(crate) fn parse_session_usage_file(path: &Path) -> Result<Vec<UsageEntry>, S
             cost: None,
             source_kind: Some(SOURCE_KIND.to_string()),
             source_dir_key: None,
-            parent_session_id: None,
-            agent_nickname: None,
-            agent_role: None,
+            parent_session_id: sub_parent_id.clone(),
+            agent_nickname: agent_nickname.clone(),
+            agent_role: sub_role.clone(),
             reasoning_effort: None,
         });
     }
@@ -435,6 +562,70 @@ mod tests {
         assert_eq!(t2.cache_read, Some(1500));
         assert_eq!(t2.reasoning, Some(120));
         assert_eq!(t2.output, 50);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn find_session_files_finds_subagent_chats() {
+        let root = temp_test_dir("find_subagents");
+        let project_dir = root.join("tmp").join("proj_sub");
+        let chats_dir = project_dir.join("chats");
+        let parent_dir = chats_dir.join("parent-uuid-999");
+        fs::create_dir_all(&parent_dir).unwrap();
+
+        let main_file = chats_dir.join("session-2026-10-14T10-00-parent.jsonl");
+        let sub_file = parent_dir.join("child-uuid-888.jsonl");
+        File::create(&main_file).unwrap();
+        File::create(&sub_file).unwrap();
+
+        let files = find_session_files(&root);
+        assert_eq!(files.len(), 2);
+        assert!(files.contains(&main_file));
+        assert!(files.contains(&sub_file));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parse_session_usage_file_handles_subagent_hierarchy_and_roles() {
+        let root = temp_test_dir("subagent_hierarchy");
+        let chats_dir = root.join("tmp").join("proj_x").join("chats");
+        let parent_dir = chats_dir.join("parent-uuid-999");
+        fs::create_dir_all(&parent_dir).unwrap();
+        let sub_file = parent_dir.join("child-uuid-888.jsonl");
+
+        let mut file = File::create(&sub_file).unwrap();
+        writeln!(
+            file,
+            r#"{{"sessionId":"child-uuid-888","kind":"subagent","directories":["/tmp/test-project"]}}"#
+        )
+        .unwrap();
+        writeln!(
+            file,
+            r#"{{"id":"ctx","type":"user","content":[{{"text":"<loaded_context>\nIgnored\n</loaded_context>"}},{{"text":"<objective>\nRole: Codebase Debugger\nTask: Find all null offset errors\n</objective>"}}]}}"#
+        )
+        .unwrap();
+        writeln!(
+            file,
+            r#"{{"id":"t1","timestamp":"2026-10-14T10:05:00.000Z","type":"gemini","model":"gemini-3.8-flash","tokens":{{"input":500,"output":20,"cached":100,"thoughts":10,"total":530}}}}"#
+        )
+        .unwrap();
+
+        let entries = parse_session_usage_file(&sub_file).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].session_id, "child-uuid-888");
+        assert_eq!(
+            entries[0].parent_session_id.as_deref(),
+            Some("parent-uuid-999")
+        );
+        assert_eq!(entries[0].agent_nickname.as_deref(), Some("Subagent"));
+        assert_eq!(entries[0].agent_role.as_deref(), Some("Codebase Debugger"));
+        assert_eq!(
+            entries[0].session_name.as_deref(),
+            Some("Codebase Debugger")
+        );
+        assert_eq!(entries[0].cwd.as_deref(), Some("/tmp/test-project"));
 
         let _ = fs::remove_dir_all(&root);
     }

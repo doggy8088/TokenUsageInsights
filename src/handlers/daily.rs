@@ -72,12 +72,14 @@ fn aggregate_usage_details(
 
         summary.add_usage(&session_usage.usage);
 
+        let session_name = s_entries
+            .iter()
+            .find_map(|e| e.session_name.clone())
+            .unwrap_or_else(|| "Start Coding Session".to_string());
+
         sessions_summary.push(SessionSummary {
             session_id: identity.session_id.clone(),
-            session_name: last_entry
-                .session_name
-                .clone()
-                .unwrap_or_else(|| "Start Coding Session".to_string()),
+            session_name,
             assistant_type: identity.assistant_type.clone(),
             source_kind: identity.source_kind.clone(),
             source_dir_key: identity.source_dir_key.clone(),
@@ -94,9 +96,9 @@ fn aggregate_usage_details(
             duration_ms: session_duration,
             total_requests: session_requests,
             cost_usd: session_usage.usage.cost_usd,
-            parent_session_id: last_entry.parent_session_id.clone(),
-            agent_nickname: last_entry.agent_nickname.clone(),
-            agent_role: last_entry.agent_role.clone(),
+            parent_session_id: s_entries.iter().find_map(|e| e.parent_session_id.clone()),
+            agent_nickname: s_entries.iter().find_map(|e| e.agent_nickname.clone()),
+            agent_role: s_entries.iter().find_map(|e| e.agent_role.clone()),
             reasoning_effort: last_entry.reasoning_effort.clone(),
         });
     }
@@ -727,6 +729,84 @@ mod tests {
                 < 1e-9
         );
         assert_eq!(summary.total_sessions, sessions.len());
+    }
+
+    #[test]
+    fn aggregate_usage_details_preserves_subagent_hierarchy_and_labels() {
+        let pricing = PreparedPricingRules::from_rules(Vec::new());
+        let turn1 = UsageEntry {
+            timestamp: "2026-10-14T10:00:00Z".to_string(),
+            session_id: "sub-123".to_string(),
+            session_name: Some("Subagent Task".to_string()),
+            transcript_path: None,
+            cwd: Some("/repo".to_string()),
+            version: None,
+            turn_no: 1,
+            model: Some("gemini-3.8-flash".to_string()),
+            model_id: Some("gemini-3.8-flash".to_string()),
+            tokens: Some(TokenStats {
+                input: 100,
+                output: 50,
+                cache_read: None,
+                cache_write: None,
+                cache_write_5m: None,
+                cache_write_1h: None,
+                reasoning: None,
+                total: 150,
+            }),
+            delta_tokens: None,
+            context: None,
+            cost: None,
+            source_kind: Some("gemini-cli".to_string()),
+            source_dir_key: None,
+            parent_session_id: Some("main-root".to_string()),
+            agent_nickname: Some("Subagent".to_string()),
+            agent_role: Some("Debugger".to_string()),
+            reasoning_effort: None,
+        };
+        // Turn 2 where parent_session_id happened to be None on later entries
+        let turn2 = UsageEntry {
+            timestamp: "2026-10-14T10:01:00Z".to_string(),
+            session_id: "sub-123".to_string(),
+            session_name: Some("Subagent Task".to_string()),
+            transcript_path: None,
+            cwd: Some("/repo".to_string()),
+            version: None,
+            turn_no: 2,
+            model: Some("gemini-3.8-flash".to_string()),
+            model_id: Some("gemini-3.8-flash".to_string()),
+            tokens: Some(TokenStats {
+                input: 200,
+                output: 80,
+                cache_read: None,
+                cache_write: None,
+                cache_write_5m: None,
+                cache_write_1h: None,
+                reasoning: None,
+                total: 280,
+            }),
+            delta_tokens: None,
+            context: None,
+            cost: None,
+            source_kind: Some("gemini-cli".to_string()),
+            source_dir_key: None,
+            parent_session_id: None,
+            agent_nickname: None,
+            agent_role: None,
+            reasoning_effort: None,
+        };
+
+        let records = vec![
+            usage_day_record(turn1, "gemini"),
+            usage_day_record(turn2, "gemini"),
+        ];
+
+        let (_, sessions, _, _) = aggregate_usage_details(&records, &pricing);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, "sub-123");
+        assert_eq!(sessions[0].parent_session_id.as_deref(), Some("main-root"));
+        assert_eq!(sessions[0].agent_nickname.as_deref(), Some("Subagent"));
+        assert_eq!(sessions[0].agent_role.as_deref(), Some("Debugger"));
     }
 
     #[test]
