@@ -71,19 +71,6 @@ impl Metrics {
     }
 }
 
-/// 時間軸側讀出單一 `session.usage_record` 事件的用量。與 `read_calls` 的
-/// typed 解析同規則：只認新格式 `data.usage`，明確 null 視同缺欄；缺少
-/// `usage` 傳回 `None`（匯入端對此仍屬錯誤並保留原資料待重試，時間軸僅
-/// 不累計該筆）。
-pub(crate) fn usage_record_metrics(event: &Value) -> Option<Result<Metrics, String>> {
-    let usage = event
-        .get("data")
-        .filter(|value| !value.is_null())
-        .and_then(|data| data.get("usage"))
-        .filter(|value| !value.is_null())?;
-    Some(Metrics::from_usage(usage))
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Call {
     /// Stable within the source directory and parent session; independent of time/model.

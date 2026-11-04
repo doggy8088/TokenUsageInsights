@@ -3081,52 +3081,50 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
 /// with that counter, so a SQLite-only sub-agent call must not keep the
 /// parent session's `turn_index + 1` (review comment 4403291628).
 struct AgentFilteredTurns {
-    /// `(timestamp, turn_no)` of every nonempty reply, in stream order.
-    replies: Vec<(Option<chrono::DateTime<chrono::Utc>>, u32)>,
-    /// 回合序號於事件流結尾的值，供晚於所有回覆的呼叫使用。
-    end_turn: u32,
+    /// `(timestamp, turn_no)` of every counted prompt, in stream order.
+    prompts: Vec<(Option<chrono::DateTime<chrono::Utc>>, u32)>,
+    /// 該檢視第一個事件當下的回合編號，供早於所有已記錄提示的呼叫使用。
+    initial_turn: u32,
 }
 
 impl AgentFilteredTurns {
-    /// A call belongs to the next reply of the agent's filtered timeline — the
-    /// same forward attribution `copilot::read_calls` derives from the stream.
-    /// A reply without a parseable timestamp may sit on either side of the
-    /// call, so it competes with the first reply that is definitely at or after
-    /// the call (review comment 4436837487): attribute to the earliest reply
-    /// that can follow the call, and return `None` when those candidates span
-    /// different turns so the caller keeps the source rows for retry instead of
-    /// writing a guessed turn.
+    /// 用量歸屬 =「呼叫當下已出現的最後一則有主體提示」的回合（統計回合以
+    /// 使用者訊息分界，回覆不再推進回合）。明確晚於呼叫的提示之後只會更晚、
+    /// 終止掃描；無時間戳提示可能落在呼叫前後任一側，與既有候選跨越不同回合
+    /// 時拒絕推定、保留原資料待重試（沿用 review 4436837487 對無時間戳回覆
+    /// 的先例）。
     fn turn_at(&self, ts: chrono::DateTime<chrono::Utc>) -> Option<u32> {
         let mut candidate: Option<u32> = None;
-        for (reply_ts, turn) in &self.replies {
-            let definitely_after_call = match reply_ts {
-                // Definitely before the call: never the next reply.
-                Some(reply_ts) if *reply_ts < ts => continue,
-                Some(_) => true,
-                // Timestamp missing or unparseable: either side of the call,
-                // so it stays a candidate until a definitely-later reply ends
-                // the run.
-                None => false,
-            };
-            if candidate.is_some_and(|previous| previous != *turn) {
-                return None;
-            }
-            candidate = Some(*turn);
-            if definitely_after_call {
-                break;
+        for (prompt_ts, turn) in &self.prompts {
+            match prompt_ts {
+                // 明確不晚於呼叫：以最晚一則為候選。
+                Some(prompt_ts) if *prompt_ts <= ts => candidate = Some(*turn),
+                // 明確晚於呼叫：其後的提示只會更晚。
+                Some(_) => break,
+                // 無時間戳提示可能在前後任一側：呼叫可能屬於它開的回合，
+                // 也可能屬於它之前的回合（含 initial_turn）；跨越不同回合時
+                // 拒絕推定。
+                None => {
+                    let previous = candidate.unwrap_or(self.initial_turn);
+                    if previous != *turn {
+                        return None;
+                    }
+                    candidate = Some(*turn);
+                }
             }
         }
-        Some(candidate.unwrap_or(self.end_turn))
+        Some(candidate.unwrap_or(self.initial_turn))
     }
 }
 
 /// Replay each sub-agent's filtered timeline from the shared events file to
-/// learn its per-reply turn numbers. Mirrors the keep and numbering rules of
+/// learn its prompt turn boundaries. Mirrors the keep and numbering rules of
 /// `timeline::parse_copilot_timeline_filtered` with `agent_filter = Some(a)`:
 /// 共用提示（無 `agentId`）與專屬提示各推進該檢視的回合序號
-/// （`max(1, 已見提示數)`），同一則使用者訊息的多個回覆同編號。Only prompts
-/// with an event body count — body-less prompts leave the replay untouched,
-/// exactly like the timeline's `event_body` gate (review 4433948800).
+/// （`max(1, 已見提示數)`），同一則使用者訊息的呼叫（含其後、下一則提示之前
+/// 的呼叫）同編號。Only prompts with an event body count — body-less prompts
+/// leave the replay untouched, exactly like the timeline's `event_body` gate
+/// (review 4433948800).
 fn copilot_filtered_agent_turns(
     path: &Path,
     should_cancel: &(dyn Fn() -> bool + Sync),
@@ -3134,17 +3132,25 @@ fn copilot_filtered_agent_turns(
     struct AgentState {
         /// 該檢視已見的有主體提示數。
         prompts: u32,
-        replies: Vec<(Option<chrono::DateTime<chrono::Utc>>, u32)>,
+        /// `(timestamp, turn_no)` of every counted prompt, in stream order.
+        prompt_turns: Vec<(Option<chrono::DateTime<chrono::Utc>>, u32)>,
+        /// 狀態建立當下的回合編號（其第一個事件之前已見的共用提示數）。
+        initial_turn: u32,
     }
     impl AgentState {
         fn new(prompts: u32) -> Self {
             Self {
                 prompts,
-                replies: Vec::new(),
+                prompt_turns: Vec::new(),
+                initial_turn: prompts.max(1),
             }
         }
         fn turn_no(&self) -> u32 {
             self.prompts.max(1)
+        }
+        fn push_prompt(&mut self, ts: Option<chrono::DateTime<chrono::Utc>>) {
+            let turn_no = self.turn_no();
+            self.prompt_turns.push((ts, turn_no));
         }
     }
     let file = File::open(path).map_err(|e| format!("讀取 Copilot 事件檔失敗: {e}"))?;
@@ -3174,12 +3180,20 @@ fn copilot_filtered_agent_turns(
             .get("timestamp")
             .and_then(|v| v.as_str())
             .and_then(|raw| crate::copilot::parse_timestamp(raw).ok());
+        // 任一事件都可能先於該 Agent 的提示出現；懶建立的狀態以當前共用提示
+        // 數起步，其 `initial_turn` 供早於所有已記錄提示的 SQLite-only 呼叫
+        // 歸屬。
+        if let Some(agent) = agent {
+            states
+                .entry(agent.to_owned())
+                .or_insert_with(|| AgentState::new(shared_prompts));
+        }
         match (kind, agent) {
-            // (review 4433948800) Prompt arms run only for prompts with an
-            // event body: the filtered timeline drops body-less prompts via
+            // (review 4433948800) Prompt boundaries run only for prompts with
+            // an event body: the filtered timeline drops body-less prompts via
             // `event_body`, so a body-less prompt must leave the replay
-            // untouched instead of arming a phantom turn boundary that
-            // renumbers every later reply.
+            // untouched instead of opening a phantom turn boundary that
+            // renumbers every later call.
             ("user.message" | "USER_PROMPT", None)
                 if crate::copilot::event_body(event.get("payload"), event.get("data"))
                     .is_some() =>
@@ -3192,6 +3206,7 @@ fn copilot_filtered_agent_turns(
                         .prompts
                         .checked_add(1)
                         .ok_or("Copilot 回合數超出範圍")?;
+                    state.push_prompt(ts);
                 }
             }
             ("user.message" | "USER_PROMPT", Some(agent))
@@ -3208,20 +3223,7 @@ fn copilot_filtered_agent_turns(
                     .prompts
                     .checked_add(1)
                     .ok_or("Copilot 回合數超出範圍")?;
-            }
-            ("assistant.message" | "ASSISTANT_REPLY", Some(agent)) => {
-                let content = crate::copilot::event_body(event.get("payload"), event.get("data"))
-                    .and_then(|p| p.get("content"))
-                    .and_then(|c| c.as_str())
-                    .unwrap_or("");
-                if content.is_empty() {
-                    continue;
-                }
-                let state = states
-                    .entry(agent.to_owned())
-                    .or_insert_with(|| AgentState::new(shared_prompts));
-                // 同一則使用者訊息的多個回覆同編號；回覆不再推進回合。
-                state.replies.push((ts, state.turn_no()));
+                state.push_prompt(ts);
             }
             _ => {}
         }
@@ -3229,12 +3231,11 @@ fn copilot_filtered_agent_turns(
     Ok(states
         .into_iter()
         .map(|(agent, state)| {
-            let end_turn = state.turn_no();
             (
                 agent,
                 AgentFilteredTurns {
-                    replies: state.replies,
-                    end_turn,
+                    prompts: state.prompt_turns,
+                    initial_turn: state.initial_turn,
                 },
             )
         })
@@ -8936,6 +8937,10 @@ pub struct SessionData {
     pub cwd: Option<String>,
     pub model: Option<String>,
     pub turn_stats: HashMap<u32, (TokenStats, String)>,
+    /// 對帳後逐次呼叫列的 `(timestamp, 淨用量)` 檢查點，依 turn_no 分組。
+    /// 時間軸的回覆累計用它計算「每則使用者訊息分別累計，累計到當前這條
+    /// 回覆為止」。
+    pub turn_call_checkpoints: HashMap<u32, Vec<(String, TokenStats)>>,
 }
 
 impl SessionLookup {
@@ -8979,6 +8984,14 @@ impl SessionLookup {
                 parent_scope,
             )?,
             turn_stats: get_session_turns_token_stats_in_parent_scope(
+                conn,
+                &self.assistant_type,
+                session_id,
+                source_kind,
+                source_dir_key,
+                parent_scope,
+            )?,
+            turn_call_checkpoints: get_session_turn_call_checkpoints(
                 conn,
                 &self.assistant_type,
                 session_id,
@@ -9419,6 +9432,122 @@ fn add_optional_token_total(current: &mut Option<u64>, incoming: Option<u64>) {
     if let Some(value) = incoming {
         *current = Some(current.unwrap_or(0).saturating_add(value));
     }
+}
+
+/// 對帳後逐次呼叫列（`usage_identity` 非空）的 `(timestamp, 淨用量)`，依
+/// `(timestamp, id)` 排序、按 `turn_no` 分組。回覆顯示的累計值以此為準：
+/// 這些列已合併事件檔與 `session-store.db` 兩個來源並完成呼叫去重（重複
+/// 記錄與 SQLite-only 呼叫都只算一次），依「呼叫時間 ≤ 回覆時間」累計即
+/// 「每則使用者訊息分別累計，累計到當前這條回覆為止」；沒有逐呼叫列的
+/// 回合（Hook／舊聚合列）才退回該回合的彙總統計（review：累計路徑不得把
+/// 事件檔當成完整來源，也不得對同一筆呼叫重複加總）。
+pub fn get_session_turn_call_checkpoints(
+    conn: &rusqlite::Connection,
+    assistant: &str,
+    session_id: &str,
+    source_kind: Option<&str>,
+    source_dir_key: Option<&str>,
+    parent_scope: ParentSessionScope<'_>,
+) -> Result<HashMap<u32, Vec<(String, TokenStats)>>, String> {
+    let mut map: HashMap<u32, Vec<(String, TokenStats)>> = HashMap::new();
+    // 與 `get_session_turns_token_stats_in_parent_scope` 同一條解析路徑：
+    // 一律先解析單一 `source_kind`，避免跨收集器／跨親代範圍混列。
+    let Some(resolved_source_kind) = resolve_session_query_scope(
+        conn,
+        assistant,
+        session_id,
+        source_kind,
+        source_dir_key,
+        parent_scope,
+    )?
+    else {
+        return Ok(map);
+    };
+    let mut sql = String::from(
+        "SELECT turn_no, timestamp, delta_input, delta_output, delta_cache_read, delta_cache_write, delta_cache_write_5m, delta_cache_write_1h, delta_reasoning, delta_total
+         FROM usage_entries
+         WHERE assistant_type = ? AND session_id = ? AND source_kind = ?
+           AND usage_identity != ''",
+    );
+    let mut params_vec: Vec<rusqlite::types::Value> = vec![
+        rusqlite::types::Value::Text(assistant.to_string()),
+        rusqlite::types::Value::Text(session_id.to_string()),
+        rusqlite::types::Value::Text(resolved_source_kind),
+    ];
+    if let Some(key) = source_dir_key {
+        sql.push_str(" AND source_dir_key = ?");
+        params_vec.push(rusqlite::types::Value::Text(key.to_string()));
+    } else {
+        sql.push_str(" AND source_dir_key IS NULL");
+    }
+    parent_scope.push_filter(&mut sql, &mut params_vec);
+    // 殘餘呼叫按時間序累入回覆，`(timestamp, id)` 是穩定決勝序。
+    sql.push_str(" ORDER BY timestamp, id");
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let mut rows = stmt
+        .query(rusqlite::params_from_iter(params_vec))
+        .map_err(|e| e.to_string())?;
+    while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+        if let (Ok(turn_no), Ok(ts), Ok(delta_input), Ok(delta_output), Ok(delta_total)) = (
+            row.get::<_, i64>(0),
+            row.get::<_, String>(1),
+            row.get::<_, Option<i64>>(2),
+            row.get::<_, Option<i64>>(3),
+            row.get::<_, Option<i64>>(9),
+        ) {
+            if let (Some(input), Some(output), Some(total)) =
+                (delta_input, delta_output, delta_total)
+            {
+                let mut stats = TokenStats {
+                    input: input as u64,
+                    output: output as u64,
+                    cache_read: None,
+                    cache_write: None,
+                    cache_write_5m: None,
+                    cache_write_1h: None,
+                    reasoning: None,
+                    total: total as u64,
+                };
+                add_optional_token_total(
+                    &mut stats.cache_read,
+                    row.get::<_, Option<i64>>(4)
+                        .ok()
+                        .flatten()
+                        .map(|v| v as u64),
+                );
+                add_optional_token_total(
+                    &mut stats.cache_write,
+                    row.get::<_, Option<i64>>(5)
+                        .ok()
+                        .flatten()
+                        .map(|v| v as u64),
+                );
+                add_optional_token_total(
+                    &mut stats.cache_write_5m,
+                    row.get::<_, Option<i64>>(6)
+                        .ok()
+                        .flatten()
+                        .map(|v| v as u64),
+                );
+                add_optional_token_total(
+                    &mut stats.cache_write_1h,
+                    row.get::<_, Option<i64>>(7)
+                        .ok()
+                        .flatten()
+                        .map(|v| v as u64),
+                );
+                add_optional_token_total(
+                    &mut stats.reasoning,
+                    row.get::<_, Option<i64>>(8)
+                        .ok()
+                        .flatten()
+                        .map(|v| v as u64),
+                );
+                map.entry(turn_no as u32).or_default().push((ts, stats));
+            }
+        }
+    }
+    Ok(map)
 }
 
 /// Legacy wrapper for callers that do not pass a parent session (see
@@ -18177,12 +18306,37 @@ mod tests {
             let entries = self.conn.prepare("SELECT turn_no,SUM(delta_total) FROM usage_entries WHERE session_id=? GROUP BY turn_no")
                 .unwrap().query_map([sid], |r|Ok((r.get::<_,u32>(0)?,r.get::<_,u64>(1)?))).unwrap()
                 .map(|r| { let (turn,total)=r.unwrap(); (turn,(TokenStats { total,input:0,output:0,cache_read:None,cache_write:None,cache_write_5m:None,cache_write_1h:None,reasoning:None }, "B".into())) }).collect();
+            // 對帳後逐呼叫列走正式查詢計算回覆累計（含 SQLite-only 呼叫、
+            // 已去重）。
+            let scope: Option<(String, Option<String>)> = self
+                .conn
+                .query_row(
+                    "SELECT source_kind, source_dir_key FROM usage_entries WHERE session_id=? LIMIT 1",
+                    [sid],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .ok();
+            let checkpoints = match scope {
+                Some((source_kind, source_dir_key)) => {
+                    crate::db::get_session_turn_call_checkpoints(
+                        &self.conn,
+                        "copilot",
+                        sid,
+                        Some(&source_kind),
+                        source_dir_key.as_deref(),
+                        crate::db::ParentSessionScope::Unfiltered,
+                    )
+                    .unwrap()
+                }
+                None => HashMap::new(),
+            };
             let mut timeline = Vec::new();
             crate::timeline::parse_copilot_timeline_filtered(
                 BufReader::new(
                     File::open(self.root.join("session-state/app/events.jsonl")).unwrap(),
                 ),
                 &entries,
+                Some(&checkpoints),
                 &mut timeline,
                 &mut HashMap::new(),
                 agent,
@@ -19075,12 +19229,12 @@ mod tests {
         f.write(
             "app",
             &[
-                app_text("user.message"),
+                app_text_at("user.message", "2026-07-23T11:59:50Z"),
                 cli_usage_fixture(1, "2026-07-23T12:00:00Z"),
-                app_text("assistant.message"),
-                app_text("user.message"),
+                app_text_at("assistant.message", "2026-07-23T12:00:30Z"),
+                app_text_at("user.message", "2026-07-23T12:00:40Z"),
                 cli_usage_fixture(2, "2026-07-23T12:01:00Z"),
-                app_text("assistant.message"),
+                app_text_at("assistant.message", "2026-07-23T12:01:30Z"),
             ],
         );
         f.sync();
@@ -19107,14 +19261,14 @@ mod tests {
         f.write(
             "app",
             &[
-                app_text("user.message"),
-                app_text("user.message"),
+                app_text_at("user.message", "2026-07-23T11:59:40Z"),
+                app_text_at("user.message", "2026-07-23T11:59:50Z"),
                 cli_usage_fixture(1, "2026-07-23T12:00:00Z"),
-                app_text("assistant.message"),
-                app_text("user.message"),
+                app_text_at("assistant.message", "2026-07-23T12:00:30Z"),
+                app_text_at("user.message", "2026-07-23T12:00:40Z"),
                 cli_usage_fixture(2, "2026-07-23T12:01:00Z"),
-                app_text("assistant.message"),
-                app_text("user.message"),
+                app_text_at("assistant.message", "2026-07-23T12:01:30Z"),
+                app_text_at("user.message", "2026-07-23T12:01:40Z"),
                 child,
                 reply,
             ],
@@ -19285,12 +19439,11 @@ mod tests {
     }
 
     #[test]
-    fn copilot_filtered_agent_turns_counts_explicit_null_payload_replies() {
-        // (review comment 4433863670) The db-side filtered turn counter must
-        // apply the same explicit-null precedence as `event_body`, or replies
-        // with `payload: null` next to non-empty `data.content` never surface
-        // here while the import and timeline sides see them. 回合以提示序號
-        // 編號後，兩則專屬提示各一回合，兩條回覆同號於各自的訊息回合。
+    fn copilot_filtered_agent_turns_counts_explicit_null_payload_prompts() {
+        // (review comment 4433863670) db 側的回合重放必須套用與 `event_body`
+        // 相同的明確 null 優先序：`payload: null` 旁有非空 `data.content` 的
+        // 提示，匯入端與時間軸都視為有主體提示，這裡不得漏數——漏數會讓
+        // SQLite-only 呼叫的回合歸屬與時間軸分歧。
         let dir = std::env::temp_dir().join(format!(
             "token-usage-insights-null-payload-turns-{}",
             std::process::id()
@@ -19298,28 +19451,33 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("events.jsonl");
-        let mut prompt = app_text_at("user.message", "2026-07-23T12:00:00Z");
-        prompt["agentId"] = serde_json::json!("child");
-        let mut null_reply = app_text_at("assistant.message", "2026-07-23T12:00:10Z");
-        null_reply["payload"] = serde_json::Value::Null;
-        null_reply["agentId"] = serde_json::json!("child");
-        let mut second_prompt = app_text_at("user.message", "2026-07-23T12:01:00Z");
-        second_prompt["agentId"] = serde_json::json!("child");
-        let mut second_null_reply = app_text_at("assistant.message", "2026-07-23T12:01:10Z");
-        second_null_reply["payload"] = serde_json::Value::Null;
-        second_null_reply["agentId"] = serde_json::json!("child");
-        let lines = [prompt, null_reply, second_prompt, second_null_reply]
-            .iter()
-            .map(|event| event.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
+        let explicit_null_prompt = |ts: &str| {
+            let mut event = app_text_at("user.message", ts);
+            event["payload"] = serde_json::Value::Null;
+            event["agentId"] = serde_json::json!("child");
+            event
+        };
+        let lines = [
+            explicit_null_prompt("2026-07-23T12:00:00Z"),
+            explicit_null_prompt("2026-07-23T12:01:00Z"),
+        ]
+        .iter()
+        .map(|event| event.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
         fs::write(&path, lines).unwrap();
 
         let turns = copilot_filtered_agent_turns(&path, &|| false).unwrap();
         let child = turns.get("child").expect("child agent turns present");
-        let reply_turns: Vec<u32> = child.replies.iter().map(|(_, turn)| *turn).collect();
-        assert_eq!(reply_turns, vec![1, 2]);
-        assert_eq!(child.end_turn, 2);
+        let prompt_turns: Vec<u32> = child.prompts.iter().map(|(_, turn)| *turn).collect();
+        assert_eq!(prompt_turns, vec![1, 2], "明確 null 的提示必須計入回合序號");
+        let at = |raw: &str| crate::copilot::parse_timestamp(raw).unwrap();
+        assert_eq!(
+            child.turn_at(at("2026-07-23T12:00:30Z")),
+            Some(1),
+            "兩則提示之間的 SQLite-only 呼叫留在較早訊息的回合"
+        );
+        assert_eq!(child.turn_at(at("2026-07-23T12:01:30Z")), Some(2));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -19366,21 +19524,24 @@ mod tests {
         let child = with_bodyless
             .get("child")
             .expect("child agent turns present");
-        let reply_turns: Vec<u32> = child.replies.iter().map(|(_, turn)| *turn).collect();
-        assert_eq!(
-            reply_turns,
-            vec![1, 1],
-            "無主體提示不得開回合：第二個回覆的編號必須與時間軸一致"
+        assert!(
+            child.prompts.is_empty(),
+            "無主體提示不得開回合邊界：SQLite-only 呼叫必須留在初始回合"
         );
-        assert_eq!(child.end_turn, 1);
+        let at = |raw: &str| crate::copilot::parse_timestamp(raw).unwrap();
+        assert_eq!(
+            child.turn_at(at("2026-07-23T12:00:07Z")),
+            Some(1),
+            "無主體提示不得開回合：回覆前後的呼叫都留在回合 1"
+        );
         // 對照：完全沒有無主體提示時的重放必須逐項相同（回合重放不受它們影響）。
         write(&[first_reply, second_reply]);
         let without_bodyless = copilot_filtered_agent_turns(&path, &|| false).unwrap();
         let baseline = without_bodyless
             .get("child")
             .expect("child agent turns present");
-        assert_eq!(child.replies, baseline.replies);
-        assert_eq!(child.end_turn, baseline.end_turn);
+        assert_eq!(child.prompts, baseline.prompts);
+        assert_eq!(child.initial_turn, baseline.initial_turn);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -19651,7 +19812,7 @@ mod tests {
     }
 
     #[test]
-    fn native_only_subagent_turn_retries_when_reply_candidates_span_turns() {
+    fn native_only_subagent_turn_retries_when_prompt_candidates_span_turns() {
         use chrono::{DateTime, Utc};
 
         fn at(raw: &str) -> DateTime<Utc> {
@@ -19671,41 +19832,46 @@ mod tests {
             }
         }
         fn turns(
-            replies: Vec<(Option<DateTime<Utc>>, u32)>,
+            prompts: Vec<(Option<DateTime<Utc>>, u32)>,
+            initial_turn: u32,
         ) -> HashMap<String, AgentFilteredTurns> {
             HashMap::from([(
                 "child".to_string(),
                 AgentFilteredTurns {
-                    replies,
-                    end_turn: 3,
+                    prompts,
+                    initial_turn,
                 },
             )])
         }
 
-        // The untimed reply may sit on either side of the call, so the next
-        // reply is turn one or turn two: undecidable, keep the source rows and
-        // retry (review comment 4436837487).
-        let undecidable = turns(vec![(None, 1), (Some(at("2026-07-23T12:03:00Z")), 2)]);
+        // 無時間戳提示可能落在呼叫前後任一側：前側屬它開的回合 2、後側屬
+        // 初始回合 1 → 無解，保留原資料待重試（沿用 review comment 4436837487
+        // 對無時間戳邊界的先例）。
+        let undecidable = turns(vec![(None, 2), (Some(at("2026-07-23T12:03:00Z")), 3)], 1);
         let error = native_only_subagent_turn(&call_at("2026-07-23T12:02:00Z"), &undecidable)
             .expect_err("candidates spanning turns must retry");
         assert!(error.contains("保留原資料待重試"), "{error}");
-        // A single untimed reply is decidable: attribute to the earliest
-        // possible reply, matching the timeline's stream-order numbering.
-        let decidable = turns(vec![(None, 1)]);
+        // 單一無時間戳提示與初始回合同號：可判定。
+        let decidable = turns(vec![(None, 1)], 1);
         assert_eq!(
             native_only_subagent_turn(&call_at("2026-07-23T12:00:30Z"), &decidable).unwrap(),
             Some(1)
         );
-        // Replies after the first definitely-later boundary never compete for
-        // "next reply": the guard must not fire on ordinary multi-reply streams.
-        let later = turns(vec![
-            (Some(at("2026-07-23T12:00:10Z")), 1),
-            (Some(at("2026-07-23T12:05:00Z")), 2),
-            (Some(at("2026-07-23T12:20:00Z")), 3),
-        ]);
+        // 呼叫屬於「呼叫當下已出現的最後一則提示」的回合（review：回覆後、
+        // 下一則提示之前的 SQLite-only 呼叫不得改指下一個回覆的回合、污染
+        // 下一則訊息的用量）。
+        let later = turns(
+            vec![
+                (Some(at("2026-07-23T12:00:10Z")), 1),
+                (Some(at("2026-07-23T12:05:00Z")), 2),
+                (Some(at("2026-07-23T12:20:00Z")), 3),
+            ],
+            1,
+        );
         assert_eq!(
             native_only_subagent_turn(&call_at("2026-07-23T12:02:00Z"), &later).unwrap(),
-            Some(2)
+            Some(1),
+            "回覆後、下一則提示之前的呼叫留在同一則訊息的回合"
         );
     }
 
@@ -19750,6 +19916,34 @@ mod tests {
     }
 
     #[test]
+    fn reply_usage_dedupes_duplicate_events_and_includes_sqlite_only_calls() {
+        // review：回覆累計不得對同一筆呼叫重複加總（事件檔同識別碼重寫），
+        // 也不得漏掉只存在 SQLite 的呼叫（混合來源）。事件檔與 SQLite 各一筆
+        // 110 的呼叫 + 事件檔重複記錄一次 → 回覆顯示 220（不是 330、也不是 110）。
+        let mut f = AppReviewFixture::new(&["app"]);
+        let mut event_call = cli_usage_fixture(1, "2026-07-23T12:00:00Z");
+        event_call["agentId"] = serde_json::json!("child");
+        let mut native_call = event_call.clone();
+        native_call["id"] = serde_json::json!("event-dup");
+        let mut child_reply = app_text_at("assistant.message", "2026-07-23T12:01:00Z");
+        child_reply["agentId"] = serde_json::json!("child");
+        f.native(3, "app", "2026-07-23T12:00:30Z", Some(0), Some("child"));
+        f.write(
+            "app",
+            &[
+                app_text_at("user.message", "2026-07-23T11:59:50Z"),
+                event_call.clone(),
+                event_call,
+                native_call,
+                child_reply,
+            ],
+        );
+        f.sync();
+        assert_eq!(f.replies("app", None), vec![]);
+        assert_eq!(f.replies("app__child", Some("child")), vec![(1, 220)]);
+    }
+
+    #[test]
     fn intermediate_text_reply_accumulates_within_its_message_turn() {
         // 中途文字回覆不再切分回合：同一則使用者訊息的呼叫同屬一個統計回合，
         // 每條回覆顯示「累計到自己為止」的用量（第二條因此是兩次呼叫合計）。
@@ -19759,9 +19953,9 @@ mod tests {
             &[
                 app_text("user.message"),
                 cli_usage_fixture(1, "2026-07-23T12:00:00Z"),
-                app_text("assistant.message"),
+                app_text_at("assistant.message", "2026-07-23T12:00:30Z"),
                 cli_usage_fixture(2, "2026-07-23T12:01:00Z"),
-                app_text("assistant.message"),
+                app_text_at("assistant.message", "2026-07-23T12:01:30Z"),
             ],
         );
         f.sync();
@@ -20891,6 +21085,7 @@ mod tests {
         crate::timeline::parse_copilot_timeline_filtered(
             BufReader::new(File::open(base.join("session-state/app/events.jsonl")).unwrap()),
             &entries,
+            None,
             &mut timeline,
             &mut HashMap::new(),
             None,
@@ -21032,6 +21227,7 @@ mod tests {
         crate::timeline::parse_copilot_timeline_filtered(
             BufReader::new(File::open(events).unwrap()),
             &entries,
+            None,
             &mut timeline,
             &mut HashMap::new(),
             agent,

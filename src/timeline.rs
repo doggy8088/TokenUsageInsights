@@ -317,25 +317,38 @@ fn empty_turn_usage() -> TokenStats {
     }
 }
 
-/// 將單次 API 呼叫用量累計進回覆顯示值。欄位正規化與 `usage_entries` 逐呼叫
-/// 列一致：`input` 為排除 cache read 的淨輸入，`total` 為 raw input + output
-/// （cache write 與 reasoning 保留為 breakdown，不重複加總）。
-fn accumulate_turn_usage(accumulated: &mut TokenStats, metrics: &crate::copilot::Metrics) {
-    let net_input = metrics.input.saturating_sub(metrics.cache_read);
-    accumulated.input = accumulated.input.saturating_add(net_input);
-    accumulated.output = accumulated.output.saturating_add(metrics.output);
+/// 將單列淨用量累計進回覆顯示值（逐次呼叫列直接以 `delta_*` 建構，欄位已
+/// 正規化）。
+fn accumulate_tokens(accumulated: &mut TokenStats, delta: &TokenStats) {
+    accumulated.input = accumulated.input.saturating_add(delta.input);
+    accumulated.output = accumulated.output.saturating_add(delta.output);
     for (slot, value) in [
-        (&mut accumulated.cache_read, metrics.cache_read),
-        (&mut accumulated.cache_write, metrics.cache_write),
-        (&mut accumulated.reasoning, metrics.reasoning),
+        (&mut accumulated.cache_read, delta.cache_read),
+        (&mut accumulated.cache_write, delta.cache_write),
+        (&mut accumulated.cache_write_5m, delta.cache_write_5m),
+        (&mut accumulated.cache_write_1h, delta.cache_write_1h),
+        (&mut accumulated.reasoning, delta.reasoning),
     ] {
-        *slot = Some(slot.unwrap_or(0).saturating_add(value));
+        if let Some(value) = value {
+            *slot = Some(slot.unwrap_or(0).saturating_add(value));
+        }
     }
-    accumulated.total = accumulated.total.saturating_add(
-        net_input
-            .saturating_add(metrics.cache_read)
-            .saturating_add(metrics.output),
-    );
+    accumulated.total = accumulated.total.saturating_add(delta.total);
+}
+
+/// SQLite-only 呼叫列與回覆事件的時間比較（RFC3339；解析失敗時退回字串序）。
+/// 只有不晚於回覆的呼叫計入該回覆的累計——與「累計到當前這條回覆為止」一致。
+fn timestamp_at_or_before(row_ts: &str, reply_ts: &str) -> bool {
+    match (
+        crate::copilot::parse_timestamp(row_ts),
+        crate::copilot::parse_timestamp(reply_ts),
+    ) {
+        (Ok(row), Ok(reply)) => row <= reply,
+        // 回覆沒有可用時間戳（或呼叫列時間無解）時無法排序：整回合的呼叫都
+        // 計入（單回覆回合即回合總量，與舊顯示一致）。
+        (Ok(_), Err(_)) => true,
+        _ => row_ts <= reply_ts,
+    }
 }
 
 /// Backwards-compatible entry point that reconstructs a Copilot CLI timeline
@@ -349,7 +362,7 @@ pub fn parse_copilot_timeline(
     timeline: &mut Vec<TimelineItem>,
     metadata: &mut HashMap<String, serde_json::Value>,
 ) {
-    parse_copilot_timeline_filtered(reader, db_entries, timeline, metadata, None, None);
+    parse_copilot_timeline_filtered(reader, db_entries, None, timeline, metadata, None, None);
 }
 
 /// Copilot App-aware variant of [`parse_copilot_timeline`].
@@ -383,6 +396,7 @@ pub fn parse_copilot_timeline(
 pub fn parse_copilot_timeline_filtered(
     reader: BufReader<File>,
     db_entries: &HashMap<u32, (TokenStats, String)>,
+    turn_call_checkpoints: Option<&HashMap<u32, Vec<(String, TokenStats)>>>,
     timeline: &mut Vec<TimelineItem>,
     metadata: &mut HashMap<String, serde_json::Value>,
     agent_filter: Option<&str>,
@@ -392,15 +406,11 @@ pub fn parse_copilot_timeline_filtered(
     // 與 `copilot::read_calls` 的匯入端回合推導同步：同一則訊息的多次 API 呼叫
     // （工具呼叫、中途文字回覆、final）同屬一個回合，回覆不再推進回合。
     let mut prompts_seen = 0u32;
-    // 每則使用者訊息分別累計，累計到當前這條回覆為止：逐次
-    // `session.usage_record` 與匯入端逐呼叫用量列同值（`copilot::usage_record_metrics`）。
-    // 回合內完全沒有任何事件用量（Hook／舊聚合列）時，結尾才退回該回合的
-    // `db_entries` 總量；事件用量晚於回覆的回合不退回，避免後到的呼叫灌回
-    // 先到的回覆。
-    let mut turn_usage = empty_turn_usage();
-    let mut turn_usage_seen = false;
-    let mut turns_with_stream_usage: std::collections::HashSet<u32> =
-        std::collections::HashSet::new();
+    // 回覆顯示的用量 =「每則使用者訊息分別累計，累計到當前這條回覆為止」：
+    // 以對帳後逐次呼叫列為準（`db::get_session_turn_call_checkpoints`，已
+    // 合併事件檔與 SQLite 兩個來源並去重），依「呼叫時間 ≤ 回覆時間」累計。
+    // 回合內沒有任何逐呼叫列（Hook／舊聚合列）時，結尾才退回該回合的
+    // `db_entries` 總量。
     let mut pending_reply_usage: Vec<(usize, u32)> = Vec::new();
     // Seed the model from the DB child session model when available so a
     // subagent drawer starts with its own model and is never overwritten by
@@ -536,10 +546,8 @@ pub fn parse_copilot_timeline_filtered(
                         .unwrap_or("")
                         .to_string();
                     let context = p.get("context").cloned();
-                    // 每則有主體提示開啟一個新的統計回合並重置累計。
+                    // 每則有主體提示開啟一個新的統計回合。
                     prompts_seen = prompts_seen.saturating_add(1);
-                    turn_usage = empty_turn_usage();
-                    turn_usage_seen = false;
                     timeline.push(TimelineItem::UserPrompt {
                         timestamp,
                         prompt: content,
@@ -606,10 +614,24 @@ pub fn parse_copilot_timeline_filtered(
                             current_model = model.clone();
                         }
                         // 回覆顯示的用量 =「每則使用者訊息分別累計，累計到
-                        // 當前這條回覆為止」。回合的事件用量尚未出現時先留
-                        // 空，結尾再決定是否退回該回合的 `db_entries` 總量。
-                        let tokens = if turn_usage_seen {
-                            Some(turn_usage.clone())
+                        // 當前這條回覆為止」：對帳後逐呼叫列中「呼叫時間 ≤
+                        // 回覆時間」的全部呼叫（含 SQLite-only 與事件檔呼叫，
+                        // 且已經過去重）。都沒有命中時先留空，結尾再決定是否
+                        // 退回該回合的 `db_entries` 總量。
+                        let mut accumulated = empty_turn_usage();
+                        let mut accumulated_any = false;
+                        for (row_ts, delta) in turn_call_checkpoints
+                            .and_then(|checkpoints| checkpoints.get(&turn_no))
+                            .map(Vec::as_slice)
+                            .unwrap_or(&[])
+                        {
+                            if timestamp_at_or_before(row_ts, &timestamp) {
+                                accumulate_tokens(&mut accumulated, delta);
+                                accumulated_any = true;
+                            }
+                        }
+                        let tokens = if accumulated_any {
+                            Some(accumulated)
                         } else {
                             pending_reply_usage.push((timeline.len(), turn_no));
                             None
@@ -834,24 +856,16 @@ pub fn parse_copilot_timeline_filtered(
                     message: "子代理失敗 (Subagent Failed)".to_string(),
                 });
             }
-            // 逐次 API 呼叫用量：回覆顯示的累計值由此累加。解析與匯入端逐呼叫
-            // 用量列共用同一支（`copilot::usage_record_metrics`），同一則訊息
-            // 內的呼叫依事件流順序累計到當前回覆為止。用量無效時不累計（匯入
-            // 端會對同一筆回報錯誤並保留原資料待重試）。
-            "session.usage_record" => {
-                if let Some(Ok(metrics)) = crate::copilot::usage_record_metrics(&event) {
-                    accumulate_turn_usage(&mut turn_usage, &metrics);
-                    turn_usage_seen = true;
-                    turns_with_stream_usage.insert(prompts_seen.max(1));
-                }
-            }
             _ => {}
         }
     }
-    // 回合內完全沒有任何事件用量（Hook／舊聚合列）才退回該回合的 `db_entries`
-    // 總量；有事件用量的回合一律以逐次累計為準（哪怕用量晚於回覆）。
+    // 回合內沒有任何逐呼叫列（Hook／舊聚合列）才退回該回合的 `db_entries`
+    // 總量；有逐呼叫列的回合一律以逐次累計為準（哪怕用量晚於回覆）。
     for (index, turn_no) in pending_reply_usage {
-        if turns_with_stream_usage.contains(&turn_no) {
+        if turn_call_checkpoints
+            .and_then(|checkpoints| checkpoints.get(&turn_no))
+            .is_some_and(|rows| !rows.is_empty())
+        {
             continue;
         }
         if let Some(TimelineItem::AgentReply { tokens, .. }) = timeline.get_mut(index) {
@@ -1845,6 +1859,7 @@ mod tests {
         parse_copilot_timeline_filtered(
             reader,
             &db_entries,
+            None,
             &mut timeline,
             &mut metadata,
             None,
@@ -1873,6 +1888,7 @@ mod tests {
         parse_copilot_timeline_filtered(
             reader,
             &db_entries,
+            None,
             &mut timeline,
             &mut metadata,
             Some("call_v4b32z66"),
@@ -1918,6 +1934,7 @@ mod tests {
         parse_copilot_timeline_filtered(
             reader,
             &db_entries,
+            None,
             &mut timeline,
             &mut metadata,
             None,
@@ -1943,6 +1960,29 @@ mod tests {
             reasoning: None,
             total,
         }
+    }
+
+    /// 由 `read_calls` 的逐呼叫列建立回覆累計檢查點（與 `db` 側查詢同值：
+    /// `(timestamp, 淨用量)`，依 (timestamp, id) 排序）。
+    fn call_checkpoints(calls: &[crate::copilot::Call]) -> HashMap<u32, Vec<(String, TokenStats)>> {
+        let mut checkpoints: HashMap<u32, Vec<(String, TokenStats)>> = HashMap::new();
+        for call in calls {
+            let net_input = call.metrics.input.saturating_sub(call.metrics.cache_read);
+            checkpoints.entry(call.turn_no.unwrap()).or_default().push((
+                call.timestamp.to_rfc3339(),
+                TokenStats {
+                    input: net_input,
+                    output: call.metrics.output,
+                    cache_read: Some(call.metrics.cache_read),
+                    cache_write: Some(call.metrics.cache_write),
+                    cache_write_5m: None,
+                    cache_write_1h: None,
+                    reasoning: Some(call.metrics.reasoning),
+                    total: call.metrics.input + call.metrics.output,
+                },
+            ));
+        }
+        checkpoints
     }
 
     fn reply_turn_usage(timeline: &[TimelineItem]) -> Vec<(u32, Option<u64>)> {
@@ -1982,6 +2022,7 @@ mod tests {
         parse_copilot_timeline_filtered(
             reader,
             &db_entries,
+            None,
             &mut timeline,
             &mut metadata,
             None,
@@ -2051,6 +2092,7 @@ mod tests {
         parse_copilot_timeline_filtered(
             BufReader::new(file),
             &db_entries,
+            Some(&call_checkpoints(&calls)),
             &mut timeline,
             &mut metadata,
             None,
@@ -2165,6 +2207,7 @@ mod tests {
         parse_copilot_timeline_filtered(
             BufReader::new(File::open(&path).unwrap()),
             &db_entries,
+            Some(&call_checkpoints(&calls)),
             &mut timeline,
             &mut metadata,
             None,
@@ -2223,6 +2266,7 @@ mod tests {
         parse_copilot_timeline_filtered(
             BufReader::new(file),
             &db_entries,
+            Some(&call_checkpoints(&calls)),
             &mut timeline,
             &mut metadata,
             None,
@@ -2270,6 +2314,7 @@ mod tests {
         parse_copilot_timeline_filtered(
             reader,
             &db_entries,
+            None,
             &mut timeline,
             &mut metadata,
             Some("child"),
@@ -2308,6 +2353,7 @@ mod tests {
         parse_copilot_timeline_filtered(
             reader,
             &db_entries,
+            None,
             &mut timeline,
             &mut metadata,
             Some("ghost"),
@@ -2368,6 +2414,7 @@ mod tests {
         parse_copilot_timeline_filtered(
             reader,
             &db_entries,
+            None,
             &mut timeline,
             &mut metadata,
             Some("call_f91rg5gy"),
@@ -2422,6 +2469,7 @@ mod tests {
         parse_copilot_timeline_filtered(
             reader,
             &db_entries,
+            None,
             &mut timeline,
             &mut metadata,
             Some("call_2m0yl1q0"),
@@ -2464,6 +2512,7 @@ mod tests {
         parse_copilot_timeline_filtered(
             reader,
             &db_entries,
+            None,
             &mut timeline,
             &mut metadata,
             Some("call_o6g6unk8"),
@@ -2512,6 +2561,7 @@ mod tests {
         parse_copilot_timeline_filtered(
             reader,
             &db_entries,
+            None,
             &mut timeline,
             &mut metadata,
             None,
@@ -2562,6 +2612,7 @@ mod tests {
             parse_copilot_timeline_filtered(
                 reader,
                 &db_entries,
+                None,
                 &mut timeline,
                 &mut metadata,
                 Some("call_2m0yl1q0"),
@@ -2590,6 +2641,7 @@ mod tests {
             parse_copilot_timeline_filtered(
                 reader,
                 &db_entries,
+                None,
                 &mut timeline,
                 &mut metadata,
                 Some("call_o6g6unk8"),
@@ -2630,6 +2682,7 @@ mod tests {
         parse_copilot_timeline_filtered(
             reader,
             &db_entries,
+            None,
             &mut timeline,
             &mut metadata,
             Some("call_evt_model"),

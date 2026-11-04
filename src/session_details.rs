@@ -61,6 +61,7 @@ pub(crate) fn parse_session_timeline_file(
     source_kind: &str,
     filepath: &Path,
     db_entries: &HashMap<u32, (TokenStats, String)>,
+    copilot_turn_call_checkpoints: Option<&HashMap<u32, Vec<(String, TokenStats)>>>,
     copilot_agent_filter: Option<&str>,
     copilot_session_model: Option<&str>,
 ) -> SessionTimelineResult {
@@ -106,6 +107,7 @@ pub(crate) fn parse_session_timeline_file(
         "copilot" => parse_copilot_timeline_filtered(
             reader,
             db_entries,
+            copilot_turn_call_checkpoints,
             &mut timeline,
             &mut metadata,
             copilot_agent_filter,
@@ -384,6 +386,7 @@ pub(crate) fn load_session_details(
         &lookup.source_kind,
         &filepath,
         &db_entries,
+        Some(&session_data.turn_call_checkpoints),
         agent_filter,
         session_model.as_deref(),
     )
@@ -565,6 +568,7 @@ mod tests {
         crate::timeline::parse_copilot_timeline_filtered(
             reader,
             &db_entries,
+            None,
             &mut timeline,
             &mut metadata,
             Some(agent),
@@ -678,6 +682,7 @@ mod tests {
             "copilot-cli",
             &resolved,
             &db_entries,
+            None,
             Some(agent),
             Some("gpt-5.4-mini"),
         )
