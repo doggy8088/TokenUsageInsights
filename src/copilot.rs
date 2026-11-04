@@ -9,7 +9,8 @@ use std::path::Path;
 
 // Parser/reconciliation revision, hashed into the Copilot CLI/App transcript
 // fingerprints: bumping it re-syncs every unchanged session exactly once.
-pub(crate) const PARSER_VERSION: u32 = 5;
+// 回合推導改為「每則使用者訊息一個統計回合」並新增回覆累計顯示時升版。
+pub(crate) const PARSER_VERSION: u32 = 6;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) struct Metrics {
@@ -42,6 +43,45 @@ impl Metrics {
             .ok_or("Copilot token 總數超出範圍")?;
         Ok(())
     }
+
+    /// 解析單一 `session.usage_record` 的 `usage` 物件。缺欄與明確 null 視同 0。
+    /// `read_calls` 的逐呼叫用量列與時間軸的回覆累計共用此解析，兩側對同一次
+    /// 呼叫永遠得到同一組數值。
+    pub(crate) fn from_usage(usage: &Value) -> Result<Metrics, String> {
+        let count = |key: &str| -> Result<u64, String> {
+            match usage.get(key) {
+                None | Some(Value::Null) => Ok(0),
+                Some(v) => v
+                    .as_u64()
+                    .filter(|v| *v <= i64::MAX as u64)
+                    .ok_or_else(|| format!("Copilot {key} 必須是範圍內的非負整數")),
+            }
+        };
+        let metrics = Metrics {
+            input: count("inputTokens")?,
+            output: count("outputTokens")?,
+            cache_read: count("cacheReadTokens")?,
+            cache_write: count("cacheWriteTokens")?,
+            reasoning: count("reasoningTokens")?,
+            duration_ms: count("duration")?,
+        };
+        let mut validate = Metrics::default();
+        validate.add(&metrics)?;
+        Ok(metrics)
+    }
+}
+
+/// 時間軸側讀出單一 `session.usage_record` 事件的用量。與 `read_calls` 的
+/// typed 解析同規則：只認新格式 `data.usage`，明確 null 視同缺欄；缺少
+/// `usage` 傳回 `None`（匯入端對此仍屬錯誤並保留原資料待重試，時間軸僅
+/// 不累計該筆）。
+pub(crate) fn usage_record_metrics(event: &Value) -> Option<Result<Metrics, String>> {
+    let usage = event
+        .get("data")
+        .filter(|value| !value.is_null())
+        .and_then(|data| data.get("usage"))
+        .filter(|value| !value.is_null())?;
+    Some(Metrics::from_usage(usage))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -75,52 +115,6 @@ pub(crate) fn parse_timestamp(raw: &str) -> Result<DateTime<Utc>, String> {
 #[derive(Deserialize, Default)]
 struct Data {
     usage: Option<Value>,
-    #[serde(default, deserialize_with = "nonempty_content")]
-    content: bool,
-}
-
-// Inspect only whether a reply has text; never retain conversation content.
-fn nonempty_content<'de, D: serde::Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
-    struct Content;
-    impl<'de> serde::de::Visitor<'de> for Content {
-        type Value = bool;
-        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("reply text or null")
-        }
-        fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<bool, E> {
-            Ok(!value.is_empty())
-        }
-        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<bool, A::Error> {
-            while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
-            Ok(false)
-        }
-        fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<bool, A::Error> {
-            while map
-                .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
-                .is_some()
-            {}
-            Ok(false)
-        }
-        fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<bool, E> {
-            Ok(false)
-        }
-        fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<bool, E> {
-            Ok(false)
-        }
-        fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<bool, E> {
-            Ok(false)
-        }
-        fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<bool, E> {
-            Ok(false)
-        }
-        fn visit_none<E: serde::de::Error>(self) -> Result<bool, E> {
-            Ok(false)
-        }
-        fn visit_unit<E: serde::de::Error>(self) -> Result<bool, E> {
-            Ok(false)
-        }
-    }
-    d.deserialize_any(Content)
 }
 
 // The shared body precedence for Copilot events (review 4433863670): an
@@ -139,21 +133,33 @@ pub(crate) fn event_body<'a>(
         .or_else(|| second.filter(|v| !v.is_null()))
 }
 
-// Mirror the filtered timeline: consecutive prompts share a turn; the first
-// nonempty reply after a prompt advances the next reply. Each agent starts its
-// own filtered counter at one, even if first invoked on a later parent turn.
-// A prompt counts only when its event body is present (`payload`/`data`
-// non-null, the same rule the timeline applies through `event_body`): a
-// body-less prompt is invisible in the timeline and must never open a turn
-// here either (review 4433948800).
+// 統計回合 = 每則「有主體」的使用者訊息，以該 Agent 檢視可見的提示序號編號
+// (`max(1, 已見提示數)`)：同一則訊息的多次 API 呼叫（工具呼叫、中途文字回覆、
+// final）同屬一個回合，回覆不再推進回合。共用提示（無 agentId）計入所有 Agent
+// 檢視，專屬提示只計入該 Agent；三個回合推導站點（本函式、
+// `timeline::parse_copilot_timeline_filtered`、`db::copilot_filtered_agent_turns`）
+// 必須同步，詳情頁的用量才會掛回自己的回覆。
+// 這與來源 `assistant_usage_events.turn_index` 的原生語意一致（一個回合可收到
+// 多次 API 呼叫），SQLite-only 呼叫的 `turn_index + 1` 因此與主時間軸同編號。
+// 無主體提示在時間軸完全不可見，不計入序號（review 4433948800）。
 #[derive(Clone)]
 struct TurnState {
-    next: u32,
-    pending: bool,
+    /// 該檢視已見的有主體提示數。
+    prompts: u32,
 }
 impl TurnState {
-    fn new(pending: bool) -> Self {
-        Self { next: 1, pending }
+    fn new(prompts: u32) -> Self {
+        Self { prompts }
+    }
+    fn turn_no(&self) -> u32 {
+        self.prompts.max(1)
+    }
+    fn advance(&mut self) -> Result<(), String> {
+        self.prompts = self
+            .prompts
+            .checked_add(1)
+            .ok_or("Copilot 回合數超出範圍")?;
+        Ok(())
     }
 }
 
@@ -184,8 +190,8 @@ pub(crate) fn read_calls(
     let mut line = String::new();
     let mut calls: Vec<Call> = Vec::new();
     let mut identities: HashMap<(String, Option<String>, String), usize> = HashMap::new();
-    let mut turns = HashMap::new();
-    let mut seen_prompt = false;
+    let mut turns: HashMap<Option<String>, TurnState> = HashMap::new();
+    let mut shared_prompts = 0u32;
     loop {
         if should_cancel() {
             return Err("Copilot 同步已取消".into());
@@ -209,40 +215,37 @@ pub(crate) fn read_calls(
         // `event_body`. Classifying by type alone lets `{"type":"user.message",
         // "payload":null}` push usage onto a turn the timeline never uses, so
         // the reply cannot attach its usage (review 4433948800).
+        // A prompt counts only when its event body is present — the same
+        // `payload`/`data` non-null rule the filtered timeline applies through
+        // `event_body`. Classifying by type alone lets `{"type":"user.message",
+        // "payload":null}` claim a turn the timeline never shows, misplacing
+        // every later reply's usage (review 4433948800).
         let is_prompt = matches!(event.kind.as_str(), "user.message" | "USER_PROMPT")
             && (event.payload.is_some() || event.data.is_some());
         // One empty-`agentId` rule for prompt classification, the entry key,
         // and usage attribution: an empty id is the shared timeline (`None`).
         let agent = event.agent_id.filter(|id| !id.is_empty());
         if is_prompt && agent.is_none() {
-            seen_prompt = true;
+            // 共用提示計入所有 Agent 檢視（含尚未建立的：其狀態以當前共用
+            // 提示數起步），每個檢視的回合序號永遠與自己的提示列同編號。
+            shared_prompts = shared_prompts
+                .checked_add(1)
+                .ok_or("Copilot 回合數超出範圍")?;
             for state in turns.values_mut() {
                 let state: &mut TurnState = state;
-                state.pending = true;
+                state.advance()?;
             }
         }
         let state = turns
             .entry(agent.clone())
-            .or_insert_with(|| TurnState::new(seen_prompt));
+            .or_insert_with(|| TurnState::new(shared_prompts));
         if is_prompt {
-            // (review comment 4436837470) A prompt also marks its dedicated
-            // agent's own turn pending: `db::copilot_filtered_agent_turns` and
-            // the filtered timeline both treat a dedicated sub-agent prompt as
-            // a turn boundary. Shared prompts re-set every state above and here
-            // (idempotent); a dedicated prompt must never touch the shared
-            // state, whose counter only shared prompts and main replies move.
-            state.pending = true;
-        }
-        if matches!(event.kind.as_str(), "assistant.message" | "ASSISTANT_REPLY")
-            && event
-                .payload
-                .as_ref()
-                .or(event.data.as_ref())
-                .is_some_and(|data| data.content)
-            && state.pending
-        {
-            state.next = state.next.checked_add(1).ok_or("Copilot 回合數超出範圍")?;
-            state.pending = false;
+            // (review comment 4436837470) 專屬提示是該子 Agent 自己的使用者
+            // 訊息，只推進它自己的回合序號；共用提示已在上面推進所有狀態
+            // （此處於共用提示時重設為同一值，冪等）。
+            if agent.is_some() {
+                state.advance()?;
+            }
         }
         if event.kind != "session.usage_record" {
             continue;
@@ -267,28 +270,10 @@ pub(crate) fn read_calls(
             .filter(|s| !s.is_empty())
             .ok_or("Copilot 用量缺少穩定識別碼")?
             .to_owned();
-        let count = |key: &str| -> Result<u64, String> {
-            match usage.get(key) {
-                None | Some(Value::Null) => Ok(0),
-                Some(v) => v
-                    .as_u64()
-                    .filter(|v| *v <= i64::MAX as u64)
-                    .ok_or_else(|| format!("Copilot {key} 必須是範圍內的非負整數")),
-            }
-        };
-        let metrics = Metrics {
-            input: count("inputTokens")?,
-            output: count("outputTokens")?,
-            cache_read: count("cacheReadTokens")?,
-            cache_write: count("cacheWriteTokens")?,
-            reasoning: count("reasoningTokens")?,
-            duration_ms: count("duration")?,
-        };
-        let mut validate = Metrics::default();
-        validate.add(&metrics)?;
+        let metrics = Metrics::from_usage(&usage)?;
         let key = (source_session.to_owned(), agent_id.clone(), identity);
         let call = Call {
-            turn_no: Some(state.next),
+            turn_no: Some(state.turn_no()),
             native_identity: None,
             reasoning_effort: usage["reasoningEffort"].as_str().map(str::to_owned),
             identity: format!(
@@ -884,8 +869,9 @@ mod tests {
     #[test]
     fn bodyless_prompt_event_shapes_do_not_open_import_turns() {
         // (review 4433948800) 主體缺席的提示（明確 null、缺欄、兩側皆 null）在
-        // 時間軸完全不可見、不開回合；匯入端不得只憑事件類型把用量推到回合 2，
-        // 否則回覆掛不到自己的用量（repro-r7 實測：匯入回合 2 vs 時間軸回合 1）。
+        // 時間軸完全不可見、不計入回合序號；匯入端不得只憑事件類型把用量推到
+        // 回合 2，否則回覆掛不到自己的用量（repro-r7 實測：匯入回合 2 vs 時間軸
+        // 回合 1）。
         for prompt in [
             json!({"type":"user.message","payload":null}),
             json!({"type":"user.message"}),
@@ -911,10 +897,11 @@ mod tests {
     }
 
     #[test]
-    fn body_prompt_still_opens_a_turn_and_advances_after_reply() {
-        // 回歸守衛（防過度收斂）：有主體的提示照舊開回合。主體存在與內容無關
-        // （時間軸連空主體的 `"data":{}` 都記錄為提示），且明確 null 的 `payload`
-        // 退回 `data` 側的既有優先序不變（review 4433863670）。
+    fn body_prompt_counts_one_turn_per_user_message() {
+        // 回歸守衛（防過度收斂）：有主體的提示各佔一個統計回合（每則使用者
+        // 訊息分別累計），回覆不再推進回合。主體存在與內容無關（時間軸連空
+        // 主體的 `"data":{}` 都記錄為提示），且明確 null 的 `payload` 退回
+        // `data` 側的既有優先序不變（review 4433863670）。
         for prompt in [
             json!({"type":"user.message","payload":{"content":"q"}}),
             json!({"type":"user.message","data":{"content":"q"}}),
@@ -924,9 +911,12 @@ mod tests {
             let label = prompt.to_string();
             let rows = read(
                 &[
-                    prompt,
+                    prompt.clone(),
                     json!({"type":"assistant.message","data":{"content":"hi"}}),
                     event("u1", "2026-07-22T10:00:10Z"),
+                    prompt,
+                    json!({"type":"assistant.message","data":{"content":"hi again"}}),
+                    event("u2", "2026-07-22T10:01:10Z"),
                 ],
                 "",
                 false,
@@ -934,10 +924,43 @@ mod tests {
             .unwrap();
             assert_eq!(
                 rows[0].turn_no,
+                Some(1),
+                "第一則有主體提示的回合是 1，回覆不推進回合: {label}"
+            );
+            assert_eq!(
+                rows[1].turn_no,
                 Some(2),
-                "有主體提示必須開回合並在回覆後推進: {label}"
+                "第二則有主體提示另開回合: {label}"
             );
         }
+    }
+
+    #[test]
+    fn mid_message_replies_stay_in_the_message_turn_and_next_message_restarts() {
+        // 回歸（PR #74 review 2026-11-01）：同一則使用者訊息的中途文字回覆與
+        // final 同屬一個統計回合；下一則使用者訊息另開回合。舊推導只推進「提示
+        // 後第一個回覆」，第二個回覆的呼叫會與下一則訊息的呼叫共用回合，兩條
+        // final 都顯示合計，後到的用量還會回灌先到的回覆。
+        let rows = read(
+            &[
+                json!({"type":"user.message","data":{"content":"m1"}}),
+                event("c1", "2026-11-01T06:52:20Z"),
+                json!({"type":"assistant.message","data":{"content":"mid","phase":"commentary"}}),
+                event("c2", "2026-11-01T06:52:39Z"),
+                json!({"type":"assistant.message","data":{"content":"final","phase":"final_answer"}}),
+                json!({"type":"user.message","data":{"content":"m2"}}),
+                event("c3", "2026-11-01T06:53:55Z"),
+                json!({"type":"assistant.message","data":{"content":"final 2","phase":"final_answer"}}),
+            ],
+            "",
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            rows.iter().map(|row| row.turn_no).collect::<Vec<_>>(),
+            vec![Some(1), Some(1), Some(2)],
+            "中途回覆與 final 同屬訊息 1 的回合，下一則訊息另開回合"
+        );
     }
 
     #[test]

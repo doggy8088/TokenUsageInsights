@@ -398,7 +398,7 @@ const COPILOT_APP_TRANSCRIPT_PENDING_PREFIX: &str = "sync:copilot_app_transcript
 /// Upgrades scan all CLI sessions regardless of older SQLite cursors. Each
 /// session is replaced atomically with per-call rows; failed
 /// sessions retain durable pending markers for automatic retry.
-const COPILOT_CLI_AGENT_MIGRATION_KEY: &str = "migration:copilot_cli_per_call_usage_v4";
+const COPILOT_CLI_AGENT_MIGRATION_KEY: &str = "migration:copilot_cli_per_call_usage_v5";
 
 /// One-time backfill of `cwd` for existing Copilot rows (`copilot-cli` and
 /// `copilot-app`) that were written before CWD was populated from
@@ -3075,15 +3075,15 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
 
 /// Per-sub-agent turn boundaries of the agent's filtered timeline view.
 ///
-/// The detail page numbers each agent's replies with its own filtered counter
-/// (see `timeline::parse_copilot_timeline_filtered`): prompts share a turn and
-/// the first nonempty reply after a prompt closes it. Usage joins those replies
-/// strictly by that number, so a SQLite-only sub-agent call must not keep the
+/// 統計回合 = 每則該檢視可見的有主體提示（共用提示 + 專屬提示），以提示序號
+/// 編號（`max(1, 已見提示數)`），與 `timeline::parse_copilot_timeline_filtered`
+/// 及 `copilot::read_calls` 同步。The detail page numbers each agent's replies
+/// with that counter, so a SQLite-only sub-agent call must not keep the
 /// parent session's `turn_index + 1` (review comment 4403291628).
 struct AgentFilteredTurns {
     /// `(timestamp, turn_no)` of every nonempty reply, in stream order.
     replies: Vec<(Option<chrono::DateTime<chrono::Utc>>, u32)>,
-    /// Turn counter after the last reply, for calls that follow every reply.
+    /// 回合序號於事件流結尾的值，供晚於所有回覆的呼叫使用。
     end_turn: u32,
 }
 
@@ -3123,24 +3123,35 @@ impl AgentFilteredTurns {
 /// Replay each sub-agent's filtered timeline from the shared events file to
 /// learn its per-reply turn numbers. Mirrors the keep and numbering rules of
 /// `timeline::parse_copilot_timeline_filtered` with `agent_filter = Some(a)`:
-/// shared prompts (no `agentId`) and the agent's own prompts open a turn, and
-/// the agent's first nonempty reply closes it. Only prompts with an event body
-/// open a turn — body-less prompts leave the replay untouched, exactly like
-/// the timeline's `event_body` gate (review 4433948800).
+/// 共用提示（無 `agentId`）與專屬提示各推進該檢視的回合序號
+/// （`max(1, 已見提示數)`），同一則使用者訊息的多個回覆同編號。Only prompts
+/// with an event body count — body-less prompts leave the replay untouched,
+/// exactly like the timeline's `event_body` gate (review 4433948800).
 fn copilot_filtered_agent_turns(
     path: &Path,
     should_cancel: &(dyn Fn() -> bool + Sync),
 ) -> Result<HashMap<String, AgentFilteredTurns>, String> {
     struct AgentState {
-        next: u32,
-        pending_prompt: bool,
+        /// 該檢視已見的有主體提示數。
+        prompts: u32,
         replies: Vec<(Option<chrono::DateTime<chrono::Utc>>, u32)>,
+    }
+    impl AgentState {
+        fn new(prompts: u32) -> Self {
+            Self {
+                prompts,
+                replies: Vec::new(),
+            }
+        }
+        fn turn_no(&self) -> u32 {
+            self.prompts.max(1)
+        }
     }
     let file = File::open(path).map_err(|e| format!("讀取 Copilot 事件檔失敗: {e}"))?;
     let mut reader = BufReader::new(file);
     let mut line = String::new();
     let mut states: HashMap<String, AgentState> = HashMap::new();
-    let mut shared_prompt_seen = false;
+    let mut shared_prompts = 0u32;
     loop {
         if should_cancel() {
             return Err("Copilot 同步已取消".into());
@@ -3173,23 +3184,30 @@ fn copilot_filtered_agent_turns(
                 if crate::copilot::event_body(event.get("payload"), event.get("data"))
                     .is_some() =>
             {
-                shared_prompt_seen = true;
+                shared_prompts = shared_prompts
+                    .checked_add(1)
+                    .ok_or("Copilot 回合數超出範圍")?;
                 for state in states.values_mut() {
-                    state.pending_prompt = true;
+                    state.prompts = state
+                        .prompts
+                        .checked_add(1)
+                        .ok_or("Copilot 回合數超出範圍")?;
                 }
             }
             ("user.message" | "USER_PROMPT", Some(agent))
                 if crate::copilot::event_body(event.get("payload"), event.get("data"))
                     .is_some() =>
             {
-                states
+                // (review comment 4436837470) 專屬提示是該子 Agent 自己的
+                // 使用者訊息，只推進它自己的回合序號；共用提示不得觸碰其他
+                // 檢視的計數。
+                let state = states
                     .entry(agent.to_owned())
-                    .or_insert_with(|| AgentState {
-                        next: 1,
-                        pending_prompt: shared_prompt_seen,
-                        replies: Vec::new(),
-                    })
-                    .pending_prompt = true;
+                    .or_insert_with(|| AgentState::new(shared_prompts));
+                state.prompts = state
+                    .prompts
+                    .checked_add(1)
+                    .ok_or("Copilot 回合數超出範圍")?;
             }
             ("assistant.message" | "ASSISTANT_REPLY", Some(agent)) => {
                 let content = crate::copilot::event_body(event.get("payload"), event.get("data"))
@@ -3201,16 +3219,9 @@ fn copilot_filtered_agent_turns(
                 }
                 let state = states
                     .entry(agent.to_owned())
-                    .or_insert_with(|| AgentState {
-                        next: 1,
-                        pending_prompt: shared_prompt_seen,
-                        replies: Vec::new(),
-                    });
-                state.replies.push((ts, state.next));
-                if state.pending_prompt {
-                    state.next = state.next.checked_add(1).ok_or("Copilot 回合數超出範圍")?;
-                    state.pending_prompt = false;
-                }
+                    .or_insert_with(|| AgentState::new(shared_prompts));
+                // 同一則使用者訊息的多個回覆同編號；回覆不再推進回合。
+                state.replies.push((ts, state.turn_no()));
             }
             _ => {}
         }
@@ -3218,11 +3229,12 @@ fn copilot_filtered_agent_turns(
     Ok(states
         .into_iter()
         .map(|(agent, state)| {
+            let end_turn = state.turn_no();
             (
                 agent,
                 AgentFilteredTurns {
                     replies: state.replies,
-                    end_turn: state.next,
+                    end_turn,
                 },
             )
         })
@@ -3329,7 +3341,7 @@ fn sync_copilot_app_transcripts(
             // v6 (PRRT_kwDOTOgsec6yUXND): storage uniqueness now includes the
             // normalized parent, so the App transcript takeover must replay
             // once more to restore rows the old key had clobbered.
-            6u32.hash(&mut hash); // App reconciliation/accounting revision.
+            7u32.hash(&mut hash); // App reconciliation/accounting revision.
             title.hash(&mut hash);
             let fingerprint = (before.0, (hash.finish() & i64::MAX as u64) as i64);
             if states.get(&state_key) == Some(&fingerprint) {
@@ -19108,8 +19120,11 @@ mod tests {
             ],
         );
         f.sync();
-        assert_eq!(f.replies("app", None), vec![(1, 110), (2, 110)]);
-        assert_eq!(f.replies("app__child", Some("child")), vec![(1, 110)]);
+        // 連續提示各佔一個回合：呼叫 1 屬訊息 2（最後一則提示）、呼叫 2 屬
+        // 訊息 3，回覆各自累計到自己為止。較晚出現的子 Agent 以自己檢視的
+        // 提示序號編號（共用提示 1..3 + 自己的回覆），與逐呼叫列同編號。
+        assert_eq!(f.replies("app", None), vec![(2, 110), (3, 110)]);
+        assert_eq!(f.replies("app__child", Some("child")), vec![(4, 110)]);
     }
 
     fn app_text_at(kind: &str, ts: &str) -> serde_json::Value {
@@ -19273,8 +19288,9 @@ mod tests {
     fn copilot_filtered_agent_turns_counts_explicit_null_payload_replies() {
         // (review comment 4433863670) The db-side filtered turn counter must
         // apply the same explicit-null precedence as `event_body`, or replies
-        // with `payload: null` next to non-empty `data.content` never advance
-        // turns here while the import and timeline sides advance them.
+        // with `payload: null` next to non-empty `data.content` never surface
+        // here while the import and timeline sides see them. 回合以提示序號
+        // 編號後，兩則專屬提示各一回合，兩條回覆同號於各自的訊息回合。
         let dir = std::env::temp_dir().join(format!(
             "token-usage-insights-null-payload-turns-{}",
             std::process::id()
@@ -19303,7 +19319,7 @@ mod tests {
         let child = turns.get("child").expect("child agent turns present");
         let reply_turns: Vec<u32> = child.replies.iter().map(|(_, turn)| *turn).collect();
         assert_eq!(reply_turns, vec![1, 2]);
-        assert_eq!(child.end_turn, 3);
+        assert_eq!(child.end_turn, 2);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -19440,11 +19456,11 @@ mod tests {
             .unwrap()
             .map(Result::unwrap)
             .collect();
-        // The main reply has no shared prompt behind it, so the main counter
-        // stays at one and both main calls join the same filtered turn the
-        // timeline renders.
+        // The main view has no shared prompt behind it, so every main call
+        // stays in turn 1 — the same filtered turn the timeline renders. 回覆
+        // 只累計到自己為止，12:00:08 的呼叫晚於回覆、不計入。
         assert_eq!(main_turns, vec![1, 1]);
-        assert_eq!(f.replies("app", None), vec![(1, 220)]);
+        assert_eq!(f.replies("app", None), vec![(1, 110)]);
         let child_turns: Vec<i64> = f
             .conn
             .prepare(
@@ -19506,12 +19522,12 @@ mod tests {
     }
 
     #[test]
-    fn app_review_empty_agent_id_calls_after_reply_join_the_next_reply() {
+    fn empty_agent_id_prompt_counts_and_call_stays_in_its_message_turn() {
         // Reviewer's literal order: empty-id prompt → plain reply → call →
-        // prompt → reply. The call lands after the first reply already closed
-        // turn 1, so the import side books it into turn 2 and only the second
-        // reply may claim it. A timeline that skips the empty-id prompt keeps
-        // both replies in turn 1 and orphans the call.
+        // prompt → reply. 空 agentId 的提示正規化為共用提示，兩側同視為
+        // 「訊息 1」；回覆之後、下一則提示之前的呼叫仍屬訊息 1 的回合（回覆
+        // 不再推進回合），只是它晚於第一條回覆、不計入該回覆的累計。跳過
+        // 空 id 提示的時間軸會把整段都算成沒有提示的回合 1，與匯入端分歧。
         let mut f = AppReviewFixture::new(&["app"]);
         let empty_prompt = |kind: &str, ts: &str| {
             let mut event = app_text_at(kind, ts);
@@ -19541,10 +19557,10 @@ mod tests {
             .unwrap()
             .map(Result::unwrap)
             .collect();
-        assert_eq!(turns, vec![2], "回覆後的呼叫屬於下一個回覆的回合");
-        // `replies()` only reports replies that joined usage: r1 has none and
-        // must stay silent, while r2 has to reach the turn-2 call.
-        assert_eq!(f.replies("app", None), vec![(2, 110)]);
+        assert_eq!(turns, vec![1], "回覆後的呼叫仍屬同一則訊息的回合");
+        // `replies()` only reports replies that joined usage: r1 的累計（到
+        // 自己為止）沒有呼叫、r2 屬於沒有呼叫的訊息 2，兩者都保持沉默。
+        assert_eq!(f.replies("app", None), vec![]);
     }
 
     #[test]
@@ -19698,8 +19714,11 @@ mod tests {
         let mut f = AppReviewFixture::new(&["app"]);
         let mut child_reply = app_text_at("assistant.message", "2026-07-23T12:02:10Z");
         child_reply["agentId"] = serde_json::json!("child");
+        let mut dedicated_prompt = app_text_at("user.message", "2026-07-23T12:01:55Z");
+        dedicated_prompt["agentId"] = serde_json::json!("child");
         // SQLite-only sub-agent call: the parent session's turn_index is 2
-        // (turn 3) but the child's filtered timeline only has one reply.
+        // (turn 3) but the child's filtered timeline numbers its reply with its
+        // own view's prompt ordinals (shared prompts 1..3 + its own prompt → 4).
         f.native(3, "app", "2026-07-23T12:02:00Z", Some(2), Some("child"));
         f.write(
             "app",
@@ -19709,6 +19728,7 @@ mod tests {
                 app_text_at("user.message", "2026-07-23T12:01:00Z"),
                 app_text_at("assistant.message", "2026-07-23T12:01:10Z"),
                 app_text_at("user.message", "2026-07-23T12:01:50Z"),
+                dedicated_prompt,
                 child_reply,
             ],
         );
@@ -19725,12 +19745,14 @@ mod tests {
             .unwrap()
             .map(Result::unwrap)
             .collect();
-        assert_eq!(turns, vec![1]);
-        assert_eq!(f.replies("app__child", Some("child")), vec![(1, 110)]);
+        assert_eq!(turns, vec![4]);
+        assert_eq!(f.replies("app__child", Some("child")), vec![(4, 110)]);
     }
 
     #[test]
-    fn app_review_intermediate_text_reply_advances_usage_with_timeline() {
+    fn intermediate_text_reply_accumulates_within_its_message_turn() {
+        // 中途文字回覆不再切分回合：同一則使用者訊息的呼叫同屬一個統計回合，
+        // 每條回覆顯示「累計到自己為止」的用量（第二條因此是兩次呼叫合計）。
         let mut f = AppReviewFixture::new(&["app"]);
         f.write(
             "app",
@@ -19743,7 +19765,7 @@ mod tests {
             ],
         );
         f.sync();
-        assert_eq!(f.replies("app", None), vec![(1, 110), (2, 110)]);
+        assert_eq!(f.replies("app", None), vec![(1, 110), (1, 220)]);
     }
 
     #[test]

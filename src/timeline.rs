@@ -303,6 +303,41 @@ pub fn parse_antigravity_timeline(
     );
 }
 
+/// 回覆顯示累計值的累加基底（一則使用者訊息一份）。
+fn empty_turn_usage() -> TokenStats {
+    TokenStats {
+        input: 0,
+        output: 0,
+        cache_read: None,
+        cache_write: None,
+        cache_write_5m: None,
+        cache_write_1h: None,
+        reasoning: None,
+        total: 0,
+    }
+}
+
+/// 將單次 API 呼叫用量累計進回覆顯示值。欄位正規化與 `usage_entries` 逐呼叫
+/// 列一致：`input` 為排除 cache read 的淨輸入，`total` 為 raw input + output
+/// （cache write 與 reasoning 保留為 breakdown，不重複加總）。
+fn accumulate_turn_usage(accumulated: &mut TokenStats, metrics: &crate::copilot::Metrics) {
+    let net_input = metrics.input.saturating_sub(metrics.cache_read);
+    accumulated.input = accumulated.input.saturating_add(net_input);
+    accumulated.output = accumulated.output.saturating_add(metrics.output);
+    for (slot, value) in [
+        (&mut accumulated.cache_read, metrics.cache_read),
+        (&mut accumulated.cache_write, metrics.cache_write),
+        (&mut accumulated.reasoning, metrics.reasoning),
+    ] {
+        *slot = Some(slot.unwrap_or(0).saturating_add(value));
+    }
+    accumulated.total = accumulated.total.saturating_add(
+        net_input
+            .saturating_add(metrics.cache_read)
+            .saturating_add(metrics.output),
+    );
+}
+
 /// Backwards-compatible entry point that reconstructs a Copilot CLI timeline
 /// without any agent filtering. Kept as a thin shim so existing callers and
 /// documentation continue to resolve; the Copilot CLI events never carry a
@@ -353,8 +388,20 @@ pub fn parse_copilot_timeline_filtered(
     agent_filter: Option<&str>,
     db_session_model: Option<&str>,
 ) {
-    let mut current_turn_no = 1;
-    let mut has_seen_user_prompt = false;
+    // 統計回合 = 每則「有主體」的使用者訊息，以提示序號編號（`max(1, 已見提示數)`），
+    // 與 `copilot::read_calls` 的匯入端回合推導同步：同一則訊息的多次 API 呼叫
+    // （工具呼叫、中途文字回覆、final）同屬一個回合，回覆不再推進回合。
+    let mut prompts_seen = 0u32;
+    // 每則使用者訊息分別累計，累計到當前這條回覆為止：逐次
+    // `session.usage_record` 與匯入端逐呼叫用量列同值（`copilot::usage_record_metrics`）。
+    // 回合內完全沒有任何事件用量（Hook／舊聚合列）時，結尾才退回該回合的
+    // `db_entries` 總量；事件用量晚於回覆的回合不退回，避免後到的呼叫灌回
+    // 先到的回覆。
+    let mut turn_usage = empty_turn_usage();
+    let mut turn_usage_seen = false;
+    let mut turns_with_stream_usage: std::collections::HashSet<u32> =
+        std::collections::HashSet::new();
+    let mut pending_reply_usage: Vec<(usize, u32)> = Vec::new();
     // Seed the model from the DB child session model when available so a
     // subagent drawer starts with its own model and is never overwritten by
     // the shared parent `session.start.selectedModel`. Main sessions pass
@@ -489,13 +536,16 @@ pub fn parse_copilot_timeline_filtered(
                         .unwrap_or("")
                         .to_string();
                     let context = p.get("context").cloned();
+                    // 每則有主體提示開啟一個新的統計回合並重置累計。
+                    prompts_seen = prompts_seen.saturating_add(1);
+                    turn_usage = empty_turn_usage();
+                    turn_usage_seen = false;
                     timeline.push(TimelineItem::UserPrompt {
                         timestamp,
                         prompt: content,
                         context,
-                        turn_no: current_turn_no,
+                        turn_no: prompts_seen,
                     });
-                    has_seen_user_prompt = true;
                 }
             }
             "assistant.message" | "ASSISTANT_REPLY" => {
@@ -551,29 +601,30 @@ pub fn parse_copilot_timeline_filtered(
 
                     // 有實質回覆內容才推入 AgentReply
                     if !content.is_empty() {
-                        let (tokens, model_name) =
-                            if let Some((stats, model)) = db_entries.get(&current_turn_no) {
-                                current_model = model.clone();
-                                (Some(stats.clone()), current_model.clone())
-                            } else {
-                                (None, current_model.clone())
-                            };
+                        let turn_no = prompts_seen.max(1);
+                        if let Some((_, model)) = db_entries.get(&turn_no) {
+                            current_model = model.clone();
+                        }
+                        // 回覆顯示的用量 =「每則使用者訊息分別累計，累計到
+                        // 當前這條回覆為止」。回合的事件用量尚未出現時先留
+                        // 空，結尾再決定是否退回該回合的 `db_entries` 總量。
+                        let tokens = if turn_usage_seen {
+                            Some(turn_usage.clone())
+                        } else {
+                            pending_reply_usage.push((timeline.len(), turn_no));
+                            None
+                        };
 
                         timeline.push(TimelineItem::AgentReply {
                             timestamp,
                             reply: content,
                             reasoning,
-                            turn_no: current_turn_no,
-                            model: model_name,
+                            turn_no,
+                            model: current_model.clone(),
                             tokens,
                             duration_ms: None,
                             reasoning_effort: None,
                         });
-
-                        if has_seen_user_prompt {
-                            current_turn_no += 1;
-                            has_seen_user_prompt = false;
-                        }
                     }
                 }
             }
@@ -783,7 +834,30 @@ pub fn parse_copilot_timeline_filtered(
                     message: "子代理失敗 (Subagent Failed)".to_string(),
                 });
             }
+            // 逐次 API 呼叫用量：回覆顯示的累計值由此累加。解析與匯入端逐呼叫
+            // 用量列共用同一支（`copilot::usage_record_metrics`），同一則訊息
+            // 內的呼叫依事件流順序累計到當前回覆為止。用量無效時不累計（匯入
+            // 端會對同一筆回報錯誤並保留原資料待重試）。
+            "session.usage_record" => {
+                if let Some(Ok(metrics)) = crate::copilot::usage_record_metrics(&event) {
+                    accumulate_turn_usage(&mut turn_usage, &metrics);
+                    turn_usage_seen = true;
+                    turns_with_stream_usage.insert(prompts_seen.max(1));
+                }
+            }
             _ => {}
+        }
+    }
+    // 回合內完全沒有任何事件用量（Hook／舊聚合列）才退回該回合的 `db_entries`
+    // 總量；有事件用量的回合一律以逐次累計為準（哪怕用量晚於回覆）。
+    for (index, turn_no) in pending_reply_usage {
+        if turns_with_stream_usage.contains(&turn_no) {
+            continue;
+        }
+        if let Some(TimelineItem::AgentReply { tokens, .. }) = timeline.get_mut(index) {
+            if tokens.is_none() {
+                *tokens = db_entries.get(&turn_no).map(|(stats, _)| stats.clone());
+            }
         }
     }
     metadata.insert(
@@ -1923,11 +1997,13 @@ mod tests {
     }
 
     #[test]
-    fn explicit_null_payload_reply_advances_the_same_turn_on_import_and_timeline() {
-        // (review 4433863670) 同一事件形狀必須在兩側同推進：typed 匯入端把明確
-        // `payload: null` 視同缺欄 → 退回非空 `data.content` → 回覆推進回合；
-        // 時間軸的 `Value::get("payload")` 對明確 null 回 `Some(Null)`，若仍「優先
-        // payload」就會丟掉回覆、回合卡住，後續呼叫的用量再也掛不到同回合回覆。
+    fn explicit_null_payload_reply_stays_visible_and_turns_match_on_both_sides() {
+        // (review 4433863670) 同一事件形狀必須在兩側一致：typed 匯入端把明確
+        // `payload: null` 視同缺欄 → 退回非空 `data.content`；時間軸的
+        // `Value::get("payload")` 對明確 null 回 `Some(Null)`，若仍「優先 payload」
+        // 就會丟掉回覆，後續呼叫的用量再也掛不到同訊息的回覆。
+        // 回合改以「每則使用者訊息」分界後：hello 之後、下一則訊息之前的
+        // u-next 仍屬訊息 1；回覆顯示只累計到當前這條回覆為止。
         let events = [
             r#"{"type":"user.message","data":{"content":"q"},"timestamp":"2026-07-23T12:00:00Z"}"#,
             r#"{"type":"assistant.message","payload":null,"data":{"content":"hello"},"timestamp":"2026-07-23T12:00:01Z"}"#,
@@ -1950,13 +2026,14 @@ mod tests {
                 .collect::<String>(),
         )
         .unwrap();
-        // 匯入端：明確 null 的回覆仍推進回合，u-next 因此落在回合 2（未推進則為 1）。
+        // 匯入端：明確 null 的回覆仍在自己的訊息回合，u-next 在它之後但還沒
+        // 有下一則提示，仍屬訊息 1。
         let calls = crate::copilot::read_calls(&path, "s", &|| false).unwrap();
         let call_turns: Vec<Option<u32>> = calls.iter().map(|c| c.turn_no).collect();
         assert_eq!(
             call_turns,
-            vec![Some(2), Some(2)],
-            "匯入端已推進過明確 null 的回覆"
+            vec![Some(1), Some(2)],
+            "匯入端已把明確 null 的回覆算進訊息 1 的回合"
         );
         // 以匯入端的回合編號建立回合用量對照表，驗證時間軸側的掛載一致。
         let mut turn_total: HashMap<u32, u64> = HashMap::new();
@@ -1989,12 +2066,119 @@ mod tests {
         assert_eq!(
             replies,
             vec![("hello".to_string(), 1), ("world".to_string(), 2)],
-            "時間軸必須記錄明確 null 的回覆並與匯入端同步推進回合"
+            "時間軸必須記錄明確 null 的回覆並與匯入端同回合編號"
         );
         assert_eq!(
             reply_turn_usage(&timeline),
-            vec![(1, None), (2, Some(330))],
-            "呼叫用量必須掛到同回合的回覆"
+            vec![(1, None), (2, Some(220))],
+            "回覆只累計到自己為止：u-next 晚於 hello 不計入，world 只累計 u-2"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn copilot_reply_usage_accumulates_per_user_message_up_to_each_reply() {
+        // 回歸（PR #74 review 2026-11-01，真實事件脫敏樣本）：三則使用者訊息、
+        // 九次 API 呼叫（工具呼叫 + 中途文字回覆 + final）。回覆顯示必須是
+        // 「每則使用者訊息分別累計，累計到當前這條回覆為止」：
+        //   訊息 1 final（call 3）= calls 1–3 = 139,149
+        //   訊息 2 commentary（call 7）= calls 4–7 = 214,842
+        //   訊息 2 final（call 8）= calls 4–8 = 273,794
+        //   訊息 3 final（call 9）= call 9 = 60,181（新互動重新累計）
+        // call 8 與 call 9 不得共用統計回合（舊推導把兩者併成一回合，兩條
+        // final 都顯示合計 119,133，且後到的 call 9 用量回灌 call 8 的顯示）。
+        // call 8 的回合總量（273,794）恰好與 call 7 的累計（214,842）不同，
+        // 也因此同時驗證顯示值取「累計到當前回覆」而非回合總量。
+        let events = [
+            r#"{"type":"user.message","data":{"content":"m1"},"timestamp":"2026-11-01T06:52:15.002Z"}"#,
+            r#"{"type":"session.usage_record","id":"c1","timestamp":"2026-11-01T06:52:20.023Z","data":{"usage":{"model":"M","inputTokens":43485,"outputTokens":81,"cacheReadTokens":0,"cacheWriteTokens":43482,"reasoningTokens":0,"duration":642,"accounting":{"sourceSessionId":"s","usageId":"c1","sequence":1}}}}"#,
+            r#"{"type":"assistant.message","data":{"toolRequests":true},"timestamp":"2026-11-01T06:52:20.025Z"}"#,
+            r#"{"type":"session.usage_record","id":"c2","timestamp":"2026-11-01T06:52:24.670Z","data":{"usage":{"model":"M","inputTokens":46970,"outputTokens":76,"cacheReadTokens":43482,"cacheWriteTokens":3485,"reasoningTokens":35,"duration":362,"accounting":{"sourceSessionId":"s","usageId":"c2","sequence":2}}}}"#,
+            r#"{"type":"assistant.message","data":{"toolRequests":true},"timestamp":"2026-11-01T06:52:24.672Z"}"#,
+            r#"{"type":"session.usage_record","id":"c3","timestamp":"2026-11-01T06:52:25.010Z","data":{"usage":{"model":"M","inputTokens":48252,"outputTokens":285,"cacheReadTokens":46967,"cacheWriteTokens":1282,"reasoningTokens":0,"duration":220,"accounting":{"sourceSessionId":"s","usageId":"c3","sequence":3}}}}"#,
+            r#"{"type":"assistant.message","data":{"content":"done","phase":"final_answer"},"timestamp":"2026-11-01T06:52:25.012Z"}"#,
+            r#"{"type":"user.message","data":{"content":"m2"},"timestamp":"2026-11-01T06:52:30.253Z"}"#,
+            r#"{"type":"session.usage_record","id":"c4","timestamp":"2026-11-01T06:52:34.443Z","data":{"usage":{"model":"M","inputTokens":48583,"outputTokens":37,"cacheReadTokens":46967,"cacheWriteTokens":1616,"reasoningTokens":0,"duration":113,"accounting":{"sourceSessionId":"s","usageId":"c4","sequence":4}}}}"#,
+            r#"{"type":"assistant.message","data":{"toolRequests":true},"timestamp":"2026-11-01T06:52:34.445Z"}"#,
+            r#"{"type":"session.usage_record","id":"c5","timestamp":"2026-11-01T06:52:38.460Z","data":{"usage":{"model":"M","inputTokens":52676,"outputTokens":83,"cacheReadTokens":48583,"cacheWriteTokens":4093,"reasoningTokens":68,"duration":410,"accounting":{"sourceSessionId":"s","usageId":"c5","sequence":5}}}}"#,
+            r#"{"type":"assistant.message","data":{"toolRequests":true},"timestamp":"2026-11-01T06:52:38.462Z"}"#,
+            r#"{"type":"session.usage_record","id":"c6","timestamp":"2026-11-01T06:52:38.800Z","data":{"usage":{"model":"M","inputTokens":54522,"outputTokens":131,"cacheReadTokens":52676,"cacheWriteTokens":1846,"reasoningTokens":0,"duration":180,"accounting":{"sourceSessionId":"s","usageId":"c6","sequence":6}}}}"#,
+            r#"{"type":"assistant.message","data":{"toolRequests":true},"timestamp":"2026-11-01T06:52:38.802Z"}"#,
+            r#"{"type":"session.usage_record","id":"c7","timestamp":"2026-11-01T06:52:39.170Z","data":{"usage":{"model":"M","inputTokens":58476,"outputTokens":334,"cacheReadTokens":54522,"cacheWriteTokens":3954,"reasoningTokens":0,"duration":260,"accounting":{"sourceSessionId":"s","usageId":"c7","sequence":7}}}}"#,
+            r#"{"type":"assistant.message","data":{"content":"progress","phase":"commentary"},"timestamp":"2026-11-01T06:52:39.172Z"}"#,
+            r#"{"type":"session.usage_record","id":"c8","timestamp":"2026-11-01T06:52:39.180Z","data":{"usage":{"model":"M","inputTokens":58901,"outputTokens":51,"cacheReadTokens":58476,"cacheWriteTokens":425,"reasoningTokens":0,"duration":90,"accounting":{"sourceSessionId":"s","usageId":"c8","sequence":8}}}}"#,
+            r#"{"type":"assistant.message","data":{"content":"done 2","phase":"final_answer"},"timestamp":"2026-11-01T06:52:39.184Z"}"#,
+            r#"{"type":"user.message","data":{"content":"m3"},"timestamp":"2026-11-01T06:53:46.021Z"}"#,
+            r#"{"type":"session.usage_record","id":"c9","timestamp":"2026-11-01T06:53:55.270Z","data":{"usage":{"model":"M","inputTokens":59901,"outputTokens":280,"cacheReadTokens":58901,"cacheWriteTokens":1000,"reasoningTokens":0,"duration":240,"accounting":{"sourceSessionId":"s","usageId":"c9","sequence":9}}}}"#,
+            r#"{"type":"assistant.message","data":{"content":"done 3","phase":"final_answer"},"timestamp":"2026-11-01T06:53:55.287Z"}"#,
+            // 第四則訊息（樣本中的 origin／interaction 衝突呼叫）：無內容回覆
+            // 不產生回覆列，其用量仍屬訊息 4 的回合。
+            r#"{"type":"user.message","data":{"content":"m4"},"timestamp":"2026-11-01T06:53:55.491Z"}"#,
+            r#"{"type":"session.usage_record","id":"c10","timestamp":"2026-11-01T06:53:55.840Z","data":{"usage":{"model":"M","inputTokens":60122,"outputTokens":300,"cacheReadTokens":59901,"cacheWriteTokens":221,"reasoningTokens":0,"duration":120,"accounting":{"sourceSessionId":"s","usageId":"c10","sequence":10}}}}"#,
+            r#"{"type":"assistant.message","data":{"toolRequests":true},"timestamp":"2026-11-01T06:53:55.842Z"}"#,
+        ];
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "token-insights-reply-attribution-{}-{}.jsonl",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(
+            &path,
+            events
+                .iter()
+                .map(|line| format!("{line}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        // 匯入端：call 8 屬訊息 2 的回合、call 9 屬訊息 3 的回合，不得同號。
+        let calls = crate::copilot::read_calls(&path, "s", &|| false).unwrap();
+        assert_eq!(
+            calls.iter().map(|call| call.turn_no).collect::<Vec<_>>(),
+            vec![
+                Some(1),
+                Some(1),
+                Some(1),
+                Some(2),
+                Some(2),
+                Some(2),
+                Some(2),
+                Some(2),
+                Some(3),
+                Some(4)
+            ],
+            "統計回合以每則使用者訊息分界"
+        );
+        // 以回合總量建對照表：call 7 必須顯示 214,842（累計到自己）而非
+        // 273,794（回合總量），正好區分兩種語意。
+        let mut turn_total: HashMap<u32, u64> = HashMap::new();
+        for call in &calls {
+            *turn_total.entry(call.turn_no.unwrap()).or_default() +=
+                call.metrics.input + call.metrics.output;
+        }
+        let db_entries: HashMap<u32, (TokenStats, String)> = turn_total
+            .into_iter()
+            .map(|(turn, total)| (turn, (timeline_stats(total), "M".to_string())))
+            .collect();
+        let mut timeline = Vec::new();
+        let mut metadata = HashMap::new();
+        parse_copilot_timeline_filtered(
+            BufReader::new(File::open(&path).unwrap()),
+            &db_entries,
+            &mut timeline,
+            &mut metadata,
+            None,
+            None,
+        );
+        assert_eq!(
+            reply_turn_usage(&timeline),
+            vec![
+                (1, Some(139_149)),
+                (2, Some(214_842)),
+                (2, Some(273_794)),
+                (3, Some(60_181))
+            ],
+            "每則使用者訊息分別累計，累計到當前這條回覆為止"
         );
         let _ = fs::remove_file(path);
     }
@@ -2058,8 +2242,9 @@ mod tests {
         );
         assert_eq!(
             reply_turn_usage(&timeline),
-            vec![(1, Some(110))],
-            "用量必須掛到同回合的回覆（匯入回合 1 == 時間軸回合 1）"
+            vec![(1, None)],
+            "回覆顯示只累計到自己為止：trailing usage 仍屬回合 1（見上），\
+             但不計入發生在它之前的回覆"
         );
         let _ = fs::remove_file(path);
     }
