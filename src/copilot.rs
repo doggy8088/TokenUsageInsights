@@ -2,15 +2,18 @@
 use chrono::{DateTime, NaiveDateTime, Utc};
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 // Parser/reconciliation revision, hashed into the Copilot CLI/App transcript
 // fingerprints: bumping it re-syncs every unchanged session exactly once.
-// 回合推導改為「每則使用者訊息一個統計回合」並新增回覆累計顯示時升版。
-pub(crate) const PARSER_VERSION: u32 = 6;
+// 回合推導改為「每則使用者訊息一個統計回合」並新增回覆累計顯示時升版（6）。
+// 缺欄衝突檢查沿用一秒配對窗、子 Agent 回合邊界補入共享提示與後續已知提示
+// 歧義判定時再升版（7）：讓先前已對帳過的 App／CLI session 重新對帳，重建被
+// 錯歸的 SQLite-only 回合，而不只是讓全新 fixture 通過（review 4472095861）。
+pub(crate) const PARSER_VERSION: u32 = 7;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) struct Metrics {
@@ -319,8 +322,21 @@ impl From<&Call> for Signature {
 }
 
 /// Index key for the absent-versus-nonzero twin check in `merge_calls`:
-/// (model, agent, timestamp, input, output).
-type TwinKey = (Option<String>, Option<String>, DateTime<Utc>, u64, u64);
+/// (model, agent, input, output). Timestamps are compared with the same ±1s
+/// pairing window as the `Signature` proximity gate — the two sources may
+/// disagree by up to a second (review 4472095847), so an exact-time-only
+/// check would let a drifted twin through and append it as an independent
+/// row.
+type TwinKey = (Option<String>, Option<String>, u64, u64);
+
+/// True when two source rows are close enough to be two representations of
+/// the same call: the ±1s window `merge_calls` pairs on (clock jitter between
+/// the event file and SQLite).
+fn within_pairing_window(left: DateTime<Utc>, right: DateTime<Utc>) -> bool {
+    (left - right)
+        .num_microseconds()
+        .is_some_and(|delta| delta.unsigned_abs() <= 1_000_000)
+}
 
 /// SQLite has no API identity. Match the two representations one-to-one,
 /// keeping transcript timestamps (including the correct side of midnight).
@@ -333,22 +349,27 @@ pub(crate) fn merge_calls(
     for (index, call) in transcript.iter().enumerate() {
         candidates.entry(call.into()).or_default().push(index);
     }
-    // (review 4433948817) Index the event-file rows by (time, model, agent,
-    // input, output). When a native call shares that key with an event row but
-    // their `Signature` differs, some metric the event file omitted (parsed as
-    // 0) is non-zero in SQLite — reasoning, cache or duration. The all-or-nothing
+    // (review 4433948817) Index the event-file rows by (model, agent, input,
+    // output). When a native call shares that key with an event row but their
+    // `Signature` differs, some metric the event file omitted (parsed as 0)
+    // is non-zero in SQLite — reasoning, cache or duration. The all-or-nothing
     // `Signature` then misses on both the exact and window gates and the call
     // would be appended as an independent row, double-counting its whole
-    // input/output. A shared key is the fingerprint of that drift shape.
-    let mut twins: HashSet<TwinKey> = HashSet::new();
+    // input/output. A shared key is the fingerprint of that drift shape. The
+    // timestamps ride along so the conflict check can span the same ±1s
+    // window the pairing gates use (review 4472095847): a 500ms clock skew
+    // must not turn one call into two rows.
+    let mut twins: HashMap<TwinKey, Vec<DateTime<Utc>>> = HashMap::new();
     for call in &transcript {
-        twins.insert((
-            call.model.clone(),
-            call.agent_id.clone(),
-            call.timestamp,
-            call.metrics.input,
-            call.metrics.output,
-        ));
+        twins
+            .entry((
+                call.model.clone(),
+                call.agent_id.clone(),
+                call.metrics.input,
+                call.metrics.output,
+            ))
+            .or_default()
+            .push(call.timestamp);
     }
     let mut matched = vec![false; transcript.len()];
     let mut remaining = Vec::new();
@@ -404,9 +425,7 @@ pub(crate) fn merge_calls(
             .flatten()
             .copied()
         {
-            let within_window = (transcript[i].timestamp - call.timestamp)
-                .num_microseconds()
-                .is_some_and(|delta| delta.unsigned_abs() <= 1_000_000);
+            let within_window = within_pairing_window(transcript[i].timestamp, call.timestamp);
             if !within_window {
                 continue;
             }
@@ -431,21 +450,28 @@ pub(crate) fn merge_calls(
             // call's only near candidate and this arm appends a phantom
             // SQLite-only row, double-counting the same usage (review
             // 4433863665). The `twins` guard extends the same rule to
-            // signature-drifted twins (review 4433948817): a same-time event
-            // row that matches on model/agent/input/output necessarily
-            // disagrees on another metric (equal ones would have matched by
-            // signature), so independence is unproven — keep both sources
-            // intact and retry through the established 保留原資料待重試 path
-            // instead of appending a phantom row. Genuinely independent calls
-            // differ in input/output or time and still append below.
+            // signature-drifted twins (review 4433948817): a near event row
+            // that matches on model/agent/input/output necessarily disagrees
+            // on another metric (equal ones would have matched by signature),
+            // so independence is unproven — keep both sources intact and retry
+            // through the established 保留原資料待重試 path instead of appending
+            // a phantom row. "Near" spans the same ±1s pairing window as the
+            // gates above (review 4472095847): the conflict shape occurs with
+            // clock skew too, and an exact-time-only check then double-counts
+            // the call. Genuinely independent calls differ in input/output or
+            // stay outside the window and still append below.
             [] if stolen.is_empty() => {
-                if twins.contains(&(
-                    call.model.clone(),
-                    call.agent_id.clone(),
-                    call.timestamp,
-                    call.metrics.input,
-                    call.metrics.output,
-                )) {
+                let near_twin = twins
+                    .get(&(
+                        call.model.clone(),
+                        call.agent_id.clone(),
+                        call.metrics.input,
+                        call.metrics.output,
+                    ))
+                    .into_iter()
+                    .flatten()
+                    .any(|ts| within_pairing_window(*ts, call.timestamp));
+                if near_twin {
                     return Err("Copilot 事件檔與 SQLite 用量無法唯一配對，保留原資料待重試".into());
                 }
                 transcript.push(call)
@@ -803,6 +829,42 @@ mod tests {
             assert!(
                 result.unwrap_err().contains("保留原資料待重試"),
                 "缺欄-vs-非零的同時間候選必須走保守重試路線"
+            );
+        }
+    }
+
+    #[test]
+    fn absent_metric_twin_within_pairing_window_must_not_append_independent_row() {
+        // (review 4472095847) 缺欄衝突也可能帶 ±1 秒時間誤差：事件檔省略
+        // `reasoningTokens`（解析折 0）、SQLite 保留非零值且兩來源相差 500ms 時，
+        // 全指標 `Signature` 讓 exact／一秒窗配對都找不到對方，衝突檢查若只比對
+        // 完全相同時間就會漏掉 → 同一呼叫存成兩列、input/output 雙計（100/10 變
+        // 200/20）。一秒配對窗內的缺欄-vs-非零候選必須走保守重試、保留原資料。
+        let mut usage_event = event("a", "2026-07-22T10:00:00Z");
+        usage_event["data"]["usage"]
+            .as_object_mut()
+            .unwrap()
+            .remove("reasoningTokens");
+        let transcript = read(&[usage_event], "", false).unwrap();
+        for offset_ms in [-500i64, 0, 500] {
+            let mut native = transcript[0].clone();
+            native.identity = "sqlite:1".into();
+            native.turn_no = None;
+            native.metrics.reasoning = 300;
+            native.timestamp = transcript[0].timestamp + chrono::Duration::milliseconds(offset_ms);
+            let result = merge_calls(transcript.clone(), vec![native]);
+            assert!(
+                result.is_err(),
+                "缺欄-vs-非零、偏移 {offset_ms}ms 不得附加獨立列：實得 {} 列、input 總和 {}（真實 100）",
+                result.as_ref().map(Vec::len).unwrap_or(0),
+                result
+                    .as_ref()
+                    .map(|rows| rows.iter().map(|call| call.metrics.input).sum::<u64>())
+                    .unwrap_or(0),
+            );
+            assert!(
+                result.unwrap_err().contains("保留原資料待重試"),
+                "一秒窗內的缺欄-vs-非零候選（偏移 {offset_ms}ms）必須走保守重試路線"
             );
         }
     }

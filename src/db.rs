@@ -3083,7 +3083,7 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
 struct AgentFilteredTurns {
     /// `(timestamp, turn_no)` of every counted prompt, in stream order.
     prompts: Vec<(Option<chrono::DateTime<chrono::Utc>>, u32)>,
-    /// 該檢視第一個事件當下的回合編號，供早於所有已記錄提示的呼叫使用。
+    /// 早於所有已知提示邊界（含補入的共享提示）的 SQLite-only 呼叫的回合編號。
     initial_turn: u32,
 }
 
@@ -3092,26 +3092,38 @@ impl AgentFilteredTurns {
     /// 使用者訊息分界，回覆不再推進回合）。明確晚於呼叫的提示之後只會更晚、
     /// 終止掃描；無時間戳提示可能落在呼叫前後任一側，與既有候選跨越不同回合
     /// 時拒絕推定、保留原資料待重試（沿用 review 4436837487 對無時間戳回覆
-    /// 的先例）。
+    /// 的先例）。但流中更後面的已知提示若確定不晚於呼叫，歧義的無時間戳提示
+    /// 必然也在呼叫前、不再造成歧義——先檢查後續已知邊界再判定（review
+    /// 4472095891），否則已被後續提示消除歧義的呼叫會讓整個 session 的本次
+    /// 對帳失敗，連可明確判定的新用量都無法匯入。
     fn turn_at(&self, ts: chrono::DateTime<chrono::Utc>) -> Option<u32> {
         let mut candidate: Option<u32> = None;
+        let mut ambiguous = false;
         for (prompt_ts, turn) in &self.prompts {
             match prompt_ts {
-                // 明確不晚於呼叫：以最晚一則為候選。
-                Some(prompt_ts) if *prompt_ts <= ts => candidate = Some(*turn),
+                // 明確不晚於呼叫：以最晚一則為候選，並消除它之前的無時間戳
+                // 提示造成的歧義（那些提示都在它之前、必然不晚於呼叫）。
+                Some(prompt_ts) if *prompt_ts <= ts => {
+                    candidate = Some(*turn);
+                    ambiguous = false;
+                }
                 // 明確晚於呼叫：其後的提示只會更晚。
                 Some(_) => break,
                 // 無時間戳提示可能在前後任一側：呼叫可能屬於它開的回合，
                 // 也可能屬於它之前的回合（含 initial_turn）；跨越不同回合時
-                // 拒絕推定。
+                // 先標記歧義、繼續尋找可能消除它的後續已知提示。
                 None => {
                     let previous = candidate.unwrap_or(self.initial_turn);
                     if previous != *turn {
-                        return None;
+                        ambiguous = true;
+                    } else {
+                        candidate = Some(*turn);
                     }
-                    candidate = Some(*turn);
                 }
             }
+        }
+        if ambiguous {
+            return None;
         }
         Some(candidate.unwrap_or(self.initial_turn))
     }
@@ -3134,15 +3146,26 @@ fn copilot_filtered_agent_turns(
         prompts: u32,
         /// `(timestamp, turn_no)` of every counted prompt, in stream order.
         prompt_turns: Vec<(Option<chrono::DateTime<chrono::Utc>>, u32)>,
-        /// 狀態建立當下的回合編號（其第一個事件之前已見的共用提示數）。
+        /// 早於所有已知提示邊界的 SQLite-only 呼叫的回合編號。
         initial_turn: u32,
     }
     impl AgentState {
-        fn new(prompts: u32) -> Self {
+        /// 懶建立的檢視補入建立前已出現的共享提示邊界（review 4472095877）：
+        /// 只有累計共享提示數不足以定位較早的 SQLite-only 呼叫——共享提示
+        /// #1/#2 都先於子 Agent 第一個事件時，僅帶計數的狀態會把 #1、#2 之間
+        /// 的呼叫誤掛到 #2 的回合、計入第二則訊息的回覆徽章。共享提示是每個
+        /// 檢視的前幾個可見提示，而懶建立的檢視在此前沒有專屬提示，其檢視內
+        /// 回合序號即共享序號，可直接補入。`initial_turn` 只服務早於所有已知
+        /// 邊界的呼叫（該時點已見提示 0 則 → `max(1, 0)` = 回合 1）。
+        fn new(
+            prompts: u32,
+            shared_prompt_turns: &[(Option<chrono::DateTime<chrono::Utc>>, u32)],
+        ) -> Self {
+            debug_assert_eq!(prompts as usize, shared_prompt_turns.len());
             Self {
                 prompts,
-                prompt_turns: Vec::new(),
-                initial_turn: prompts.max(1),
+                prompt_turns: shared_prompt_turns.to_vec(),
+                initial_turn: 1,
             }
         }
         fn turn_no(&self) -> u32 {
@@ -3158,6 +3181,8 @@ fn copilot_filtered_agent_turns(
     let mut line = String::new();
     let mut states: HashMap<String, AgentState> = HashMap::new();
     let mut shared_prompts = 0u32;
+    // 共享提示邊界 `(timestamp, 共享序號)`：留給之後才懶建立的檢視補入。
+    let mut shared_prompt_turns: Vec<(Option<chrono::DateTime<chrono::Utc>>, u32)> = Vec::new();
     loop {
         if should_cancel() {
             return Err("Copilot 同步已取消".into());
@@ -3181,12 +3206,12 @@ fn copilot_filtered_agent_turns(
             .and_then(|v| v.as_str())
             .and_then(|raw| crate::copilot::parse_timestamp(raw).ok());
         // 任一事件都可能先於該 Agent 的提示出現；懶建立的狀態以當前共用提示
-        // 數起步，其 `initial_turn` 供早於所有已記錄提示的 SQLite-only 呼叫
-        // 歸屬。
+        // 數起步並補入共享提示的時間邊界，其 `initial_turn` 供早於所有已知
+        // 邊界的 SQLite-only 呼叫歸屬（review 4472095877）。
         if let Some(agent) = agent {
             states
                 .entry(agent.to_owned())
-                .or_insert_with(|| AgentState::new(shared_prompts));
+                .or_insert_with(|| AgentState::new(shared_prompts, &shared_prompt_turns));
         }
         match (kind, agent) {
             // (review 4433948800) Prompt boundaries run only for prompts with
@@ -3208,6 +3233,9 @@ fn copilot_filtered_agent_turns(
                         .ok_or("Copilot 回合數超出範圍")?;
                     state.push_prompt(ts);
                 }
+                // 已存在的檢視以各自的檢視序號記錄這則提示；之後才建立的檢視
+                // 沒有專屬提示在前，共享序號即其檢視序號（review 4472095877）。
+                shared_prompt_turns.push((ts, shared_prompts));
             }
             ("user.message" | "USER_PROMPT", Some(agent))
                 if crate::copilot::event_body(event.get("payload"), event.get("data"))
@@ -3218,7 +3246,7 @@ fn copilot_filtered_agent_turns(
                 // 檢視的計數。
                 let state = states
                     .entry(agent.to_owned())
-                    .or_insert_with(|| AgentState::new(shared_prompts));
+                    .or_insert_with(|| AgentState::new(shared_prompts, &shared_prompt_turns));
                 state.prompts = state
                     .prompts
                     .checked_add(1)
@@ -19482,6 +19510,57 @@ mod tests {
     }
 
     #[test]
+    fn copilot_filtered_agent_turns_seeds_shared_prompt_boundaries_into_late_agents() {
+        // (review 4472095877) 共享提示 #1@12:00、#2@12:02 都先於子 Agent 在事件
+        // 檔的第一個事件@12:03 出現。懶建立的狀態若只帶累計提示數，#1、#2 之間
+        // 的 SQLite-only 呼叫（@12:01）只能回傳 initial_turn=2、被誤掛到提示 #2
+        // 的回合並計入第二則訊息的回覆徽章。懶建立必須補入共享提示的時間邊界：
+        // 呼叫留在提示 #1 的回合 1，提示 #2 之後的呼叫才是回合 2。
+        let dir = std::env::temp_dir().join(format!(
+            "token-usage-insights-shared-boundary-turns-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("events.jsonl");
+        let mut child_first = app_text_at("assistant.message", "2026-07-23T12:03:00Z");
+        child_first["agentId"] = serde_json::json!("child");
+        let lines = [
+            app_text_at("user.message", "2026-07-23T12:00:00Z"),
+            app_text_at("user.message", "2026-07-23T12:02:00Z"),
+            child_first,
+        ]
+        .iter()
+        .map(|event| event.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        fs::write(&path, lines).unwrap();
+
+        let turns = copilot_filtered_agent_turns(&path, &|| false).unwrap();
+        let child = turns.get("child").expect("child agent turns present");
+        let at = |raw: &str| crate::copilot::parse_timestamp(raw).unwrap();
+        assert_eq!(
+            child.prompts,
+            vec![
+                (Some(at("2026-07-23T12:00:00Z")), 1),
+                (Some(at("2026-07-23T12:02:00Z")), 2)
+            ],
+            "懶建立的狀態必須補入共享提示的時間邊界"
+        );
+        assert_eq!(
+            child.turn_at(at("2026-07-23T12:01:00Z")),
+            Some(1),
+            "共享提示 #1、#2 之間的 SQLite-only 呼叫留在提示 #1 的回合"
+        );
+        assert_eq!(
+            child.turn_at(at("2026-07-23T12:03:30Z")),
+            Some(2),
+            "共享提示 #2 之後的 SQLite-only 呼叫留在提示 #2 的回合"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn copilot_filtered_agent_turns_ignores_bodyless_prompts_like_the_filtered_timeline() {
         // (review 4433948800) A prompt without an event body never opens a
         // turn in the filtered timeline (`event_body` drops it). If the replay
@@ -19857,6 +19936,27 @@ mod tests {
             native_only_subagent_turn(&call_at("2026-07-23T12:00:30Z"), &decidable).unwrap(),
             Some(1)
         );
+        // (review 4472095891) 無時間戳提示之後若有確定不晚於呼叫的後續已知提示，
+        // 歧義即被消除：提示 #1@12:00、無時間戳 #2、#3@12:03，呼叫 12:04 已確定
+        // 晚於 #3（#2 在 #3 之前、也必然在呼叫前）→ 直接判定回合 3；只有後續
+        // 已知邊界都晚於呼叫（呼叫 12:01 仍可能落在 #2 前後）才保留待重試。
+        let resolved = turns(
+            vec![
+                (Some(at("2026-07-23T12:00:00Z")), 1),
+                (None, 2),
+                (Some(at("2026-07-23T12:03:00Z")), 3),
+            ],
+            1,
+        );
+        assert_eq!(
+            native_only_subagent_turn(&call_at("2026-07-23T12:04:00Z"), &resolved).unwrap(),
+            Some(3),
+            "後續已知提示消除無時間戳提示的歧義時必須直接判定回合"
+        );
+        assert!(
+            native_only_subagent_turn(&call_at("2026-07-23T12:01:00Z"), &resolved).is_err(),
+            "後續已知邊界都晚於呼叫時仍須保留原資料待重試"
+        );
         // 呼叫屬於「呼叫當下已出現的最後一則提示」的回合（review：回覆後、
         // 下一則提示之前的 SQLite-only 呼叫不得改指下一個回覆的回合、污染
         // 下一則訊息的用量）。
@@ -19913,6 +20013,44 @@ mod tests {
             .collect();
         assert_eq!(turns, vec![4]);
         assert_eq!(f.replies("app__child", Some("child")), vec![(4, 110)]);
+    }
+
+    #[test]
+    fn app_review_early_sqlite_only_subagent_call_joins_first_shared_prompt_turn() {
+        // (review 4472095877) 共享提示 #1/#2 都先於子 Agent 在事件檔的第一個出
+        // 現，其間的 SQLite-only 呼叫必須掛回提示 #1 的回合；不得因懶建立狀態
+        // 只帶累計提示數而改計提示 #2 的回覆徽章。
+        let mut f = AppReviewFixture::new(&["app"]);
+        f.native(3, "app", "2026-07-23T12:01:00Z", Some(0), Some("child"));
+        let mut child_reply = app_text_at("assistant.message", "2026-07-23T12:03:00Z");
+        child_reply["agentId"] = serde_json::json!("child");
+        f.write(
+            "app",
+            &[
+                app_text_at("user.message", "2026-07-23T12:00:00Z"),
+                app_text_at("user.message", "2026-07-23T12:02:00Z"),
+                child_reply,
+            ],
+        );
+        f.sync();
+        let turns: Vec<i64> = f
+            .conn
+            .prepare(
+                "SELECT turn_no FROM usage_entries
+                 WHERE session_id = 'app__child' AND parent_session_id = 'app'
+                 ORDER BY timestamp",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(turns, vec![1], "呼叫必須掛回提示 #1 的回合");
+        assert_eq!(
+            f.replies("app__child", Some("child")),
+            vec![],
+            "提示 #2 的回覆徽章不得吸收提示 #1 的 SQLite-only 呼叫（修正前顯示 (2, 110)）"
+        );
     }
 
     #[test]
