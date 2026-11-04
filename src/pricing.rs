@@ -1480,6 +1480,28 @@ mod tests {
     }
 
     #[test]
+    fn kimi_k3_1_pro_resolves_pricing_from_csv() {
+        let rules = load_prepared_pricing_rules();
+
+        for model_name in ["kimi-k3.1-pro", "kimi-k3.1-pro:cloud", "Kimi K3.1 Pro"] {
+            for (input, output, cache_read, expected) in [
+                (1_000_000, 0, 0, 2.00),
+                (0, 0, 1_000_000, 0.20),
+                (0, 1_000_000, 0, 10.00),
+                (1_000_000, 1_000_000, 1_000_000, 12.20),
+            ] {
+                let cost = rules
+                    .calculate_cost(model_name, input, output, cache_read, 0, 0)
+                    .expect("kimi-k3.1-pro should have a pricing rule");
+                assert!(
+                    (cost - expected).abs() < 1e-12,
+                    "unexpected cost for {model_name}: {cost}, expected {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn composer_2_5_speed_tiers_resolve_distinct_pricing_from_csv() {
         let rules = load_pricing_rules();
 
