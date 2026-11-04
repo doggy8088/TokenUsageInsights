@@ -4,9 +4,21 @@
 
 ## [未發行]
 
+## [1.6.4] - 2026-11-05
+
+本次 patch release 補上 Kimi K3.1 Pro 定價規則，修正其使用量被套用 Kimi K3 費率而高估約五成的問題。
+
 ### 修正
 
 - 補上 Kimi K3.1 Pro（`kimi-k3.1-pro`）的定價規則：先前該模型的使用量會被包含比對套用 Kimi K3 費率（輸入 3.00、快取輸入 0.30、輸出 15.00 美元），高估約五成。依 Ollama 與 Kimi 官方公布費率新增 `Kimi K3.1 Pro` 與 `kimi-k3.1-pro` 雙格式規則（輸入 2.00、快取輸入 0.20、輸出 10.00 美元／每百萬 tokens），`kimi-k3.1-pro:cloud` 等名稱亦可正確計價。
+
+### 資料影響
+
+- 僅新增費率規則：`kimi-k3.1-pro` 相關 session 的費用估算會改用新費率計算，其他模型的估算結果不變。
+
+### 相容性
+
+- 未變更 SQLite 資料表結構、API 或執行期環境變數。
 
 ## [1.6.3] - 2026-11-03
 
@@ -1103,7 +1115,8 @@
 - 修正行動版側邊欄遮擋、黑畫面、標題擠壓、圖表導覽索引與年度版面問題。
 - 修正並補齊多個 Gemini、Claude、GPT 與 GPT-OSS 模型的定價規則。
 
-[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.6.3...HEAD
+[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.6.4...HEAD
+[1.6.4]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.6.3...v1.6.4
 [1.6.3]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.6.2...v1.6.3
 [1.6.2]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.6.1...v1.6.2
 [1.1.0]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.0.6...v1.1.0
