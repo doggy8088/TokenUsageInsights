@@ -189,9 +189,16 @@ pub(crate) fn latest_usage_entry<'a>(
 static WARNED_PRICING_MODELS: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
+/// 內部工具與無法識別的模型沒有可靠價格規則，保留用量統計但略過錯誤提示。
+fn is_unpriced_internal_model(model: &str) -> bool {
+    matches!(
+        model.trim().to_ascii_lowercase().as_str(),
+        "copilot-search-a" | "copilot-search-b" | "unknown model"
+    )
+}
+
 fn log_pricing_failure(model: &str, session_id: &str, turn_no: u32, error: &str) {
-    // 此模型缺少價格規則時保留用量統計，僅略過錯誤提示。
-    if model.eq_ignore_ascii_case("copilot-search-b") {
+    if is_unpriced_internal_model(model) {
         return;
     }
 
@@ -1009,10 +1016,19 @@ mod tests {
     }
 
     #[test]
-    fn missing_copilot_search_b_pricing_is_silent_and_preserves_tokens() {
+    fn missing_internal_model_pricing_is_silent_and_preserves_tokens() {
         let rules = PreparedPricingRules::from_rules(vec![]);
 
-        for model in ["copilot-search-b", "COPILOT-SEARCH-B", " copilot-search-b "] {
+        for model in [
+            "copilot-search-a",
+            "COPILOT-SEARCH-A",
+            " copilot-search-a ",
+            "copilot-search-b",
+            "COPILOT-SEARCH-B",
+            " copilot-search-b ",
+            "Unknown Model",
+            "unknown model",
+        ] {
             for has_delta in [true, false] {
                 let entries = [summary_entry(1, model, token_stats(100, 50, 25), has_delta)];
 
