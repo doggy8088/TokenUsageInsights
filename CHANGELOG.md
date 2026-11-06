@@ -4,9 +4,21 @@
 
 ## [未發行]
 
+## [1.6.5] - 2026-11-06
+
+本次 patch release 擴充缺少價格規則時的靜默清單，減少內部工具模型與無法識別模型造成的日誌雜訊。
+
 ### 修正
 
 - 擴充缺少價格規則時的靜默清單：內部工具模型 `copilot-search-a` 與無法識別的 `Unknown Model` 會保留 Token 用量統計，並略過「計算成本失敗」的重複提示，與既有的 `copilot-search-b` 行為一致；其他缺少價格規則的模型仍會提示。
+
+### 資料影響
+
+- 僅調整日誌提示行為：Token 用量統計與成本計算結果不變。
+
+### 相容性
+
+- 未變更 SQLite 資料表結構、API、環境變數或安裝流程。
 
 ## [1.6.4] - 2026-11-05
 
@@ -1119,7 +1131,8 @@
 - 修正行動版側邊欄遮擋、黑畫面、標題擠壓、圖表導覽索引與年度版面問題。
 - 修正並補齊多個 Gemini、Claude、GPT 與 GPT-OSS 模型的定價規則。
 
-[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.6.4...HEAD
+[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.6.5...HEAD
+[1.6.5]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.6.4...v1.6.5
 [1.6.4]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.6.3...v1.6.4
 [1.6.3]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.6.2...v1.6.3
 [1.6.2]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.6.1...v1.6.2
