@@ -55,7 +55,7 @@ jobs:
             target: x86_64-apple-darwin
             executable: token-usage-insights
             archive_ext: tar.gz
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             executable: token-usage-insights
             archive_ext: tar.gz
