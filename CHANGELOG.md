@@ -4,9 +4,21 @@
 
 ## [未發行]
 
-### 新增
+## [1.6.6] - 2026-11-12
 
-- 補上 `Gemini 4 Carbon`（含 `Medium`、`High`、`Low` 思考層級變體）的 Google AI 官方標準定價規則，並將 Antigravity 的 `gemini-4-carbon-medium`、`gemini-4-carbon-high`、`gemini-4-carbon-low` 模型代號對應為顯示名稱，修正使用 Gemini 4 Carbon 的會話找不到可用模型價格規則、無法估算成本的問題。價格採 2026-12-01 起的標準價（輸入 4.00、快取輸入 0.20、輸出 20.00 美元／每百萬 Token）；2026-11-30 以前的優惠期用量會高估約 2 倍。
+本次 patch release 補上 Gemini 4 Carbon 的費用估算規則與 Antigravity 模型名稱對應。
+
+### 新增與改善
+
+- 新增 Gemini 4 Carbon 及 Medium、High、Low 思考層級的 Google AI 定價規則，並將 Antigravity 模型代號 `gemini-4-carbon-medium`、`gemini-4-carbon-high`、`gemini-4-carbon-low` 對應為顯示名稱；使用這些模型的會話可估算成本，不再出現找不到價格規則的提示。
+
+### 資料影響
+
+- Gemini 4 Carbon 標準價為每百萬 Token 輸入 4.00、快取輸入 0.20、輸出 20.00 美元；官方優惠價將持續至 2026-11-30，標準價自 2026-12-01 生效。`pricing.csv` 採用標準價，因此 2026-11-30 以前的用量估算約為優惠價的 2 倍。
+
+### 相容性
+
+- 未變更 SQLite 資料表結構、公開 API、CLI 參數、環境變數或安裝流程。
 
 ## [1.6.5] - 2026-11-06
 
@@ -1135,7 +1147,8 @@
 - 修正行動版側邊欄遮擋、黑畫面、標題擠壓、圖表導覽索引與年度版面問題。
 - 修正並補齊多個 Gemini、Claude、GPT 與 GPT-OSS 模型的定價規則。
 
-[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.6.5...HEAD
+[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.6.6...HEAD
+[1.6.6]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.6.5...v1.6.6
 [1.6.5]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.6.4...v1.6.5
 [1.6.4]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.6.3...v1.6.4
 [1.6.3]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.6.2...v1.6.3
