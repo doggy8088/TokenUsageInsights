@@ -538,6 +538,9 @@ fn model_label(uid: &str) -> &str {
     // Verified with `agy models`; keep aliases explicit so unknown future models
     // cannot silently inherit an unrelated model's price.
     match uid {
+        "gemini-4-carbon-medium" => "Gemini 4 Carbon (Medium)",
+        "gemini-4-carbon-high" => "Gemini 4 Carbon (High)",
+        "gemini-4-carbon-low" => "Gemini 4 Carbon (Low)",
         "agy-demo-medium" | "gemini-4-argon-medium" => "Gemini 4 Argon (Medium)",
         "agy-demo-high" | "gemini-4-argon-high" => "Gemini 4 Argon (High)",
         "agy-demo-low" | "gemini-4-argon-low" => "Gemini 4 Argon (Low)",
@@ -653,6 +656,20 @@ mod tests {
         assert_eq!(models[&10], "Gemini 4 Argon (Medium)");
         assert_eq!(models[&20], "new-unknown-model");
         assert!(!models.contains_key(&1));
+    }
+
+    #[test]
+    fn gemini_4_carbon_agy_model_ids_map_to_display_names() {
+        // IDs verified with `agy models` on 2026-11-12.
+        assert_eq!(
+            model_label("gemini-4-carbon-medium"),
+            "Gemini 4 Carbon (Medium)"
+        );
+        assert_eq!(
+            model_label("gemini-4-carbon-high"),
+            "Gemini 4 Carbon (High)"
+        );
+        assert_eq!(model_label("gemini-4-carbon-low"), "Gemini 4 Carbon (Low)");
     }
 
     #[test]

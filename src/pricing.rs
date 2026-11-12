@@ -1038,6 +1038,40 @@ mod tests {
     }
 
     #[test]
+    fn gemini_4_carbon_thinking_levels_use_packaged_pricing() {
+        let rules = load_pricing_rules();
+
+        for model_name in [
+            "Gemini 4 Carbon",
+            "Gemini 4 Carbon (Medium)",
+            "Gemini 4 Carbon (High)",
+            "Gemini 4 Carbon (Low)",
+            "gemini-4-carbon",
+        ] {
+            let input =
+                calculate_usage_cost(&rules, Some(model_name), 1_000_000, 0, 0, 0, 0).unwrap();
+            let output =
+                calculate_usage_cost(&rules, Some(model_name), 0, 1_000_000, 0, 0, 0).unwrap();
+            let cached =
+                calculate_usage_cost(&rules, Some(model_name), 0, 0, 1_000_000, 0, 0).unwrap();
+
+            // Standard (post-introductory) rates: input 4.00, cached input 0.20, output 20.00.
+            assert!(
+                (input - 4.00).abs() < 1e-9,
+                "unexpected Gemini 4 Carbon input cost for {model_name}: {input}"
+            );
+            assert!(
+                (output - 20.00).abs() < 1e-9,
+                "unexpected Gemini 4 Carbon output cost for {model_name}: {output}"
+            );
+            assert!(
+                (cached - 0.20).abs() < 1e-9,
+                "unexpected Gemini 4 Carbon cached input cost for {model_name}: {cached}"
+            );
+        }
+    }
+
+    #[test]
     fn gemini_4_argon_thinking_levels_use_packaged_pricing() {
         let rules = load_pricing_rules();
 

@@ -4,6 +4,10 @@
 
 ## [未發行]
 
+### 新增
+
+- 補上 `Gemini 4 Carbon`（含 `Medium`、`High`、`Low` 思考層級變體）的 Google AI 官方標準定價規則，並將 Antigravity 的 `gemini-4-carbon-medium`、`gemini-4-carbon-high`、`gemini-4-carbon-low` 模型代號對應為顯示名稱，修正使用 Gemini 4 Carbon 的會話找不到可用模型價格規則、無法估算成本的問題。價格採 2026-12-01 起的標準價（輸入 4.00、快取輸入 0.20、輸出 20.00 美元／每百萬 Token）；2026-11-30 以前的優惠期用量會高估約 2 倍。
+
 ## [1.6.5] - 2026-11-06
 
 本次 patch release 擴充缺少價格規則時的靜默清單，減少內部工具模型與無法識別模型造成的日誌雜訊。
