@@ -4,6 +4,10 @@
 
 ## [未發行]
 
+### 新增
+
+- 補上 `Gemini 4 Hydrogen`（含 `Low`、`Medium`、`High`、`Extra` 思考層級變體）的 Google AI 官方付費標準定價規則（輸入 1.50、快取輸入 0.075、輸出 7.50 美元／每百萬 Token），讓使用 Gemini 4 Hydrogen 的會話可以估算成本；Antigravity 的 `gemini-4-hydrogen-*` 模型代號也會對應到同一組價格。
+
 ## [1.6.6] - 2026-11-12
 
 本次 patch release 補上 Gemini 4 Carbon 的費用估算規則與 Antigravity 模型名稱對應。

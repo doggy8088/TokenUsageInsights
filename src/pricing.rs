@@ -1038,6 +1038,44 @@ mod tests {
     }
 
     #[test]
+    fn gemini_4_hydrogen_thinking_levels_use_packaged_pricing() {
+        let rules = load_pricing_rules();
+
+        for model_name in [
+            "Gemini 4 Hydrogen",
+            "Gemini 4 Hydrogen (Low)",
+            "Gemini 4 Hydrogen (Medium)",
+            "Gemini 4 Hydrogen (High)",
+            "Gemini 4 Hydrogen (Extra)",
+            "gemini-4-hydrogen",
+            // Antigravity CLI model ID documented at antigravity.google/docs/models;
+            // unmapped IDs fall back to the contains match on the base rule.
+            "gemini-4-hydrogen-xhigh",
+        ] {
+            let input =
+                calculate_usage_cost(&rules, Some(model_name), 1_000_000, 0, 0, 0, 0).unwrap();
+            let output =
+                calculate_usage_cost(&rules, Some(model_name), 0, 1_000_000, 0, 0, 0).unwrap();
+            let cached =
+                calculate_usage_cost(&rules, Some(model_name), 0, 0, 1_000_000, 0, 0).unwrap();
+
+            // Standard paid tier: input 1.50, cached input 0.075, output 7.50.
+            assert!(
+                (input - 1.50).abs() < 1e-9,
+                "unexpected Gemini 4 Hydrogen input cost for {model_name}: {input}"
+            );
+            assert!(
+                (output - 7.50).abs() < 1e-9,
+                "unexpected Gemini 4 Hydrogen output cost for {model_name}: {output}"
+            );
+            assert!(
+                (cached - 0.075).abs() < 1e-9,
+                "unexpected Gemini 4 Hydrogen cached input cost for {model_name}: {cached}"
+            );
+        }
+    }
+
+    #[test]
     fn gemini_4_carbon_thinking_levels_use_packaged_pricing() {
         let rules = load_pricing_rules();
 
