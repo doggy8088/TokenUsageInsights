@@ -1,0 +1,99 @@
+name: Weekly LiteLLM Pricing Refresh
+
+# 內建的 model_prices_and_context_window.json 只是 LiteLLM 的快照，不會自動更新。
+# 本流程每週下載最新版本，驗證後若有差異就開（或更新）一個 PR，交由人工審核後合併。
+on:
+  schedule:
+    - cron: '43 2 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: pricing-refresh
+  cancel-in-progress: false
+
+env:
+  PRICING_FILE: model_prices_and_context_window.json
+  LITELLM_URL: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
+  BRANCH: chore/pricing-refresh
+
+jobs:
+  refresh:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Download and validate LiteLLM pricing
+        id: fetch
+        run: |
+          curl -fsSL --retry 3 --max-time 60 "$LITELLM_URL" -o /tmp/litellm.json
+          node -e '
+            const j = JSON.parse(require("fs").readFileSync("/tmp/litellm.json", "utf8"));
+            const n = Object.keys(j).filter((k) => k !== "sample_spec").length;
+            if (n < 1000) { console.error(`model count too low: ${n}`); process.exit(1); }
+            console.log(`models: ${n}`);
+          '
+          if cmp -s /tmp/litellm.json "$PRICING_FILE"; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Packaged pricing is already up to date."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Summarize changes
+        if: steps.fetch.outputs.changed == 'true'
+        run: |
+          node -e '
+            const fs = require("fs");
+            const strip = (j) => { delete j.sample_spec; return j; };
+            const a = strip(JSON.parse(fs.readFileSync(process.env.PRICING_FILE, "utf8")));
+            const b = strip(JSON.parse(fs.readFileSync("/tmp/litellm.json", "utf8")));
+            const added = Object.keys(b).filter((k) => !(k in a));
+            const removed = Object.keys(a).filter((k) => !(k in b));
+            const changed = Object.keys(b).filter((k) => k in a && JSON.stringify(a[k]) !== JSON.stringify(b[k]));
+            const list = (title, xs) => xs.length ? [`### ${title}（${xs.length}）`, "", ...xs.slice(0, 50).map((x) => `- \`${x}\``), xs.length > 50 ? `- …另有 ${xs.length - 50} 筆` : "", ""] : [];
+            fs.writeFileSync("/tmp/pr-body.md", [
+              "自動從 LiteLLM main 同步內建定價快照。合併前請確認下列變更合理，並確認測試通過。", "",
+              ...list("新增模型", added), ...list("移除模型", removed), ...list("價格或欄位變更", changed),
+            ].join("\n"));
+          '
+
+      - name: Apply and run pricing tests
+        if: steps.fetch.outputs.changed == 'true'
+        id: test
+        continue-on-error: true
+        run: |
+          cp /tmp/litellm.json "$PRICING_FILE"
+          cargo test --locked pricing
+
+      - name: Open or update pull request
+        if: steps.fetch.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TEST_OUTCOME: ${{ steps.test.outcome }}
+        run: |
+          if [ "$TEST_OUTCOME" = "success" ]; then
+            printf '\n✅ `cargo test pricing` 通過。\n' >> /tmp/pr-body.md
+          else
+            printf '\n⚠️ `cargo test pricing` 失敗，可能是內建補充定價或測試預期需要調整，請勿直接合併。\n' >> /tmp/pr-body.md
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$BRANCH"
+          git add "$PRICING_FILE"
+          git commit -m "chore(pricing): 同步 LiteLLM 最新模型定價快照" \
+            -m "自動從 BerriAI/litellm main 下載 model_prices_and_context_window.json 更新內建定價資料。"
+          git push --force origin "$BRANCH"
+          number=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty')
+          if [ -n "$number" ]; then
+            gh pr edit "$number" --body-file /tmp/pr-body.md
+          else
+            gh pr create --head "$BRANCH" --base "${{ github.event.repository.default_branch }}" \
+              --title "chore(pricing): 同步 LiteLLM 最新模型定價快照" --body-file /tmp/pr-body.md
+          fi
