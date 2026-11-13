@@ -4,6 +4,40 @@
 
 ## [未發行]
 
+## [1.7.0] - 2026-11-13
+
+本次 minor release 將定價來源改為 LiteLLM 開源價格表、新增 Gemini CLI 與 Antigravity 原生 Token 統計，並讓所有 Agent 的 Subagent 在儀表板以樹狀階層顯示。
+
+### 新增與改善
+
+- 新增 Google Gemini CLI 的 Token 用量計算與會話時間軸（可用 `GEMINI_DIR` 指定資料目錄）。
+- 新增 Antigravity 與 Antigravity IDE 的原生 Token 計算與增量同步，並以 metadata 補齊模型名稱。
+- 所有 Agent 的 Subagent 會話以樹狀階層顯示並關聯跨來源的父會話；Pi／OMP 的歷史會話會在升級後重新解析以回填父子關係、角色與任務名稱。
+- 模型定價來源改為社群開源的 LiteLLM `model_prices_and_context_window.json`（內建於執行檔）：
+  - 涵蓋 OpenAI、Anthropic、Google、xAI、DeepSeek、MiniMax、Moonshot、小米 MiMo 等廠商的價格。
+  - 支援供應商前綴剝離（如 `openai/`、`anthropic/`、`xai/`）、模型名稱正規化比對，以及 `_above_100k_tokens`、`_above_200k_tokens`、`_above_272k_tokens` 等長上下文階梯計價。
+  - 支援以 `gemini/` 等原廠 Provider 優先識別；LiteLLM 尚未收錄的模型（Gemini 4 Hydrogen／Carbon 等）由 `src/pricing.rs` 的內建補充定價提供。
+- 新增 `token-usage-insights pricing update [--url <網址>]`：手動從 LiteLLM 下載最新價格並原子寫入 `~/.token-usage-insights/`。下載的快取只在同一程式版本內優先於內建資料，升級後需重新執行。
+- 新增每週 GitHub Actions 流程，自動下載 LiteLLM 最新價格表，有差異時開 PR 供人工審核後合併內建定價快照。
+- 「Unknown Model」、「unknown」等無法識別的模型保留 Token 統計，成本記為 0 且不再重複輸出計價失敗警告。
+- 將側邊欄 Codex 額度進度條動畫改用 GPU 合成的 `transform: scaleX`，並為 12 個 Agent 按鈕補齊 `:focus-visible` 樣式。
+- 修正 daily／monthly 圖表的 label 欄位選擇。
+
+### 修正
+
+- Antigravity 原生資料存在時，清除同一 session 的 legacy hook 記錄，不再因 transcript 路徑不同而重複計算。
+
+### 資料影響
+
+- 費用估算改用 LiteLLM 價格，部分模型的估算金額可能與舊版 `pricing.csv` 不同。
+- Pi／OMP 歷史會話會在首次啟動時重新同步一次。
+
+### 相容性
+
+- 移除根目錄的 `pricing.csv`；安裝腳本、打包流程（`release.yml`、`npm/install.cjs`）、Docker 建置與自我更新驗證改用 `model_prices_and_context_window.json`。
+- 每日定價檢查（`scripts/pricing-check.mjs`）改為與內建 JSON 比對。
+- 未變更公開 API 與環境變數；僅新增 `GEMINI_DIR` 與 `pricing update` 子命令。
+
 ## [1.6.7] - 2026-11-13
 
 本次 patch release 新增 Gemini 4 Hydrogen 的費用估算規則，並升級自我更新功能使用的 ZIP 解壓縮套件。
@@ -73,8 +107,6 @@
 - 未變更 SQLite 資料表結構、API 或執行期環境變數。
 
 ## [1.6.3] - 2026-11-03
-
-本次 patch release 新增小米 MiMo-V2.6 系列模型定價規則，補齊對應 session 的費用估算。
 
 ### 新增與改善
 
