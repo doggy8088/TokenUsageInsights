@@ -3056,8 +3056,8 @@ function initAgentShareControls() {
 }
 
 function renderAgentTrendChart(viewKey, breakdown) {
-  const isMonthly = viewKey === 'monthly';
-  const labelKey = isMonthly ? 'date' : 'month';
+  const isDailyOrMonthly = viewKey === 'daily' || viewKey === 'monthly';
+  const labelKey = viewKey === 'yearly' ? 'month' : 'date';
   // 同一份 breakdown 陣列會被月／年彙總表原地排序，因此保存副本並自行依時間升冪排列
   const buckets = (Array.isArray(breakdown) ? [...breakdown] : [])
     .sort((left, right) => String(left[labelKey] || '').localeCompare(String(right[labelKey] || '')));
@@ -3098,7 +3098,7 @@ function renderAgentTrendChart(viewKey, breakdown) {
     };
   });
   const labels = buckets.map(bucket => (
-    isMonthly ? String(bucket.date || '').substring(5) : String(bucket.month || '')
+    isDailyOrMonthly ? String(bucket.date || '').substring(5) : String(bucket.month || '')
   ));
 
   agentTrendCharts.get(viewKey)?.destroy();

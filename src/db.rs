@@ -5524,6 +5524,7 @@ pub(crate) fn sync_muse_usage_logs_with_cancel(
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn sync_gemini_usage_logs(
     conn: &mut Connection,
     gemini_dir: &Path,
@@ -6242,187 +6243,194 @@ fn query_usage_entries(
 
     let mut entries = Vec::new();
     while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-        let ast_type = row.get::<_, String>(30).map_err(|e| e.to_string())?;
-        let tokens_input: Option<u64> = row
-            .get::<_, Option<i64>>(9)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let tokens_output: Option<u64> = row
-            .get::<_, Option<i64>>(10)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let tokens_cache_read: Option<u64> = row
-            .get::<_, Option<i64>>(11)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let tokens_cache_write: Option<u64> = row
-            .get::<_, Option<i64>>(12)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let tokens_cache_write_5m: Option<u64> = row
-            .get::<_, Option<i64>>(13)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let tokens_cache_write_1h: Option<u64> = row
-            .get::<_, Option<i64>>(14)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let tokens_reasoning: Option<u64> = row
-            .get::<_, Option<i64>>(15)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let tokens_total: Option<u64> = row
-            .get::<_, Option<i64>>(16)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-
-        let tokens = if let (Some(input), Some(output), Some(total)) =
-            (tokens_input, tokens_output, tokens_total)
-        {
-            Some(TokenStats {
-                input,
-                output,
-                cache_read: tokens_cache_read,
-                cache_write: tokens_cache_write,
-                cache_write_5m: tokens_cache_write_5m,
-                cache_write_1h: tokens_cache_write_1h,
-                reasoning: tokens_reasoning,
-                total,
-            })
-        } else {
-            None
-        };
-
-        let delta_input: Option<u64> = row
-            .get::<_, Option<i64>>(17)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let delta_output: Option<u64> = row
-            .get::<_, Option<i64>>(18)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let delta_cache_read: Option<u64> = row
-            .get::<_, Option<i64>>(19)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let delta_cache_write: Option<u64> = row
-            .get::<_, Option<i64>>(20)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let delta_cache_write_5m: Option<u64> = row
-            .get::<_, Option<i64>>(21)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let delta_cache_write_1h: Option<u64> = row
-            .get::<_, Option<i64>>(22)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let delta_reasoning: Option<u64> = row
-            .get::<_, Option<i64>>(23)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let delta_total: Option<u64> = row
-            .get::<_, Option<i64>>(24)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-
-        let delta_tokens = if let (Some(input), Some(output), Some(total)) =
-            (delta_input, delta_output, delta_total)
-        {
-            Some(TokenStats {
-                input,
-                output,
-                cache_read: delta_cache_read,
-                cache_write: delta_cache_write,
-                cache_write_5m: delta_cache_write_5m,
-                cache_write_1h: delta_cache_write_1h,
-                reasoning: delta_reasoning,
-                total,
-            })
-        } else {
-            None
-        };
-
-        let duration_ms: Option<f64> = row
-            .get::<_, Option<i64>>(25)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as f64);
-        let premium_requests: Option<f64> = row
-            .get::<_, Option<i64>>(26)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as f64);
-
-        let reported_cost_usd: Option<f64> =
-            row.get::<_, Option<f64>>(35).map_err(|e| e.to_string())?;
-        let cost =
-            if duration_ms.is_some() || premium_requests.is_some() || reported_cost_usd.is_some() {
-                Some(CostStats {
-                    total_api_duration_ms: duration_ms,
-                    total_duration_ms: None,
-                    total_premium_requests: premium_requests,
-                    reported_cost_usd,
-                })
-            } else {
-                None
-            };
-        let import_source_id = normalize_import_source_id(
-            row.get::<_, Option<String>>(32)
-                .map_err(|e| e.to_string())?
-                .as_deref(),
-        );
-
-        let mut record = UsageDayExportRecord {
-            entry: UsageEntry {
-                timestamp: row.get(0).map_err(|e| e.to_string())?,
-                session_id: row.get(1).map_err(|e| e.to_string())?,
-                session_name: row.get(2).ok(),
-                transcript_path: row.get(3).ok(),
-                cwd: row.get(4).ok(),
-                version: row.get(5).ok(),
-                turn_no: row.get::<_, i64>(6).map_err(|e| e.to_string())? as u32,
-                model: row.get(7).ok(),
-                model_id: row.get(8).ok(),
-                tokens,
-                delta_tokens,
-                context: None,
-                cost,
-                source_kind: row.get(33).ok(),
-                source_dir_key: row.get(34).ok(),
-                parent_session_id: row.get(27).ok(),
-                agent_nickname: row.get(28).ok(),
-                agent_role: row.get(29).ok(),
-                reasoning_effort: row.get(31).ok(),
-            },
-            import_source_id,
-            usage_identity: Some(
-                row.get::<_, String>(36)
-                    .map_err(|e| e.to_string())?
-                    .trim()
-                    .to_string(),
-            ),
-        };
-
-        if record.usage_identity.as_deref() == Some("") {
-            record.usage_identity = None;
-        }
-
-        let entry_date = row.get::<_, String>(37).map_err(|e| e.to_string())?;
-        if record.import_source_id.is_none() {
-            record.import_source_id = Some(build_usage_entry_import_source_id(
-                assistant,
-                &entry_date,
-                &record.entry,
-                record.usage_identity.as_deref(),
-            ));
-        }
-
-        entries.push(UsageDayRecordWithAssistant {
-            record,
-            assistant_type: ast_type,
-            date: entry_date,
-        });
+        entries.push(map_usage_day_row(row, assistant)?);
     }
     Ok(entries)
+}
+
+fn map_usage_day_row(
+    row: &rusqlite::Row,
+    assistant: &str,
+) -> Result<UsageDayRecordWithAssistant, String> {
+    let ast_type = row.get::<_, String>(30).map_err(|e| e.to_string())?;
+    let tokens_input: Option<u64> = row
+        .get::<_, Option<i64>>(9)
+        .map_err(|e| e.to_string())?
+        .map(|v| v as u64);
+    let tokens_output: Option<u64> = row
+        .get::<_, Option<i64>>(10)
+        .map_err(|e| e.to_string())?
+        .map(|v| v as u64);
+    let tokens_cache_read: Option<u64> = row
+        .get::<_, Option<i64>>(11)
+        .map_err(|e| e.to_string())?
+        .map(|v| v as u64);
+    let tokens_cache_write: Option<u64> = row
+        .get::<_, Option<i64>>(12)
+        .map_err(|e| e.to_string())?
+        .map(|v| v as u64);
+    let tokens_cache_write_5m: Option<u64> = row
+        .get::<_, Option<i64>>(13)
+        .map_err(|e| e.to_string())?
+        .map(|v| v as u64);
+    let tokens_cache_write_1h: Option<u64> = row
+        .get::<_, Option<i64>>(14)
+        .map_err(|e| e.to_string())?
+        .map(|v| v as u64);
+    let tokens_reasoning: Option<u64> = row
+        .get::<_, Option<i64>>(15)
+        .map_err(|e| e.to_string())?
+        .map(|v| v as u64);
+    let tokens_total: Option<u64> = row
+        .get::<_, Option<i64>>(16)
+        .map_err(|e| e.to_string())?
+        .map(|v| v as u64);
+
+    let tokens = if let (Some(input), Some(output), Some(total)) =
+        (tokens_input, tokens_output, tokens_total)
+    {
+        Some(TokenStats {
+            input,
+            output,
+            cache_read: tokens_cache_read,
+            cache_write: tokens_cache_write,
+            cache_write_5m: tokens_cache_write_5m,
+            cache_write_1h: tokens_cache_write_1h,
+            reasoning: tokens_reasoning,
+            total,
+        })
+    } else {
+        None
+    };
+
+    let delta_input: Option<u64> = row
+        .get::<_, Option<i64>>(17)
+        .map_err(|e| e.to_string())?
+        .map(|v| v as u64);
+    let delta_output: Option<u64> = row
+        .get::<_, Option<i64>>(18)
+        .map_err(|e| e.to_string())?
+        .map(|v| v as u64);
+    let delta_cache_read: Option<u64> = row
+        .get::<_, Option<i64>>(19)
+        .map_err(|e| e.to_string())?
+        .map(|v| v as u64);
+    let delta_cache_write: Option<u64> = row
+        .get::<_, Option<i64>>(20)
+        .map_err(|e| e.to_string())?
+        .map(|v| v as u64);
+    let delta_cache_write_5m: Option<u64> = row
+        .get::<_, Option<i64>>(21)
+        .map_err(|e| e.to_string())?
+        .map(|v| v as u64);
+    let delta_cache_write_1h: Option<u64> = row
+        .get::<_, Option<i64>>(22)
+        .map_err(|e| e.to_string())?
+        .map(|v| v as u64);
+    let delta_reasoning: Option<u64> = row
+        .get::<_, Option<i64>>(23)
+        .map_err(|e| e.to_string())?
+        .map(|v| v as u64);
+    let delta_total: Option<u64> = row
+        .get::<_, Option<i64>>(24)
+        .map_err(|e| e.to_string())?
+        .map(|v| v as u64);
+
+    let delta_tokens = if let (Some(input), Some(output), Some(total)) =
+        (delta_input, delta_output, delta_total)
+    {
+        Some(TokenStats {
+            input,
+            output,
+            cache_read: delta_cache_read,
+            cache_write: delta_cache_write,
+            cache_write_5m: delta_cache_write_5m,
+            cache_write_1h: delta_cache_write_1h,
+            reasoning: delta_reasoning,
+            total,
+        })
+    } else {
+        None
+    };
+
+    let duration_ms: Option<f64> = row
+        .get::<_, Option<i64>>(25)
+        .map_err(|e| e.to_string())?
+        .map(|v| v as f64);
+    let premium_requests: Option<f64> = row
+        .get::<_, Option<i64>>(26)
+        .map_err(|e| e.to_string())?
+        .map(|v| v as f64);
+
+    let reported_cost_usd: Option<f64> =
+        row.get::<_, Option<f64>>(35).map_err(|e| e.to_string())?;
+    let cost = if duration_ms.is_some() || premium_requests.is_some() || reported_cost_usd.is_some()
+    {
+        Some(CostStats {
+            total_api_duration_ms: duration_ms,
+            total_duration_ms: None,
+            total_premium_requests: premium_requests,
+            reported_cost_usd,
+        })
+    } else {
+        None
+    };
+    let import_source_id = normalize_import_source_id(
+        row.get::<_, Option<String>>(32)
+            .map_err(|e| e.to_string())?
+            .as_deref(),
+    );
+
+    let mut record = UsageDayExportRecord {
+        entry: UsageEntry {
+            timestamp: row.get(0).map_err(|e| e.to_string())?,
+            session_id: row.get(1).map_err(|e| e.to_string())?,
+            session_name: row.get(2).ok(),
+            transcript_path: row.get(3).ok(),
+            cwd: row.get(4).ok(),
+            version: row.get(5).ok(),
+            turn_no: row.get::<_, i64>(6).map_err(|e| e.to_string())? as u32,
+            model: row.get(7).ok(),
+            model_id: row.get(8).ok(),
+            tokens,
+            delta_tokens,
+            context: None,
+            cost,
+            source_kind: row.get(33).ok(),
+            source_dir_key: row.get(34).ok(),
+            parent_session_id: row.get(27).ok(),
+            agent_nickname: row.get(28).ok(),
+            agent_role: row.get(29).ok(),
+            reasoning_effort: row.get(31).ok(),
+        },
+        import_source_id,
+        usage_identity: Some(
+            row.get::<_, String>(36)
+                .map_err(|e| e.to_string())?
+                .trim()
+                .to_string(),
+        ),
+    };
+
+    if record.usage_identity.as_deref() == Some("") {
+        record.usage_identity = None;
+    }
+
+    let entry_date = row.get::<_, String>(37).map_err(|e| e.to_string())?;
+    if record.import_source_id.is_none() {
+        record.import_source_id = Some(build_usage_entry_import_source_id(
+            assistant,
+            &entry_date,
+            &record.entry,
+            record.usage_identity.as_deref(),
+        ));
+    }
+
+    Ok(UsageDayRecordWithAssistant {
+        record,
+        assistant_type: ast_type,
+        date: entry_date,
+    })
 }
 
 pub fn get_usage_entries_by_date(

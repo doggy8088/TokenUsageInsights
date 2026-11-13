@@ -1080,6 +1080,17 @@ mod tests {
     }
 
     #[test]
+    fn is_valid_period_supports_year_month_and_day() {
+        assert!(super::is_valid_period("2026"));
+        assert!(super::is_valid_period("2026-10"));
+        assert!(super::is_valid_period("2026-10-13"));
+
+        assert!(!super::is_valid_period("2026-13"));
+        assert!(!super::is_valid_period("2026-10-32"));
+        assert!(!super::is_valid_period("invalid"));
+    }
+
+    #[test]
     fn import_source_assistant_must_match_cli_target() {
         let error = validate_import_source_assistant("antigravity", Some("codex")).unwrap_err();
         assert!(error.contains("匯入已取消"));
