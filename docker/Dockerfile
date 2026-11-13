@@ -22,6 +22,8 @@ ENV APP_BUILD_DATE=${APP_BUILD_DATE}
 
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY src ./src
+# 內建定價資料由 include_str! 編進執行檔，編譯時必須存在
+COPY model_prices_and_context_window.json ./
 
 # 快取 crates 與 target 目錄以加速重複建置；執行檔需在同一個 RUN 內複製出快取掛載點
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
@@ -44,7 +46,6 @@ WORKDIR /app
 # 刻意不放 VERSION 檔：避免程式把 /app 判定為標準安裝目錄而啟用自我更新與服務 runner 機制
 COPY --from=builder /out/token-usage-insights /app/token-usage-insights
 COPY static /app/static
-COPY pricing.csv /app/pricing.csv
 
 # INSIGHTS_DIR 指向獨立的資料磁碟區；容器內沒有任何 AI 工具的本機日誌，資料只來自 import
 ENV INSIGHTS_DIR=/data \

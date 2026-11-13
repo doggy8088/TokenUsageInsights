@@ -46,7 +46,7 @@ gh api users/<author> --jq '{login,created_at,public_repos,followers}'
 | `package.json` 的 `scripts`（`preinstall`/`postinstall`/`prepare`/`prepublishOnly`）、`npm/**`（downloader、checksum 驗證） | 安裝時執行任意程式碼、繞過校驗 |
 | `shell/**`、`scripts/**`、`systemd` 單元 | 本機以高權限執行 |
 | `Cargo.lock`／`package-lock.json` 變動 | 注意 registry／resolved URL 是否被改成非官方來源、版本與 checksum 是否異常 |
-| `pricing.csv` | 資料竄改（價格異常） |
+| `model_prices_and_context_window.json` | 資料竄改（價格異常） |
 | `static/**`、`public/**` | XSS、外部腳本、追蹤碼、資料外洩 |
 
 ### 3.2 惡意或可疑模式（`gh pr diff` 搜尋並人工確認）

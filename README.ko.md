@@ -96,7 +96,7 @@ Windows는 기본적으로 다음 네이티브 경로를 사용합니다.
 - 일별·월별·연별 Token 통계
 - “모든 Agent” 통합 보기: 컴퓨터의 모든 Coding Agent Token 사용량과 예상 비용을 합산하고, Agent별 비중과 Agent별로 누적한 일별·월별 추이를 표시
 - 입력, 출력, 캐시 읽기, 캐시 쓰기, 추론 Token 분류
-- `pricing.csv`에 따른 로컬 비용 추정
+- `model_prices_and_context_window.json`에 따른 로컬 비용 추정
 - Session 수, 요청 수 및 API 소요 시간 통계
 - 모델 사용량 순위
 - 로컬 `state.vscdb`의 `agentKv` 기록으로 Cursor를 구체적인 모델에 귀속하며, 고유하게 일치하지 않으면 `Unknown Model`로 유지
@@ -338,7 +338,7 @@ Cursor는 대화와 Agent transcript를 프로젝트 디렉터리 아래에 저�
 3. 왼쪽에서 Cursor를 선택합니다.
 4. 오른쪽 위 동기화 버튼을 클릭하거나 백그라운드 동기화를 기다립니다.
 
-Cursor의 로컬 데이터에는 정확한 Token 수나 공식 청구 내역이 없으므로 Token은 텍스트 내용에서 추정합니다. 비용은 `pricing.csv`에 일치하는 모델이 있을 때만 추정되며 공식 청구액과 같지 않습니다. 기본 위치가 아닌 경우 `CURSOR_DIR` 및 `CURSOR_STATE_DB`를 사용할 수 있습니다.
+Cursor의 로컬 데이터에는 정확한 Token 수나 공식 청구 내역이 없으므로 Token은 텍스트 내용에서 추정합니다. 비용은 `model_prices_and_context_window.json`에 일치하는 모델이 있을 때만 추정되며 공식 청구액과 같지 않습니다. 기본 위치가 아닌 경우 `CURSOR_DIR` 및 `CURSOR_STATE_DB`를 사용할 수 있습니다.
 
 * * *
 
@@ -359,7 +359,7 @@ Gemini CLI는 각 프로젝트의 Session을 `~/.gemini/tmp` 아래 프로젝트
 3. 왼쪽에서 Gemini CLI를 선택합니다.
 4. 오른쪽 위 동기화 버튼을 클릭하거나 백그라운드 동기화를 기다립니다.
 
-이 대시보드는 Session이 보고하는 Token 및 캐시 사용량을 `pricing.csv`의 Google AI 모델 단가와 대조하여 실시간으로 비용을 계산합니다. 기본 위치가 아닌 경우 `GEMINI_DIR`로 지정할 수 있습니다.
+이 대시보드는 Session이 보고하는 Token 및 캐시 사용량을 `model_prices_and_context_window.json`의 Google AI 모델 단가와 대조하여 실시간으로 비용을 계산합니다. 기본 위치가 아닌 경우 `GEMINI_DIR`로 지정할 수 있습니다.
 
 * * *
 
@@ -382,7 +382,7 @@ Grok Build가 내부적으로 저장하는 Session stream을 사용합니다. �
 3. 왼쪽에서 Grok Build를 선택합니다.
 4. 오른쪽 위 동기화 버튼을 클릭하거나 백그라운드 동기화를 기다립니다.
 
-Grok Build Session은 context token snapshot만 제공할 수도 있고 provider usage와 비용을 포함할 수도 있습니다. 대시보드는 provider usage/cost를 우선하며 context snapshot만 있는 경우 `pricing.csv`의 xAI API 가격으로 비용을 추정하고 Session 목록에 `Context`로 표시합니다. 이는 SuperGrok 또는 다른 구독 요금제의 주간 할당량을 의미하지 않습니다.
+Grok Build Session은 context token snapshot만 제공할 수도 있고 provider usage와 비용을 포함할 수도 있습니다. 대시보드는 provider usage/cost를 우선하며 context snapshot만 있는 경우 `model_prices_and_context_window.json`의 xAI API 가격으로 비용을 추정하고 Session 목록에 `Context`로 표시합니다. 이는 SuperGrok 또는 다른 구독 요금제의 주간 할당량을 의미하지 않습니다.
 
 * * *
 
@@ -445,7 +445,7 @@ Muse Code는 날짜와 Session ID로 구분된 `session.jsonl` 파일에 Session
 3. 왼쪽에서 Muse Code를 선택합니다.
 4. 오른쪽 위 동기화 버튼을 클릭하거나 백그라운드 동기화를 기다립니다.
 
-Muse Code 비용은 Session이 보고한 모델과 `pricing.csv`를 기준으로 추정합니다. 데이터가 기본 위치에 없다면 `MUSE_DIR`을 `sessions`가 포함된 Muse Code 데이터 디렉터리로 설정합니다.
+Muse Code 비용은 Session이 보고한 모델과 `model_prices_and_context_window.json`를 기준으로 추정합니다. 데이터가 기본 위치에 없다면 `MUSE_DIR`을 `sessions`가 포함된 Muse Code 데이터 디렉터리로 설정합니다.
 
 * * *
 
@@ -466,7 +466,7 @@ MiniMax Code는 각 Session을 연, 월, 일 계층 디렉터리에 저장하고
 3. 왼쪽에서 MiniMax Code를 선택합니다.
 4. 오른쪽 위 동기화 버튼을 클릭하거나 백그라운드 동기화를 기다립니다.
 
-MiniMax Code 로컬 로그에는 비용 필드가 없으므로, 이 대시보드는 Session이 보고하는 Token 수를 `pricing.csv`의 모델 단가와 대조해 비용을 추정합니다. 작업 디렉터리와 Session 이름은 MiniMax Code runtime의 `runtime-state.sqlite`에서 읽기 전용으로 가져오며, 이 프로젝트는 해당 데이터베이스에 쓰거나 수정하지 않습니다. 데이터가 기본 위치에 없다면 `MCODE_DIR`을 `sessions`가 포함된 MiniMax Code 데이터 디렉터리로 설정합니다.
+MiniMax Code 로컬 로그에는 비용 필드가 없으므로, 이 대시보드는 Session이 보고하는 Token 수를 `model_prices_and_context_window.json`의 모델 단가와 대조해 비용을 추정합니다. 작업 디렉터리와 Session 이름은 MiniMax Code runtime의 `runtime-state.sqlite`에서 읽기 전용으로 가져오며, 이 프로젝트는 해당 데이터베이스에 쓰거나 수정하지 않습니다. 데이터가 기본 위치에 없다면 `MCODE_DIR`을 `sessions`가 포함된 MiniMax Code 데이터 디렉터리로 설정합니다.
 
 * * *
 
@@ -845,7 +845,7 @@ Invoke-WebRequest -Uri https://raw.githubusercontent.com/doggy8088/TokenUsageIns
 
 - 단일 플랫폼 실행 파일
 - `static/`의 프런트엔드 자산
-- 모델 가격표 `pricing.csv`
+- 모델 가격표 `model_prices_and_context_window.json`
 - `shell/` 디렉터리의 Status Line 및 서비스 스크립트
 - `scripts/` 디렉터리(`install.sh`, `install.ps1`, `get.sh`, `get.ps1`, `run-service.ps1` 포함)
 - README, LICENSE 및 VERSION
@@ -889,7 +889,7 @@ Windows 설치 위치 및 포트 사용자 지정:
 `Release` workflow는 매 빌드마다 Linux, macOS 및 Windows에서 해당 설치 스크립트(`install.sh` / `install.ps1`)를 실제로 실행하고, 설치 후 실행 파일을 시작하여 다음을 확인합니다.
 
 - 서비스가 지정된 포트에서 `/api/<assistant>/pricing`에 응답함
-- 응답 내용이 패키지에 포함된 `pricing.csv`를 실제로 읽음
+- 응답 내용이 패키지에 포함된 `model_prices_and_context_window.json`를 실제로 읽음
 - 새로운 `INSIGHTS_DIR`이 생성되고 SQLite 데이터베이스가 만들어짐
 
 `get.sh` 및 `get.ps1`도 매 빌드 전에 구문 검사(`bash -n` 및 PowerShell AST 분석)를 수행하여 Release에 게시되는 버전이 정상적으로 실행되는지 확인합니다.
@@ -1049,7 +1049,7 @@ src/                 Rust 後端、API、SQLite 同步、價格與時間軸解�
 static/              前端 HTML、JavaScript、CSS 與圖片資產
 shell/               Bash/PowerShell Status Line collector 與 systemd 服務範本
 scripts/             Linux/macOS、Windows 安裝與 Windows smoke test
-pricing.csv          模型價格表，本地估算費用依此檔案載入
+model_prices_and_context_window.json          模型價格表，本地估算費用依此檔案載入
 ```
 
 * * *

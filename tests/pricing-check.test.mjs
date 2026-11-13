@@ -1,16 +1,31 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  parseCsv, isBaseRow, parsePrice, parseTableProvider, parseGeminiProvider, compareProvider,
+  parseLitellmJson, isBaseRow, parsePrice, parseTableProvider, parseGeminiProvider, compareProvider,
 } from '../scripts/pricing-check.mjs';
 
-const csv = `模型名稱,部署類型,單位,輸入價格(美金),快取輸入價格(美金),輸出價格(美金),批次 API 價格(美金)
-Gemini 3.8 Flash,Google AI,1M Tokens,1.50,0.15,7.50,N/A
-Gemini 3.8 Flash (High),Google AI,1M Tokens,1.50,0.15,7.50,N/A
-Gemini 3.1 Pro (<200k),Google AI,1M Tokens,2.00,0.20,12.00,N/A
-GPT-6.1 Sol,Global,1M Tokens,2.00,0.10,10.00,N/A
-GPT-5.6 Luna,Global,1M Tokens,1.00,0.10,6.00,N/A
-`;
+// 以 [模型, litellm_provider, 輸入, 快取輸入, 輸出]（USD / 1M tokens）組出 LiteLLM 格式 JSON。
+const litellmJson = (entries) => JSON.stringify({
+  sample_spec: { litellm_provider: 'one of https://docs.litellm.ai/docs/providers', mode: 'one of chat' },
+  ...Object.fromEntries(entries.map(([model, provider, input, cached, output]) => [
+    `${provider}/${model}`,
+    {
+      litellm_provider: provider,
+      mode: 'chat',
+      input_cost_per_token: input / 1e6,
+      cache_read_input_token_cost: cached / 1e6,
+      output_cost_per_token: output / 1e6,
+    },
+  ])),
+  'bedrock/gpt-6.1-sol': { litellm_provider: 'bedrock', mode: 'chat', input_cost_per_token: 9e-6 },
+});
+
+const pricingJson = litellmJson([
+  ['gemini-3.8-flash', 'gemini', 1.5, 0.15, 7.5],
+  ['gemini-3.1-pro', 'gemini', 2, 0.2, 12],
+  ['gpt-6.1-sol', 'openai', 2, 0.1, 10],
+  ['gpt-5.6-luna', 'openai', 1, 0.1, 6],
+]);
 
 const openaiMd = `### Standard pricing data
 
@@ -55,10 +70,13 @@ const geminiMd = `## Gemini 3.8 Flash
 | Output price | Free | $2.00 |
 `;
 
-test('parseCsv 解析價格與部署類型', () => {
-  const rows = parseCsv(csv);
-  assert.equal(rows.length, 5);
-  assert.equal(rows[3].deployment, 'Global');
+test('parseLitellmJson 只取原廠直連條目並換算為每百萬 Token 價格', () => {
+  const rows = parseLitellmJson(pricingJson);
+  assert.equal(rows.length, 4); // sample_spec 與 bedrock 轉售價不納入
+  const sol = rows.find((r) => r.model === 'gpt-6.1-sol');
+  assert.equal(sol.deployment, 'Global');
+  assert.deepEqual([sol.input, sol.cached, sol.output], [2, 0.1, 10]);
+  assert.equal(rows.find((r) => r.model === 'gemini-3.8-flash').deployment, 'Google AI');
 });
 
 test('isBaseRow 排除分級列', () => {
@@ -90,17 +108,17 @@ test('parseGeminiProvider 只取 Standard 表格並解析促銷價', () => {
 });
 
 test('compareProvider 偵測差異、促銷價與新模型', () => {
-  const rows = parseCsv(csv);
+  const rows = parseLitellmJson(pricingJson);
   const openai = compareProvider(rows.filter((r) => r.deployment === 'Global'), parseTableProvider(openaiMd, '### Standard pricing data'));
   assert.equal(openai.mismatches.length, 1);
-  assert.equal(openai.mismatches[0].model, 'GPT-5.6 Luna');
+  assert.equal(openai.mismatches[0].model, 'gpt-5.6-luna');
   assert.deepEqual(openai.missing.sort(), ['gpt-5.5', 'gpt-9-nova']);
 
   const ignored = compareProvider(rows.filter((r) => r.deployment === 'Global'), parseTableProvider(openaiMd, '### Standard pricing data'), ['gpt-5.5', 'gpt-9-nova']);
   assert.deepEqual(ignored.missing, []);
 
   const google = compareProvider(rows.filter((r) => r.deployment === 'Google AI'), parseGeminiProvider(geminiMd));
-  assert.equal(google.mismatches.length, 0); // CSV 採促銷後價格，視為一致
+  assert.equal(google.mismatches.length, 0); // 價格檔採促銷後價格，視為一致
   assert.ok(google.promos.length >= 1);
   assert.deepEqual(google.missing, []); // TTS 屬非文字模型，略過
 });
@@ -116,11 +134,9 @@ test('csvKey 正規化 Extra High 變體', async () => {
   assert.equal(csvKey('Grok 4.7 (Extra High)'), csvKey('Grok 4.7'));
 });
 
-test('CSV 誤填促銷價時視為差異', () => {
-  const promoCsv = parseCsv(`h,h,h,h,h,h,h
-Gemini 3.8 Flash,Google AI,1M Tokens,0.75,0.075,3.75,N/A
-`);
-  const result = compareProvider(promoCsv, parseGeminiProvider(geminiMd));
+test('價格檔誤填促銷價時視為差異', () => {
+  const promoRows = parseLitellmJson(litellmJson([['gemini-3.8-flash', 'gemini', 0.75, 0.075, 3.75]]));
+  const result = compareProvider(promoRows, parseGeminiProvider(geminiMd));
   assert.equal(result.mismatches.length, 1);
   assert.match(result.mismatches[0].diffs[0], /標準價/);
 });

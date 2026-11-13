@@ -13,7 +13,7 @@
 | 檔案 | 用途 |
 | --- | --- |
 | `Dockerfile` | 多階段建置：以 `rust:1-alpine` 編譯 musl 靜態執行檔，執行階段只用 `alpine:3.22`，映像檔約 30 MB |
-| `Dockerfile.dockerignore` | 白名單式建置內容，只送出 `Cargo.toml`、`Cargo.lock`、`build.rs`、`src/`、`static/`、`pricing.csv` |
+| `Dockerfile.dockerignore` | 白名單式建置內容，只送出 `Cargo.toml`、`Cargo.lock`、`build.rs`、`src/`、`static/`、`model_prices_and_context_window.json` |
 | `tui-docker.sh` | 建立容器、匯入資料、開啟瀏覽器、匯出、清除等管理命令 |
 
 ## 需求

@@ -96,7 +96,7 @@ Windows ではデフォルトで次のネイティブパスを使用します：
 - 日別・月別・年別の Token 統計
 - 「すべての Agent」合算ビュー：マシン上のすべての Coding Agent の Token 使用量と推定費用を集計し、Agent 別の比率と Agent 別に積み上げた日別・月別の推移を表示
 - 入力、出力、キャッシュ読み取り、キャッシュ書き込み、推論 Token の内訳
-- `pricing.csv` に基づくローカルコスト推定
+- `model_prices_and_context_window.json` に基づくローカルコスト推定
 - Session 数、リクエスト数、API 所要時間の統計
 - モデル使用量ランキング
 - ローカル `state.vscdb` の `agentKv` 記録から Cursor を具体的なモデルに帰属。 一意に照合できない場合は `Unknown Model` のまま表示
@@ -338,7 +338,7 @@ Cursor は会話と Agent の transcript をプロジェクトディレクトリ
 3. 左側で Cursor を選択します。
 4. 右上の同期ボタンをクリックするか、バックグラウンド同期を待ちます。
 
-Cursor のローカルデータには正確な Token 数や公式の請求明細が含まれないため、Token はテキスト内容から推定します。コストは `pricing.csv` に対応するモデルがある場合のみ推定され、公式請求額とは一致しません。デフォルト以外の場所には `CURSOR_DIR` と `CURSOR_STATE_DB` を使用できます。
+Cursor のローカルデータには正確な Token 数や公式の請求明細が含まれないため、Token はテキスト内容から推定します。コストは `model_prices_and_context_window.json` に対応するモデルがある場合のみ推定され、公式請求額とは一致しません。デフォルト以外の場所には `CURSOR_DIR` と `CURSOR_STATE_DB` を使用できます。
 
 * * *
 
@@ -359,7 +359,7 @@ Gemini CLI は各プロジェクトの Session を `~/.gemini/tmp` 配下のプ�
 3. 左側で Gemini CLI を選択します。
 4. 右上の同期ボタンをクリックするか、バックグラウンド同期を待ちます。
 
-本ダッシュボードは Session が報告する Token とキャッシュ使用量をもとに、`pricing.csv` の Google AI モデル単価からリアルタイムに費用を試算します。デフォルト以外の場所は `GEMINI_DIR` で指定できます。
+本ダッシュボードは Session が報告する Token とキャッシュ使用量をもとに、`model_prices_and_context_window.json` の Google AI モデル単価からリアルタイムに費用を試算します。デフォルト以外の場所は `GEMINI_DIR` で指定できます。
 
 * * *
 
@@ -382,7 +382,7 @@ Grok Build が内部保存する Session stream を使用します。旧形式�
 3. 左側で Grok Build を選択します。
 4. 右上の同期ボタンをクリックするか、バックグラウンド同期を待ちます。
 
-Grok Build Session は context token snapshot だけを提供する場合も、provider usage とコストを含む場合もあります。ダッシュボードは provider usage/cost を優先します。context snapshot だけの場合は、`pricing.csv` の xAI API 価格でコストを推定し、Session 一覧に `Context` と表示します。これは SuperGrok や他のサブスクリプションプランの週間クォータを意味しません。
+Grok Build Session は context token snapshot だけを提供する場合も、provider usage とコストを含む場合もあります。ダッシュボードは provider usage/cost を優先します。context snapshot だけの場合は、`model_prices_and_context_window.json` の xAI API 価格でコストを推定し、Session 一覧に `Context` と表示します。これは SuperGrok や他のサブスクリプションプランの週間クォータを意味しません。
 
 * * *
 
@@ -445,7 +445,7 @@ Muse Code は Session を日付と Session ID ごとの `session.jsonl` とし�
 3. 左側で Muse Code を選択します。
 4. 右上の同期ボタンをクリックするか、バックグラウンド同期を待ちます。
 
-Muse Code のコストは、Session が報告するモデルと `pricing.csv` から推定します。データがデフォルトの場所にない場合は、`MUSE_DIR` に `sessions` を含む Muse Code データディレクトリを指定します。
+Muse Code のコストは、Session が報告するモデルと `model_prices_and_context_window.json` から推定します。データがデフォルトの場所にない場合は、`MUSE_DIR` に `sessions` を含む Muse Code データディレクトリを指定します。
 
 * * *
 
@@ -466,7 +466,7 @@ MiniMax Code は各 Session を年、月、日の階層ディレクトリに保�
 3. 左側で MiniMax Code を選択します。
 4. 右上の同期ボタンをクリックするか、バックグラウンド同期を待ちます。
 
-MiniMax Code のローカルログには費用欄がないため、本ダッシュボードは Session が報告する Token 数から `pricing.csv` のモデル単価で費用を推定します。作業ディレクトリと Session 名は MiniMax Code 実行期の `runtime-state.sqlite` から読み取り専用で取得し、本プロジェクトはこのデータベースへ書き込みや変更を行いません。データがデフォルトの場所にない場合は、`MCODE_DIR` に `sessions` を含む MiniMax Code データディレクトリを指定します。
+MiniMax Code のローカルログには費用欄がないため、本ダッシュボードは Session が報告する Token 数から `model_prices_and_context_window.json` のモデル単価で費用を推定します。作業ディレクトリと Session 名は MiniMax Code 実行期の `runtime-state.sqlite` から読み取り専用で取得し、本プロジェクトはこのデータベースへ書き込みや変更を行いません。データがデフォルトの場所にない場合は、`MCODE_DIR` に `sessions` を含む MiniMax Code データディレクトリを指定します。
 
 * * *
 
@@ -845,7 +845,7 @@ Invoke-WebRequest -Uri https://raw.githubusercontent.com/doggy8088/TokenUsageIns
 
 - 単一プラットフォーム用の実行ファイル
 - `static/` のフロントエンドアセット
-- モデル料金表 `pricing.csv`
+- モデル料金表 `model_prices_and_context_window.json`
 - `shell/` の Status Line およびサービススクリプト
 - `scripts/` ディレクトリ（`install.sh`、`install.ps1`、`get.sh`、`get.ps1`、`run-service.ps1` を含む）
 - README、LICENSE、VERSION
@@ -889,7 +889,7 @@ Windows のインストール先とポートをカスタマイズ：
 `Release` workflow は各ビルドで Linux、macOS、Windows 上の対応するインストールスクリプト（`install.sh` / `install.ps1`）を実行し、インストール後に実行ファイルを起動して次を確認します：
 
 - 指定したポートでサービスが `/api/<assistant>/pricing` に応答する
-- 応答内容がパッケージ内の `pricing.csv` を実際に読み込んでいる
+- 応答内容がパッケージ内の `model_prices_and_context_window.json` を実際に読み込んでいる
 - 新しい `INSIGHTS_DIR` が作成され、SQLite データベースが生成される
 
 `get.sh` と `get.ps1` も各ビルド前に構文チェック（`bash -n` と PowerShell AST 解析）を受け、Release に公開されるバージョンが正常に実行できることを保証します。
@@ -1049,7 +1049,7 @@ src/                 Rust 後端、API、SQLite 同步、價格與時間軸解�
 static/              前端 HTML、JavaScript、CSS 與圖片資產
 shell/               Bash/PowerShell Status Line collector 與 systemd 服務範本
 scripts/             Linux/macOS、Windows 安裝與 Windows smoke test
-pricing.csv          模型價格表，本地估算費用依此檔案載入
+model_prices_and_context_window.json          模型價格表，本地估算費用依此檔案載入
 ```
 
 * * *

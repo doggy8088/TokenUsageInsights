@@ -424,9 +424,22 @@ fn supplemental_pricing_entries() -> Vec<PricingEntry> {
     ]
 }
 
+/// 記錄下載快取時的程式版本，用來判斷快取是否仍可蓋過內建定價資料。
+const LITELLM_CACHE_VERSION_FILENAME: &str = "model_prices_and_context_window.json.version";
+
+/// 使用者以 `pricing update` 下載的快取只在「下載當時的程式版本」生效。
+/// 升級程式後內建 JSON 可能收錄更新的模型，舊快取若繼續蓋過它會讓新模型找不到價格，
+/// 因此版本不符（或沒有版本標記的舊快取）時回退到內建資料，需重新執行 `pricing update`。
+fn pricing_cache_is_current(dir: &std::path::Path) -> bool {
+    dir.join(LITELLM_PRICING_FILENAME).is_file()
+        && std::fs::read_to_string(dir.join(LITELLM_CACHE_VERSION_FILENAME))
+            .is_ok_and(|v| v.trim() == env!("CARGO_PKG_VERSION"))
+}
+
 pub fn resolve_pricing_file_path() -> PathBuf {
-    let user_cache = crate::db::get_insights_dir().join(LITELLM_PRICING_FILENAME);
-    if user_cache.is_file() {
+    let insights_dir = crate::db::get_insights_dir();
+    let user_cache = insights_dir.join(LITELLM_PRICING_FILENAME);
+    if pricing_cache_is_current(&insights_dir) {
         return user_cache;
     }
 
@@ -855,6 +868,11 @@ pub async fn download_and_update_pricing(
 
     std::fs::rename(&temp_file, &target_file)
         .map_err(|e| format!("無法替換目標檔案 {}: {e}", target_file.display()))?;
+    std::fs::write(
+        target_dir.join(LITELLM_CACHE_VERSION_FILENAME),
+        env!("CARGO_PKG_VERSION"),
+    )
+    .map_err(|e| format!("無法寫入快取版本標記: {e}"))?;
 
     Ok(PricingUpdateResult {
         success: true,
@@ -2593,6 +2611,34 @@ mod tests {
         assert!(entries
             .iter()
             .any(|e| e.model_name == "custom/test-model (>200k)"));
+    }
+
+    #[test]
+    fn pricing_cache_only_overrides_packaged_data_for_same_version() {
+        let dir = std::env::temp_dir().join(format!("tui-pricing-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 沒有快取檔
+        assert!(!pricing_cache_is_current(&dir));
+
+        // 有快取檔但沒有版本標記（舊版本下載）
+        std::fs::write(dir.join(LITELLM_PRICING_FILENAME), "{}").unwrap();
+        assert!(!pricing_cache_is_current(&dir));
+
+        // 版本不符
+        std::fs::write(dir.join(LITELLM_CACHE_VERSION_FILENAME), "0.0.0").unwrap();
+        assert!(!pricing_cache_is_current(&dir));
+
+        // 版本相符
+        std::fs::write(
+            dir.join(LITELLM_CACHE_VERSION_FILENAME),
+            format!("{}\n", env!("CARGO_PKG_VERSION")),
+        )
+        .unwrap();
+        assert!(pricing_cache_is_current(&dir));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

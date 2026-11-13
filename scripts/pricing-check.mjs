@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // 每日定價檢查：直接解析各供應商「官方定價文件」（以官方站台提供的 Markdown 版本為資料來源），
-// 與 pricing.csv 的基礎列（無長上下文分級）比對，回報價格差異、促銷價以及尚未收錄的新模型。
-// 僅產生報告（Markdown），不會直接改寫 pricing.csv，需人工對照官方文件確認後再更新。
+// 與內建的 LiteLLM model_prices_and_context_window.json 基礎價（無長上下文分級）比對，
+// 回報價格差異、促銷價以及尚未收錄的新模型。
+// 僅產生報告（Markdown），不會直接改寫價格檔，需人工對照官方文件確認後再更新。
 // 若某個官方頁面抓取失敗或解析不到任何價格（通常代表頁面改版），會列為錯誤。
 import { readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -9,21 +10,40 @@ import path from 'node:path';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const EPSILON = 1e-9;
-// 非文字模型（圖像、語音、嵌入等）不在 pricing.csv 的追蹤範圍，列新模型時略過。
+// 非文字模型（圖像、語音、嵌入等）不在價格檔的追蹤範圍，列新模型時略過。
 const NON_TEXT = /tts|image|embedding|live|lyria|transcribe|robotics|veo|imagen|omni|nano banana|gemma|audio|imagine|video|speech/i;
 
-export function parseCsv(text) {
+// LiteLLM 的 litellm_provider 對應到 pricing-sources.json 的 deployments 名稱；
+// 只取原廠直連條目，雲端轉售（bedrock、azure、vertex_ai 等）價格不屬於官方文件比對範圍。
+const LITELLM_DEPLOYMENTS = {
+  openai: 'Global',
+  anthropic: 'Global',
+  gemini: 'Google AI',
+  xai: 'xAI API',
+};
+
+const perMillion = (cost) => (Number.isFinite(cost) ? Number((cost * 1e6).toPrecision(10)) : null);
+
+export function parseLitellmJson(text) {
   const rows = [];
-  for (const line of text.replace(/^\uFEFF/, '').split(/\r?\n/).slice(1)) {
-    if (!line.trim()) continue;
-    const c = line.split(',');
-    if (c.length < 6) continue;
+  const seen = new Set();
+  for (const [key, v] of Object.entries(JSON.parse(text.replace(/^\uFEFF/, '')))) {
+    if (!v || typeof v !== 'object') continue;
+    const deployment = LITELLM_DEPLOYMENTS[v.litellm_provider];
+    if (!deployment || !['chat', 'responses'].includes(v.mode)) continue;
+    // LiteLLM 的 Claude 代號用連字號表示版本（claude-opus-4-5-20251101），還原為官方文件的 4.5 寫法。
+    const model = (key.startsWith(`${v.litellm_provider}/`) ? key.slice(v.litellm_provider.length + 1) : key)
+      .replace(/-(?:\d{8}|latest)$/, '')
+      .replace(/(\d)-(\d{1,2})(?!\d)/g, '$1.$2');
+    const id = `${deployment}|${model}`;
+    if (seen.has(id)) continue;
+    seen.add(id);
     rows.push({
-      model: c[0].trim(),
-      deployment: c[1].trim(),
-      input: toNumber(c[3]),
-      cached: toNumber(c[4]),
-      output: toNumber(c[5]),
+      model,
+      deployment,
+      input: perMillion(v.input_cost_per_token),
+      cached: perMillion(v.cache_read_input_token_cost),
+      output: perMillion(v.output_cost_per_token),
     });
   }
   return rows;
@@ -43,7 +63,7 @@ export function normalizeName(name) {
   return name.toLowerCase().replace(/[^a-z0-9.]+/g, ' ').trim();
 }
 
-// CSV 的推理強度／Thinking 後綴與官方基礎模型共用同一組價格。
+// 價格檔的推理強度／Thinking 後綴與官方基礎模型共用同一組價格。
 export function csvKey(name) {
   return normalizeName(name.replace(/\s*\((?:low|medium|high|xhigh|extra high|minimal|thinking|non-thinking|reasoning)\)/gi, ''));
 }
@@ -172,7 +192,7 @@ export function parseProvider(provider, md) {
   return provider.parser === 'gemini' ? parseGeminiProvider(md) : parseTableProvider(md, provider.sectionHeading);
 }
 
-// pricing.csv 依慣例記錄標準牌價：有促銷時以促銷後價格（after）為準，促銷價僅作報告提醒。
+// 價格檔依慣例記錄標準牌價：有促銷時以促銷後價格（after）為準，促銷價僅作報告提醒。
 const standardPrice = (p) => (p.after != null ? p.after : p.now);
 const matchesPrice = (local, p) => Math.abs(local - standardPrice(p)) <= EPSILON;
 
@@ -194,9 +214,9 @@ export function compareProvider(csvRows, official, ignoreModels = []) {
     ]) {
       if (local == null || !price) continue;
       if (!matchesPrice(local, price)) {
-        diffs.push(`${label}：CSV ${local} → 官方標準價 ${standardPrice(price)}${price.after != null ? `（目前促銷價 ${price.now}，至 ${price.until}）` : ''}`);
+        diffs.push(`${label}：本地 ${local} → 官方標準價 ${standardPrice(price)}${price.after != null ? `（目前促銷價 ${price.now}，至 ${price.until}）` : ''}`);
       } else if (price.after != null) {
-        promos.push(`${csvKey(row.model)} ${label}：官方目前促銷價 ${price.now}，${price.until} 後為 ${price.after}（CSV 已採後者）`);
+        promos.push(`${csvKey(row.model)} ${label}：官方目前促銷價 ${price.now}，${price.until} 後為 ${price.after}（價格檔已採後者）`);
       }
     }
     if (diffs.length) mismatches.push({ model: row.model, diffs });
@@ -225,9 +245,9 @@ async function fetchText(url) {
   throw lastError;
 }
 
-export async function run({ csvPath = path.join(root, 'pricing.csv'), reportPath } = {}) {
+export async function run({ pricingPath = path.join(root, 'model_prices_and_context_window.json'), reportPath } = {}) {
   const sources = JSON.parse(readFileSync(path.join(root, 'scripts', 'pricing-sources.json'), 'utf8'));
-  const csvRows = parseCsv(readFileSync(csvPath, 'utf8'));
+  const csvRows = parseLitellmJson(readFileSync(pricingPath, 'utf8'));
   const lines = ['# 模型定價每日檢查報告', '', '價格來源：各供應商官方定價文件（權威來源）。', ''];
   let drift = 0;
   let errors = 0;
@@ -263,7 +283,7 @@ export async function run({ csvPath = path.join(root, 'pricing.csv'), reportPath
       lines.push('');
     }
     if (missing.length) {
-      lines.push('### pricing.csv 尚未收錄的新模型', '');
+      lines.push('### 內建價格檔（LiteLLM JSON）尚未收錄的新模型', '');
       for (const name of missing) lines.push(`- ${name}`);
       lines.push('');
     }

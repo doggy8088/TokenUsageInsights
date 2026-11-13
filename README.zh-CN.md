@@ -96,7 +96,7 @@ Windows 默认使用以下原生路径：
 - 每日、月度、年度 Token 统计
 - “全部 Agent”合并视图：汇总整台电脑所有 Coding Agent 的 Token 用量与估算费用，并列出各 Agent 占比与按 Agent 堆叠的每日／每月趋势
 - 输入、输出、缓存读取、缓存写入、推理 Token 拆分
-- 根据 `pricing.csv` 进行本地费用估算
+- 根据 `model_prices_and_context_window.json` 进行本地费用估算
 - Session 数量、请求次数与 API 耗时统计
 - 模型使用量排名
 - Cursor 可由本地 `state.vscdb` 的 `agentKv` 记录归因到具体模型；无法唯一匹配时保留为 `Unknown Model`
@@ -338,7 +338,7 @@ Cursor 会将对话与 Agent transcript 保存到项目目录下。看板也会�
 3. 在左侧选择 Cursor。
 4. 按右上角同步按钮，或等待后台同步。
 
-Cursor 本地数据不包含精确 Token 或官方账单明细，因此 Token 根据文本内容估算；仅当 `pricing.csv` 存在对应模型时才会估算费用，结果不等同于官方账单。非默认数据位置可使用 `CURSOR_DIR` 与 `CURSOR_STATE_DB` 指定。
+Cursor 本地数据不包含精确 Token 或官方账单明细，因此 Token 根据文本内容估算；仅当 `model_prices_and_context_window.json` 存在对应模型时才会估算费用，结果不等同于官方账单。非默认数据位置可使用 `CURSOR_DIR` 与 `CURSOR_STATE_DB` 指定。
 
 * * *
 
@@ -359,7 +359,7 @@ Gemini CLI 会将各项目的 Session 保存在 `~/.gemini/tmp` 下的项目目�
 3. 在左侧选择 Gemini CLI。
 4. 按右上角同步按钮，或等待后台同步。
 
-本看板会根据 session 记录的 Token 与缓存用量，对照 `pricing.csv` 的 Google AI 模型单价即时估算费用；非默认数据位置可使用 `GEMINI_DIR` 指定包含 `tmp` 的根目录。
+本看板会根据 session 记录的 Token 与缓存用量，对照 `model_prices_and_context_window.json` 的 Google AI 模型单价即时估算费用；非默认数据位置可使用 `GEMINI_DIR` 指定包含 `tmp` 的根目录。
 
 * * *
 
@@ -382,7 +382,7 @@ Gemini CLI 会将各项目的 Session 保存在 `~/.gemini/tmp` 下的项目目�
 3. 在左侧选择 Grok Build。
 4. 按右上角同步按钮，或等待后台同步。
 
-Grok Build Session 可能只提供 context token snapshot，也可能包含 provider usage 与成本。看板会优先使用 provider usage/cost；只有 context snapshot 时，费用会根据 `pricing.csv` 的 xAI API 价格估算，并在 Session 列表标示 `Context`，不代表 SuperGrok 或其他订阅方案的每周配额。
+Grok Build Session 可能只提供 context token snapshot，也可能包含 provider usage 与成本。看板会优先使用 provider usage/cost；只有 context snapshot 时，费用会根据 `model_prices_and_context_window.json` 的 xAI API 价格估算，并在 Session 列表标示 `Context`，不代表 SuperGrok 或其他订阅方案的每周配额。
 
 * * *
 
@@ -445,7 +445,7 @@ Muse Code 会将 Session 按日期与 Session ID 分层保存为 `session.jsonl`
 3. 在左侧选择 Muse Code。
 4. 按右上角同步按钮，或等待后台同步。
 
-Muse Code 的费用会根据 Session 报告的模型与 `pricing.csv` 进行估算。如果数据不在默认位置，可设置 `MUSE_DIR` 指向包含 `sessions` 的 Muse Code 数据目录。
+Muse Code 的费用会根据 Session 报告的模型与 `model_prices_and_context_window.json` 进行估算。如果数据不在默认位置，可设置 `MUSE_DIR` 指向包含 `sessions` 的 Muse Code 数据目录。
 
 * * *
 
@@ -466,7 +466,7 @@ MiniMax Code 会将每个 Session 按年份、月份与日期分层保存，并�
 3. 在左侧选择 MiniMax Code。
 4. 按右上角同步按钮，或等待后台同步。
 
-MiniMax Code 的本地日志不提供费用字段，因此本看板会依 Session 回报的 Token 数量，对照 `pricing.csv` 的模型单价估算费用。工作目录与 Session 名称会以只读方式从 MiniMax Code 运行期的 `runtime-state.sqlite` 取得，本项目不会写入或修改该数据库。如果数据不在默认位置，可设置 `MCODE_DIR` 指向包含 `sessions` 的 MiniMax Code 数据目录。
+MiniMax Code 的本地日志不提供费用字段，因此本看板会依 Session 回报的 Token 数量，对照 `model_prices_and_context_window.json` 的模型单价估算费用。工作目录与 Session 名称会以只读方式从 MiniMax Code 运行期的 `runtime-state.sqlite` 取得，本项目不会写入或修改该数据库。如果数据不在默认位置，可设置 `MCODE_DIR` 指向包含 `sessions` 的 MiniMax Code 数据目录。
 
 * * *
 
@@ -845,7 +845,7 @@ Invoke-WebRequest -Uri https://raw.githubusercontent.com/doggy8088/TokenUsageIns
 
 - 单一平台可执行文件
 - `static/` 前端资源
-- `pricing.csv` 模型费用表
+- `model_prices_and_context_window.json` 模型费用表
 - `shell/` 目录下的 Status Line 与服务脚本
 - `scripts/` 目录（含 `install.sh`、`install.ps1`、`get.sh`、`get.ps1`、`run-service.ps1`）
 - README、LICENSE 与 VERSION
@@ -889,7 +889,7 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1 -Service
 `Release` workflow 每次构建都会在 Linux、macOS 与 Windows 上实际运行对应的安装脚本（`install.sh` / `install.ps1`），安装后启动可执行文件并确认：
 
 - 服务会在指定端口响应 `/api/<assistant>/pricing`
-- 响应内容确实加载了包内的 `pricing.csv`
+- 响应内容确实加载了包内的 `model_prices_and_context_window.json`
 - 全新的 `INSIGHTS_DIR` 会被创建并生成 SQLite 数据库
 
 `get.sh` 与 `get.ps1` 也会在每次构建时先进行语法检查（`bash -n` 与 PowerShell AST 解析），确保推送到 Release 的版本可以正常运行。
@@ -1049,7 +1049,7 @@ src/                 Rust 後端、API、SQLite 同步、價格與時間軸解�
 static/              前端 HTML、JavaScript、CSS 與圖片資產
 shell/               Bash/PowerShell Status Line collector 與 systemd 服務範本
 scripts/             Linux/macOS、Windows 安裝與 Windows smoke test
-pricing.csv          模型價格表，本地估算費用依此檔案載入
+model_prices_and_context_window.json          模型價格表，本地估算費用依此檔案載入
 ```
 
 * * *

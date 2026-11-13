@@ -96,7 +96,7 @@ Drive letters, paths containing spaces or non-ASCII characters, and UNC paths ar
 - Daily, monthly, and yearly token statistics
 - “All Agents” combined view: aggregates token usage and estimated cost from every coding agent on the machine, with per-agent shares and daily/monthly trends stacked by agent
 - Breakdown of input, output, cache read, cache write, and reasoning tokens
-- Local cost estimates based on `pricing.csv`
+- Local cost estimates based on `model_prices_and_context_window.json`
 - Session count, request count, and API duration statistics
 - Model usage rankings
 - Cursor sessions can be attributed to specific models from local `state.vscdb` `agentKv` records; unmatched sessions remain `Unknown Model`
@@ -338,7 +338,7 @@ Usage:
 3. Select Cursor on the left.
 4. Click the sync button in the upper-right corner, or wait for background sync.
 
-Cursor's local data does not contain exact token counts or official billing details, so tokens are estimated from text content. Costs are estimated only when `pricing.csv` contains the matching model and do not represent the official bill. Use `CURSOR_DIR` and `CURSOR_STATE_DB` for non-default locations.
+Cursor's local data does not contain exact token counts or official billing details, so tokens are estimated from text content. Costs are estimated only when `model_prices_and_context_window.json` contains the matching model and do not represent the official bill. Use `CURSOR_DIR` and `CURSOR_STATE_DB` for non-default locations.
 
 * * *
 
@@ -359,7 +359,7 @@ Usage:
 3. Select Gemini CLI on the left.
 4. Click the sync button in the upper-right corner, or wait for background sync.
 
-The dashboard estimates costs in real time from the tokens and cache reported by each session against Google AI model pricing in `pricing.csv`. For non-default data locations, set `GEMINI_DIR` to the directory containing `tmp`.
+The dashboard estimates costs in real time from the tokens and cache reported by each session against Google AI model pricing in `model_prices_and_context_window.json`. For non-default data locations, set `GEMINI_DIR` to the directory containing `tmp`.
 
 * * *
 
@@ -382,7 +382,7 @@ Usage:
 3. Select Grok Build on the left.
 4. Click the sync button in the upper-right corner, or wait for background sync.
 
-A Grok Build session may provide only a context token snapshot, or may also include provider usage and cost. The dashboard prioritizes provider usage/cost; when only a context snapshot is available, cost is estimated using the xAI API prices in `pricing.csv` and the session list labels it `Context`. This does not represent the weekly quota of SuperGrok or other subscription plans.
+A Grok Build session may provide only a context token snapshot, or may also include provider usage and cost. The dashboard prioritizes provider usage/cost; when only a context snapshot is available, cost is estimated using the xAI API prices in `model_prices_and_context_window.json` and the session list labels it `Context`. This does not represent the weekly quota of SuperGrok or other subscription plans.
 
 * * *
 
@@ -445,7 +445,7 @@ Usage:
 3. Select Muse Code on the left.
 4. Click the sync button in the upper-right corner, or wait for background sync.
 
-Muse Code costs are estimated from the model reported by the session and `pricing.csv`. If the data is not in the default location, set `MUSE_DIR` to the Muse Code data directory that contains `sessions`.
+Muse Code costs are estimated from the model reported by the session and `model_prices_and_context_window.json`. If the data is not in the default location, set `MUSE_DIR` to the Muse Code data directory that contains `sessions`.
 
 * * *
 
@@ -466,7 +466,7 @@ Usage:
 3. Select MiniMax Code on the left.
 4. Click the sync button in the upper-right corner, or wait for background sync.
 
-MiniMax Code local logs do not report a cost field, so the dashboard estimates cost from the tokens each session reports against the model prices in `pricing.csv`. The working directory and session name are read read-only from MiniMax Code's runtime `runtime-state.sqlite`; this project never writes to or modifies that database. If the data is not in the default location, set `MCODE_DIR` to the MiniMax Code data directory that contains `sessions`.
+MiniMax Code local logs do not report a cost field, so the dashboard estimates cost from the tokens each session reports against the model prices in `model_prices_and_context_window.json`. The working directory and session name are read read-only from MiniMax Code's runtime `runtime-state.sqlite`; this project never writes to or modifies that database. If the data is not in the default location, set `MCODE_DIR` to the MiniMax Code data directory that contains `sessions`.
 
 * * *
 
