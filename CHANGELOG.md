@@ -4,9 +4,25 @@
 
 ## [未發行]
 
-### 新增
+## [1.6.7] - 2026-11-13
 
-- 補上 `Gemini 4 Hydrogen`（含 `Low`、`Medium`、`High`、`Extra` 思考層級變體）的 Google AI 官方付費標準定價規則（輸入 1.50、快取輸入 0.075、輸出 7.50 美元／每百萬 Token），讓使用 Gemini 4 Hydrogen 的會話可以估算成本；Antigravity 的 `gemini-4-hydrogen-*` 模型代號也會對應到同一組價格。
+本次 patch release 新增 Gemini 4 Hydrogen 的費用估算規則，並升級自我更新功能使用的 ZIP 解壓縮套件。
+
+### 新增與改善
+
+- 新增 Gemini 4 Hydrogen 及 Low、Medium、High、Extra 思考層級的 Google AI 定價規則；使用 Gemini 4 Hydrogen 的會話可估算成本，不再出現找不到價格規則的提示。Antigravity 的 `gemini-4-hydrogen-*` 模型代號（例如 `gemini-4-hydrogen-xhigh`）也會套用同一組價格，但儀表板暫時顯示原始代號。
+
+### 變更
+
+- 將 `zip` 套件從 2.4.2 升級至 9.0.5；自我更新在 Windows 解開 ZIP 發行封裝時改用新版套件，行為不變。
+
+### 資料影響
+
+- Gemini 4 Hydrogen 標準價為每百萬 Token 輸入 1.50、快取輸入 0.075、輸出 7.50 美元（批次 API 為 0.75／0.0375／3.75）。官方未公告優惠價或日後調價，也沒有長上下文分層，既有 Hydrogen 用量現在可計算費用估算。
+
+### 相容性
+
+- 未變更 SQLite 資料表結構、公開 API、CLI 參數、環境變數或安裝流程。
 
 ## [1.6.6] - 2026-11-12
 
@@ -1151,7 +1167,8 @@
 - 修正行動版側邊欄遮擋、黑畫面、標題擠壓、圖表導覽索引與年度版面問題。
 - 修正並補齊多個 Gemini、Claude、GPT 與 GPT-OSS 模型的定價規則。
 
-[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.6.6...HEAD
+[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.6.7...HEAD
+[1.6.7]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.6.6...v1.6.7
 [1.6.6]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.6.5...v1.6.6
 [1.6.5]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.6.4...v1.6.5
 [1.6.4]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.6.3...v1.6.4
