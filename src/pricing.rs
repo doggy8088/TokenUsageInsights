@@ -1024,6 +1024,17 @@ pub struct PreparedPricingRules {
     parsed: Vec<PreparedRule>,
 }
 
+/// 判斷模型名稱是否為未識別或預設佔位名稱（例如 "Unknown Model"、"Unknown" 等）。
+/// 未識別模型無法對應到價格規則，成本估算應直接視為 0.0，不應擲出錯誤或嘗試查詢費率。
+pub fn is_unknown_model_name(model: &str) -> bool {
+    let trimmed = model.trim();
+    trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("unknown")
+        || trimmed.eq_ignore_ascii_case("unknown model")
+        || trimmed.eq_ignore_ascii_case("unknown_model")
+        || trimmed.eq_ignore_ascii_case("<unknown>")
+}
+
 impl PreparedPricingRules {
     pub fn from_rules(rules: Vec<PricingRule>) -> Self {
         let parsed = rules
@@ -1063,7 +1074,7 @@ impl PreparedPricingRules {
 
         let model_name = model_name
             .map(str::trim)
-            .filter(|name| !name.is_empty())
+            .filter(|name| !name.is_empty() && !is_unknown_model_name(name))
             .ok_or_else(|| "缺少模型名稱，無法估算成本".to_string())?;
         self.calculate_cost(
             model_name,
@@ -1261,7 +1272,7 @@ fn calculate_usage_cost(
 
     let model_name = model_name
         .map(str::trim)
-        .filter(|name| !name.is_empty())
+        .filter(|name| !name.is_empty() && !is_unknown_model_name(name))
         .ok_or_else(|| "缺少模型名稱，無法估算成本".to_string())?;
     calculate_cost(
         rules,
@@ -1288,6 +1299,21 @@ mod tests {
     fn token_usage_without_model_reports_missing_metadata() {
         let error = calculate_usage_cost(&[], None, 10, 2, 3, 0, 0).unwrap_err();
         assert_eq!(error, "缺少模型名稱，無法估算成本");
+    }
+
+    #[test]
+    fn token_usage_with_unknown_model_reports_missing_metadata() {
+        for unknown in [
+            "Unknown Model",
+            "unknown model",
+            "Unknown",
+            "unknown",
+            " unknown_model ",
+            "<unknown>",
+        ] {
+            let error = calculate_usage_cost(&[], Some(unknown), 10, 2, 3, 0, 0).unwrap_err();
+            assert_eq!(error, "缺少模型名稱，無法估算成本");
+        }
     }
 
     #[test]

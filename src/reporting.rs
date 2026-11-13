@@ -191,10 +191,10 @@ static WARNED_PRICING_MODELS: LazyLock<Mutex<HashSet<String>>> =
 
 /// 內部工具與無法識別的模型沒有可靠價格規則，保留用量統計但略過錯誤提示。
 fn is_unpriced_internal_model(model: &str) -> bool {
-    matches!(
-        model.trim().to_ascii_lowercase().as_str(),
-        "copilot-search-a" | "copilot-search-b" | "unknown model"
-    )
+    let trimmed = model.trim();
+    trimmed.eq_ignore_ascii_case("copilot-search-a")
+        || trimmed.eq_ignore_ascii_case("copilot-search-b")
+        || crate::pricing::is_unknown_model_name(trimmed)
 }
 
 fn log_pricing_failure(model: &str, session_id: &str, turn_no: u32, error: &str) {
@@ -226,6 +226,8 @@ fn record_usage(
     let cost_usd =
         if let Some(reported_cost) = entry.cost.as_ref().and_then(|cost| cost.reported_cost_usd) {
             reported_cost
+        } else if model.is_none_or(crate::pricing::is_unknown_model_name) {
+            0.0
         } else {
             match pricing_rules.calculate_usage_cost(
                 model,
@@ -1046,6 +1048,59 @@ mod tests {
                 let was_warned = WARNED_PRICING_MODELS.lock().unwrap().contains(model.trim());
                 assert!(!was_warned, "{model} 缺少價格規則時應忽略錯誤提示");
             }
+        }
+    }
+
+    #[test]
+    fn unknown_model_pricing_is_silent_and_preserves_tokens() {
+        let rules = PreparedPricingRules::from_rules(vec![]);
+
+        for model in [
+            "Unknown Model",
+            "unknown model",
+            "Unknown",
+            "unknown",
+            " unknown_model ",
+            "<unknown>",
+        ] {
+            for has_delta in [true, false] {
+                let entries = [summary_entry(1, model, token_stats(100, 50, 25), has_delta)];
+
+                let result = summarize_session_usage(&rules, &entries);
+
+                assert_eq!(result.usage.total_tokens, 175);
+                assert_eq!(result.usage.input_tokens, 100);
+                assert_eq!(result.usage.output_tokens, 50);
+                assert_eq!(result.usage.cache_read_tokens, 25);
+                assert_eq!(result.usage.cost_usd, 0.0);
+                assert_eq!(result.models.len(), 1);
+                assert_eq!(result.models[0].model, model.trim());
+                assert_eq!(result.models[0].usage.total_tokens, 175);
+                assert_eq!(result.models[0].usage.cost_usd, 0.0);
+                let was_warned = WARNED_PRICING_MODELS.lock().unwrap().contains(model.trim());
+                assert!(
+                    !was_warned,
+                    "{model} 為未識別模型，應直接估為 0.0 且不應提示錯誤"
+                );
+            }
+        }
+
+        // 測試 model 為 None 的情況
+        for has_delta in [true, false] {
+            let mut entry = summary_entry(1, "", token_stats(100, 50, 25), has_delta);
+            entry.model = None;
+            let result = summarize_session_usage(&rules, &[entry]);
+
+            assert_eq!(result.usage.total_tokens, 175);
+            assert_eq!(result.usage.cost_usd, 0.0);
+            assert_eq!(result.models.len(), 1);
+            assert_eq!(result.models[0].model, "Unknown Model");
+            assert_eq!(result.models[0].usage.cost_usd, 0.0);
+            let was_warned = WARNED_PRICING_MODELS
+                .lock()
+                .unwrap()
+                .contains("Unknown Model");
+            assert!(!was_warned, "None 模型應標為 Unknown Model，且不應提示錯誤");
         }
     }
 
