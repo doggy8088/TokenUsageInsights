@@ -4,6 +4,15 @@
 
 ## [未發行]
 
+### 新增
+
+- 補上 `Claude Fable 5.2` 與 `Claude Mythos 5.2`（含 `Cursor` 部署條目）的官方標準定價規則（輸入 8.00、快取輸入 0.20、輸出 40.00 美元／每百萬 Token）。
+- 補齊 Antigravity CLI 透過 `agy models` 查證的新增模型顯示名稱對應，包含 `Gemini 4 Hydrogen (Low/Medium/High/XHigh)`、`Orchestrator (Carbon)`、`Orchestrator (Argon)`、`Claude Opus 5.5 (Low/Medium/High)`、`Claude Sonnet 5.5 (Low/Medium/High)` 與 `GPT-OSS 120B (Medium)`。
+
+### 修正
+
+- 修正每日定價檢查腳本對 Google Gemini 官方定價頁新版 Markdoc 格式（`{% tab title="Standard" %}` / `{% table %}`）的解析，以及 Anthropic retired 模型巢狀括號備註的正規化處理，解決 #83 的解析錯誤與誤報。
+
 ## [1.6.7] - 2026-11-13
 
 本次 patch release 新增 Gemini 4 Hydrogen 的費用估算規則，並升級自我更新功能使用的 ZIP 解壓縮套件。

@@ -1038,6 +1038,23 @@ mod tests {
     }
 
     #[test]
+    fn claude_fable_and_mythos_5_2_use_packaged_pricing() {
+        let rules = load_pricing_rules();
+
+        assert_packaged_cost_per_million(
+            &rules,
+            &[
+                "Claude Fable 5.2",
+                "Claude Mythos 5.2",
+                "claude-fable-5-2",
+                "claude-mythos-5-2",
+            ],
+            8.00 + 40.00 + 0.20,
+            "Claude Fable/Mythos 5.2",
+        );
+    }
+
+    #[test]
     fn gemini_4_hydrogen_thinking_levels_use_packaged_pricing() {
         let rules = load_pricing_rules();
 
@@ -1047,6 +1064,7 @@ mod tests {
             "Gemini 4 Hydrogen (Medium)",
             "Gemini 4 Hydrogen (High)",
             "Gemini 4 Hydrogen (Extra)",
+            "Gemini 4 Hydrogen (XHigh)",
             "gemini-4-hydrogen",
             // Antigravity CLI model ID documented at antigravity.google/docs/models;
             // unmapped IDs fall back to the contains match on the base rule.

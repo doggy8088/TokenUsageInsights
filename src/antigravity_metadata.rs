@@ -544,11 +544,24 @@ fn model_label(uid: &str) -> &str {
         "agy-demo-medium" | "gemini-4-argon-medium" => "Gemini 4 Argon (Medium)",
         "agy-demo-high" | "gemini-4-argon-high" => "Gemini 4 Argon (High)",
         "agy-demo-low" | "gemini-4-argon-low" => "Gemini 4 Argon (Low)",
+        "gemini-4-hydrogen-high" => "Gemini 4 Hydrogen (High)",
+        "gemini-4-hydrogen-xhigh" => "Gemini 4 Hydrogen (XHigh)",
+        "gemini-4-hydrogen-medium" => "Gemini 4 Hydrogen (Medium)",
+        "gemini-4-hydrogen-low" => "Gemini 4 Hydrogen (Low)",
+        "gemini-pro-orchestrator" => "Orchestrator (Carbon)",
+        "gemini-pro-orchestrator-argon" => "Orchestrator (Argon)",
         "gemini-3.8-flash-high" => "Gemini 3.8 Flash (High)",
         "gemini-3.8-flash-medium" => "Gemini 3.8 Flash (Medium)",
         "gemini-3.8-flash-low" => "Gemini 3.8 Flash (Low)",
         "gemini-flash-demo" => "Gemini 3.7 Flash",
         "gemini-3.8-flash-demo" => "Gemini 3.8 Flash",
+        "claude-opus-5-5-low" => "Claude Opus 5.5 (Low)",
+        "claude-opus-5-5-medium" => "Claude Opus 5.5 (Medium)",
+        "claude-opus-5-5-high" => "Claude Opus 5.5 (High)",
+        "claude-sonnet-5-5-low" => "Claude Sonnet 5.5 (Low)",
+        "claude-sonnet-5-5-medium" => "Claude Sonnet 5.5 (Medium)",
+        "claude-sonnet-5-5-high" => "Claude Sonnet 5.5 (High)",
+        "gpt-oss-120b-medium" => "GPT-OSS 120B (Medium)",
         _ => uid,
     }
 }
@@ -670,6 +683,28 @@ mod tests {
             "Gemini 4 Carbon (High)"
         );
         assert_eq!(model_label("gemini-4-carbon-low"), "Gemini 4 Carbon (Low)");
+    }
+
+    #[test]
+    fn antigravity_2026_11_agy_model_ids_map_to_display_names() {
+        // IDs verified with `agy models` on 2026-11-15.
+        for (uid, expected) in [
+            ("gemini-4-hydrogen-high", "Gemini 4 Hydrogen (High)"),
+            ("gemini-4-hydrogen-xhigh", "Gemini 4 Hydrogen (XHigh)"),
+            ("gemini-4-hydrogen-medium", "Gemini 4 Hydrogen (Medium)"),
+            ("gemini-4-hydrogen-low", "Gemini 4 Hydrogen (Low)"),
+            ("gemini-pro-orchestrator", "Orchestrator (Carbon)"),
+            ("gemini-pro-orchestrator-argon", "Orchestrator (Argon)"),
+            ("claude-opus-5-5-low", "Claude Opus 5.5 (Low)"),
+            ("claude-opus-5-5-medium", "Claude Opus 5.5 (Medium)"),
+            ("claude-opus-5-5-high", "Claude Opus 5.5 (High)"),
+            ("claude-sonnet-5-5-low", "Claude Sonnet 5.5 (Low)"),
+            ("claude-sonnet-5-5-medium", "Claude Sonnet 5.5 (Medium)"),
+            ("claude-sonnet-5-5-high", "Claude Sonnet 5.5 (High)"),
+            ("gpt-oss-120b-medium", "GPT-OSS 120B (Medium)"),
+        ] {
+            assert_eq!(model_label(uid), expected, "unexpected label for {uid}");
+        }
     }
 
     #[test]
