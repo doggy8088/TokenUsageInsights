@@ -1930,6 +1930,27 @@ fn sync_hook_usage_logs_with_cancel(
                     for entry in &mut parsed_entries {
                         normalize_copilot_cli_usage_entry(entry);
                     }
+                } else if assistant_type == "antigravity" {
+                    for entry in &mut parsed_entries {
+                        if let Some(raw) = entry
+                            .model
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|v| !v.is_empty())
+                        {
+                            entry.model =
+                                Some(crate::antigravity_metadata::model_label(raw).to_owned());
+                        }
+                        if let Some(raw) = entry
+                            .model_id
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|v| !v.is_empty())
+                        {
+                            entry.model_id =
+                                Some(crate::antigravity_metadata::model_label(raw).to_owned());
+                        }
+                    }
                 }
 
                 if parsed_entries.is_empty() {

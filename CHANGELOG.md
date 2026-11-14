@@ -8,11 +8,11 @@
 
 - 補上 `Claude Fable 5.2` 與 `Claude Mythos 5.2`（含 `Cursor` 部署條目）的官方標準定價規則（輸入 8.00、快取輸入 0.20、輸出 40.00 美元／每百萬 Token）。
 - 補上 `Orchestrator (Carbon)` 與 `Orchestrator (Argon)` 的 `Google AI` 官方標準定價規則（依各自規劃模型標準價設定為輸入 4.00、快取輸入 0.20、輸出 20.00 美元／每百萬 Token）。
-- 補齊 Antigravity CLI 透過 `agy models` 與會話實測查證的模型顯示名稱對應，包含 `Gemini 4 Hydrogen (Low/Medium/High/XHigh)`、`Orchestrator (Carbon)`、`Orchestrator (Argon)`、`gemini-flash-worker-agy`（對應 `Gemini 4 Hydrogen`）、`Claude Opus 5.5 (Low/Medium/High)`、`Claude Sonnet 5.5 (Low/Medium/High)` 與 `GPT-OSS 120B (Medium)`，並將 Antigravity parser 版本提升至 4 以自動重新歸屬既有會話。
+- 補齊 Antigravity CLI 透過 `agy models` 與會話實測查證的模型顯示名稱對應，包含 `Gemini 4 Hydrogen (Low/Medium/High/XHigh)`、`Orchestrator (Carbon)`、`Orchestrator (Argon)`、`gemini-flash-worker-agy`（對應 `Gemini 4 Hydrogen`）、`Claude Opus 5.5 (Low/Medium/High)`、`Claude Sonnet 5.5 (Low/Medium/High)` 與 `GPT-OSS 120B (Medium)`，並對 JSONL 明確 `model_id`/`model` 與 hook 紀錄統一套用別名映射，同時將 Antigravity parser 版本提升至 5 以自動重新歸屬既有會話。
 
 ### 變更
 
-- 每日定價檢查腳本將原本泛稱的 `Google Gemini` 項目改為針對 `Antigravity`：結合 Antigravity 官方模型文件（`antigravity.google/docs/models.md`）與 Google AI Studio 官方定價頁（`aistudio.google.com/docs/pricing.md`），僅對 Antigravity 官方支援模型檢查收錄完整性，同時核對所有 `Google AI` 部署列的標準牌價。
+- 每日定價檢查腳本將原本泛稱的 `Google Gemini` 項目改為針對 `Antigravity`：結合 Antigravity 官方模型文件（`antigravity.google/docs/models.md`）與 Google AI Studio 官方定價頁（`aistudio.google.com/docs/pricing.md`），僅對 Antigravity 官方支援模型檢查收錄完整性、逐一驗證每個 Orchestrator 的 Planner 對應與解析價格，同時核對所有 `Google AI` 部署列的標準牌價。
 
 ### 修正
 

@@ -491,19 +491,20 @@ fn read_response_models(conn: &Connection) -> rusqlite::Result<HashMap<u32, Stri
         let Some(inner) = bytes_field(&fields, 1).and_then(protobuf_fields) else {
             continue;
         };
-        let Some(uid) = bytes_field(&inner, 19).and_then(|v| std::str::from_utf8(v).ok()) else {
+        let Some(model_id) = bytes_field(&inner, 19).and_then(|v| std::str::from_utf8(v).ok())
+        else {
             continue;
         };
         // Preserve unknown identifiers, but never expose arbitrary binary payloads.
-        if uid.is_empty()
-            || uid.len() > 200
-            || !uid
+        if model_id.is_empty()
+            || model_id.len() > 200
+            || !model_id
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b"-_.:/".contains(&b))
         {
             continue;
         }
-        let model = model_label(uid).to_owned();
+        let model = model_label(model_id).to_owned();
         generations
             .entry(id.to_vec())
             .and_modify(|previous| {
@@ -534,10 +535,10 @@ fn read_response_models(conn: &Connection) -> rusqlite::Result<HashMap<u32, Stri
     Ok(result)
 }
 
-fn model_label(uid: &str) -> &str {
+pub(crate) fn model_label(model_id: &str) -> &str {
     // Verified with `agy models`; keep aliases explicit so unknown future models
     // cannot silently inherit an unrelated model's price.
-    match uid {
+    match model_id {
         "gemini-4-carbon-medium" => "Gemini 4 Carbon (Medium)",
         "gemini-4-carbon-high" => "Gemini 4 Carbon (High)",
         "gemini-4-carbon-low" => "Gemini 4 Carbon (Low)",
@@ -565,7 +566,7 @@ fn model_label(uid: &str) -> &str {
         "claude-sonnet-5-5-medium" => "Claude Sonnet 5.5 (Medium)",
         "claude-sonnet-5-5-high" => "Claude Sonnet 5.5 (High)",
         "gpt-oss-120b-medium" => "GPT-OSS 120B (Medium)",
-        _ => uid,
+        _ => model_id,
     }
 }
 
@@ -652,10 +653,10 @@ mod tests {
     fn joins_generation_uuid_instead_of_unrelated_row_indices() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("CREATE TABLE gen_metadata(idx INTEGER, data BLOB); CREATE TABLE steps(idx INTEGER, metadata BLOB);").unwrap();
-        for (index, uid) in [(1, "agy-demo-medium"), (2, "new-unknown-model")] {
+        for (index, model_id) in [(1, "agy-demo-medium"), (2, "new-unknown-model")] {
             let id = format!("generation-{index}");
             let mut blob = field(4, id.as_bytes());
-            blob.extend(field(1, &field(19, uid.as_bytes())));
+            blob.extend(field(1, &field(19, model_id.as_bytes())));
             conn.execute(
                 "INSERT INTO gen_metadata VALUES (?1, ?2)",
                 rusqlite::params![index, blob],
@@ -691,7 +692,7 @@ mod tests {
     #[test]
     fn antigravity_2026_11_agy_model_ids_map_to_display_names() {
         // IDs verified with `agy models` on 2026-11-15.
-        for (uid, expected) in [
+        for (model_id, expected) in [
             ("gemini-4-hydrogen-high", "Gemini 4 Hydrogen (High)"),
             ("gemini-4-hydrogen-xhigh", "Gemini 4 Hydrogen (XHigh)"),
             ("gemini-4-hydrogen-medium", "Gemini 4 Hydrogen (Medium)"),
@@ -707,7 +708,7 @@ mod tests {
             ("claude-sonnet-5-5-high", "Claude Sonnet 5.5 (High)"),
             ("gpt-oss-120b-medium", "GPT-OSS 120B (Medium)"),
         ] {
-            assert_eq!(model_label(uid), expected, "unexpected label for {uid}");
+            assert_eq!(model_label(model_id), expected);
         }
     }
 

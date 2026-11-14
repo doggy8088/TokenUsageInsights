@@ -383,7 +383,7 @@ test('csvKey 剝除 Extra/Max 後綴並保留 Orchestrator 括號區分', () => 
   assert.notEqual(csvKey('Orchestrator (Carbon)'), csvKey('Orchestrator (Argon)'));
 });
 
-test('parseAntigravityProvider 缺少模型表或 Orchestrator 對應表時拋錯', () => {
+test('parseAntigravityProvider 缺少模型表、部分 Orchestrator 對應或 Planner 價格時拋錯', () => {
   assert.throws(
     () => parseAntigravityProvider('# Empty', antigravityPricingMd),
     /解析不到任何 Antigravity 模型/,
@@ -395,5 +395,24 @@ test('parseAntigravityProvider 缺少模型表或 Orchestrator 對應表時拋�
 | Orchestrator (Carbon) | Ultra |
 `, antigravityPricingMd),
     /解析不到 Antigravity Orchestrator 對應表/,
+  );
+  assert.throws(
+    () => parseAntigravityProvider(`## Reasoning model
+| Model | Plan |
+| --- | --- |
+| Orchestrator (Carbon) | Ultra |
+| Orchestrator (Argon) | Ultra |
+
+## Orchestrator
+| Model selector option | Planner | Implementation | Available on |
+| --- | --- | --- | --- |
+| Orchestrator (Carbon) | Gemini 4 Carbon | Gemini 4 Hydrogen | Google AI Ultra |
+`, antigravityPricingMd),
+    /解析不到 Antigravity Orchestrator 對應表.*Orchestrator \(Argon\)/,
+  );
+  const carbonOnlyPricingMd = antigravityPricingMd.split('## Gemini 4 Argon')[0];
+  assert.throws(
+    () => parseAntigravityProvider(antigravityModelsMd, carbonOnlyPricingMd),
+    /解析不到 Antigravity Orchestrator「Orchestrator \(Argon\)」.*官方價格/,
   );
 });

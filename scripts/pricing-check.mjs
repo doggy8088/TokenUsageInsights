@@ -276,14 +276,23 @@ function parseAntigravityTables(md, modelsHeading, orchestratorHeading) {
     }
     if (!orchCols) continue;
     const cells = splitRow(line);
-    const optionKey = csvKey(cleanAntigravityCell(cells[orchCols.option]));
+    const optionName = cleanAntigravityCell(cells[orchCols.option]);
+    const optionKey = csvKey(optionName);
     const plannerKey = csvKey(cleanAntigravityCell(cells[orchCols.planner]));
-    if (optionKey && plannerKey && !orchestratorPlanners.has(optionKey)) {
-      orchestratorPlanners.set(optionKey, plannerKey);
+    if (optionKey && optionName !== '-') {
+      if (!antigravityModels.has(optionKey)) antigravityModels.set(optionKey, optionName);
+      if (plannerKey && !orchestratorPlanners.has(optionKey)) {
+        orchestratorPlanners.set(optionKey, plannerKey);
+      }
     }
   }
-  if ([...antigravityModels.keys()].some((k) => k.startsWith('orchestrator ')) && orchestratorPlanners.size === 0) {
-    throw new Error('解析不到 Antigravity Orchestrator 對應表，官方模型頁面格式可能已變更');
+  const unmappedOrchestrators = [...antigravityModels.entries()]
+    .filter(([key]) => /^orchestrator(?:\s|$)/i.test(key) && !orchestratorPlanners.has(key))
+    .map(([, name]) => name);
+  if (unmappedOrchestrators.length > 0) {
+    throw new Error(
+      `解析不到 Antigravity Orchestrator 對應表（缺少：${unmappedOrchestrators.join('、')}），官方模型頁面格式可能已變更`,
+    );
   }
 
   return { antigravityModels, orchestratorPlanners };
@@ -305,7 +314,19 @@ export function parseAntigravityProvider(modelsMd, pricingMd, options = {}) {
 
   const entries = new Map();
   for (const [key, name] of antigravityModels) {
+    const isOrchestrator = /^orchestrator(?:\s|$)/i.test(key);
+    const plannerKey = orchestratorPlanners.get(key);
+    if (isOrchestrator && !plannerKey) {
+      throw new Error(
+        `解析不到 Antigravity Orchestrator 對應表（缺少：${name}），官方模型頁面格式可能已變更`,
+      );
+    }
     const price = resolveGeminiPrice(key);
+    if (isOrchestrator && (!price?.input || !price?.output)) {
+      throw new Error(
+        `解析不到 Antigravity Orchestrator「${name}」（Planner: ${plannerKey}）的官方價格，定價頁面格式可能已變更`,
+      );
+    }
     entries.set(key, {
       name,
       input: price?.input ?? null,
