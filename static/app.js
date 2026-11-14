@@ -1,4 +1,4 @@
-import i18n from './i18n.js?v=39';
+import i18n from './i18n.js?v=41';
 import {
   aggregateDailyTokenCandles,
   calculateCandleViewport,
@@ -6,14 +6,19 @@ import {
   calculateMovingAverageTrend,
   calculateMovingAverageViewportTrend,
   getChartDataPointX,
-} from './chart-utils.js?v=9';
+} from './chart-utils.js?v=16';
 import {
+  buildSessionParentIndex,
   compareSessionRows,
   filterEntriesBySessionIdentity,
   matchesSessionIdentity,
-  parentSessionIdentityKey,
+  nextSessionSearchDisplayState,
+  nextSessionSearchRunState,
+  nextSessionSearchSearchedFingerprint,
   sessionIdentityKey,
-} from './session-utils.js?v=4';
+  sessionSearchDataFingerprint,
+  sessionSearchMatchKey,
+} from './session-utils.js?v=11';
 import { parseUsageTimestamp } from './time-utils.js?v=1';
 
 // Globals
@@ -360,6 +365,9 @@ let currentSessionSearchUnavailable = 0;
 let currentSessionSearchState = 'idle';
 let sessionSearchDebounceTimer = null;
 let sessionSearchAbortController = null;
+// 搜尋重跑排程狀態：資料變更保留執行中的請求、標記 dirty 待完成後合併
+// 成恰好一次重跑（決策見 session-utils 的 nextSessionSearchRunState）。
+let sessionSearchRunState = { inFlight: false, dirty: false };
 let currentSessionCwdFilter = '';
 let currentSessionHomeDir = '';
 let sessionCwdFilterFromUrl = false;
@@ -2313,11 +2321,15 @@ async function executePendingUsageImport() {
       ? summary.total
       : pendingImport.records.length;
     const skipped = summary && typeof summary.skipped_duplicates === 'number' ? summary.skipped_duplicates : 0;
+    const conflicts = summary && typeof summary.skipped_conflicts === 'number' ? summary.skipped_conflicts : 0;
     let msg = t('usage_import_success')
       .replace('{imported}', String(imported))
       .replace('{total}', String(total));
     if (skipped > 0) {
       msg = `${msg}; ${t('usage_import_skipped').replace('{skipped}', String(skipped))}`;
+    }
+    if (conflicts > 0) {
+      msg = `${msg}; ${t('usage_import_conflicts').replace('{conflicts}', String(conflicts))}`;
     }
     showNotification(msg, 'success');
     document.getElementById('usage-import-modal')?.classList.remove('active');
@@ -2411,7 +2423,7 @@ function renderUsageImportHistory(batches, assistant) {
             ${escapeHtml(t('import_history_counts')
               .replace('{imported}', String(batch?.imported ?? 0))
               .replace('{total}', String(batch?.total ?? 0))
-              .replace('{skipped}', String(batch?.skipped_duplicates ?? 0)))}<br>
+              .replace('{skipped}', String(batch?.skipped_duplicates ?? 0)))}${Number(batch?.skipped_conflicts ?? 0) > 0 ? ` · ${escapeHtml(t('usage_import_conflicts').replace('{conflicts}', String(batch?.skipped_conflicts ?? 0)))}` : ''}<br>
             ${escapeHtml(createdAt)}
             ${rolledBack ? ` · ${escapeHtml(t('import_removed_records').replace('{count}', String(batch?.removed_records ?? 0)))}` : ''}
           </div>
@@ -3170,21 +3182,21 @@ function renderDashboard(data) {
     }
     currentSessionSearchContext = nextSearchContext;
   }
-  const nextSearchFingerprint = JSON.stringify(
-    allSessions
-      .map(session => [
-        session.assistant_type,
-        session.source_kind,
-        session.source_dir_key,
-        session.session_id,
-        session.max_turn_no,
-      ])
-      .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)))
-  );
+  const rawUsageEntryCount = Array.isArray(data.raw_entries) ? data.raw_entries.length : 0;
+  const nextSearchFingerprint = sessionSearchDataFingerprint(allSessions, rawUsageEntryCount);
   const shouldRefreshSearch = currentSessionSearchQuery
     && nextSearchFingerprint !== currentSessionSearchDataFingerprint;
-  currentSessionSearchDataFingerprint = nextSearchFingerprint;
+  // 「已搜尋」指紋記錄維持在 render（先記後搜是同資料重複渲染不重跑的
+  // dedupe 基準）；搜尋失敗時由 executeSessionPromptSearch 的 catch 經純
+  // 函式失效成 ''，讓下次資料刷新視為未搜尋而重試（comment 4434003880）。
+  currentSessionSearchDataFingerprint = nextSessionSearchSearchedFingerprint(
+    currentSessionSearchDataFingerprint,
+    { type: 'searched', fingerprint: nextSearchFingerprint },
+  );
   currentSessions = [...allSessions];
+  // 每次 master sessions 更新即預建父層／根節點索引（無篩選時下游建樹
+  // 直接重用；衍生陣列由呼叫端重建，見 sessionParentIndexFor）。
+  sessionParentIndexFor(currentSessions);
   updateSessionCwdFilterOptions(currentSessions);
   if (activeTab === 'daily') {
     updateUrlParams();
@@ -3303,7 +3315,15 @@ function renderDashboard(data) {
 
   // 7. 渲染 Session 列表
   if (shouldRefreshSearch) {
-    scheduleSessionPromptSearch(currentSessionSearchQuery, { immediate: true });
+    // 資料變更不取消執行中的搜尋：只標記待重跑，於完成後合併成恰好一次
+    // 重跑；僅閒置時才立即重跑（comment 4433863686）。重跑走背景路徑，
+    // 保留已完成結果至新結果原子替換（comment 4433948840）。
+    sessionSearchRunState = nextSessionSearchRunState(sessionSearchRunState, 'data-changed');
+    if (sessionSearchRunState.startRun) {
+      scheduleSessionPromptSearch(currentSessionSearchQuery, { immediate: true, background: true });
+    } else {
+      sortAndRenderSessionTable();
+    }
   } else {
     sortAndRenderSessionTable();
   }
@@ -4286,7 +4306,11 @@ function resetSessionPromptSearch() {
   currentSessionSearchMatches = null;
   currentSessionSearchUnavailable = 0;
   currentSessionSearchState = 'idle';
-  currentSessionSearchDataFingerprint = '';
+  currentSessionSearchDataFingerprint = nextSessionSearchSearchedFingerprint(
+    currentSessionSearchDataFingerprint,
+    { type: 'reset' },
+  );
+  sessionSearchRunState = nextSessionSearchRunState(sessionSearchRunState, 'reset');
 
   const input = document.getElementById('session-search-input');
   if (input) input.value = '';
@@ -4484,10 +4508,6 @@ function updateSessionCwdFilterOptions(sessions) {
     : t('session_cwd_filter_aria_label');
 }
 
-function sessionSearchMatchKey(session) {
-  return sessionIdentityKey(session);
-}
-
 function getSearchFilteredSessions() {
   const cwdFilteredSessions = getCwdFilteredSessions();
 
@@ -4504,8 +4524,28 @@ function getSearchFilteredSessions() {
   ));
 }
 
-function scheduleSessionPromptSearch(value, { immediate = false } = {}) {
+// 套用純函式決定的搜尋可見狀態（決策全部取自 nextSessionSearchDisplayState）：
+// matches／status 經純函式單組交換後由呼叫端一次重繪；unavailable 計數與
+// 命中同組，命中被替換／清空時歸零，背景重跑保留舊命中時整組原樣續用。
+function applySessionSearchDisplayState(event, replacedUnavailable = 0) {
+  const prev = {
+    matches: currentSessionSearchMatches,
+    status: currentSessionSearchState,
+  };
+  const next = nextSessionSearchDisplayState(prev, event);
+  if (next.matches !== prev.matches) {
+    currentSessionSearchMatches = next.matches;
+    currentSessionSearchUnavailable = next.matches ? replacedUnavailable : 0;
+  }
+  currentSessionSearchState = next.status;
+}
+
+function scheduleSessionPromptSearch(value, { immediate = false, background = false } = {}) {
   const query = String(value || '').trim();
+
+  // 排程即新意圖（query／context 變更或資料驅動重跑）：沿用既有 abort＋
+  // 重啟語意，狀態機一併歸零，避免被中止的舊 run 殘留 dirty／inFlight。
+  sessionSearchRunState = nextSessionSearchRunState(sessionSearchRunState, 'reset');
 
   if (sessionSearchDebounceTimer) {
     clearTimeout(sessionSearchDebounceTimer);
@@ -4517,30 +4557,36 @@ function scheduleSessionPromptSearch(value, { immediate = false } = {}) {
   }
 
   currentSessionSearchQuery = query;
-  currentSessionSearchMatches = null;
-  currentSessionSearchUnavailable = 0;
+
+  // 可見狀態交換取自純函式：背景重跑（同查詢、資料驅動）保留已完成命中與
+  // 'complete' 續顯至新結果原子替換（comment 4433948840）；query／context
+  // 變更維持 clear-and-load（新查詢的舊命中無意義）。
+  const runnable = Boolean(query) && Boolean(currentUsageData?.date);
+  applySessionSearchDisplayState(
+    background && runnable
+      ? { type: 'background-rerun' }
+      : { type: 'new-intent', hasQuery: runnable },
+  );
 
   if (!query) {
-    currentSessionSearchState = 'idle';
     sortAndRenderSessionTable();
     return;
   }
 
   if (!currentUsageData?.date) {
-    currentSessionSearchState = 'idle';
     return;
   }
 
-  currentSessionSearchState = 'loading';
   sortAndRenderSessionTable();
   const delay = immediate ? 0 : 250;
   sessionSearchDebounceTimer = setTimeout(() => {
     sessionSearchDebounceTimer = null;
-    executeSessionPromptSearch(query, currentSessionSearchContext);
+    executeSessionPromptSearch(query, currentSessionSearchContext, { background });
   }, delay);
 }
 
-async function executeSessionPromptSearch(query, searchContext) {
+async function executeSessionPromptSearch(query, searchContext, { background = false } = {}) {
+  sessionSearchRunState = nextSessionSearchRunState(sessionSearchRunState, 'run-started');
   const controller = new AbortController();
   sessionSearchAbortController = controller;
   const date = currentUsageData?.date;
@@ -4563,11 +4609,17 @@ async function executeSessionPromptSearch(query, searchContext) {
       return;
     }
 
-    currentSessionSearchMatches = new Set(
-      (result.matches || []).map(match => sessionSearchMatchKey(match))
+    // 成功完成：新命中原子替換可見結果（單次交換＋一次重繪，無空集合
+    // 中間態）；背景重跑期間舊結果續顯，直到此刻才被取代。
+    applySessionSearchDisplayState(
+      {
+        type: 'complete',
+        matches: new Set(
+          (result.matches || []).map(match => sessionSearchMatchKey(match))
+        ),
+      },
+      Number(result.unavailable_sessions) || 0,
     );
-    currentSessionSearchUnavailable = Number(result.unavailable_sessions) || 0;
-    currentSessionSearchState = 'complete';
     sortAndRenderSessionTable();
   } catch (error) {
     if (error.name === 'AbortError') return;
@@ -4579,9 +4631,20 @@ async function executeSessionPromptSearch(query, searchContext) {
     }
 
     console.error('搜尋 USER 提示詞失敗:', error);
-    currentSessionSearchMatches = null;
-    currentSessionSearchUnavailable = 0;
-    currentSessionSearchState = 'error';
+    // 已有完成結果的背景重跑失敗保留既有命中與 'complete'（舊命中仍較未過濾
+    // 正確）；無完成結果的失敗（首跑、或首搜 debounce 期間被資料刷新翻成背景）
+    // 轉既有 null+'error'，不得凍結 'loading'（comment 4434003894）。無論
+    // 哪種失敗都照常發錯誤通知。
+    applySessionSearchDisplayState({ type: 'fail', background });
+    // 失敗使「已搜尋」指紋失效（顯示結果原樣不動）：下次資料刷新視為未搜尋
+    // 而重試，避免 run-completed（dirty=false）後同資料永不重搜、舊命中集合
+    // 凍結、新符合 session 永久隱藏（comment 4434003880）。重試時機是下次
+    // 資料刷新而非立即重試：持續性故障下最多每個刷新週期一次重試＋一顆
+    // session_search_failed toast，無緊密重試迴圈。
+    currentSessionSearchDataFingerprint = nextSessionSearchSearchedFingerprint(
+      currentSessionSearchDataFingerprint,
+      { type: 'fail' },
+    );
     sortAndRenderSessionTable();
     showNotification(t('session_search_failed'), 'error');
   } finally {
@@ -4589,9 +4652,36 @@ async function executeSessionPromptSearch(query, searchContext) {
       sessionSearchAbortController = null;
     }
   }
+
+  // 完成後合併處理：執行期間累積的資料變更（dirty）合併成恰好一次重跑，
+  // 而非每筆變更各取消重啟一次（comment 4433863686）。AbortError 與
+  // stale（query／context 已變更）的提前回傳不經過這裡：那些路徑已由
+  // scheduleSessionPromptSearch／resetSessionPromptSearch 歸零狀態機。
+  sessionSearchRunState = nextSessionSearchRunState(sessionSearchRunState, 'run-completed');
+  if (sessionSearchRunState.startRun) {
+    // 資料驅動重跑走背景路徑：不清空剛取得的命中、不切 'loading'，保留
+    // 已完成結果與篩選狀態至新結果原子替換（comment 4433948840）。
+    scheduleSessionPromptSearch(query, { immediate: true, background: true });
+  }
+}
+
+// 依當代 sessions 陣列取得（或建立）父層／根節點查找索引。索引以陣列
+// 參照識別世代：同一陣列重複查詢直接重用，衍生出的新陣列（篩選、扁平化）
+// 各自重建，確保查找結果與當代資料一致（comment 4436837586）。
+let sessionParentIndexSource = null;
+let sessionParentIndexValue = null;
+
+function sessionParentIndexFor(sessions) {
+  if (sessionParentIndexValue && sessionParentIndexSource === sessions) {
+    return sessionParentIndexValue;
+  }
+  sessionParentIndexValue = buildSessionParentIndex(sessions);
+  sessionParentIndexSource = sessions;
+  return sessionParentIndexValue;
 }
 
 function sortAndGetFlatSessions(sessions, sortCol, sortDir) {
+  const parentIndex = sessionParentIndexFor(sessions);
   const map = new Map();
   sessions.forEach(s => {
     map.set(sessionIdentityKey(s), { ...s, children: [] });
@@ -4600,7 +4690,7 @@ function sortAndGetFlatSessions(sessions, sortCol, sortDir) {
   const nodes = [...map.values()];
   const roots = [];
   nodes.forEach(item => {
-    const parentKey = parentSessionIdentityKey(item);
+    const parentKey = parentIndex.parentKeyOf(item);
     const parent = parentKey ? map.get(parentKey) : null;
     if (parent && parent !== item) {
       parent.children.push(item);
@@ -4722,6 +4812,7 @@ function getCursorModeBadge(mode) {
 }
 
 function renderSessionTable(sessions) {
+  const parentIndex = sessionParentIndexFor(sessions);
   const tbody = document.getElementById('session-list-body');
   const sessionCount = document.getElementById('session-count');
   const cwdFilteredTotal = currentSessionCwdFilter
@@ -4768,45 +4859,14 @@ function renderSessionTable(sessions) {
     return;
   }
 
-  // 建立快速查詢 Map 以供 Hover 高亮與樹狀結構查詢
-  const sessionsMap = new Map();
-  sessions.forEach(s => {
-    sessionsMap.set(sessionIdentityKey(s), s);
-  });
-
-  function getRootParentKey(session) {
-    let curr = session;
-    const path = [];
-    const positions = new Map();
-
-    while (curr) {
-      const key = sessionIdentityKey(curr);
-      if (positions.has(key)) {
-        return path
-          .slice(positions.get(key))
-          .map(node => sessionIdentityKey(node))
-          .sort((a, b) => a.localeCompare(b))[0];
-      }
-
-      positions.set(key, path.length);
-      path.push(curr);
-
-      const parentKey = parentSessionIdentityKey(curr);
-      if (!parentKey || !sessionsMap.has(parentKey)) {
-        return key;
-      }
-      curr = sessionsMap.get(parentKey);
-    }
-
-    return sessionIdentityKey(session);
-  }
-
+  // 逐列建立 Session 資料列（身分／父層／根節點鍵由預建索引 O(1) 取得）
   sessions.forEach(s => {
     const tr = document.createElement('tr');
     tr.setAttribute('data-session-id', s.session_id);
     tr.setAttribute('data-parent-id', s.parent_session_id || '');
     tr.setAttribute('data-session-key', sessionIdentityKey(s));
-    tr.setAttribute('data-parent-key', parentSessionIdentityKey(s) || '');
+    tr.setAttribute('data-parent-key', parentIndex.parentKeyOf(s) || '');
+    tr.setAttribute('data-root-key', parentIndex.rootKeyOf(s) || '');
 
     if (s.isSubagent) {
       tr.classList.add('subagent-row');
@@ -4891,15 +4951,17 @@ function renderSessionTable(sessions) {
       openSessionTimeline(s);
     });
 
-    // 群組 Hover 高亮
+    // 群組 Hover 高亮：比對預先寫入的 data-root-key／data-parent-key／
+    // data-session-key，每次 mouseenter 只做 O(列數) DOM 操作，不再逐列
+    // 重算根節點（comment 4436837586）。
     tr.addEventListener('mouseenter', () => {
-      const rootKey = getRootParentKey(s);
+      const rootKey = tr.getAttribute('data-root-key');
       tbody.querySelectorAll('tr').forEach(row => {
         const sid = row.getAttribute('data-session-key');
         const pid = row.getAttribute('data-parent-key');
-        const rowSession = sessionsMap.get(sid);
-        
-        if (sid === rootKey || pid === rootKey || (rowSession && getRootParentKey(rowSession) === rootKey)) {
+        const rowRootKey = row.getAttribute('data-root-key');
+
+        if (sid === rootKey || pid === rootKey || rowRootKey === rootKey) {
           row.classList.add('family-highlight');
         }
       });
@@ -4935,6 +4997,7 @@ async function openSessionTimeline(session) {
     cost_usd: estimatedCost,
     source_kind: sourceKind,
     source_dir_key: sourceDirKey,
+    parent_session_id: parentSessionId,
   } = session;
   const drawerOverlay = document.getElementById('timeline-drawer');
   const timelineContainer = document.getElementById('timeline-items');
@@ -5010,6 +5073,14 @@ async function openSessionTimeline(session) {
     const queryParams = new URLSearchParams();
     if (sourceKind) queryParams.set('source_kind', sourceKind);
     if (sourceDirKey) queryParams.set('source_dir_key', sourceDirKey);
+    // 攜帶 parent_session_id，讓後端能單獨選取子 Agent session（合成
+    // `<parent>__<agent>`），不會與同 id 的獨立 session 混淆。無父層的
+    // session 顯式送空字串（parent_session_id IS NULL 選取）；呼叫端拿
+    // 不到父層時（例如搜尋結果列未帶 parent_session_id）省略參數，讓
+    // 後端維持既有查詢行為。
+    if (parentSessionId !== undefined) {
+      queryParams.set('parent_session_id', parentSessionId || '');
+    }
     const queryString = queryParams.toString();
     const sessionUrl = `/api/${encodeURIComponent(resolvedAssistant)}/session/${encodeURIComponent(sessionId)}${queryString ? `?${queryString}` : ''}`;
     const res = await fetch(sessionUrl);
@@ -6204,7 +6275,7 @@ function renderModelSessionDrilldown(sessions) {
                   const cwd = session.cwd || t('unknown_cwd');
                   const time = formatLocalTime(session.timestamp, true) || '—';
                   return `
-                    <button type="button" class="model-session-link" data-session-id="${escapeHtml(session.session_id)}" data-assistant-type="${escapeHtml(session.assistant_type || '')}" data-source-kind="${escapeHtml(session.source_kind || '')}" data-source-dir-key="${escapeHtml(session.source_dir_key || '')}" aria-label="${escapeHtml(`${t('open_session')}: ${name}`)}">
+                    <button type="button" class="model-session-link" data-session-id="${escapeHtml(session.session_id)}" data-assistant-type="${escapeHtml(session.assistant_type || '')}" data-source-kind="${escapeHtml(session.source_kind || '')}" data-source-dir-key="${escapeHtml(session.source_dir_key || '')}" data-parent-session-id="${escapeHtml(session.parent_session_id || '')}" aria-label="${escapeHtml(`${t('open_session')}: ${name}`)}">
                       <span class="model-session-primary">
                         <span class="model-session-name-row">
                           <span class="model-session-name">${escapeHtml(name)}</span>
@@ -6339,6 +6410,7 @@ function appendModelSummaryRows(tbody, models, period) {
         assistant_type: sessionButton.dataset.assistantType,
         source_kind: sessionButton.dataset.sourceKind,
         source_dir_key: sessionButton.dataset.sourceDirKey,
+        parent_session_id: sessionButton.dataset.parentSessionId || null,
       }));
       if (session) {
         openSessionTimeline({
