@@ -1,5 +1,5 @@
 {
-  "_comment": "價格一律以官方定價文件為準（各官方文件站台提供的 Markdown 版本，內容與官網頁面相同）。parser=table 解析 Markdown 表格；parser=gemini 解析 Google 以區塊呈現的 Standard 價格表。sectionHeading 用來限定只讀標準文字 API 價格段落。",
+  "_comment": "價格一律以官方定價文件為準（各官方文件站台提供的 Markdown 版本，內容與官網頁面相同）。parser=table 解析 Markdown 表格；parser=antigravity 會同時讀取 Antigravity 官方模型清單（sourceUrl）與 Google AI Studio 官方 Gemini API 定價文件（pricingSourceUrl），僅針對 Antigravity 支援的模型檢查完整性，並以 Gemini API 標準牌價核對所有 Google AI 部署列。sectionHeading 用來限定只讀標準文字 API 價格段落。",
   "providers": [
     {
       "name": "Anthropic",
@@ -58,20 +58,26 @@
       ]
     },
     {
-      "name": "Google Gemini",
+      "name": "Antigravity",
       "deployments": [
+        "Google AI",
+        "Global",
+        "Local/OSS"
+      ],
+      "priceDeployments": [
         "Google AI"
       ],
-      "pageUrl": "https://ai.google.dev/gemini-api/docs/pricing",
-      "sourceUrl": "https://ai.google.dev/gemini-api/docs/pricing.md.txt",
-      "parser": "gemini",
-      "ignoreModels": [
-        "Gemini 3.5 Flash-Lite",
-        "Gemini 3.1 Flash-Lite",
-        "Gemini 2.5 Pro",
-        "Gemini 2.5 Flash",
-        "Gemini 2.5 Flash-Lite"
-      ]
+      "pageUrl": "https://antigravity.google/docs/models",
+      "sourceUrl": "https://antigravity.google/docs/models.md",
+      "modelsSectionHeading": "## Reasoning model",
+      "orchestratorSectionHeading": "## Orchestrator",
+      "pricingPageUrl": "https://aistudio.google.com/docs/pricing",
+      "pricingSourceUrl": "https://aistudio.google.com/docs/pricing.md",
+      "parser": "antigravity",
+      "unpricedModels": [
+        "Gemini 3.7 Flash"
+      ],
+      "ignoreModels": []
     },
     {
       "name": "xAI",
@@ -90,5 +96,5 @@
       ]
     }
   ],
-  "_comment2": "ignoreModels：已知且刻意不追蹤的官方模型（多為舊世代）。不在此清單也不在 pricing.csv 的官方模型會被視為新模型並觸發通知。"
+  "_comment2": "ignoreModels：已知且刻意不追蹤的官方模型（多為舊世代）；unpricedModels：僅 Antigravity 使用，已知尚未登上 Google AI Studio 定價表但仍須追蹤收錄完整性的 Google AI 模型（預設為空）。不在此清單也不在 pricing.csv 的官方模型會被視為新模型並觸發通知。"
 }

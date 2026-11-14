@@ -11,6 +11,8 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const EPSILON = 1e-9;
 // 非文字模型（圖像、語音、嵌入等）不在 pricing.csv 的追蹤範圍，列新模型時略過。
 const NON_TEXT = /tts|image|embedding|live|lyria|transcribe|robotics|veo|imagen|omni|nano banana|gemma|audio|imagine|video|speech/i;
+// Antigravity 清單中非 Google 自研（Anthropic Claude / OpenAI OSS）模型不查 Google AI Studio 價表。
+const NON_GOOGLE_ANTIGRAVITY_MODEL = /^(?:claude|gpt)(?:\s|$)/i;
 
 export function parseCsv(text) {
   const rows = [];
@@ -45,7 +47,7 @@ export function normalizeName(name) {
 
 // CSV 的推理強度／Thinking 後綴與官方基礎模型共用同一組價格。
 export function csvKey(name) {
-  return normalizeName(name.replace(/\s*\((?:low|medium|high|xhigh|extra high|minimal|thinking|non-thinking|reasoning)\)/gi, ''));
+  return normalizeName(name.replace(/\s*\((?:low|medium|high|xhigh|extra high|extra|max|minimal|thinking|non-thinking|reasoning)\)/gi, ''));
 }
 
 // 去除 Markdown 連結與 HTML 標籤（反覆處理直到穩定，最後移除殘留的角括號），僅用於比對與顯示名稱。
@@ -60,7 +62,13 @@ export function stripMarkup(text) {
 }
 
 export function officialKey(name) {
-  return normalizeName(stripMarkup(name).replace(/\([^)]*\)/g, '').replace(/[^\x20-\x7E]/g, ''));
+  let cleaned = stripMarkup(name).replace(/[^\x20-\x7E]/g, '');
+  let prev;
+  do {
+    prev = cleaned;
+    cleaned = cleaned.replace(/\([^()]*\)/g, '');
+  } while (cleaned !== prev);
+  return normalizeName(cleaned);
 }
 
 // 取出價格文字中的第一個金額；若為促銷格式（"$0.75 through Dec 31, 2026. $1.50 starting ..."）一併回傳促銷後價格。
@@ -128,14 +136,28 @@ export function parseTableProvider(md, heading) {
   return entries;
 }
 
-// Google 定價頁以「## 模型名稱 → ### Standard 表格」呈現，價格在 Paid Tier 欄。
+// Google 定價頁以「## 模型名稱 → {% tab title="Standard" %} / {% table %}」（或舊版「### Standard」Markdown 表格）呈現，價格在 Paid Tier 欄。
 export function parseGeminiProvider(md) {
   const entries = new Map();
   const lines = md.split(/\r?\n/);
   let model = null;
   let inStandard = false;
+  let inMarkdocTable = false;
   let row = {};
+  let cells = [];
+  const applyRow = (labelText, paidText) => {
+    const label = labelText.toLowerCase();
+    const paid = paidText.replace(/\s+/g, ' ').trim();
+    if (label.startsWith('input price')) row.input = parsePrice(paid);
+    else if (label.startsWith('output price')) row.output = parsePrice(paid);
+    else if (label.startsWith('context caching price')) row.cached = parsePrice(paid);
+  };
+  const flushMarkdocRow = () => {
+    if (cells.length >= 2) applyRow(cells[0], cells[cells.length - 1]);
+    cells = [];
+  };
   const flush = () => {
+    flushMarkdocRow();
     if (model && row.input && row.output) {
       const key = officialKey(model);
       if (!entries.has(key)) entries.set(key, { name: model, input: row.input, output: row.output, cached: row.cached || null });
@@ -143,32 +165,205 @@ export function parseGeminiProvider(md) {
     row = {};
   };
   for (const line of lines) {
+    const trimmed = line.trim();
     const h2 = line.match(/^##\s+(.+)$/);
     if (h2) {
       flush();
-      model = h2[1].replace(/\[([^\]]*)\]\([^)]*\)/g, '$1').replace(/[^\x20-\x7E]/g, '').trim();
+      model = h2[1]
+        .replace(/\{%[^%]*%\}/g, '')
+        .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
+        .replace(/[^\x20-\x7E]/g, '')
+        .trim();
       inStandard = false;
+      inMarkdocTable = false;
       continue;
     }
     const h3 = line.match(/^###\s+(.+)$/);
     if (h3) {
       if (inStandard) flush();
       inStandard = h3[1].trim() === 'Standard';
+      inMarkdocTable = false;
       continue;
     }
-    if (!inStandard || !line.trim().startsWith('|')) continue;
-    const cells = splitRow(line);
-    const label = (cells[0] || '').toLowerCase();
-    const paid = cells[cells.length - 1];
-    if (label.startsWith('input price')) row.input = parsePrice(paid);
-    else if (label.startsWith('output price')) row.output = parsePrice(paid);
-    else if (label.startsWith('context caching price')) row.cached = parsePrice(paid);
+    const tabOpen = trimmed.match(/^\{%\s*tab\s+title="([^"]+)"\s*%\}$/);
+    if (tabOpen) {
+      if (inStandard) flush();
+      inStandard = tabOpen[1] === 'Standard';
+      inMarkdocTable = false;
+      continue;
+    }
+    if (/^\{%\s*\/tab\s*%\}$/.test(trimmed)) {
+      if (inStandard) flush();
+      inStandard = false;
+      inMarkdocTable = false;
+      continue;
+    }
+    if (!inStandard) continue;
+    if (/^\{%\s*table\s*%\}$/.test(trimmed)) {
+      inMarkdocTable = true;
+      cells = [];
+      continue;
+    }
+    if (/^\{%\s*\/table\s*%\}$/.test(trimmed)) {
+      flushMarkdocRow();
+      inMarkdocTable = false;
+      continue;
+    }
+    if (inMarkdocTable) {
+      if (trimmed === '---') {
+        flushMarkdocRow();
+      } else if (trimmed.startsWith('* ')) {
+        cells.push(trimmed.slice(2).trim());
+      } else if (trimmed && cells.length > 0) {
+        cells[cells.length - 1] += ` ${trimmed}`;
+      }
+      continue;
+    }
+    if (!trimmed.startsWith('|')) continue;
+    const mdCells = splitRow(line);
+    applyRow(mdCells[0] || '', mdCells[mdCells.length - 1] || '');
   }
   flush();
   return entries;
 }
 
+function cleanAntigravityCell(cell) {
+  return stripMarkup(cell || '')
+    .replace(/\\?\*+/g, '')
+    .replace(/[^\x20-\x7E]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function parseAntigravityTables(md, modelsHeading, orchestratorHeading) {
+  const antigravityModels = new Map();
+  let inModelsTable = false;
+  const modelLines = sectionLines(md, modelsHeading);
+  for (let i = 0; i < modelLines.length; i++) {
+    const line = modelLines[i];
+    if (!line.trim().startsWith('|')) { inModelsTable = false; continue; }
+    const next = modelLines[i + 1] || '';
+    if (/^\s*\|?\s*:?-{2,}/.test(next) && !inModelsTable) {
+      const headers = splitRow(line);
+      inModelsTable = /^model$/i.test(cleanAntigravityCell(headers[0]));
+      i++; // 略過分隔列
+      continue;
+    }
+    if (!inModelsTable) continue;
+    const cells = splitRow(line);
+    const cleaned = cleanAntigravityCell(cells[0]);
+    const name = cleaned.replace(/\s*\((?:thinking|non-thinking|reasoning)\)/gi, '').trim();
+    if (!name || name === '-') continue;
+    const key = csvKey(name);
+    if (key && !antigravityModels.has(key)) antigravityModels.set(key, name);
+  }
+  if (antigravityModels.size === 0) {
+    throw new Error('解析不到任何 Antigravity 模型，官方模型頁面格式可能已變更');
+  }
+
+  const orchestratorPlanners = new Map();
+  let orchCols = null;
+  const orchLines = sectionLines(md, orchestratorHeading);
+  for (let i = 0; i < orchLines.length; i++) {
+    const line = orchLines[i];
+    if (!line.trim().startsWith('|')) { orchCols = null; continue; }
+    const next = orchLines[i + 1] || '';
+    if (/^\s*\|?\s*:?-{2,}/.test(next) && !orchCols) {
+      const headers = splitRow(line).map(cleanAntigravityCell);
+      const option = headers.findIndex((h) => /model selector option/i.test(h));
+      const planner = headers.findIndex((h) => /planner/i.test(h));
+      orchCols = option >= 0 && planner >= 0 ? { option, planner } : null;
+      i++; // 略過分隔列
+      continue;
+    }
+    if (!orchCols) continue;
+    const cells = splitRow(line);
+    const optionName = cleanAntigravityCell(cells[orchCols.option]);
+    const optionKey = csvKey(optionName);
+    const plannerKey = csvKey(cleanAntigravityCell(cells[orchCols.planner]));
+    if (optionKey && optionName !== '-') {
+      if (!antigravityModels.has(optionKey)) antigravityModels.set(optionKey, optionName);
+      if (plannerKey && !orchestratorPlanners.has(optionKey)) {
+        orchestratorPlanners.set(optionKey, plannerKey);
+      }
+    }
+  }
+  const unmappedOrchestrators = [...antigravityModels.entries()]
+    .filter(([key]) => /^orchestrator(?:\s|$)/i.test(key) && !orchestratorPlanners.has(key))
+    .map(([, name]) => name);
+  if (unmappedOrchestrators.length > 0) {
+    throw new Error(
+      `解析不到 Antigravity Orchestrator 對應表（缺少：${unmappedOrchestrators.join('、')}），官方模型頁面格式可能已變更`,
+    );
+  }
+
+  return { antigravityModels, orchestratorPlanners };
+}
+
+// Antigravity 官方模型頁列出支援的推理模型與 Orchestrator 對應，價格取自 Google AI Studio 官方定價文件。
+export function parseAntigravityProvider(modelsMd, pricingMd, options = {}) {
+  const {
+    modelsHeading = '## Reasoning model',
+    orchestratorHeading = '## Orchestrator',
+    unpricedModels = [],
+  } = options;
+  const { antigravityModels, orchestratorPlanners } = parseAntigravityTables(modelsMd, modelsHeading, orchestratorHeading);
+  const geminiPrices = parseGeminiProvider(pricingMd);
+  if (geminiPrices.size === 0) {
+    throw new Error('解析不到任何價格，官方定價頁面格式可能已變更');
+  }
+
+  const unpriced = new Set(unpricedModels.flatMap((m) => [officialKey(m), csvKey(m)]));
+  const resolveGeminiPrice = (key) => {
+    const targetKey = orchestratorPlanners.get(key) || key;
+    return geminiPrices.get(targetKey) || geminiPrices.get(`${targetKey} preview`) || null;
+  };
+
+  const entries = new Map();
+  for (const [key, name] of antigravityModels) {
+    const isOrchestrator = /^orchestrator(?:\s|$)/i.test(key);
+    const plannerKey = orchestratorPlanners.get(key);
+    if (isOrchestrator && !plannerKey) {
+      throw new Error(
+        `解析不到 Antigravity Orchestrator 對應表（缺少：${name}），官方模型頁面格式可能已變更`,
+      );
+    }
+    const price = resolveGeminiPrice(key);
+    if (isOrchestrator && (!price?.input || !price?.output)) {
+      throw new Error(
+        `解析不到 Antigravity Orchestrator「${name}」（Planner: ${plannerKey}）的官方價格，定價頁面格式可能已變更`,
+      );
+    }
+    if (!isOrchestrator && !NON_GOOGLE_ANTIGRAVITY_MODEL.test(key) && !unpriced.has(key) && (!price?.input || !price?.output)) {
+      throw new Error(
+        `解析不到 Antigravity 模型「${name}」的官方價格，定價頁面格式可能已變更`,
+      );
+    }
+    entries.set(key, {
+      name,
+      input: price?.input ?? null,
+      output: price?.output ?? null,
+      cached: price?.cached ?? null,
+      trackMissing: true,
+    });
+  }
+  for (const [key, price] of geminiPrices) {
+    if (!entries.has(key)) {
+      entries.set(key, { ...price, trackMissing: false });
+    }
+  }
+  return entries;
+}
+
 export function parseProvider(provider, md) {
+  if (provider.parser === 'antigravity') {
+    const { modelsMd, pricingMd } = typeof md === 'object' && md !== null ? md : {};
+    return parseAntigravityProvider(modelsMd, pricingMd, {
+      modelsHeading: provider.modelsSectionHeading,
+      orchestratorHeading: provider.orchestratorSectionHeading,
+      unpricedModels: provider.unpricedModels,
+    });
+  }
   return provider.parser === 'gemini' ? parseGeminiProvider(md) : parseTableProvider(md, provider.sectionHeading);
 }
 
@@ -176,13 +371,15 @@ export function parseProvider(provider, md) {
 const standardPrice = (p) => (p.after != null ? p.after : p.now);
 const matchesPrice = (local, p) => Math.abs(local - standardPrice(p)) <= EPSILON;
 
-export function compareProvider(csvRows, official, ignoreModels = []) {
-  const ignored = new Set(ignoreModels.map(officialKey));
+export function compareProvider(csvRows, official, ignoreModels = [], options = {}) {
+  const { priceDeployments } = options;
+  const ignored = new Set(ignoreModels.flatMap((m) => [officialKey(m), csvKey(m)]));
   const mismatches = [];
   const promos = [];
   const known = new Set();
   for (const row of csvRows) {
     known.add(csvKey(row.model));
+    if (priceDeployments && !priceDeployments.includes(row.deployment)) continue;
     if (!isBaseRow(row.model)) continue;
     const remote = official.get(csvKey(row.model));
     if (!remote) continue;
@@ -202,7 +399,7 @@ export function compareProvider(csvRows, official, ignoreModels = []) {
     if (diffs.length) mismatches.push({ model: row.model, diffs });
   }
   const missing = [...official.entries()]
-    .filter(([key, e]) => !known.has(key) && !ignored.has(key) && !NON_TEXT.test(e.name))
+    .filter(([key, e]) => e.trackMissing !== false && !known.has(key) && !ignored.has(key) && !NON_TEXT.test(e.name))
     .map(([, e]) => e.name);
   return { mismatches, promos: [...new Set(promos)], missing };
 }
@@ -234,21 +431,41 @@ export async function run({ csvPath = path.join(root, 'pricing.csv'), reportPath
   let added = 0;
 
   for (const p of sources.providers) {
-    lines.push(`## ${p.name}`, '', `官方文件：<${p.pageUrl}>`, '');
+    if (p.pricingPageUrl) {
+      lines.push(`## ${p.name}`, '', `官方模型清單：<${p.pageUrl}>`, `官方定價文件：<${p.pricingPageUrl}>`, '');
+    } else {
+      lines.push(`## ${p.name}`, '', `官方文件：<${p.pageUrl}>`, '');
+    }
     let official;
     try {
-      official = parseProvider(p, await fetchText(p.sourceUrl));
+      if (p.parser === 'antigravity') {
+        const [modelsMd, pricingMd] = await Promise.all([fetchText(p.sourceUrl), fetchText(p.pricingSourceUrl)]);
+        official = parseAntigravityProvider(modelsMd, pricingMd, {
+          modelsHeading: p.modelsSectionHeading,
+          orchestratorHeading: p.orchestratorSectionHeading,
+          unpricedModels: p.unpricedModels,
+        });
+      } else {
+        official = parseProvider(p, await fetchText(p.sourceUrl));
+      }
       if (official.size === 0) throw new Error('解析不到任何價格，官方頁面格式可能已變更');
     } catch (err) {
       errors++;
       lines.push(`> ⚠️ 無法取得或解析官方價格：${err.message}`, '');
       continue;
     }
-    lines.push(`解析到 ${official.size} 個官方模型價格。`, '');
+    if (p.parser === 'antigravity') {
+      const tracked = [...official.values()].filter((e) => e.trackMissing !== false);
+      const pricedCount = tracked.filter((e) => e.input && e.output).length;
+      lines.push(`解析到 ${tracked.length} 個 Antigravity 官方支援模型（其中 ${pricedCount} 個對應 Gemini 官方標準價）。`, '');
+    } else {
+      lines.push(`解析到 ${official.size} 個官方模型價格。`, '');
+    }
     const { mismatches, promos, missing } = compareProvider(
       csvRows.filter((r) => p.deployments.includes(r.deployment)),
       official,
       p.ignoreModels,
+      { priceDeployments: p.priceDeployments },
     );
     drift += mismatches.length;
     added += missing.length;

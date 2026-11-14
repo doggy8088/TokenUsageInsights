@@ -491,19 +491,20 @@ fn read_response_models(conn: &Connection) -> rusqlite::Result<HashMap<u32, Stri
         let Some(inner) = bytes_field(&fields, 1).and_then(protobuf_fields) else {
             continue;
         };
-        let Some(uid) = bytes_field(&inner, 19).and_then(|v| std::str::from_utf8(v).ok()) else {
+        let Some(model_id) = bytes_field(&inner, 19).and_then(|v| std::str::from_utf8(v).ok())
+        else {
             continue;
         };
         // Preserve unknown identifiers, but never expose arbitrary binary payloads.
-        if uid.is_empty()
-            || uid.len() > 200
-            || !uid
+        if model_id.is_empty()
+            || model_id.len() > 200
+            || !model_id
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b"-_.:/".contains(&b))
         {
             continue;
         }
-        let model = model_label(uid).to_owned();
+        let model = model_label(model_id).to_owned();
         generations
             .entry(id.to_vec())
             .and_modify(|previous| {
@@ -534,22 +535,38 @@ fn read_response_models(conn: &Connection) -> rusqlite::Result<HashMap<u32, Stri
     Ok(result)
 }
 
-fn model_label(uid: &str) -> &str {
+pub(crate) fn model_label(model_id: &str) -> &str {
     // Verified with `agy models`; keep aliases explicit so unknown future models
     // cannot silently inherit an unrelated model's price.
-    match uid {
+    match model_id {
         "gemini-4-carbon-medium" => "Gemini 4 Carbon (Medium)",
         "gemini-4-carbon-high" => "Gemini 4 Carbon (High)",
         "gemini-4-carbon-low" => "Gemini 4 Carbon (Low)",
         "agy-demo-medium" | "gemini-4-argon-medium" => "Gemini 4 Argon (Medium)",
         "agy-demo-high" | "gemini-4-argon-high" => "Gemini 4 Argon (High)",
         "agy-demo-low" | "gemini-4-argon-low" => "Gemini 4 Argon (Low)",
+        "gemini-4-hydrogen-high" => "Gemini 4 Hydrogen (High)",
+        "gemini-4-hydrogen-xhigh" => "Gemini 4 Hydrogen (XHigh)",
+        "gemini-4-hydrogen-medium" => "Gemini 4 Hydrogen (Medium)",
+        "gemini-4-hydrogen-low" => "Gemini 4 Hydrogen (Low)",
+        "gemini-pro-orchestrator" => "Orchestrator (Carbon)",
+        "gemini-pro-orchestrator-argon" => "Orchestrator (Argon)",
+        // Verified from Antigravity Orchestrator session `gen_metadata` and
+        // https://antigravity.google/docs/models#orchestrator (execution runs on Gemini 4 Hydrogen).
+        "gemini-flash-worker-agy" => "Gemini 4 Hydrogen",
         "gemini-3.8-flash-high" => "Gemini 3.8 Flash (High)",
         "gemini-3.8-flash-medium" => "Gemini 3.8 Flash (Medium)",
         "gemini-3.8-flash-low" => "Gemini 3.8 Flash (Low)",
         "gemini-flash-demo" => "Gemini 3.7 Flash",
         "gemini-3.8-flash-demo" => "Gemini 3.8 Flash",
-        _ => uid,
+        "claude-opus-5-5-low" => "Claude Opus 5.5 (Low)",
+        "claude-opus-5-5-medium" => "Claude Opus 5.5 (Medium)",
+        "claude-opus-5-5-high" => "Claude Opus 5.5 (High)",
+        "claude-sonnet-5-5-low" => "Claude Sonnet 5.5 (Low)",
+        "claude-sonnet-5-5-medium" => "Claude Sonnet 5.5 (Medium)",
+        "claude-sonnet-5-5-high" => "Claude Sonnet 5.5 (High)",
+        "gpt-oss-120b-medium" => "GPT-OSS 120B (Medium)",
+        _ => model_id,
     }
 }
 
@@ -636,10 +653,10 @@ mod tests {
     fn joins_generation_uuid_instead_of_unrelated_row_indices() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("CREATE TABLE gen_metadata(idx INTEGER, data BLOB); CREATE TABLE steps(idx INTEGER, metadata BLOB);").unwrap();
-        for (index, uid) in [(1, "agy-demo-medium"), (2, "new-unknown-model")] {
+        for (index, model_id) in [(1, "agy-demo-medium"), (2, "new-unknown-model")] {
             let id = format!("generation-{index}");
             let mut blob = field(4, id.as_bytes());
-            blob.extend(field(1, &field(19, uid.as_bytes())));
+            blob.extend(field(1, &field(19, model_id.as_bytes())));
             conn.execute(
                 "INSERT INTO gen_metadata VALUES (?1, ?2)",
                 rusqlite::params![index, blob],
@@ -670,6 +687,29 @@ mod tests {
             "Gemini 4 Carbon (High)"
         );
         assert_eq!(model_label("gemini-4-carbon-low"), "Gemini 4 Carbon (Low)");
+    }
+
+    #[test]
+    fn antigravity_2026_11_agy_model_ids_map_to_display_names() {
+        // IDs verified with `agy models` on 2026-11-15.
+        for (model_id, expected) in [
+            ("gemini-4-hydrogen-high", "Gemini 4 Hydrogen (High)"),
+            ("gemini-4-hydrogen-xhigh", "Gemini 4 Hydrogen (XHigh)"),
+            ("gemini-4-hydrogen-medium", "Gemini 4 Hydrogen (Medium)"),
+            ("gemini-4-hydrogen-low", "Gemini 4 Hydrogen (Low)"),
+            ("gemini-pro-orchestrator", "Orchestrator (Carbon)"),
+            ("gemini-pro-orchestrator-argon", "Orchestrator (Argon)"),
+            ("gemini-flash-worker-agy", "Gemini 4 Hydrogen"),
+            ("claude-opus-5-5-low", "Claude Opus 5.5 (Low)"),
+            ("claude-opus-5-5-medium", "Claude Opus 5.5 (Medium)"),
+            ("claude-opus-5-5-high", "Claude Opus 5.5 (High)"),
+            ("claude-sonnet-5-5-low", "Claude Sonnet 5.5 (Low)"),
+            ("claude-sonnet-5-5-medium", "Claude Sonnet 5.5 (Medium)"),
+            ("claude-sonnet-5-5-high", "Claude Sonnet 5.5 (High)"),
+            ("gpt-oss-120b-medium", "GPT-OSS 120B (Medium)"),
+        ] {
+            assert_eq!(model_label(model_id), expected);
+        }
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! Antigravity CLI's native, per-response token records. No statusline required.
 use crate::antigravity_metadata::{
-    apply_subagent_descriptor_fallback, is_valid_session_id, read_session_metadata, SessionMetadata,
+    apply_subagent_descriptor_fallback, is_valid_session_id, model_label, read_session_metadata,
+    SessionMetadata,
 };
 use crate::db::{InitialUserPromptSelector, TokenStats, UsageEntry};
 use serde_json::Value;
@@ -10,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 pub(crate) const SOURCE_KIND: &str = "antigravity-session";
 // Bump when parsed fields change so unchanged historical sources are re-imported.
-pub(crate) const PARSER_VERSION: u32 = 3;
+pub(crate) const PARSER_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AntigravitySystemMessage {
@@ -274,15 +275,16 @@ pub(crate) fn parse_session(path: &Path) -> Result<Vec<UsageEntry>, String> {
             .get("model_id")
             .or_else(|| event.get("model"))
             .and_then(Value::as_str)
-            .filter(|v| !v.trim().is_empty())
-            .map(str::to_owned)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
             .or_else(|| {
                 event
                     .get("step_index")
                     .and_then(Value::as_u64)
                     .and_then(|index| u32::try_from(index).ok())
-                    .and_then(|index| metadata.models.get(&index).cloned())
-            });
+                    .and_then(|index| metadata.models.get(&index).map(String::as_str))
+            })
+            .map(|raw| model_label(raw).to_owned());
         let tokens = TokenStats {
             input,
             output,
@@ -345,4 +347,66 @@ pub(crate) fn parse_session(path: &Path) -> Result<Vec<UsageEntry>, String> {
     }
 
     Ok(entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_session_applies_model_aliases_to_explicit_transcript_ids_and_prices_them() {
+        let root = std::env::temp_dir().join(format!(
+            "antigravity-explicit-model-id-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let transcript_path = root
+            .join("brain")
+            .join("11111111-1111-4111-8111-111111111111")
+            .join(".system_generated")
+            .join("logs")
+            .join("transcript_full.jsonl");
+        fs::create_dir_all(transcript_path.parent().unwrap()).unwrap();
+        let jsonl = [
+            r#"{"type":"USER_INPUT","content":"orchestrator pricing test"}"#,
+            r#"{"type":"PLANNER_RESPONSE","step_index":1,"model_id":"gemini-pro-orchestrator","created_at":"2026-11-15T01:00:00Z","input_tokens":1000000,"cache_read_tokens":1000000,"output_tokens":1000000}"#,
+            r#"{"type":"PLANNER_RESPONSE","step_index":2,"model_id":"gemini-pro-orchestrator-argon","created_at":"2026-11-15T01:01:00Z","input_tokens":1000000,"cache_read_tokens":1000000,"output_tokens":1000000}"#,
+            r#"{"type":"PLANNER_RESPONSE","step_index":3,"model_id":"gemini-flash-worker-agy","created_at":"2026-11-15T01:02:00Z","input_tokens":1000000,"cache_read_tokens":1000000,"output_tokens":1000000}"#,
+            r#"{"type":"PLANNER_RESPONSE","step_index":4,"model":"gemini-4-hydrogen-high","created_at":"2026-11-15T01:03:00Z","input_tokens":1000000,"cache_read_tokens":1000000,"output_tokens":1000000}"#,
+        ]
+        .join("\n")
+            + "\n";
+        fs::write(&transcript_path, jsonl).unwrap();
+
+        let entries = parse_session(&transcript_path).unwrap();
+        fs::remove_dir_all(&root).unwrap();
+
+        let expected = [
+            ("Orchestrator (Carbon)", 24.20),
+            ("Orchestrator (Argon)", 24.20),
+            ("Gemini 4 Hydrogen", 9.075),
+            ("Gemini 4 Hydrogen (High)", 9.075),
+        ];
+        assert_eq!(entries.len(), expected.len());
+
+        let rules = crate::pricing::load_prepared_pricing_rules();
+        for (entry, (expected_model, expected_cost)) in entries.iter().zip(expected) {
+            assert_eq!(entry.model.as_deref(), Some(expected_model));
+            assert_eq!(entry.model_id.as_deref(), Some(expected_model));
+            let cost = rules
+                .calculate_usage_cost(
+                    entry.model.as_deref(),
+                    entry.tokens.as_ref().unwrap().input,
+                    entry.tokens.as_ref().unwrap().output,
+                    entry.tokens.as_ref().unwrap().cache_read.unwrap_or(0),
+                    0,
+                    0,
+                )
+                .unwrap();
+            assert!((cost - expected_cost).abs() < 1e-9);
+        }
+    }
 }
