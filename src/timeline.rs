@@ -408,10 +408,22 @@ pub fn parse_copilot_timeline_filtered(
     let mut prompts_seen = 0u32;
     // 回覆顯示的用量 =「每則使用者訊息分別累計，累計到當前這條回覆為止」：
     // 以對帳後逐次呼叫列為準（`db::get_session_turn_call_checkpoints`，已
-    // 合併事件檔與 SQLite 兩個來源並去重），依「呼叫時間 ≤ 回覆時間」累計。
+    // 合併事件檔與 SQLite 兩個來源並去重），依「呼叫時間 ≤ 回覆時間」累計；
+    // 若事件檔中出現與回覆時間完全相同、但順序晚於該回覆的 `session.usage_record`
+    // （PR #74 2026-11-12 回歸），則排除該筆同時間戳的後續呼叫，避免回灌舊回覆。
     // 回合內沒有任何逐呼叫列（Hook／舊聚合列）時，結尾才退回該回合的
     // `db_entries` 總量。
-    let mut pending_reply_usage: Vec<(usize, u32)> = Vec::new();
+    struct EventUsageCall {
+        seq: usize,
+        timestamp: chrono::DateTime<chrono::Utc>,
+        net_input: u64,
+        output: u64,
+        total: u64,
+    }
+    let mut event_seq = 0usize;
+    let mut seen_event_usage_keys: HashSet<(String, Option<String>, String)> = HashSet::new();
+    let mut turn_event_calls: HashMap<u32, Vec<EventUsageCall>> = HashMap::new();
+    let mut reply_usage_targets: Vec<(usize, u32, String, usize)> = Vec::new();
     // Seed the model from the DB child session model when available so a
     // subagent drawer starts with its own model and is never overwritten by
     // the shared parent `session.start.selectedModel`. Main sessions pass
@@ -431,6 +443,7 @@ pub fn parse_copilot_timeline_filtered(
             Ok(v) => v,
             Err(_) => continue,
         };
+        event_seq = event_seq.saturating_add(1);
 
         let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
         // One empty-`agentId` rule for prompt classification and the entry
@@ -613,29 +626,12 @@ pub fn parse_copilot_timeline_filtered(
                         if let Some((_, model)) = db_entries.get(&turn_no) {
                             current_model = model.clone();
                         }
-                        // 回覆顯示的用量 =「每則使用者訊息分別累計，累計到
-                        // 當前這條回覆為止」：對帳後逐呼叫列中「呼叫時間 ≤
-                        // 回覆時間」的全部呼叫（含 SQLite-only 與事件檔呼叫，
-                        // 且已經過去重）。都沒有命中時先留空，結尾再決定是否
-                        // 退回該回合的 `db_entries` 總量。
-                        let mut accumulated = empty_turn_usage();
-                        let mut accumulated_any = false;
-                        for (row_ts, delta) in turn_call_checkpoints
-                            .and_then(|checkpoints| checkpoints.get(&turn_no))
-                            .map(Vec::as_slice)
-                            .unwrap_or(&[])
-                        {
-                            if timestamp_at_or_before(row_ts, &timestamp) {
-                                accumulate_tokens(&mut accumulated, delta);
-                                accumulated_any = true;
-                            }
-                        }
-                        let tokens = if accumulated_any {
-                            Some(accumulated)
-                        } else {
-                            pending_reply_usage.push((timeline.len(), turn_no));
-                            None
-                        };
+                        reply_usage_targets.push((
+                            timeline.len(),
+                            turn_no,
+                            timestamp.clone(),
+                            event_seq,
+                        ));
 
                         timeline.push(TimelineItem::AgentReply {
                             timestamp,
@@ -643,7 +639,7 @@ pub fn parse_copilot_timeline_filtered(
                             reasoning,
                             turn_no,
                             model: current_model.clone(),
-                            tokens,
+                            tokens: None,
                             duration_ms: None,
                             reasoning_effort: None,
                         });
@@ -849,6 +845,46 @@ pub fn parse_copilot_timeline_filtered(
                     message: "子代理完成 (Subagent Completed)".to_string(),
                 });
             }
+            "session.usage_record" => {
+                if let Some(usage) = data.and_then(|d| d.get("usage")) {
+                    if let (Ok(ts), Ok(metrics)) = (
+                        crate::copilot::parse_timestamp(&timestamp),
+                        crate::copilot::Metrics::from_usage(usage),
+                    ) {
+                        let source_session = usage["accounting"]["sourceSessionId"]
+                            .as_str()
+                            .unwrap_or("")
+                            .to_owned();
+                        let identity = usage["accounting"]["usageId"]
+                            .as_str()
+                            .or_else(|| usage["apiCallId"].as_str())
+                            .or_else(|| event.get("id").and_then(|v| v.as_str()))
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_owned);
+                        let is_new = match identity {
+                            Some(id) => seen_event_usage_keys.insert((
+                                source_session,
+                                event_agent_id.map(str::to_owned),
+                                id,
+                            )),
+                            None => true,
+                        };
+                        if is_new {
+                            let turn_no = prompts_seen.max(1);
+                            turn_event_calls
+                                .entry(turn_no)
+                                .or_default()
+                                .push(EventUsageCall {
+                                    seq: event_seq,
+                                    timestamp: ts,
+                                    net_input: metrics.input.saturating_sub(metrics.cache_read),
+                                    output: metrics.output,
+                                    total: metrics.input.saturating_add(metrics.output),
+                                });
+                        }
+                    }
+                }
+            }
             "subagent.failed" => {
                 timeline.push(TimelineItem::SystemStatus {
                     timestamp,
@@ -859,19 +895,61 @@ pub fn parse_copilot_timeline_filtered(
             _ => {}
         }
     }
-    // 回合內沒有任何逐呼叫列（Hook／舊聚合列）才退回該回合的 `db_entries`
-    // 總量；有逐呼叫列的回合一律以逐次累計為準（哪怕用量晚於回覆）。
-    for (index, turn_no) in pending_reply_usage {
-        if turn_call_checkpoints
+    for (index, turn_no, reply_ts, reply_seq) in reply_usage_targets {
+        let Some(TimelineItem::AgentReply { tokens, .. }) = timeline.get_mut(index) else {
+            continue;
+        };
+        let checkpoints = turn_call_checkpoints
             .and_then(|checkpoints| checkpoints.get(&turn_no))
-            .is_some_and(|rows| !rows.is_empty())
-        {
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        if checkpoints.is_empty() {
+            // 回合內沒有任何逐呼叫列（Hook／舊聚合列）才退回該回合的 `db_entries` 總量。
+            *tokens = db_entries.get(&turn_no).map(|(stats, _)| stats.clone());
             continue;
         }
-        if let Some(TimelineItem::AgentReply { tokens, .. }) = timeline.get_mut(index) {
-            if tokens.is_none() {
-                *tokens = db_entries.get(&turn_no).map(|(stats, _)| stats.clone());
+        let reply_dt = crate::copilot::parse_timestamp(&reply_ts).ok();
+        let mut after_same_ts: Vec<(u64, u64, u64)> = if let Some(reply_dt) = reply_dt {
+            turn_event_calls
+                .get(&turn_no)
+                .map(|calls| {
+                    calls
+                        .iter()
+                        .filter(|c| c.timestamp == reply_dt && c.seq > reply_seq)
+                        .map(|c| (c.net_input, c.output, c.total))
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let mut accumulated = empty_turn_usage();
+        let mut accumulated_any = false;
+        for (row_ts, delta) in checkpoints {
+            let include = match (crate::copilot::parse_timestamp(row_ts).ok(), reply_dt) {
+                (Some(row_dt), Some(reply_dt)) => {
+                    if row_dt < reply_dt {
+                        true
+                    } else if row_dt > reply_dt {
+                        false
+                    } else if let Some(pos) = after_same_ts.iter().position(|&(ni, out, tot)| {
+                        ni == delta.input && out == delta.output && tot == delta.total
+                    }) {
+                        after_same_ts.swap_remove(pos);
+                        false
+                    } else {
+                        true
+                    }
+                }
+                _ => timestamp_at_or_before(row_ts, &reply_ts),
+            };
+            if include {
+                accumulate_tokens(&mut accumulated, delta);
+                accumulated_any = true;
             }
+        }
+        if accumulated_any {
+            *tokens = Some(accumulated);
         }
     }
     metadata.insert(
@@ -2222,6 +2300,54 @@ mod tests {
                 (3, Some(60_181))
             ],
             "每則使用者訊息分別累計，累計到當前這條回覆為止"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn same_timestamp_call_after_reply_must_not_backfill_earlier_reply() {
+        // 回歸（PR #74 2026-11-12 回報）：在「110 tokens 呼叫 → 回覆」之後，
+        // 若同回合再追加一筆與前一條回覆時間戳完全相同的 110 tokens 呼叫，
+        // 舊回覆必須維持 110，不得因為 `<=` 比較而回灌成 220；即使連第一筆
+        // 呼叫也與回覆同時間戳，事件檔順序仍能區分前後。
+        let events = [
+            r#"{"type":"user.message","data":{"content":"m1"},"timestamp":"2026-11-12T00:00:00.000Z"}"#,
+            r#"{"type":"session.usage_record","id":"c1","timestamp":"2026-11-12T00:00:01.000Z","data":{"usage":{"model":"M","inputTokens":100,"outputTokens":10,"cacheReadTokens":0,"reasoningTokens":0,"duration":5,"accounting":{"sourceSessionId":"s","usageId":"c1","sequence":1}}}}"#,
+            r#"{"type":"assistant.message","data":{"content":"first"},"timestamp":"2026-11-12T00:00:01.000Z"}"#,
+            r#"{"type":"session.usage_record","id":"c2","timestamp":"2026-11-12T00:00:01.000Z","data":{"usage":{"model":"M","inputTokens":100,"outputTokens":10,"cacheReadTokens":0,"reasoningTokens":0,"duration":5,"accounting":{"sourceSessionId":"s","usageId":"c2","sequence":2}}}}"#,
+            r#"{"type":"assistant.message","data":{"content":"second"},"timestamp":"2026-11-12T00:00:02.000Z"}"#,
+        ];
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "token-insights-same-ts-backfill-{}-{}.jsonl",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(
+            &path,
+            events
+                .iter()
+                .map(|line| format!("{line}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let calls = crate::copilot::read_calls(&path, "s", &|| false).unwrap();
+        let db_entries = HashMap::from([(1u32, (timeline_stats(220), "M".to_string()))]);
+        let mut timeline = Vec::new();
+        let mut metadata = HashMap::new();
+        parse_copilot_timeline_filtered(
+            BufReader::new(File::open(&path).unwrap()),
+            &db_entries,
+            Some(&call_checkpoints(&calls)),
+            &mut timeline,
+            &mut metadata,
+            None,
+            None,
+        );
+        assert_eq!(
+            reply_turn_usage(&timeline),
+            vec![(1, Some(110)), (1, Some(220))],
+            "與回覆同時間戳但出現在回覆之後的呼叫不得回灌前一條回覆"
         );
         let _ = fs::remove_file(path);
     }

@@ -3137,10 +3137,23 @@ impl AgentFilteredTurns {
 /// 的呼叫）同編號。Only prompts with an event body count — body-less prompts
 /// leave the replay untouched, exactly like the timeline's `event_body` gate
 /// (review 4433948800).
+struct CopilotFilteredTurnMap {
+    per_agent: HashMap<String, AgentFilteredTurns>,
+    /// 完全沒有專屬事件的子 Agent 在過濾時間軸只會看到共享提示，
+    /// 仍須依共享提示的時間邊界歸屬 SQLite-only 呼叫（不能一律退回回合 1）。
+    shared_fallback: AgentFilteredTurns,
+}
+
+impl CopilotFilteredTurnMap {
+    fn get(&self, agent: &str) -> Option<&AgentFilteredTurns> {
+        self.per_agent.get(agent)
+    }
+}
+
 fn copilot_filtered_agent_turns(
     path: &Path,
     should_cancel: &(dyn Fn() -> bool + Sync),
-) -> Result<HashMap<String, AgentFilteredTurns>, String> {
+) -> Result<CopilotFilteredTurnMap, String> {
     struct AgentState {
         /// 該檢視已見的有主體提示數。
         prompts: u32,
@@ -3256,7 +3269,7 @@ fn copilot_filtered_agent_turns(
             _ => {}
         }
     }
-    Ok(states
+    let per_agent = states
         .into_iter()
         .map(|(agent, state)| {
             (
@@ -3267,7 +3280,14 @@ fn copilot_filtered_agent_turns(
                 },
             )
         })
-        .collect())
+        .collect();
+    Ok(CopilotFilteredTurnMap {
+        per_agent,
+        shared_fallback: AgentFilteredTurns {
+            prompts: shared_prompt_turns,
+            initial_turn: 1,
+        },
+    })
 }
 
 /// True for a merged call that exists only in `assistant_usage_events` and
@@ -3284,7 +3304,7 @@ fn is_native_only_subagent_call(call: &crate::copilot::Call) -> bool {
 /// source rows intact and retries instead of persisting a guessed turn.
 fn native_only_subagent_turn(
     call: &crate::copilot::Call,
-    turns: &HashMap<String, AgentFilteredTurns>,
+    turns: &CopilotFilteredTurnMap,
 ) -> Result<Option<u32>, String> {
     if !is_native_only_subagent_call(call) {
         return Ok(None);
@@ -3292,13 +3312,11 @@ fn native_only_subagent_turn(
     let Some(agent) = call.agent_id.as_deref() else {
         return Ok(None);
     };
-    match turns.get(agent) {
-        // The agent has no filtered events at all; its timeline starts at one.
-        None => Ok(Some(1)),
-        Some(boundaries) => boundaries.turn_at(call.timestamp).map(Some).ok_or_else(|| {
-            "Copilot 子 Agent 用量無法判定回覆回合歸屬，保留原資料待重試".to_string()
-        }),
-    }
+    let boundaries = turns.get(agent).unwrap_or(&turns.shared_fallback);
+    boundaries
+        .turn_at(call.timestamp)
+        .map(Some)
+        .ok_or_else(|| "Copilot 子 Agent 用量無法判定回覆回合歸屬，保留原資料待重試".to_string())
 }
 
 /// Rebuild registered App sessions from complete per-call sources, independently
@@ -19561,6 +19579,52 @@ mod tests {
     }
 
     #[test]
+    fn copilot_filtered_agent_turns_attributes_eventless_subagent_via_shared_prompts() {
+        // 真實 CLI 樣本（PR #74 2026-11-12 回報）：子 Agent 完全沒有專屬事件，
+        // 但事件檔有共享提示 #1..#5；發生在共享提示 #4 與 #5 之間的 SQLite-only
+        // 呼叫必須依共享提示邊界歸屬到回合 4，不能因缺少專屬事件而退回回合 1。
+        let dir = std::env::temp_dir().join(format!(
+            "token-usage-insights-eventless-subagent-turns-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("events.jsonl");
+        let lines = [
+            app_text_at("user.message", "2026-09-25T11:07:01.624Z"),
+            app_text_at("user.message", "2026-09-25T12:32:19.843Z"),
+            app_text_at("user.message", "2026-09-25T13:01:46.362Z"),
+            app_text_at("user.message", "2026-09-25T13:10:52.176Z"),
+            app_text_at("user.message", "2026-09-25T13:53:58.707Z"),
+        ]
+        .iter()
+        .map(|event| event.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        fs::write(&path, lines).unwrap();
+
+        let turns = copilot_filtered_agent_turns(&path, &|| false).unwrap();
+        assert!(turns.get("ghost-child").is_none());
+        let call = crate::copilot::Call {
+            identity: "sqlite:1".into(),
+            reasoning_effort: None,
+            turn_no: Some(4),
+            native_identity: Some("sqlite:1".into()),
+            timestamp: crate::copilot::parse_timestamp("2026-09-25T13:24:48.623Z").unwrap(),
+            model: Some("M".into()),
+            agent_id: Some("ghost-child".into()),
+            initiator: None,
+            metrics: crate::copilot::Metrics::default(),
+        };
+        assert_eq!(
+            native_only_subagent_turn(&call, &turns).unwrap(),
+            Some(4),
+            "無專屬事件的子 Agent 仍須依共享提示時間邊界歸屬到回合 4"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn copilot_filtered_agent_turns_ignores_bodyless_prompts_like_the_filtered_timeline() {
         // (review 4433948800) A prompt without an event body never opens a
         // turn in the filtered timeline (`event_body` drops it). If the replay
@@ -19913,14 +19977,20 @@ mod tests {
         fn turns(
             prompts: Vec<(Option<DateTime<Utc>>, u32)>,
             initial_turn: u32,
-        ) -> HashMap<String, AgentFilteredTurns> {
-            HashMap::from([(
-                "child".to_string(),
-                AgentFilteredTurns {
-                    prompts,
-                    initial_turn,
+        ) -> CopilotFilteredTurnMap {
+            CopilotFilteredTurnMap {
+                per_agent: HashMap::from([(
+                    "child".to_string(),
+                    AgentFilteredTurns {
+                        prompts,
+                        initial_turn,
+                    },
+                )]),
+                shared_fallback: AgentFilteredTurns {
+                    prompts: Vec::new(),
+                    initial_turn: 1,
                 },
-            )])
+            }
         }
 
         // 無時間戳提示可能落在呼叫前後任一側：前側屬它開的回合 2、後側屬

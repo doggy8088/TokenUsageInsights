@@ -13,7 +13,8 @@ use std::path::Path;
 // 缺欄衝突檢查沿用一秒配對窗、子 Agent 回合邊界補入共享提示與後續已知提示
 // 歧義判定時再升版（7）：讓先前已對帳過的 App／CLI session 重新對帳，重建被
 // 錯歸的 SQLite-only 回合，而不只是讓全新 fixture 通過（review 4472095861）。
-pub(crate) const PARSER_VERSION: u32 = 7;
+// 完全沒有專屬事件的子 Agent 也改依共享提示邊界歸屬 SQLite-only 回合時升版（8）。
+pub(crate) const PARSER_VERSION: u32 = 8;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) struct Metrics {
