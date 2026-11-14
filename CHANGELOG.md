@@ -4,19 +4,45 @@
 
 ## [未發行]
 
-### 新增
+## [1.7.0] - 2026-11-15
 
-- 補上 `Claude Fable 5.2` 與 `Claude Mythos 5.2`（含 `Cursor` 部署條目）的官方標準定價規則（輸入 8.00、快取輸入 0.20、輸出 40.00 美元／每百萬 Token）。
-- 補上 `Orchestrator (Carbon)` 與 `Orchestrator (Argon)` 的 `Google AI` 官方標準定價規則（依各自規劃模型標準價設定為輸入 4.00、快取輸入 0.20、輸出 20.00 美元／每百萬 Token）。
-- 補齊 Antigravity CLI 透過 `agy models` 與會話實測查證的模型顯示名稱對應，包含 `Gemini 4 Hydrogen (Low/Medium/High/XHigh)`、`Orchestrator (Carbon)`、`Orchestrator (Argon)`、`gemini-flash-worker-agy`（對應 `Gemini 4 Hydrogen`）、`Claude Opus 5.5 (Low/Medium/High)`、`Claude Sonnet 5.5 (Low/Medium/High)` 與 `GPT-OSS 120B (Medium)`，並對 JSONL 明確 `model_id`/`model`、hook 紀錄與匯入紀錄（`insert_imported_entries`）統一套用別名映射；同時將 Antigravity parser 版本提升至 5 並加入一次性資料庫遷移 `migration:antigravity_model_labels_v1`，讓既有的 native、未變動 hook 與匯入紀錄皆能自動重新歸屬並正確計價。
+### 新增與改善
+
+- **補齊 Antigravity 與新模型官方定價規則**（#85）：
+  - 補上 `Claude Fable 5.2` 與 `Claude Mythos 5.2`（含 `Cursor` 部署條目）的官方標準定價規則（輸入 `8.00`、快取輸入 `0.20`、輸出 `40.00` 美元／每百萬 Token）。
+  - 補上 `Orchestrator (Carbon)` 與 `Orchestrator (Argon)` 的 `Google AI` 官方標準定價規則（依各自規劃模型標準價設定為輸入 `4.00`、快取輸入 `0.20`、輸出 `20.00` 美元／每百萬 Token）。
+- **Antigravity CLI 模型別名正規化與統一映射**（#85）：
+  - 補齊透過 `agy models` 與會話實測查證的模型顯示名稱對應，包含 `Gemini 4 Hydrogen (Low/Medium/High/XHigh)`、`Orchestrator (Carbon)`、`Orchestrator (Argon)`、`gemini-flash-worker-agy`（對應 `Gemini 4 Hydrogen`）、`Claude Opus 5.5 (Low/Medium/High)`、`Claude Sonnet 5.5 (Low/Medium/High)` 與 `GPT-OSS 120B (Medium)`。
+  - 對 JSONL 明確 `model_id`/`model`、hook 紀錄與匯入紀錄（`insert_imported_entries`）統一套用別名映射。
+- **Copilot App 事件檔補匯與逐次呼叫對帳**（#74）：
+  - 新增 Copilot App `events.jsonl`（`session.usage_record`）來源限定同步，與 `session-store.db` 及 `data.db.sessions` 進行保守的逐次呼叫對帳與合併，補齊僅寫入事件檔的新 session 與游標超前時遺漏的歷史用量，並保留主從 Agent 歸屬與原生推理強度。
+- **匯入衝突三向裁決與前端可見性、搜尋與渲染效能強化**（#74）：
+  - 資料匯入改為依回合覆蓋範圍進行三向裁決去重，支援家族代表權判定，避免跨回合歷史被誤判重複，並於匯入批次中記錄跳過衝突筆數（於五語系前端介面顯示）。
+  - 前端 Session 表改用預建父層索引消除二次方掃描，並強化 Prompt 搜尋於即時資料刷新／背景重排期間的穩定性與成長指紋追蹤。
 
 ### 變更
 
-- 每日定價檢查腳本將原本泛稱的 `Google Gemini` 項目改為針對 `Antigravity`：結合 Antigravity 官方模型文件（`antigravity.google/docs/models.md`）與 Google AI Studio 官方定價頁（`aistudio.google.com/docs/pricing.md`），僅對 Antigravity 官方支援模型檢查收錄完整性、逐一驗證每個 Orchestrator 的 Planner 對應與一般 Google AI 模型（除明確標記於 `unpricedModels` 的 `Gemini 3.7 Flash` 與非 Google 模型外）的官方標準價格解析是否成功，同時核對所有 `Google AI` 部署列的標準牌價。
+- **每日定價檢查腳本聚焦 Antigravity 支援模型**（#83、#85）：
+  - 將原本泛稱的 `Google Gemini` 來源項目改為針對 `Antigravity`：結合 Antigravity 官方模型文件（`antigravity.google/docs/models.md`）與 Google AI Studio 官方定價頁（`aistudio.google.com/docs/pricing.md`），僅對 Antigravity 官方支援模型檢查收錄完整性、逐一驗證每個 Orchestrator 的 Planner 對應與一般 Google AI 模型（除明確標記於 `unpricedModels` 的 `Gemini 3.7 Flash` 與非 Google 模型外）的官方標準價格解析是否成功，同時核對所有 `Google AI` 部署列的標準牌價。
 
 ### 修正
 
-- 修正每日定價檢查腳本對 Google AI Studio 官方定價頁新版 Markdoc 格式（`{% tab title="Standard" %}` / `{% table %}`）的解析，以及 Anthropic retired 模型巢狀括號備註的正規化處理，解決 #83 的解析錯誤與誤報。
+- **每日定價檢查與 Markdoc／括號解析修正**（#83、#85）：
+  - 修正 Google AI Studio 官方定價頁新版 Markdoc 格式（`{% tab title="Standard" %}` / `{% table %}`）與跨行促銷價解析，並修正 Anthropic retired 模型巢狀括號備註的 `officialKey` 正規化處理，消除誤報。
+- **Copilot App／CLI 總量計算、會話身分隔離與時間軸回合歸屬修正**（#74）：
+  - 修正 Copilot App 用量總量將 `cache_write` 與 `reasoning` 額外重加導致偏高的問題，統一為來源 raw `input + output`（保留 `cache` 與 `reasoning` 明細）；並改採依涵蓋範圍聚合耗時。
+  - 徹底分離獨立 session 與合成子 Agent 身分，將正規化後的 `parent_session_id` 納入 `usage_entries` 唯一索引與搜尋指紋，並修正 Codex `parent_thread_id` 正規化與匯入批次回合細節 API 查詢。
+  - 修正時間軸回覆訊息累計用量計算（含同時間戳呼叫順序、無專屬事件子 Agent 的共享提示邊界推算、缺欄衝突一秒配對窗及撤銷匯入批次後本機事件未重建問題）。
+
+### 資料影響
+
+- SQLite `import_batches` 新增 `skipped_conflicts INTEGER NOT NULL DEFAULT 0` 欄位，記錄匯入時略過的衝突筆數。
+- `usage_entries` 唯一索引納入正規化 `parent_session_id`，並透過一次性資料庫遷移完成既有 Copilot 父層碰撞與 ID／父層空白正規化（v1–v3）、Codex `parent_thread_id` 重解析（`v10`），以及 Antigravity 模型別名正規化（`migration:antigravity_model_labels_v1`）。
+- Copilot App 與 Antigravity（`PARSER_VERSION` 升至 5）會在啟動同步時自動對既有資料執行冪等對帳與重歸屬修正，不遺失歷史紀錄。
+
+### 相容性
+
+- **向後相容**：所有資料表結構變更、索引更新與一次性遷移皆於既有 SQLite 資料庫就地自動完成，無破壞性 API、CLI 參數或環境變數異動；匯入／匯出 JSON 與既有多助理儀表板介面完全相容。
 
 ## [1.6.7] - 2026-11-13
 
@@ -1181,7 +1207,8 @@
 - 修正行動版側邊欄遮擋、黑畫面、標題擠壓、圖表導覽索引與年度版面問題。
 - 修正並補齊多個 Gemini、Claude、GPT 與 GPT-OSS 模型的定價規則。
 
-[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.6.7...HEAD
+[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.7.0...HEAD
+[1.7.0]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.6.7...v1.7.0
 [1.6.7]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.6.6...v1.6.7
 [1.6.6]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.6.5...v1.6.6
 [1.6.5]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.6.4...v1.6.5
