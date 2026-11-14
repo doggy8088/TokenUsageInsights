@@ -45,7 +45,7 @@ export function normalizeName(name) {
 
 // CSV 的推理強度／Thinking 後綴與官方基礎模型共用同一組價格。
 export function csvKey(name) {
-  return normalizeName(name.replace(/\s*\((?:low|medium|high|xhigh|extra high|minimal|thinking|non-thinking|reasoning)\)/gi, ''));
+  return normalizeName(name.replace(/\s*\((?:low|medium|high|xhigh|extra high|extra|max|minimal|thinking|non-thinking|reasoning)\)/gi, ''));
 }
 
 // 去除 Markdown 連結與 HTML 標籤（反覆處理直到穩定，最後移除殘留的角括號），僅用於比對與顯示名稱。
@@ -225,7 +225,111 @@ export function parseGeminiProvider(md) {
   return entries;
 }
 
+function cleanAntigravityCell(cell) {
+  return stripMarkup(cell || '')
+    .replace(/\\?\*+/g, '')
+    .replace(/[^\x20-\x7E]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function parseAntigravityTables(md, modelsHeading, orchestratorHeading) {
+  const antigravityModels = new Map();
+  let inModelsTable = false;
+  const modelLines = sectionLines(md, modelsHeading);
+  for (let i = 0; i < modelLines.length; i++) {
+    const line = modelLines[i];
+    if (!line.trim().startsWith('|')) { inModelsTable = false; continue; }
+    const next = modelLines[i + 1] || '';
+    if (/^\s*\|?\s*:?-{2,}/.test(next) && !inModelsTable) {
+      const headers = splitRow(line);
+      inModelsTable = /^model$/i.test(cleanAntigravityCell(headers[0]));
+      i++; // 略過分隔列
+      continue;
+    }
+    if (!inModelsTable) continue;
+    const cells = splitRow(line);
+    const cleaned = cleanAntigravityCell(cells[0]);
+    const name = cleaned.replace(/\s*\((?:thinking|non-thinking|reasoning)\)/gi, '').trim();
+    if (!name || name === '-') continue;
+    const key = csvKey(name);
+    if (key && !antigravityModels.has(key)) antigravityModels.set(key, name);
+  }
+  if (antigravityModels.size === 0) {
+    throw new Error('解析不到任何 Antigravity 模型，官方模型頁面格式可能已變更');
+  }
+
+  const orchestratorPlanners = new Map();
+  let orchCols = null;
+  const orchLines = sectionLines(md, orchestratorHeading);
+  for (let i = 0; i < orchLines.length; i++) {
+    const line = orchLines[i];
+    if (!line.trim().startsWith('|')) { orchCols = null; continue; }
+    const next = orchLines[i + 1] || '';
+    if (/^\s*\|?\s*:?-{2,}/.test(next) && !orchCols) {
+      const headers = splitRow(line).map(cleanAntigravityCell);
+      const option = headers.findIndex((h) => /model selector option/i.test(h));
+      const planner = headers.findIndex((h) => /planner/i.test(h));
+      orchCols = option >= 0 && planner >= 0 ? { option, planner } : null;
+      i++; // 略過分隔列
+      continue;
+    }
+    if (!orchCols) continue;
+    const cells = splitRow(line);
+    const optionKey = csvKey(cleanAntigravityCell(cells[orchCols.option]));
+    const plannerKey = csvKey(cleanAntigravityCell(cells[orchCols.planner]));
+    if (optionKey && plannerKey && !orchestratorPlanners.has(optionKey)) {
+      orchestratorPlanners.set(optionKey, plannerKey);
+    }
+  }
+  if ([...antigravityModels.keys()].some((k) => k.startsWith('orchestrator ')) && orchestratorPlanners.size === 0) {
+    throw new Error('解析不到 Antigravity Orchestrator 對應表，官方模型頁面格式可能已變更');
+  }
+
+  return { antigravityModels, orchestratorPlanners };
+}
+
+// Antigravity 官方模型頁列出支援的推理模型與 Orchestrator 對應，價格取自 Google AI Studio 官方定價文件。
+export function parseAntigravityProvider(modelsMd, pricingMd, options = {}) {
+  const { modelsHeading = '## Reasoning model', orchestratorHeading = '## Orchestrator' } = options;
+  const { antigravityModels, orchestratorPlanners } = parseAntigravityTables(modelsMd, modelsHeading, orchestratorHeading);
+  const geminiPrices = parseGeminiProvider(pricingMd);
+  if (geminiPrices.size === 0) {
+    throw new Error('解析不到任何價格，官方定價頁面格式可能已變更');
+  }
+
+  const resolveGeminiPrice = (key) => {
+    const targetKey = orchestratorPlanners.get(key) || key;
+    return geminiPrices.get(targetKey) || geminiPrices.get(`${targetKey} preview`) || null;
+  };
+
+  const entries = new Map();
+  for (const [key, name] of antigravityModels) {
+    const price = resolveGeminiPrice(key);
+    entries.set(key, {
+      name,
+      input: price?.input ?? null,
+      output: price?.output ?? null,
+      cached: price?.cached ?? null,
+      trackMissing: true,
+    });
+  }
+  for (const [key, price] of geminiPrices) {
+    if (!entries.has(key)) {
+      entries.set(key, { ...price, trackMissing: false });
+    }
+  }
+  return entries;
+}
+
 export function parseProvider(provider, md) {
+  if (provider.parser === 'antigravity') {
+    const { modelsMd, pricingMd } = typeof md === 'object' && md !== null ? md : {};
+    return parseAntigravityProvider(modelsMd, pricingMd, {
+      modelsHeading: provider.modelsSectionHeading,
+      orchestratorHeading: provider.orchestratorSectionHeading,
+    });
+  }
   return provider.parser === 'gemini' ? parseGeminiProvider(md) : parseTableProvider(md, provider.sectionHeading);
 }
 
@@ -233,13 +337,15 @@ export function parseProvider(provider, md) {
 const standardPrice = (p) => (p.after != null ? p.after : p.now);
 const matchesPrice = (local, p) => Math.abs(local - standardPrice(p)) <= EPSILON;
 
-export function compareProvider(csvRows, official, ignoreModels = []) {
-  const ignored = new Set(ignoreModels.map(officialKey));
+export function compareProvider(csvRows, official, ignoreModels = [], options = {}) {
+  const { priceDeployments } = options;
+  const ignored = new Set(ignoreModels.flatMap((m) => [officialKey(m), csvKey(m)]));
   const mismatches = [];
   const promos = [];
   const known = new Set();
   for (const row of csvRows) {
     known.add(csvKey(row.model));
+    if (priceDeployments && !priceDeployments.includes(row.deployment)) continue;
     if (!isBaseRow(row.model)) continue;
     const remote = official.get(csvKey(row.model));
     if (!remote) continue;
@@ -259,7 +365,7 @@ export function compareProvider(csvRows, official, ignoreModels = []) {
     if (diffs.length) mismatches.push({ model: row.model, diffs });
   }
   const missing = [...official.entries()]
-    .filter(([key, e]) => !known.has(key) && !ignored.has(key) && !NON_TEXT.test(e.name))
+    .filter(([key, e]) => e.trackMissing !== false && !known.has(key) && !ignored.has(key) && !NON_TEXT.test(e.name))
     .map(([, e]) => e.name);
   return { mismatches, promos: [...new Set(promos)], missing };
 }
@@ -291,21 +397,40 @@ export async function run({ csvPath = path.join(root, 'pricing.csv'), reportPath
   let added = 0;
 
   for (const p of sources.providers) {
-    lines.push(`## ${p.name}`, '', `官方文件：<${p.pageUrl}>`, '');
+    if (p.pricingPageUrl) {
+      lines.push(`## ${p.name}`, '', `官方模型清單：<${p.pageUrl}>`, `官方定價文件：<${p.pricingPageUrl}>`, '');
+    } else {
+      lines.push(`## ${p.name}`, '', `官方文件：<${p.pageUrl}>`, '');
+    }
     let official;
     try {
-      official = parseProvider(p, await fetchText(p.sourceUrl));
+      if (p.parser === 'antigravity') {
+        const [modelsMd, pricingMd] = await Promise.all([fetchText(p.sourceUrl), fetchText(p.pricingSourceUrl)]);
+        official = parseAntigravityProvider(modelsMd, pricingMd, {
+          modelsHeading: p.modelsSectionHeading,
+          orchestratorHeading: p.orchestratorSectionHeading,
+        });
+      } else {
+        official = parseProvider(p, await fetchText(p.sourceUrl));
+      }
       if (official.size === 0) throw new Error('解析不到任何價格，官方頁面格式可能已變更');
     } catch (err) {
       errors++;
       lines.push(`> ⚠️ 無法取得或解析官方價格：${err.message}`, '');
       continue;
     }
-    lines.push(`解析到 ${official.size} 個官方模型價格。`, '');
+    if (p.parser === 'antigravity') {
+      const tracked = [...official.values()].filter((e) => e.trackMissing !== false);
+      const pricedCount = tracked.filter((e) => e.input && e.output).length;
+      lines.push(`解析到 ${tracked.length} 個 Antigravity 官方支援模型（其中 ${pricedCount} 個對應 Gemini 官方標準價）。`, '');
+    } else {
+      lines.push(`解析到 ${official.size} 個官方模型價格。`, '');
+    }
     const { mismatches, promos, missing } = compareProvider(
       csvRows.filter((r) => p.deployments.includes(r.deployment)),
       official,
       p.ignoreModels,
+      { priceDeployments: p.priceDeployments },
     );
     drift += mismatches.length;
     added += missing.length;

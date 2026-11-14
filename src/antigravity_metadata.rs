@@ -550,6 +550,9 @@ fn model_label(uid: &str) -> &str {
         "gemini-4-hydrogen-low" => "Gemini 4 Hydrogen (Low)",
         "gemini-pro-orchestrator" => "Orchestrator (Carbon)",
         "gemini-pro-orchestrator-argon" => "Orchestrator (Argon)",
+        // Verified from Antigravity Orchestrator session `gen_metadata` and
+        // https://antigravity.google/docs/models#orchestrator (execution runs on Gemini 4 Hydrogen).
+        "gemini-flash-worker-agy" => "Gemini 4 Hydrogen",
         "gemini-3.8-flash-high" => "Gemini 3.8 Flash (High)",
         "gemini-3.8-flash-medium" => "Gemini 3.8 Flash (Medium)",
         "gemini-3.8-flash-low" => "Gemini 3.8 Flash (Low)",
@@ -695,6 +698,7 @@ mod tests {
             ("gemini-4-hydrogen-low", "Gemini 4 Hydrogen (Low)"),
             ("gemini-pro-orchestrator", "Orchestrator (Carbon)"),
             ("gemini-pro-orchestrator-argon", "Orchestrator (Argon)"),
+            ("gemini-flash-worker-agy", "Gemini 4 Hydrogen"),
             ("claude-opus-5-5-low", "Claude Opus 5.5 (Low)"),
             ("claude-opus-5-5-medium", "Claude Opus 5.5 (Medium)"),
             ("claude-opus-5-5-high", "Claude Opus 5.5 (High)"),

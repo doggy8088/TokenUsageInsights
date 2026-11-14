@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 pub(crate) const SOURCE_KIND: &str = "antigravity-session";
 // Bump when parsed fields change so unchanged historical sources are re-imported.
-pub(crate) const PARSER_VERSION: u32 = 3;
+pub(crate) const PARSER_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AntigravitySystemMessage {

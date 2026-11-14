@@ -69,6 +69,8 @@ Gemini 4 Argon,Google AI,1M Tokens,4.00,0.20,20.00,2.00/0.10/10.00
 Gemini 4 Argon (Medium),Google AI,1M Tokens,4.00,0.20,20.00,2.00/0.10/10.00
 Gemini 4 Argon (High),Google AI,1M Tokens,4.00,0.20,20.00,2.00/0.10/10.00
 Gemini 4 Argon (Low),Google AI,1M Tokens,4.00,0.20,20.00,2.00/0.10/10.00
+Orchestrator (Carbon),Google AI,1M Tokens,4.00,0.20,20.00,2.00/0.10/10.00
+Orchestrator (Argon),Google AI,1M Tokens,4.00,0.20,20.00,2.00/0.10/10.00
 Gemini 3.8 Flash,Google AI,1M Tokens,1.50,0.15,7.50,0.75/0.075/3.75
 Gemini 3.8 Flash (Medium),Google AI,1M Tokens,1.50,0.15,7.50,0.75/0.075/3.75
 Gemini 3.8 Flash (High),Google AI,1M Tokens,1.50,0.15,7.50,0.75/0.075/3.75

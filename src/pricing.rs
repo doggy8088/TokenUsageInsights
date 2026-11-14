@@ -1698,4 +1698,32 @@ mod tests {
         .expect("muse-spark-1.2-contributor should have a pricing rule");
         assert!((contributor_12 - 0.302).abs() < 1e-12);
     }
+
+    #[test]
+    fn antigravity_orchestrator_models_use_planner_standard_pricing() {
+        let rules = load_pricing_rules();
+
+        for model_name in ["Orchestrator (Carbon)", "Orchestrator (Argon)"] {
+            let input =
+                calculate_usage_cost(&rules, Some(model_name), 1_000_000, 0, 0, 0, 0).unwrap();
+            let output =
+                calculate_usage_cost(&rules, Some(model_name), 0, 1_000_000, 0, 0, 0).unwrap();
+            let cached =
+                calculate_usage_cost(&rules, Some(model_name), 0, 0, 1_000_000, 0, 0).unwrap();
+
+            // Standard (post-introductory) planner rates: input 4.00, cached input 0.20, output 20.00.
+            assert!(
+                (input - 4.00).abs() < 1e-9,
+                "unexpected {model_name} input cost: {input}"
+            );
+            assert!(
+                (output - 20.00).abs() < 1e-9,
+                "unexpected {model_name} output cost: {output}"
+            );
+            assert!(
+                (cached - 0.20).abs() < 1e-9,
+                "unexpected {model_name} cached input cost: {cached}"
+            );
+        }
+    }
 }
