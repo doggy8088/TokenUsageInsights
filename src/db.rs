@@ -406,6 +406,11 @@ const COPILOT_CLI_AGENT_MIGRATION_KEY: &str = "migration:copilot_cli_per_call_us
 /// re-runs only cover sessions synced after the marker.
 const COPILOT_CWD_BACKFILL_MIGRATION_KEY: &str = "migration:copilot_cwd_backfill_v1";
 
+/// One-time normalization of existing Antigravity `model` and `model_id`
+/// values (including unchanged `legacy` hook rows and imported rows bypassed by
+/// native `PARSER_VERSION` re-imports) via `antigravity_metadata::model_label`.
+const ANTIGRAVITY_MODEL_LABEL_MIGRATION_KEY: &str = "migration:antigravity_model_labels_v1";
+
 #[derive(Default)]
 enum InitialUserPromptState {
     #[default]
@@ -1460,6 +1465,7 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
     run_copilot_parent_collision_recovery_migration(conn)?;
     run_parent_session_id_normalization_migration_v2(conn)?;
     run_parent_session_id_normalization_migration_v3(conn)?;
+    run_antigravity_model_label_migration_v1(conn)?;
 
     Ok(())
 }
@@ -1521,6 +1527,32 @@ fn normalize_copilot_cli_token_stats(tokens: &mut Option<TokenStats>) {
 fn normalize_copilot_cli_usage_entry(entry: &mut UsageEntry) {
     normalize_copilot_cli_token_stats(&mut entry.tokens);
     normalize_copilot_cli_token_stats(&mut entry.delta_tokens);
+}
+
+fn normalize_antigravity_model_value(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mapped = crate::antigravity_metadata::model_label(trimmed);
+    (mapped != raw).then(|| mapped.to_owned())
+}
+
+fn normalize_antigravity_usage_entry(entry: &mut UsageEntry) {
+    if let Some(mapped) = entry
+        .model
+        .as_deref()
+        .and_then(normalize_antigravity_model_value)
+    {
+        entry.model = Some(mapped);
+    }
+    if let Some(mapped) = entry
+        .model_id
+        .as_deref()
+        .and_then(normalize_antigravity_model_value)
+    {
+        entry.model_id = Some(mapped);
+    }
 }
 
 fn normalize_legacy_claude_token_stats(tokens: &mut Option<TokenStats>) {
@@ -1932,24 +1964,7 @@ fn sync_hook_usage_logs_with_cancel(
                     }
                 } else if assistant_type == "antigravity" {
                     for entry in &mut parsed_entries {
-                        if let Some(raw) = entry
-                            .model
-                            .as_deref()
-                            .map(str::trim)
-                            .filter(|v| !v.is_empty())
-                        {
-                            entry.model =
-                                Some(crate::antigravity_metadata::model_label(raw).to_owned());
-                        }
-                        if let Some(raw) = entry
-                            .model_id
-                            .as_deref()
-                            .map(str::trim)
-                            .filter(|v| !v.is_empty())
-                        {
-                            entry.model_id =
-                                Some(crate::antigravity_metadata::model_label(raw).to_owned());
-                        }
+                        normalize_antigravity_usage_entry(entry);
                     }
                 }
 
@@ -2753,6 +2768,106 @@ fn run_parent_session_id_normalization_migration_v3(conn: &Connection) -> Result
         println!(
             "✅ 遷移：身分正規化 v3——trim {} 列 session／父層空白、折疊 {} 列同鍵重複、{} 個匯入碰撞組原樣保留",
             normalized_rows, folded_rows, skipped_imported_groups
+        );
+    }
+    Ok(())
+}
+
+fn apply_antigravity_model_label_migration_v1(conn: &Connection) -> Result<usize, String> {
+    let mut updates: Vec<(i64, Option<String>, Option<String>)> = Vec::new();
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, model, model_id
+                 FROM usage_entries
+                 WHERE assistant_type = 'antigravity'
+                   AND (model IS NOT NULL OR model_id IS NOT NULL)",
+            )
+            .map_err(|error| format!("準備讀取 Antigravity 模型名稱遷移資料失敗: {error}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .map_err(|error| format!("讀取 Antigravity 模型名稱遷移資料失敗: {error}"))?;
+        for row in rows {
+            let (entry_id, model, model_id) =
+                row.map_err(|error| format!("迭代 Antigravity 模型名稱遷移資料失敗: {error}"))?;
+            let next_model = model.as_deref().and_then(normalize_antigravity_model_value);
+            let next_model_id = model_id
+                .as_deref()
+                .and_then(normalize_antigravity_model_value);
+            if next_model.is_some() || next_model_id.is_some() {
+                updates.push((entry_id, next_model.or(model), next_model_id.or(model_id)));
+            }
+        }
+    }
+
+    let updated_rows = updates.len();
+    if updated_rows > 0 {
+        let mut update_stmt = conn
+            .prepare("UPDATE usage_entries SET model = ?, model_id = ? WHERE id = ?")
+            .map_err(|error| format!("準備更新 Antigravity 模型名稱失敗: {error}"))?;
+        for (entry_id, next_model, next_model_id) in updates {
+            update_stmt
+                .execute(params![next_model, next_model_id, entry_id])
+                .map_err(|error| format!("更新 Antigravity 模型名稱失敗: {error}"))?;
+        }
+    }
+
+    conn.execute(
+        "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time) VALUES (?, 1, 0)",
+        params![ANTIGRAVITY_MODEL_LABEL_MIGRATION_KEY],
+    )
+    .map_err(|error| format!("寫入 Antigravity 模型名稱遷移狀態失敗: {error}"))?;
+
+    Ok(updated_rows)
+}
+
+/// 一次性 Antigravity 模型顯示名稱正規化遷移。
+///
+/// 涵蓋既有未變動 `usage-*.jsonl` hook（`legacy`）與曾匯入的既有紀錄，
+/// 避免 native `PARSER_VERSION` 升級重匯入路徑遺漏這些列的 `model` / `model_id` 別名轉換。
+fn run_antigravity_model_label_migration_v1(conn: &Connection) -> Result<(), String> {
+    let migration_done: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = ?)",
+            params![ANTIGRAVITY_MODEL_LABEL_MIGRATION_KEY],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    if migration_done {
+        return Ok(());
+    }
+
+    conn.execute_batch("SAVEPOINT antigravity_model_labels_v1;")
+        .map_err(|error| format!("開啟 Antigravity 模型名稱遷移 SAVEPOINT 失敗: {error}"))?;
+
+    let updated_rows = match apply_antigravity_model_label_migration_v1(conn) {
+        Ok(count) => {
+            conn.execute_batch("RELEASE SAVEPOINT antigravity_model_labels_v1;")
+                .map_err(|error| {
+                    format!("提交 Antigravity 模型名稱遷移 SAVEPOINT 失敗: {error}")
+                })?;
+            count
+        }
+        Err(error) => {
+            let _ = conn.execute_batch(
+                "ROLLBACK TO SAVEPOINT antigravity_model_labels_v1;
+                 RELEASE SAVEPOINT antigravity_model_labels_v1;",
+            );
+            return Err(error);
+        }
+    };
+
+    if updated_rows > 0 {
+        println!(
+            "✅ 遷移：Antigravity 模型名稱正規化——已更新 {} 筆既有紀錄",
+            updated_rows
         );
     }
     Ok(())
@@ -8423,6 +8538,9 @@ pub fn import_usage_day_entries(
         // PRRT_kwDOTOgsec6yUKGs): the frontend identity key collapses `''` to
         // absent and RootOnly lookups cannot find rows persisted with `''`.
         entry.parent_session_id = normalize_parent_session_id(entry.parent_session_id.take());
+        if assistant == "antigravity" {
+            normalize_antigravity_usage_entry(&mut entry);
+        }
         let normalized_id = normalize_import_source_id(import_source_id.as_deref());
         let record_date = entry_date_from_timestamp(&entry.timestamp)
             .ok_or_else(|| "無效的 timestamp 格式，無法取得日期".to_string())?
@@ -10772,6 +10890,129 @@ mod tests {
             )
             .unwrap();
         assert_eq!(model, "Unknown Model");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn antigravity_upgrade_migrates_existing_unchanged_hook_model_labels() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let root = temp_jsonl_path("antigravity-hook-upgrade").with_extension("");
+        fs::create_dir_all(root.join("usage")).unwrap();
+
+        let mut orch_entry = sample_import_record().entry;
+        orch_entry.session_id = "hook-orch".to_owned();
+        orch_entry.turn_no = 1;
+        orch_entry.model = Some("gemini-pro-orchestrator".to_owned());
+        orch_entry.model_id = Some("gemini-pro-orchestrator".to_owned());
+
+        let mut worker_entry = sample_import_record().entry;
+        worker_entry.session_id = "hook-worker".to_owned();
+        worker_entry.turn_no = 1;
+        worker_entry.model = Some("gemini-flash-worker-agy".to_owned());
+        worker_entry.model_id = Some("gemini-flash-worker-agy".to_owned());
+
+        let hook_payload = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&orch_entry).unwrap(),
+            serde_json::to_string(&worker_entry).unwrap()
+        );
+        fs::write(root.join("usage/usage-2026-10-12.jsonl"), &hook_payload).unwrap();
+
+        sync_antigravity_usage_logs_with_cancel(&mut conn, &root, &|| false).unwrap();
+
+        // Simulate pre-upgrade DB rows written before model alias normalization
+        // and before ANTIGRAVITY_MODEL_LABEL_MIGRATION_KEY existed.
+        conn.execute(
+            "UPDATE usage_entries SET model = 'gemini-pro-orchestrator', model_id = 'gemini-pro-orchestrator' WHERE session_id = 'hook-orch'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE usage_entries SET model = 'gemini-flash-worker-agy', model_id = 'gemini-flash-worker-agy' WHERE session_id = 'hook-worker'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM sync_state WHERE filename = ?",
+            params![ANTIGRAVITY_MODEL_LABEL_MIGRATION_KEY],
+        )
+        .unwrap();
+
+        // Opening DB after upgrade migrates existing unchanged rows in place.
+        init_db(&conn).unwrap();
+        init_db(&conn).unwrap();
+
+        // Re-syncing unchanged usage-*.jsonl files keeps rows deduplicated and normalized.
+        sync_antigravity_usage_logs_with_cancel(&mut conn, &root, &|| false).unwrap();
+
+        let total_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries WHERE assistant_type = 'antigravity'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(total_rows, 2);
+
+        fn fetch_models(conn: &Connection, session_id: &str) -> (String, Option<String>) {
+            conn.query_row(
+                "SELECT model, model_id FROM usage_entries WHERE assistant_type = 'antigravity' AND session_id = ?",
+                params![session_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        }
+
+        let (orch_model, orch_model_id) = fetch_models(&conn, "hook-orch");
+        let (worker_model, worker_model_id) = fetch_models(&conn, "hook-worker");
+        assert_eq!(orch_model, "Orchestrator (Carbon)");
+        assert_eq!(orch_model_id.as_deref(), Some("Orchestrator (Carbon)"));
+        assert_eq!(worker_model, "Gemini 4 Hydrogen");
+        assert_eq!(worker_model_id.as_deref(), Some("Gemini 4 Hydrogen"));
+
+        let migration_recorded: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = ?)",
+                params![ANTIGRAVITY_MODEL_LABEL_MIGRATION_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(migration_recorded);
+
+        // Imported Antigravity entries also normalize model / model_id immediately.
+        let mut imported = sample_import_record();
+        imported.entry.session_id = "imported-worker".to_owned();
+        imported.entry.model = Some("gemini-flash-worker-agy".to_owned());
+        imported.entry.model_id = Some("gemini-flash-worker-agy".to_owned());
+        imported.import_source_id = Some("antigravity-import-worker-1".to_owned());
+        let summary = import_usage_day_entries(
+            &mut conn,
+            "antigravity",
+            "2026-10-12",
+            vec![imported],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        assert_eq!(summary.imported, 1);
+        let (imported_model, imported_model_id) = fetch_models(&conn, "imported-worker");
+        assert_eq!(imported_model, "Gemini 4 Hydrogen");
+        assert_eq!(imported_model_id.as_deref(), Some("Gemini 4 Hydrogen"));
+
+        let pricing = crate::pricing::load_prepared_pricing_rules();
+        let orch_cost = pricing
+            .calculate_usage_cost(Some(&orch_model), 1_000_000, 1_000_000, 1_000_000, 0, 0)
+            .unwrap();
+        let worker_cost = pricing
+            .calculate_usage_cost(Some(&worker_model), 1_000_000, 1_000_000, 1_000_000, 0, 0)
+            .unwrap();
+        assert!((orch_cost - 24.20).abs() < 1e-6, "orch_cost={orch_cost}");
+        assert!(
+            (worker_cost - 9.075).abs() < 1e-6,
+            "worker_cost={worker_cost}"
+        );
+
         fs::remove_dir_all(root).unwrap();
     }
 

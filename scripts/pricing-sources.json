@@ -74,6 +74,9 @@
       "pricingPageUrl": "https://aistudio.google.com/docs/pricing",
       "pricingSourceUrl": "https://aistudio.google.com/docs/pricing.md",
       "parser": "antigravity",
+      "unpricedModels": [
+        "Gemini 3.7 Flash"
+      ],
       "ignoreModels": []
     },
     {
@@ -93,5 +96,5 @@
       ]
     }
   ],
-  "_comment2": "ignoreModels：已知且刻意不追蹤的官方模型（多為舊世代）。不在此清單也不在 pricing.csv 的官方模型會被視為新模型並觸發通知。"
+  "_comment2": "ignoreModels：已知且刻意不追蹤的官方模型（多為舊世代）；unpricedModels：僅 Antigravity 使用，已知尚未登上 Google AI Studio 定價表但仍須追蹤收錄完整性的 Google AI 模型（預設為空）。不在此清單也不在 pricing.csv 的官方模型會被視為新模型並觸發通知。"
 }

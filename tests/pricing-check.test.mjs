@@ -416,3 +416,71 @@ test('parseAntigravityProvider 缺少模型表、部分 Orchestrator 對應或 P
     /解析不到 Antigravity Orchestrator「Orchestrator \(Argon\)」.*官方價格/,
   );
 });
+
+test('parseAntigravityProvider 對未列於 unpricedModels 的一般 Google AI 模型缺價時拋錯', () => {
+  const modelsMd = `## Reasoning model
+| Model | Plan |
+| --- | --- |
+| Gemini 4 Hydrogen | Pro |
+`;
+  const otherPricingMd = `## Gemini 4 Carbon
+
+### Standard
+
+| | Free Tier | Paid Tier |
+|---|---|---|
+| Input price | Free | $4.00 |
+| Output price | Free | $20.00 |
+`;
+  assert.throws(
+    () => parseAntigravityProvider(modelsMd, otherPricingMd),
+    /解析不到 Antigravity 模型「Gemini 4 Hydrogen」的官方價格/,
+  );
+});
+
+test('parseAntigravityProvider 允許 unpricedModels 缺價但仍透過 compareProvider 檢查收錄完整性', () => {
+  const modelsMd = `## Reasoning model
+| Model | Plan |
+| --- | --- |
+| Gemini 4 Carbon | Pro |
+| Gemini 3.7 Flash | Free |
+| Claude Opus 5.5 | Pro |
+`;
+  const pricingMd = `## Gemini 4 Carbon
+
+### Standard
+
+| | Free Tier | Paid Tier |
+|---|---|---|
+| Input price | Free | $4.00 |
+| Output price | Free | $20.00 |
+`;
+  const entries = parseAntigravityProvider(modelsMd, pricingMd, {
+    unpricedModels: ['Gemini 3.7 Flash'],
+  });
+  const unpricedEntry = entries.get(csvKey('Gemini 3.7 Flash'));
+  assert.deepEqual(unpricedEntry, {
+    name: 'Gemini 3.7 Flash',
+    input: null,
+    output: null,
+    cached: null,
+    trackMissing: true,
+  });
+
+  const csvWithoutUnpriced = parseCsv(`模型名稱,部署類型,單位,輸入價格(美金),快取輸入價格(美金),輸出價格(美金),批次 API 價格(美金)
+Gemini 4 Carbon,Google AI,1M Tokens,4.00,,20.00,N/A
+Claude Opus 5.5,Global,1M Tokens,5.00,,25.00,N/A
+`);
+  const missingResult = compareProvider(csvWithoutUnpriced, entries, [], { priceDeployments: ['Google AI'] });
+  assert.deepEqual(missingResult.mismatches, []);
+  assert.ok(missingResult.missing.some((name) => name.includes('Gemini 3.7 Flash')));
+
+  const completeCsv = parseCsv(`模型名稱,部署類型,單位,輸入價格(美金),快取輸入價格(美金),輸出價格(美金),批次 API 價格(美金)
+Gemini 4 Carbon,Google AI,1M Tokens,4.00,,20.00,N/A
+Gemini 3.7 Flash,Google AI,1M Tokens,0.10,,0.40,N/A
+Claude Opus 5.5,Global,1M Tokens,5.00,,25.00,N/A
+`);
+  const completeResult = compareProvider(completeCsv, entries, [], { priceDeployments: ['Google AI'] });
+  assert.deepEqual(completeResult.mismatches, []);
+  assert.deepEqual(completeResult.missing, []);
+});

@@ -11,6 +11,8 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const EPSILON = 1e-9;
 // 非文字模型（圖像、語音、嵌入等）不在 pricing.csv 的追蹤範圍，列新模型時略過。
 const NON_TEXT = /tts|image|embedding|live|lyria|transcribe|robotics|veo|imagen|omni|nano banana|gemma|audio|imagine|video|speech/i;
+// Antigravity 清單中非 Google 自研（Anthropic Claude / OpenAI OSS）模型不查 Google AI Studio 價表。
+const NON_GOOGLE_ANTIGRAVITY_MODEL = /^(?:claude|gpt)(?:\s|$)/i;
 
 export function parseCsv(text) {
   const rows = [];
@@ -300,13 +302,18 @@ function parseAntigravityTables(md, modelsHeading, orchestratorHeading) {
 
 // Antigravity 官方模型頁列出支援的推理模型與 Orchestrator 對應，價格取自 Google AI Studio 官方定價文件。
 export function parseAntigravityProvider(modelsMd, pricingMd, options = {}) {
-  const { modelsHeading = '## Reasoning model', orchestratorHeading = '## Orchestrator' } = options;
+  const {
+    modelsHeading = '## Reasoning model',
+    orchestratorHeading = '## Orchestrator',
+    unpricedModels = [],
+  } = options;
   const { antigravityModels, orchestratorPlanners } = parseAntigravityTables(modelsMd, modelsHeading, orchestratorHeading);
   const geminiPrices = parseGeminiProvider(pricingMd);
   if (geminiPrices.size === 0) {
     throw new Error('解析不到任何價格，官方定價頁面格式可能已變更');
   }
 
+  const unpriced = new Set(unpricedModels.flatMap((m) => [officialKey(m), csvKey(m)]));
   const resolveGeminiPrice = (key) => {
     const targetKey = orchestratorPlanners.get(key) || key;
     return geminiPrices.get(targetKey) || geminiPrices.get(`${targetKey} preview`) || null;
@@ -325,6 +332,11 @@ export function parseAntigravityProvider(modelsMd, pricingMd, options = {}) {
     if (isOrchestrator && (!price?.input || !price?.output)) {
       throw new Error(
         `解析不到 Antigravity Orchestrator「${name}」（Planner: ${plannerKey}）的官方價格，定價頁面格式可能已變更`,
+      );
+    }
+    if (!isOrchestrator && !NON_GOOGLE_ANTIGRAVITY_MODEL.test(key) && !unpriced.has(key) && (!price?.input || !price?.output)) {
+      throw new Error(
+        `解析不到 Antigravity 模型「${name}」的官方價格，定價頁面格式可能已變更`,
       );
     }
     entries.set(key, {
@@ -349,6 +361,7 @@ export function parseProvider(provider, md) {
     return parseAntigravityProvider(modelsMd, pricingMd, {
       modelsHeading: provider.modelsSectionHeading,
       orchestratorHeading: provider.orchestratorSectionHeading,
+      unpricedModels: provider.unpricedModels,
     });
   }
   return provider.parser === 'gemini' ? parseGeminiProvider(md) : parseTableProvider(md, provider.sectionHeading);
@@ -430,6 +443,7 @@ export async function run({ csvPath = path.join(root, 'pricing.csv'), reportPath
         official = parseAntigravityProvider(modelsMd, pricingMd, {
           modelsHeading: p.modelsSectionHeading,
           orchestratorHeading: p.orchestratorSectionHeading,
+          unpricedModels: p.unpricedModels,
         });
       } else {
         official = parseProvider(p, await fetchText(p.sourceUrl));
