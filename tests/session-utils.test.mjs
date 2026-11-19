@@ -12,12 +12,40 @@ import {
   nextSessionSearchSearchedFingerprint,
   normalizeSessionChatText,
   parentSessionIdentityKey,
+  readSessionChatReply,
   rootSessionIdentityKey,
   sessionChatSearchExcerpt,
   sessionIdentityKey,
   sessionSearchDataFingerprint,
   sessionSearchMatchKey,
 } from '../static/session-utils.js';
+
+test('session chat reads replies and separates reasoning from older session APIs', () => {
+  const wrapReasoning = (reasoning, reply) =>
+    '<details><summary>🧠 LLM Reasoning Process</summary>\n'
+    + reasoning + '\n</details>\n\n' + reply;
+
+  assert.deepEqual(readSessionChatReply({ reply: '**Legacy reply**' }), {
+    text: '**Legacy reply**',
+    reasoning: '',
+  });
+  assert.deepEqual(readSessionChatReply({ reply: wrapReasoning('Recorded reasoning', 'Visible reply') }), {
+    text: 'Visible reply',
+    reasoning: 'Recorded reasoning',
+  });
+  assert.deepEqual(readSessionChatReply({ reply: wrapReasoning('Reasoning-only event', '') }), {
+    text: '',
+    reasoning: 'Reasoning-only event',
+  });
+  assert.deepEqual(
+    readSessionChatReply({ reply_text: '', reasoning: 'Structured reasoning', reply: 'Old content' }),
+    { text: '', reasoning: 'Structured reasoning' },
+  );
+  assert.deepEqual(readSessionChatReply({ reply: '<details><summary>Example</summary>Reply</details>' }), {
+    text: '<details><summary>Example</summary>Reply</details>',
+    reasoning: '',
+  });
+});
 
 test('session chat search finds literal, case-insensitive phrases across whitespace and Unicode variants', () => {
   const text = normalizeSessionChatText('訊息：ＦＩＸ\n\tCafe\u0301 [v2.0]?');

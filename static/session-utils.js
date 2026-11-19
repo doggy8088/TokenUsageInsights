@@ -46,6 +46,25 @@ export function sessionSearchMatchKey(session) {
   return sessionIdentityKey(session);
 }
 
+export function readSessionChatReply(data) {
+  const reasoning = typeof data.reasoning === 'string' ? data.reasoning : null;
+  if (typeof data.reply_text === 'string') {
+    return { text: data.reply_text, reasoning: reasoning ?? '' };
+  }
+
+  // Older session APIs prepend reasoning to reply using this exact wrapper.
+  const reply = typeof data.reply === 'string' ? data.reply : '';
+  const prefix = '<details><summary>🧠 LLM Reasoning Process</summary>\n';
+  const separator = '\n</details>\n\n';
+  const reasoningEnd = reply.startsWith(prefix) ? reply.indexOf(separator, prefix.length) : -1;
+  if (reasoningEnd === -1) return { text: reply, reasoning: reasoning ?? '' };
+
+  return {
+    text: reply.slice(reasoningEnd + separator.length),
+    reasoning: reasoning ?? reply.slice(prefix.length, reasoningEnd),
+  };
+}
+
 export function normalizeSessionChatText(text) {
   return text.normalize('NFKC').replace(/\s+/gu, ' ').trim();
 }

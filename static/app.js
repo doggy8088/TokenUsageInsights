@@ -17,11 +17,12 @@ import {
   nextSessionSearchRunState,
   nextSessionSearchSearchedFingerprint,
   normalizeSessionChatText,
+  readSessionChatReply,
   sessionIdentityKey,
   sessionChatSearchExcerpt,
   sessionSearchDataFingerprint,
   sessionSearchMatchKey,
-} from './session-utils.js?v=12';
+} from './session-utils.js?v=13';
 import { parseUsageTimestamp } from './time-utils.js?v=1';
 
 // Globals
@@ -5244,7 +5245,8 @@ function createSessionChatRow(item, index, assistantType) {
   if (item?.event_type !== 'UserPrompt' && item?.event_type !== 'AssistantReply') return null;
 
   const user = item.event_type === 'UserPrompt';
-  const text = user ? data.prompt_text ?? data.prompt ?? '' : data.reply_text ?? '';
+  const reply = user ? null : readSessionChatReply(data);
+  const text = user ? data.prompt_text ?? data.prompt ?? '' : reply.text;
   if (user && data.sender_role === 'agent') {
     return createChatDetailRow('system', t('drawer_agent_context'), text, time);
   }
@@ -5255,7 +5257,7 @@ function createSessionChatRow(item, index, assistantType) {
   const body = chatElement('div', user ? 'chat-text' : 'reply-content');
 
   const tokens = user ? null : createChatTokenStats(data);
-  const reasoningText = user ? '' : data.reasoning?.trim();
+  const reasoningText = reply?.reasoning.trim();
   const hasAttachments = user && Array.isArray(data.attachments) && data.attachments.length > 0;
 
   if (!text.trim() && !hasAttachments) {
