@@ -4,6 +4,31 @@
 
 ## [未發行]
 
+## [1.8.0] - 2026-11-20
+
+本次 minor release 將會話詳情改成可搜尋的聊天介面，並在側欄提供四個統計期間快選按鈕。
+
+### 新增與改善
+
+- **聊天式會話檢視**：依日誌順序顯示訊息，使用者提問靠右，助理回覆靠左。長訊息提供六行預覽與展開操作，保留附件、Markdown 渲染與複製功能。支援鍵盤操作、深淺色主題及五種語言。
+- **會話內搜尋與顯示控制**：搜尋完整提問及回覆，並在長訊息中顯示命中摘錄。預設顯示對話，可另外開啟工具、推理與系統訊息，或切換時間與 Token。瀏覽器會記住顯示偏好。
+- **在日誌提供資料時顯示會話細節**：補上回覆的獨立推理欄位、耗時及工具狀態。Codex 可查看已記錄的系統指示、開發者指示與可讀的推理摘要。Antigravity 會區分使用者提問與代理間訊息。
+
+### 變更
+
+- **期間快速切換**：側欄以「每日、月度、年度、區間」四個按鈕取代下拉選單，並以底線標示目前的報表。
+- 助理回覆標籤只顯示名稱，例如 `MINIMAX CODE`、`CLAUDE CODE` 和 `CODEX`。
+
+### 修正
+
+- **Claude Code 重複對話**：會話解析排除 `api-request-blob` 請求快照，避免重播的訊息與工具事件重複出現，並保留真正發出、內容相同的回覆。
+- **舊版後端的會話回覆**：前端支援舊版 `reply` 欄位，並將欄位內的推理與正文分開，讓「僅顯示對話」仍可閱讀及搜尋回覆。
+- **快速切換統計期間**：延遲抵達的報表回應不會覆蓋目前報表的標題、資料或載入狀態。
+
+### 相容性
+
+- 會話詳情 API 保留既有欄位並新增結構化對話資料。可以直接使用既有 SQLite 資料庫，CLI、環境變數與安裝流程沿用原有介面。
+
 ## [1.7.0] - 2026-11-15
 
 ### 新增與改善
@@ -1207,7 +1232,8 @@
 - 修正行動版側邊欄遮擋、黑畫面、標題擠壓、圖表導覽索引與年度版面問題。
 - 修正並補齊多個 Gemini、Claude、GPT 與 GPT-OSS 模型的定價規則。
 
-[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.7.0...HEAD
+[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.8.0...HEAD
+[1.8.0]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.7.0...v1.8.0
 [1.7.0]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.6.7...v1.7.0
 [1.6.7]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.6.6...v1.6.7
 [1.6.6]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.6.5...v1.6.6
