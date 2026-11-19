@@ -1532,6 +1532,11 @@ pub fn parse_claude_timeline(
             Err(_) => continue,
         };
 
+        // Request snapshots can replay earlier messages and tool calls.
+        if event.get("type").and_then(Value::as_str) == Some("api-request-blob") {
+            continue;
+        }
+
         let timestamp = event
             .get("timestamp")
             .and_then(|t| t.as_str())
@@ -1961,6 +1966,39 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn claude_timeline_ignores_request_context_replays() {
+        let (reader, path) = reader_for_events(&[
+            r#"{"type":"user","message":{"role":"user","content":"Run the check"}}"#,
+            r#"{"type":"assistant","timestamp":"2026-11-18T09:00:00Z","requestId":"req1","message":{"role":"assistant","model":"Claude","content":[{"type":"text","text":"Checking now."},{"type":"tool_use","id":"tool1","name":"check"}]}}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool1","content":"Real result"}]}}"#,
+            r#"{"type":"api-request-blob","message":{"role":"user","content":"Run the check"}}"#,
+            r#"{"type":"api-request-blob","message":{"role":"assistant","content":[{"type":"text","text":"Checking now."},{"type":"tool_use","id":"tool1","name":"check"}]}}"#,
+            r#"{"type":"api-request-blob","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool1","content":"Replayed result"}]}}"#,
+            r#"{"type":"assistant","timestamp":"2026-11-18T09:01:00Z","requestId":"req2","message":{"role":"assistant","model":"Claude","content":[{"type":"text","text":"Checking now."}]}}"#,
+        ]);
+        let mut timeline = Vec::new();
+        parse_claude_timeline(reader, &HashMap::new(), &mut timeline, &mut HashMap::new());
+        fs::remove_file(path).unwrap();
+
+        assert_eq!(
+            extract_replies(&timeline),
+            ["Checking now.", "Checking now."]
+        );
+        assert!(matches!(
+            timeline.as_slice(),
+            [
+                TimelineItem::UserPrompt { .. },
+                TimelineItem::AgentReply { timestamp: first, .. },
+                TimelineItem::ToolStep { stdout, status, .. },
+                TimelineItem::AgentReply { timestamp: second, .. },
+            ] if first == "2026-11-18T09:00:00Z"
+                && second == "2026-11-18T09:01:00Z"
+                && stdout == "Real result"
+                && status == "success"
+        ));
     }
 
     /// A shared events.jsonl containing a main agent turn, a subagent
