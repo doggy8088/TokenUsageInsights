@@ -279,7 +279,6 @@ input {
   gap: var(--space-3);
 }
 
-.tabs-nav,
 .live-monitor-container,
 .stat-card,
 .glass-card,
@@ -564,8 +563,7 @@ input {
 .premium-select,
 .premium-select-mini,
 .mini-select,
-.premium-date-input,
-.hover-dropdown-trigger {
+.premium-date-input {
   min-height: 40px;
   background-color: var(--bg-select) !important;
   border: 1px solid var(--glass-border) !important;
@@ -581,8 +579,7 @@ input {
 .premium-select:hover,
 .premium-select-mini:hover,
 .mini-select:hover,
-.premium-date-input:hover:not(:disabled),
-.hover-dropdown-trigger:hover {
+.premium-date-input:hover:not(:disabled) {
   background-color: var(--bg-select-hover) !important;
   border-color: var(--glass-border-strong) !important;
 }
@@ -595,36 +592,45 @@ input {
   box-shadow: 0 0 0 3px var(--glass-border-focus) !important;
 }
 
-.hover-dropdown-options {
-  background: var(--surface-1);
-  border: 1px solid var(--glass-border-strong);
+.period-switcher {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 3px;
+  padding: 3px;
+  border: 1px solid var(--glass-border);
   border-radius: var(--radius-lg);
-  box-shadow: var(--shadow-lg);
-  overflow: hidden;
+  background: var(--surface-1);
 }
 
-.hover-dropdown-option {
+.period-switcher button {
+  position: relative;
+  min-block-size: 44px;
+  padding: 4px 2px;
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
   color: var(--text-secondary);
-  transition:
-    background-color 160ms var(--ease-out-quart),
-    color 160ms var(--ease-out-quart);
+  font-size: 0.75rem;
+  font-weight: 600;
+  cursor: pointer;
 }
 
-.hover-dropdown-option:hover,
-.hover-dropdown-option.active {
-  background: var(--surface-selected);
+.period-switcher button:hover {
+  background: var(--surface-hover);
   color: var(--text-primary);
 }
 
-.nav-tab {
-  border-radius: var(--radius-md);
-  color: var(--text-secondary);
-  letter-spacing: 0;
-}
-
-.nav-tab.active {
+.period-switcher button[aria-pressed="true"] {
   background: var(--surface-selected);
   color: var(--accent-cyan);
+}
+
+.period-switcher button[aria-pressed="true"]::after {
+  content: "";
+  position: absolute;
+  inset-inline: 28%;
+  inset-block-end: 4px;
+  border-block-end: 2px solid currentColor;
 }
 
 .stat-card {
@@ -1561,8 +1567,7 @@ button.session-name-text:focus-visible {
   .premium-select-mini,
   .flag-lang-btn,
   .mini-select,
-  .premium-date-input,
-  .hover-dropdown-trigger {
+  .premium-date-input {
     min-height: 44px;
   }
 }
@@ -1858,18 +1863,6 @@ body {
 .sidebar-close-btn .icon-glyph,
 .close-btn .icon-glyph {
   --icon-size: 1.05rem;
-}
-
-.dropdown-caret {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  margin-left: var(--space-1);
-  color: var(--text-muted);
-}
-
-.dropdown-caret .icon-glyph {
-  --icon-size: 0.72rem;
 }
 
 .close-btn {

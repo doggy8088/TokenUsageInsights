@@ -1,4 +1,4 @@
-import i18n from './i18n.js?v=42';
+import i18n from './i18n.js?v=43';
 import {
   aggregateDailyTokenCandles,
   calculateCandleViewport,
@@ -883,11 +883,6 @@ function initApp() {
   const sessionCwdFilter = document.getElementById('session-cwd-filter');
   const sessionDrawer = document.getElementById('timeline-drawer');
 
-  // Tab Buttons
-  const tabBtnDaily = document.getElementById('tab-btn-daily');
-  const tabBtnMonthly = document.getElementById('tab-btn-monthly');
-  const tabBtnYearly = document.getElementById('tab-btn-yearly');
-
   // Live Controls
   const liveToggle = document.getElementById('live-toggle');
   const liveInterval = document.getElementById('live-interval');
@@ -914,6 +909,8 @@ function initApp() {
     });
   }
 
+  updatePeriodButtons();
+
   // Apply initial tab visibility based on restored activeTab
   const dailySelector = document.getElementById('daily-selector-section');
   const monthlySelector = document.getElementById('monthly-selector-section');
@@ -924,9 +921,6 @@ function initApp() {
   const yearlyView = document.getElementById('yearly-view-container');
 
   if (activeTab === 'daily') {
-    tabBtnDaily.classList.add('active');
-    tabBtnMonthly.classList.remove('active');
-    if (tabBtnYearly) tabBtnYearly.classList.remove('active');
     dailySelector.classList.remove('hidden');
     monthlySelector.classList.add('hidden');
     if (yearlySelector) yearlySelector.classList.add('hidden');
@@ -936,9 +930,6 @@ function initApp() {
     if (monthlyView) monthlyView.classList.add('hidden');
     if (yearlyView) yearlyView.classList.add('hidden');
   } else if (activeTab === 'monthly') {
-    tabBtnDaily.classList.remove('active');
-    tabBtnMonthly.classList.add('active');
-    if (tabBtnYearly) tabBtnYearly.classList.remove('active');
     dailySelector.classList.add('hidden');
     monthlySelector.classList.remove('hidden');
     if (yearlySelector) yearlySelector.classList.add('hidden');
@@ -948,24 +939,17 @@ function initApp() {
     if (monthlyView) monthlyView.classList.remove('hidden');
     if (yearlyView) yearlyView.classList.add('hidden');
   } else if (activeTab === 'range') {
-    tabBtnDaily.classList.remove('active');
-    tabBtnMonthly.classList.remove('active');
-    if (tabBtnYearly) tabBtnYearly.classList.remove('active');
     dailySelector.classList.add('hidden');
     monthlySelector.classList.add('hidden');
     if (yearlySelector) yearlySelector.classList.add('hidden');
     if (quickStats) quickStats.classList.add('hidden');
     document.getElementById('range-selector-section')?.classList.remove('hidden');
-    document.getElementById('tab-btn-range')?.classList.add('active');
     applyMonthlyViewMode('range');
 
     if (dailyView) dailyView.classList.add('hidden');
     if (monthlyView) monthlyView.classList.remove('hidden');
     if (yearlyView) yearlyView.classList.add('hidden');
   } else if (activeTab === 'yearly') {
-    tabBtnDaily.classList.remove('active');
-    tabBtnMonthly.classList.remove('active');
-    if (tabBtnYearly) tabBtnYearly.classList.add('active');
     dailySelector.classList.add('hidden');
     monthlySelector.classList.add('hidden');
     if (yearlySelector) yearlySelector.classList.remove('hidden');
@@ -1082,40 +1066,11 @@ function initApp() {
   // 載入年份清單
   fetchYears();
 
-  // Initialize and synchronize custom hover-dropdown selectors
-  const tabHoverOpts = document.querySelectorAll('.tab-hover-dropdown .hover-dropdown-option');
-  const tabLabelEls = document.querySelectorAll('.tab-dropdown-label');
-
-  if (tabLabelEls.length > 0) {
-    tabLabelEls.forEach(labelEl => {
-      const activeTabOpt = document.querySelector(`.tab-hover-dropdown .hover-dropdown-option[data-value="${activeTab}"]`);
-      if (activeTabOpt) {
-        labelEl.setAttribute('data-i18n', activeTabOpt.getAttribute('data-i18n'));
-      }
-    });
-  }
-  tabHoverOpts.forEach(opt => {
-    if (opt.getAttribute('data-value') === activeTab) {
-      opt.classList.add('active');
-    } else {
-      opt.classList.remove('active');
-    }
-    opt.addEventListener('click', () => {
-      const val = opt.getAttribute('data-value');
-      const btn = document.getElementById(`tab-btn-${val}`);
-      if (btn) btn.click();
-    });
-  });
-
-  // Initialize language UI translation
   updateLanguageUI();
 
-  // Tab切換監聽
-  tabBtnDaily.addEventListener('click', () => switchTab('daily'));
-  tabBtnMonthly.addEventListener('click', () => switchTab('monthly'));
-  tabBtnYearly.addEventListener('click', () => switchTab('yearly'));
-  const tabBtnRangeEl = document.getElementById('tab-btn-range');
-  if (tabBtnRangeEl) tabBtnRangeEl.addEventListener('click', () => switchTab('range'));
+  document.querySelectorAll('#period-switcher [data-period]').forEach(button => {
+    button.addEventListener('click', () => switchTab(button.dataset.period));
+  });
   initRangeControls();
 
   // 監聽日期切換
@@ -1612,10 +1567,19 @@ function initApp() {
 // =========================================================================
 // Tab 切換邏輯
 // =========================================================================
+function updatePeriodButtons() {
+  document.querySelectorAll('#period-switcher [data-period]').forEach(button => {
+    button.setAttribute('aria-pressed', String(button.dataset.period === activeTab));
+  });
+}
+
 function switchTab(tab, options = {}) {
   if (activeTab === tab) return;
   activeTab = tab;
   setCookie('active_tab', tab);
+  updatePeriodButtons();
+  hideViewLoading();
+  clearTitleSpinner();
 
   if (tab === 'daily') {
     const dateSelect = document.getElementById('date-select');
@@ -1625,34 +1589,11 @@ function switchTab(tab, options = {}) {
   }
   updateUrlParams();
   document.getElementById('range-selector-section')?.classList.toggle('hidden', tab !== 'range');
-  document.getElementById('tab-btn-range')?.classList.toggle('active', tab === 'range');
   applyMonthlyViewMode(tab);
   updateExportButtonForTab();
 
-  // Update custom hover dropdown UI
-  const tabLabelEls = document.querySelectorAll('.tab-dropdown-label');
-  const tabHoverOpts = document.querySelectorAll('.tab-hover-dropdown .hover-dropdown-option');
-  if (tabHoverOpts.length > 0) {
-    tabHoverOpts.forEach(opt => {
-      if (opt.getAttribute('data-value') === tab) {
-        opt.classList.add('active');
-        if (tabLabelEls.length > 0) {
-          tabLabelEls.forEach(labelEl => {
-            labelEl.setAttribute('data-i18n', opt.getAttribute('data-i18n'));
-          });
-        }
-      } else {
-        opt.classList.remove('active');
-      }
-    });
-    if (typeof updateLanguageUI === 'function') {
-      updateLanguageUI();
-    }
-  }
+  updateLanguageUI();
 
-  const tabBtnDaily = document.getElementById('tab-btn-daily');
-  const tabBtnMonthly = document.getElementById('tab-btn-monthly');
-  const tabBtnYearly = document.getElementById('tab-btn-yearly');
   const dailySelector = document.getElementById('daily-selector-section');
   const monthlySelector = document.getElementById('monthly-selector-section');
   const yearlySelector = document.getElementById('yearly-selector-section');
@@ -1677,9 +1618,6 @@ function switchTab(tab, options = {}) {
   };
 
   if (tab === 'daily') {
-    tabBtnDaily.classList.add('active');
-    tabBtnMonthly.classList.remove('active');
-    if (tabBtnYearly) tabBtnYearly.classList.remove('active');
     dailySelector.classList.remove('hidden');
     monthlySelector.classList.add('hidden');
     if (yearlySelector) yearlySelector.classList.add('hidden');
@@ -1706,9 +1644,6 @@ function switchTab(tab, options = {}) {
       setCookie('live_refresh', 'false');
     }
 
-    tabBtnDaily.classList.remove('active');
-    tabBtnMonthly.classList.add('active');
-    if (tabBtnYearly) tabBtnYearly.classList.remove('active');
     dailySelector.classList.add('hidden');
     monthlySelector.classList.remove('hidden');
     if (yearlySelector) yearlySelector.classList.add('hidden');
@@ -1732,9 +1667,6 @@ function switchTab(tab, options = {}) {
       setCookie('live_refresh', 'false');
     }
 
-    tabBtnDaily.classList.remove('active');
-    tabBtnMonthly.classList.remove('active');
-    if (tabBtnYearly) tabBtnYearly.classList.remove('active');
     dailySelector.classList.add('hidden');
     monthlySelector.classList.add('hidden');
     if (yearlySelector) yearlySelector.classList.add('hidden');
@@ -1751,9 +1683,6 @@ function switchTab(tab, options = {}) {
       setCookie('live_refresh', 'false');
     }
 
-    tabBtnDaily.classList.remove('active');
-    tabBtnMonthly.classList.remove('active');
-    if (tabBtnYearly) tabBtnYearly.classList.add('active');
     dailySelector.classList.add('hidden');
     monthlySelector.classList.add('hidden');
     if (yearlySelector) yearlySelector.classList.remove('hidden');
@@ -2012,12 +1941,15 @@ async function reloadDailyData() {
 // API 呼叫: 載入當日使用量數據
 // =========================================================================
 async function loadUsageData(date, assistant = currentAssistant) {
+  if (activeTab !== 'daily') return;
   if (!date || date === 'undefined' || date === 'null') {
     return;
   }
   const resolvedAssistant = normalizeAssistant(assistant);
   updateUrlParams();
   const mySeq = ++dailyRequestSeq;
+  const isCurrent = () => mySeq === dailyRequestSeq
+    && currentAssistant === resolvedAssistant && activeTab === 'daily';
   // 同日期重整（即時監控、重新整理）不遮蔽內容，僅在標題顯示同步圖示
   const dimView = !currentUsageData || currentUsageData.date !== date;
   showViewLoading(dimView);
@@ -2025,10 +1957,7 @@ async function loadUsageData(date, assistant = currentAssistant) {
     setTitleMarkup('sync', date);
 
     const res = await fetch(`/api/${resolvedAssistant}/usage/${date}`);
-    if (mySeq !== dailyRequestSeq) return;
-    if (currentAssistant !== resolvedAssistant) return;
-    // 日報、年報與區間共用外層容器：已切到週/區間時，遲到的回應不可覆蓋區間看板
-    if (activeTab === 'range') return;
+    if (!isCurrent()) return;
     if (res.status === 404) {
       // 顯示「此 Agent 當日無資料」提示畫面，不改變日期
       showNoDataForDate(date, resolvedAssistant);
@@ -2037,18 +1966,16 @@ async function loadUsageData(date, assistant = currentAssistant) {
     }
     
     const data = await res.json();
-    if (mySeq !== dailyRequestSeq) return;
-    if (currentAssistant !== resolvedAssistant) return;
-    if (activeTab === 'range') return;
+    if (!isCurrent()) return;
     toggleEmptyState(false, resolvedAssistant);
     renderDashboard(data);
     await updateCodexRateLimit();
 
   } catch (err) {
     console.error('載入使用量失敗:', err);
-    if (mySeq === dailyRequestSeq) showNotification(t('load_failed'), 'error');
+    if (isCurrent()) showNotification(t('load_failed'), 'error');
   } finally {
-    if (mySeq === dailyRequestSeq) {
+    if (isCurrent()) {
       hideViewLoading();
       clearTitleSpinner();
     }
@@ -5791,12 +5718,15 @@ async function reloadYearlyData() {
 // API 呼叫: 載入單年彙整數據
 // =========================================================================
 async function loadYearlyData(year, assistant = currentAssistant) {
+  if (activeTab !== 'yearly') return;
   if (!year || year === 'undefined' || year === 'null') {
     return;
   }
   const resolvedAssistant = normalizeAssistant(assistant);
   updateUrlParams();
   const mySeq = ++yearlyRequestSeq;
+  const isCurrent = () => mySeq === yearlyRequestSeq
+    && currentAssistant === resolvedAssistant && activeTab === 'yearly';
   const dimView = !currentYearlyData || currentYearlyData.year !== year;
   yearlyInFlightTarget = year;
   showViewLoading(dimView);
@@ -5804,28 +5734,24 @@ async function loadYearlyData(year, assistant = currentAssistant) {
     setTitleMarkup('sync', year);
 
     const res = await fetch(`/api/${resolvedAssistant}/yearly/${year}`);
-    if (mySeq !== yearlyRequestSeq) return;
-    if (currentAssistant !== resolvedAssistant) return;
-    if (activeTab === 'range') return;
+    if (!isCurrent()) return;
     if (res.status === 404) {
       showNoDataForYear(year, resolvedAssistant);
       return;
     }
     
     const data = await res.json();
-    if (mySeq !== yearlyRequestSeq) return;
-    if (currentAssistant !== resolvedAssistant) return;
-    if (activeTab === 'range') return;
+    if (!isCurrent()) return;
     modelSessionDetailsCache.clear();
     toggleEmptyState(false, resolvedAssistant);
     renderYearlyDashboard(data);
 
   } catch (err) {
     console.error('載入年份彙整失敗:', err);
-    if (mySeq === yearlyRequestSeq) showNotification(t('yearly_load_failed'), 'error');
+    if (isCurrent()) showNotification(t('yearly_load_failed'), 'error');
   } finally {
-    if (mySeq === yearlyRequestSeq) {
-      yearlyInFlightTarget = null;
+    if (mySeq === yearlyRequestSeq) yearlyInFlightTarget = null;
+    if (isCurrent()) {
       hideViewLoading();
       clearTitleSpinner();
     }
@@ -6728,6 +6654,7 @@ function initRangeControls() {
 }
 
 async function loadRangeData(assistant = currentAssistant) {
+  if (activeTab !== 'range') return false;
   const { start, end } = getRangeInputs();
   if (!isValidRange(start, end)) {
     showNotification(t('range_invalid'), 'error');
@@ -6737,6 +6664,8 @@ async function loadRangeData(assistant = currentAssistant) {
   const resolvedAssistant = normalizeAssistant(assistant);
   updateUrlParams();
   const mySeq = ++rangeRequestSeq;
+  const isCurrent = () => mySeq === rangeRequestSeq
+    && currentAssistant === resolvedAssistant && activeTab === 'range';
   const dimView = !currentMonthlyData || currentMonthlyData.year_month !== label;
   rangeInFlightTarget = label;
   showViewLoading(dimView);
@@ -6745,8 +6674,7 @@ async function loadRangeData(assistant = currentAssistant) {
     setTitleMarkup('sync', escapeHtml(label));
 
     const res = await fetch(`/api/${resolvedAssistant}/range/${start}/${end}`);
-    if (mySeq !== rangeRequestSeq) return false;
-    if (currentAssistant !== resolvedAssistant || activeTab !== 'range') return false;
+    if (!isCurrent()) return false;
     if (res.status === 404) {
       showNoDataForMonth(label, resolvedAssistant);
       return true;
@@ -6754,8 +6682,7 @@ async function loadRangeData(assistant = currentAssistant) {
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
     const data = await res.json();
-    if (mySeq !== rangeRequestSeq) return false;
-    if (currentAssistant !== resolvedAssistant || activeTab !== 'range') return false;
+    if (!isCurrent()) return false;
     modelSessionDetailsCache.clear();
     toggleEmptyState(false, resolvedAssistant);
     applyMonthlyViewMode('range');
@@ -6763,10 +6690,10 @@ async function loadRangeData(assistant = currentAssistant) {
     updated = true;
   } catch (err) {
     console.error('載入區間彙整失敗:', err);
-    if (mySeq === rangeRequestSeq) showNotification(t('range_load_failed'), 'error');
+    if (isCurrent()) showNotification(t('range_load_failed'), 'error');
   } finally {
-    if (mySeq === rangeRequestSeq) {
-      rangeInFlightTarget = null;
+    if (mySeq === rangeRequestSeq) rangeInFlightTarget = null;
+    if (isCurrent()) {
       hideViewLoading();
       clearTitleSpinner();
     }
@@ -6778,12 +6705,15 @@ async function loadRangeData(assistant = currentAssistant) {
 // API 呼叫: 載入單月彙整數據
 // =========================================================================
 async function loadMonthlyData(month, assistant = currentAssistant) {
+  if (activeTab !== 'monthly') return;
   if (!month || month === 'undefined' || month === 'null') {
     return;
   }
   const resolvedAssistant = normalizeAssistant(assistant);
   updateUrlParams();
   const mySeq = ++monthlyRequestSeq;
+  const isCurrent = () => mySeq === monthlyRequestSeq
+    && currentAssistant === resolvedAssistant && activeTab === 'monthly';
   const dimView = !currentMonthlyData || currentMonthlyData.year_month !== month;
   monthlyInFlightTarget = month;
   showViewLoading(dimView);
@@ -6791,29 +6721,24 @@ async function loadMonthlyData(month, assistant = currentAssistant) {
     setTitleMarkup('sync', month);
 
     const res = await fetch(`/api/${resolvedAssistant}/monthly/${month}`);
-    if (mySeq !== monthlyRequestSeq) return;
-    if (currentAssistant !== resolvedAssistant) return;
-    // 月報與區間共用看板：若已切到週/區間，不可讓遲到的月報覆蓋區間結果
-    if (activeTab !== 'monthly') return;
+    if (!isCurrent()) return;
     if (res.status === 404) {
       showNoDataForMonth(month, resolvedAssistant);
       return;
     }
     
     const data = await res.json();
-    if (mySeq !== monthlyRequestSeq) return;
-    if (currentAssistant !== resolvedAssistant) return;
-    if (activeTab !== 'monthly') return;
+    if (!isCurrent()) return;
     modelSessionDetailsCache.clear();
     toggleEmptyState(false, resolvedAssistant);
     renderMonthlyDashboard(data);
 
   } catch (err) {
     console.error('載入月份彙整失敗:', err);
-    if (mySeq === monthlyRequestSeq) showNotification(t('monthly_load_failed'), 'error');
+    if (isCurrent()) showNotification(t('monthly_load_failed'), 'error');
   } finally {
-    if (mySeq === monthlyRequestSeq) {
-      monthlyInFlightTarget = null;
+    if (mySeq === monthlyRequestSeq) monthlyInFlightTarget = null;
+    if (isCurrent()) {
       hideViewLoading();
       clearTitleSpinner();
     }
