@@ -20,7 +20,7 @@
     document.documentElement.setAttribute('data-theme', savedTheme);
   </script>
   <!-- CSS Stylesheet -->
-  <link rel="stylesheet" href="/static/styles.css?v=38">
+  <link rel="stylesheet" href="/static/styles.css?v=39">
   <!-- Chart.js for beautiful charts -->
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <!-- Marked.js for rendering markdown response -->
@@ -1068,89 +1068,120 @@
     </main>
   </div>
 
-  <!-- Session Timeline Modal / Drawer -->
-  <div class="drawer-overlay" id="timeline-drawer">
-    <div class="drawer-content">
-      <div class="drawer-header">
-        <div class="drawer-title-group">
-          <span class="category" data-i18n="drawer_category">會話對話重建</span>
-          <h2 id="drawer-session-name" data-i18n="session_name">Session Name</h2>
-          <span class="session-id" id="drawer-session-id" data-i18n="session_id">Session ID</span>
-        </div>
-        <button class="close-btn" id="close-drawer-btn" data-i18n-aria-label="close" aria-label="關閉"><span class="icon-glyph icon-close" aria-hidden="true"></span></button>
+  <dialog class="drawer-content" id="timeline-drawer" aria-labelledby="drawer-session-name">
+    <header class="drawer-header">
+      <div class="drawer-title-group">
+        <h2 id="drawer-session-name" tabindex="-1" autofocus data-i18n="session_name">Session Name</h2>
+        <span class="session-id" id="drawer-session-id" data-i18n="session_id">Session ID</span>
       </div>
+      <button type="button" class="close-btn" id="close-drawer-btn" data-i18n-aria-label="close" aria-label="關閉"><span class="icon-glyph icon-close" aria-hidden="true"></span></button>
+    </header>
 
-      <div class="drawer-body">
-        <!-- Session Metadata Cards -->
-        <div class="session-meta-grid">
-          <div class="meta-item span-2">
-            <span class="lbl" data-i18n="drawer_cwd">工作路徑</span>
-            <span class="val" id="meta-cwd">-</span>
-          </div>
-          <div class="meta-item">
-            <span class="lbl" data-i18n="drawer_repo">專案庫</span>
-            <span class="val" id="meta-repo">-</span>
-          </div>
-          <div class="meta-item">
-            <span class="lbl" data-i18n="drawer_branch">Git 分支</span>
-            <span class="val" id="meta-branch">-</span>
-          </div>
-          <div class="meta-item span-2">
-            <span class="lbl" data-i18n="drawer_model">Model</span>
-            <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 4px;">
-              <span class="val" id="meta-model" style="margin-top: 0;">-</span>
-              <span class="val" id="meta-effort" style="display: none; background: rgba(127, 142, 163, 0.15); color: #aeb9c8; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600;">-</span>
-            </div>
-          </div>
-          <div class="meta-item" id="drawer-meta-nickname-container" style="display: none;">
-            <span class="lbl" data-i18n="assistant_nickname_label">Agent Nickname</span>
-            <span class="val" id="meta-nickname">-</span>
-          </div>
-          <div class="meta-item" id="drawer-meta-role-container" style="display: none;">
-            <span class="lbl" data-i18n="assistant_role_label">Agent Role</span>
-            <span class="val" id="meta-role">-</span>
-          </div>
+    <div class="chat-toolbar">
+      <div class="chat-toolbar-main">
+        <div class="chat-search" role="search" data-i18n-aria-label="drawer_search" aria-label="搜尋此對話">
+          <span class="icon-glyph icon-search" aria-hidden="true"></span>
+          <label class="sr-only" for="timeline-search-input" data-i18n="drawer_search">搜尋此對話</label>
+          <input id="timeline-search-input" type="search" autocomplete="off" spellcheck="false" data-i18n-placeholder="drawer_search" placeholder="搜尋此對話" aria-controls="timeline-items" disabled>
+          <button type="button" class="chat-search-clear" id="timeline-search-clear" data-i18n-aria-label="drawer_search_clear" aria-label="清除搜尋" hidden>
+            <span class="icon-glyph icon-close" aria-hidden="true"></span>
+          </button>
         </div>
-
-        <!-- Session Token Stats Cards -->
-        <div class="session-stats-grid">
-          <div class="meta-item stat-item">
-            <span class="lbl" data-i18n="drawer_input">輸入</span>
-            <span class="val" id="meta-input">-</span>
-          </div>
-          <div class="meta-item stat-item">
-            <span class="lbl" data-i18n="drawer_output">輸出</span>
-            <span class="val" id="meta-output">-</span>
-          </div>
-          <div class="meta-item stat-item">
-            <span class="lbl" data-i18n="drawer_reasoning">推理</span>
-            <span class="val" id="meta-reasoning">-</span>
-          </div>
-          <div class="meta-item stat-item">
-            <span class="lbl" data-i18n="drawer_cache">快取</span>
-            <span class="val" id="meta-cache">-</span>
-          </div>
-          <div class="meta-item stat-item">
-            <span class="lbl" data-i18n="drawer_compaction">壓縮次數</span>
-            <span class="val" id="meta-compaction">-</span>
-          </div>
-          <div class="meta-item stat-item highlight">
-            <span class="lbl" data-i18n="drawer_total">總計</span>
-            <span class="val" id="meta-tokens">-</span>
-          </div>
-          <div class="meta-item stat-item cost-item">
-            <span class="lbl" data-i18n="drawer_cost">估算費用</span>
-            <span class="val" id="meta-cost">-</span>
-          </div>
-        </div>
-
-        <!-- Reconstructed Timeline -->
-        <div class="timeline-container" id="timeline-items">
-          <!-- Timeline bubbles will be dynamically rendered here -->
-        </div>
+        <label class="chat-option">
+          <input id="timeline-chat-only" type="checkbox" checked>
+          <span data-i18n="drawer_chat_only">僅顯示對話</span>
+        </label>
+        <label class="chat-option">
+          <input id="timeline-metadata" type="checkbox" checked>
+          <span data-i18n="drawer_time_tokens">時間與 Token</span>
+        </label>
       </div>
+      <fieldset class="chat-toolbar-options" id="timeline-detail-options" hidden>
+        <legend class="sr-only" data-i18n="drawer_detail_options">詳細記錄篩選</legend>
+        <label class="chat-option">
+          <input id="timeline-tools" type="checkbox" checked>
+          <span data-i18n="drawer_tools">工具</span>
+        </label>
+        <label class="chat-option">
+          <input id="timeline-reasoning" type="checkbox" checked>
+          <span data-i18n="drawer_reasoning_text">推理文字</span>
+        </label>
+        <label class="chat-option">
+          <input id="timeline-system" type="checkbox" checked>
+          <span data-i18n="drawer_system">系統訊息</span>
+        </label>
+      </fieldset>
     </div>
-  </div>
+
+    <div class="drawer-body" tabindex="0" role="region" data-i18n-aria-label="drawer_category" aria-label="會話對話重建">
+      <details class="chat-session-details" id="timeline-session-details">
+        <summary data-i18n="drawer_session_details">會話詳細資料</summary>
+        <dl class="session-meta-grid">
+          <div class="meta-item">
+            <dt class="lbl" data-i18n="drawer_cwd">工作路徑</dt>
+            <dd class="val" id="meta-cwd">-</dd>
+          </div>
+          <div class="meta-item">
+            <dt class="lbl" data-i18n="drawer_model">Model</dt>
+            <dd class="chat-session-model">
+              <span class="val" id="meta-model">-</span>
+              <span class="val" id="meta-effort" hidden></span>
+            </dd>
+          </div>
+          <div class="meta-item">
+            <dt class="lbl" data-i18n="drawer_repo">專案庫</dt>
+            <dd class="val" id="meta-repo">-</dd>
+          </div>
+          <div class="meta-item">
+            <dt class="lbl" data-i18n="drawer_branch">Git 分支</dt>
+            <dd class="val" id="meta-branch">-</dd>
+          </div>
+          <div class="meta-item" id="drawer-meta-nickname-container" hidden>
+            <dt class="lbl" data-i18n="assistant_nickname_label">Agent Nickname</dt>
+            <dd class="val" id="meta-nickname">-</dd>
+          </div>
+          <div class="meta-item" id="drawer-meta-role-container" hidden>
+            <dt class="lbl" data-i18n="assistant_role_label">Agent Role</dt>
+            <dd class="val" id="meta-role">-</dd>
+          </div>
+        </dl>
+
+        <dl class="session-stats-grid">
+          <div class="meta-item">
+            <dt class="lbl" data-i18n="drawer_input">輸入</dt>
+            <dd class="val" id="meta-input">-</dd>
+          </div>
+          <div class="meta-item">
+            <dt class="lbl" data-i18n="drawer_output">輸出</dt>
+            <dd class="val" id="meta-output">-</dd>
+          </div>
+          <div class="meta-item">
+            <dt class="lbl" data-i18n="drawer_reasoning">推理</dt>
+            <dd class="val" id="meta-reasoning">-</dd>
+          </div>
+          <div class="meta-item">
+            <dt class="lbl" data-i18n="drawer_cache">快取</dt>
+            <dd class="val" id="meta-cache">-</dd>
+          </div>
+          <div class="meta-item">
+            <dt class="lbl" data-i18n="drawer_compaction">壓縮次數</dt>
+            <dd class="val" id="meta-compaction">-</dd>
+          </div>
+          <div class="meta-item">
+            <dt class="lbl" data-i18n="drawer_total">總計</dt>
+            <dd class="val" id="meta-tokens">-</dd>
+          </div>
+          <div class="meta-item">
+            <dt class="lbl" data-i18n="drawer_cost">估算費用</dt>
+            <dd class="val" id="meta-cost">-</dd>
+          </div>
+        </dl>
+      </details>
+
+      <p class="chat-status" id="timeline-status" role="status"></p>
+      <ol class="timeline-container" id="timeline-items" role="list"></ol>
+    </div>
+  </dialog>
 
   <!-- Setup Guide Modal -->
   <div class="modal-overlay" id="setup-guide-modal">
@@ -1548,6 +1579,6 @@ cd TokenUsageInsights</code></pre>
   <div class="sidebar-overlay" id="sidebar-overlay"></div>
 
   <!-- Frontend Javascript logic -->
-  <script type="module" src="/static/app.js?v=79"></script>
+  <script type="module" src="/static/app.js?v=80"></script>
 </body>
 </html>

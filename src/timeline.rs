@@ -44,6 +44,10 @@ pub enum TimelineItem {
         status_type: String, // 'session_start', 'session_end', 'compaction', etc.
         message: String,
     },
+    Reasoning {
+        timestamp: String,
+        reasoning: String,
+    },
 }
 
 pub fn parse_antigravity_timeline(
@@ -99,13 +103,15 @@ pub fn parse_antigravity_timeline(
                 if let Some(content) = step.get("content").and_then(|c| c.as_str()) {
                     match crate::antigravity::parse_system_message(content) {
                         Some(crate::antigravity::AntigravitySystemMessage::AgentMessage {
+                            sender,
                             content: prompt,
-                            ..
                         }) => {
                             timeline.push(TimelineItem::UserPrompt {
                                 timestamp,
                                 prompt,
-                                context: None,
+                                context: Some(serde_json::json!({
+                                    "antigravity_agent_sender": sender,
+                                })),
                                 turn_no,
                             });
                         }
@@ -1163,7 +1169,7 @@ fn codex_tool_arguments(payload: &serde_json::Value) -> serde_json::Value {
 }
 
 pub fn parse_codex_timeline(
-    reader: BufReader<File>,
+    reader: impl BufRead,
     db_entries: &HashMap<u32, (TokenStats, String)>,
     timeline: &mut Vec<TimelineItem>,
     metadata: &mut HashMap<String, serde_json::Value>,
@@ -1229,10 +1235,26 @@ pub fn parse_codex_timeline(
                     current_model = model.to_string();
                 }
                 timeline.push(TimelineItem::SystemStatus {
-                    timestamp,
+                    timestamp: timestamp.clone(),
                     status_type: "session_start".to_string(),
                     message: "會話開始 (Session Started)".to_string(),
                 });
+                if let Some(instructions) = payload
+                    .get("base_instructions")
+                    .and_then(|value| {
+                        value
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .or_else(|| value.as_str())
+                    })
+                    .filter(|text| !text.trim().is_empty())
+                {
+                    timeline.push(TimelineItem::SystemStatus {
+                        timestamp,
+                        status_type: "system_prompt".to_string(),
+                        message: instructions.to_string(),
+                    });
+                }
             }
             "turn_context" => {
                 if let Some(cwd) = payload.get("cwd") {
@@ -1322,49 +1344,81 @@ pub fn parse_codex_timeline(
                         .get("role")
                         .and_then(|role| role.as_str())
                         .unwrap_or("");
-                    if role == "user" {
-                        if let Some(content) = payload.get("content") {
-                            let prompt = codex_text_from_content(content);
-                            if !prompt.trim().is_empty()
-                                && seen_user_messages.insert(format!("{}:{}", timestamp, prompt))
-                            {
-                                current_turn_no += 1;
-                                next_agent_turn_no = current_turn_no;
-                                timeline.push(TimelineItem::UserPrompt {
-                                    timestamp,
-                                    prompt,
-                                    context: None,
-                                    turn_no: current_turn_no,
-                                });
-                            }
+                    let Some(content) = payload.get("content") else {
+                        continue;
+                    };
+                    let message = codex_text_from_content(content);
+                    if message.trim().is_empty() {
+                        continue;
+                    }
+
+                    match role {
+                        "user" if seen_user_messages.insert(format!("{timestamp}:{message}")) => {
+                            current_turn_no += 1;
+                            next_agent_turn_no = current_turn_no;
+                            timeline.push(TimelineItem::UserPrompt {
+                                timestamp,
+                                prompt: message,
+                                context: None,
+                                turn_no: current_turn_no,
+                            });
                         }
-                    } else if role == "assistant" {
-                        if let Some(content) = payload.get("content") {
-                            let reply = codex_text_from_content(content);
-                            if !reply.trim().is_empty()
-                                && seen_agent_messages.insert(format!("{}:{}", timestamp, reply))
-                            {
-                                let turn_no = next_agent_turn_no.max(1);
-                                let tokens = if emitted_turn_tokens.insert(turn_no) {
-                                    db_entries.get(&turn_no).map(|(stats, model)| {
-                                        current_model = model.clone();
-                                        stats.clone()
-                                    })
-                                } else {
-                                    None
-                                };
-                                timeline.push(TimelineItem::AgentReply {
-                                    timestamp,
-                                    reply,
-                                    reasoning: None,
-                                    turn_no,
-                                    model: current_model.clone(),
-                                    tokens,
-                                    duration_ms: None,
-                                    reasoning_effort: reasoning_effort.clone(),
-                                });
-                            }
+                        "assistant"
+                            if seen_agent_messages.insert(format!("{timestamp}:{message}")) =>
+                        {
+                            let turn_no = next_agent_turn_no.max(1);
+                            let tokens = if emitted_turn_tokens.insert(turn_no) {
+                                db_entries.get(&turn_no).map(|(stats, model)| {
+                                    current_model = model.clone();
+                                    stats.clone()
+                                })
+                            } else {
+                                None
+                            };
+                            timeline.push(TimelineItem::AgentReply {
+                                timestamp,
+                                reply: message,
+                                reasoning: None,
+                                turn_no,
+                                model: current_model.clone(),
+                                tokens,
+                                duration_ms: None,
+                                reasoning_effort: reasoning_effort.clone(),
+                            });
                         }
+                        "system" | "developer" => {
+                            let status_type = if role == "system" {
+                                "system_prompt"
+                            } else {
+                                "developer_instruction"
+                            };
+                            timeline.push(TimelineItem::SystemStatus {
+                                timestamp,
+                                status_type: status_type.to_string(),
+                                message,
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+                "reasoning" => {
+                    let reasoning = payload
+                        .get("summary")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter(|part| {
+                            part.get("type").and_then(Value::as_str) == Some("summary_text")
+                        })
+                        .filter_map(|part| part.get("text").and_then(Value::as_str))
+                        .filter(|text| !text.trim().is_empty())
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                    if !reasoning.is_empty() {
+                        timeline.push(TimelineItem::Reasoning {
+                            timestamp,
+                            reasoning,
+                        });
                     }
                 }
                 "function_call" => {
@@ -3996,8 +4050,9 @@ mod antigravity_tests {
 
         assert!(matches!(
             &timeline[0],
-            TimelineItem::UserPrompt { prompt, turn_no: 1, .. }
+            TimelineItem::UserPrompt { prompt, context: Some(context), turn_no: 1, .. }
             if prompt == "Audit the Antigravity subagent hierarchy."
+                && context["antigravity_agent_sender"] == "11111111-1111-4111-8111-111111111111"
         ));
         assert!(matches!(
             &timeline[1],

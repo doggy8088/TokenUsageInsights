@@ -1,4 +1,4 @@
-import i18n from './i18n.js?v=41';
+import i18n from './i18n.js?v=42';
 import {
   aggregateDailyTokenCandles,
   calculateCandleViewport,
@@ -10,15 +10,18 @@ import {
 import {
   buildSessionParentIndex,
   compareSessionRows,
+  createSessionChatSearch,
   filterEntriesBySessionIdentity,
   matchesSessionIdentity,
   nextSessionSearchDisplayState,
   nextSessionSearchRunState,
   nextSessionSearchSearchedFingerprint,
+  normalizeSessionChatText,
   sessionIdentityKey,
+  sessionChatSearchExcerpt,
   sessionSearchDataFingerprint,
   sessionSearchMatchKey,
-} from './session-utils.js?v=11';
+} from './session-utils.js?v=12';
 import { parseUsageTimestamp } from './time-utils.js?v=1';
 
 // Globals
@@ -340,16 +343,20 @@ let activeTab = ['daily', 'monthly', 'yearly', 'range'].includes(savedTab) ? sav
 let isEmptyState = false;
 let currentChartSessions = [];
 let currentMonthlyBreakdown = [];
-let currentSessionTotalTokens = 0;
-let currentSessionCacheTokens = 0;
-let currentSessionInputTokens = 0;
-let currentSessionOutputTokens = 0;
-let currentSessionReasoningTokens = 0;
-let currentSessionCwd = '';
-let currentSessionModel = '';
-let currentSessionAssistantType = '';
-let currentSessionAgentNickname = '';
-let currentSessionAgentRole = '';
+const SESSION_CHAT_PREFERENCES_KEY = 'session_chat_preferences';
+const sessionChatOptions = {
+  chatOnly: 'timeline-chat-only',
+  tools: 'timeline-tools',
+  reasoning: 'timeline-reasoning',
+  system: 'timeline-system',
+  metadata: 'timeline-metadata',
+};
+const sessionChat = {
+  request: null,
+  trigger: null,
+  rows: null,
+  preferences: Object.fromEntries(Object.keys(sessionChatOptions).map(key => [key, true])),
+};
 let availableDates = [];
 let pricingRules = [];
 
@@ -554,12 +561,6 @@ function hideViewLoading() {
   ['daily-view-container', 'monthly-view-container', 'yearly-view-container'].forEach(id => {
     document.getElementById(id)?.classList.remove('is-loading');
   });
-}
-
-function setDisclosureIcon(target, expanded) {
-  if (target) {
-    target.innerHTML = iconMarkup(expanded ? 'chevron-up' : 'chevron-down', 'toggle-arrow-icon');
-  }
 }
 
 function updateBrandLogo() {
@@ -879,8 +880,7 @@ function initApp() {
   const yearSelect = document.getElementById('year-select');
   const sessionSearchInput = document.getElementById('session-search-input');
   const sessionCwdFilter = document.getElementById('session-cwd-filter');
-  const closeDrawerBtn = document.getElementById('close-drawer-btn');
-  const drawerOverlay = document.getElementById('timeline-drawer');
+  const sessionDrawer = document.getElementById('timeline-drawer');
 
   // Tab Buttons
   const tabBtnDaily = document.getElementById('tab-btn-daily');
@@ -1531,16 +1531,11 @@ function initApp() {
     }
   });
 
-  // 關閉抽屜彈窗
-  closeDrawerBtn.addEventListener('click', closeDrawer);
-  drawerOverlay.addEventListener('click', (e) => {
-    if (e.target === drawerOverlay) {
-      closeDrawer();
-    }
-  });
+  initSessionDrawer(sessionDrawer);
 
-  // 支援 ESC 鍵關閉抽屜與關閉行動端側欄
+  // 對話抽屜開啟時，由原生 dialog 處理 Escape。
   window.addEventListener('keydown', (e) => {
+    if (sessionDrawer.open) return;
     if (isSidebarToggleShortcut(e) && !isEditableShortcutTarget(e.target)) {
       e.preventDefault();
       toggleSidebar();
@@ -1548,7 +1543,6 @@ function initApp() {
     }
 
     if (e.key === 'Escape') {
-      closeDrawer();
       const container = document.querySelector('.app-container');
       if (container && window.innerWidth <= 992) {
         setSidebarCollapsed(true, { persist: true });
@@ -4906,14 +4900,14 @@ function renderSessionTable(sessions) {
             ${nickname ? `<span class="badge agent-nickname-badge" title="${escapeHtml(t('assistant_nickname_label'))}: ${escapeHtml(nickname)}">${escapeHtml(nickname)}</span>` : ''}
             ${semanticRole ? `<span class="badge agent-role-badge" title="${escapeHtml(t('assistant_role_label'))}: ${escapeHtml(semanticRole)}">${escapeHtml(semanticRole)}</span>` : ''}
           </div>
-          <span class="session-name-text" title="${escapeHtml(subagentDisplayName)}">${escapeHtml(subagentDisplayName)}</span>
+          <button type="button" class="session-name-text" aria-haspopup="dialog" title="${escapeHtml(subagentDisplayName)}">${escapeHtml(subagentDisplayName)}</button>
           <span class="session-id-sub">${escapeHtml(String(s.session_id))}</span>
         </div>
       `;
     } else {
       nameCellContent = `
         <div class="session-name-wrapper">
-          <span class="session-name-text" title="${escapeHtml(s.session_name)}">${escapeHtml(s.session_name)}</span>
+          <button type="button" class="session-name-text" aria-haspopup="dialog" title="${escapeHtml(s.session_name || s.session_id)}">${escapeHtml(s.session_name || s.session_id)}</button>
           ${nameSourceBadge}
           <span class="session-id-sub">${escapeHtml(String(s.session_id))}</span>
         </div>
@@ -4948,7 +4942,7 @@ function renderSessionTable(sessions) {
 
     // 當點擊 Session 時，開啟對話詳細還原
     tr.addEventListener('click', () => {
-      openSessionTimeline(s);
+      openSessionTimeline(s, tr.querySelector('.session-name-text'));
     });
 
     // 群組 Hover 高亮：比對預先寫入的 data-root-key／data-parent-key／
@@ -4978,558 +4972,547 @@ function renderSessionTable(sessions) {
 }
 
 // =========================================================================
-// API 呼叫: 載入並渲染特定 Session 對話時間軸 (Timeline)
+// 會話對話抽屜
 // =========================================================================
-async function openSessionTimeline(session) {
-  const {
-    session_id: sessionId,
-    session_name: sessionName,
-    total_tokens: totalTokens,
-    total_cache_read_tokens: cacheReadTokens,
-    total_input_tokens: inputTokens,
-    total_output_tokens: outputTokens,
-    total_reasoning_tokens: reasoningTokens,
-    cwd,
-    model,
-    assistant_type: assistantType,
-    agent_nickname: agentNickname,
-    agent_role: agentRole,
-    cost_usd: estimatedCost,
-    source_kind: sourceKind,
-    source_dir_key: sourceDirKey,
-    parent_session_id: parentSessionId,
-  } = session;
-  const drawerOverlay = document.getElementById('timeline-drawer');
-  const timelineContainer = document.getElementById('timeline-items');
-
-  // 保存當前點擊之 Session 的正確統計與資訊以作為 Fallback
-  currentSessionTotalTokens = totalTokens || 0;
-  currentSessionCacheTokens = cacheReadTokens || 0;
-  currentSessionInputTokens = inputTokens || 0;
-  currentSessionOutputTokens = outputTokens || 0;
-  currentSessionReasoningTokens = reasoningTokens || 0;
-  currentSessionCwd = cwd || '';
-  currentSessionModel = model || '';
-  currentSessionAssistantType = assistantType || '';
-  currentSessionAgentNickname = agentNickname || '';
-  currentSessionAgentRole = agentRole || '';
-
-  // 設定基礎抬頭 (截斷至 100 字元，滑鼠移過去可以看到全部)
-  let displayName = sessionName || '';
-  if (displayName.length > 100) {
-    displayName = displayName.substring(0, 100) + '...';
-  }
-  const nameEl = document.getElementById('drawer-session-name');
-  nameEl.textContent = displayName;
-  nameEl.title = sessionName || '';
-  document.getElementById('drawer-session-id').textContent = sessionId;
-
-  // 更新會話 Token & 基礎資訊（立即呈現在畫面上）
-  const displayCwd = abbreviateHomePath(cwd) || '-';
-  document.getElementById('meta-cwd').textContent = displayCwd;
-  document.getElementById('meta-cwd').title = displayCwd;
-  document.getElementById('meta-model').textContent = model || '-';
-  const metaEffort = document.getElementById('meta-effort');
-  if (metaEffort) {
-    metaEffort.textContent = '-';
-    metaEffort.style.display = 'none';
-  }
-  document.getElementById('meta-tokens').textContent = formatToken(totalTokens || 0);
-  document.getElementById('meta-cache').textContent = formatToken(cacheReadTokens || 0);
-  document.getElementById('meta-compaction').textContent = '-';
-  document.getElementById('meta-input').textContent = formatToken(inputTokens || 0);
-  document.getElementById('meta-output').textContent = formatToken(outputTokens || 0);
-  document.getElementById('meta-reasoning').textContent = formatToken(reasoningTokens || 0);
-  document.getElementById('meta-cost').textContent = formatCost(estimatedCost);
-
-  const nicknameContainer = document.getElementById('drawer-meta-nickname-container');
-  const roleContainer = document.getElementById('drawer-meta-role-container');
-
-  if (agentNickname) {
-    document.getElementById('meta-nickname').textContent = agentNickname;
-    if (nicknameContainer) nicknameContainer.style.display = 'flex';
-  } else {
-    if (nicknameContainer) nicknameContainer.style.display = 'none';
-  }
-
-  if (agentRole) {
-    document.getElementById('meta-role').textContent = agentRole;
-    if (roleContainer) roleContainer.style.display = 'flex';
-  } else {
-    if (roleContainer) roleContainer.style.display = 'none';
-  }
-
-  // 顯示加載動畫
-  timelineContainer.innerHTML = `<div class="placeholder-text">${t('drawer_loading')}</div>`;
-  
-  // 顯示抽屜面板
-  drawerOverlay.classList.add('active');
+function initSessionDrawer(drawer) {
+  const search = document.getElementById('timeline-search-input');
+  const clear = document.getElementById('timeline-search-clear');
+  let pointerOnBackdrop = false;
 
   try {
-    const resolvedAssistant = assistantType || currentAssistant;
-    // Pass source_kind and source_dir_key as query params so the backend can
-    // unambiguously identify the correct session when multiple sources share
-    // the same session_id (e.g. Copilot CLI vs. App, or two App directories).
-    const queryParams = new URLSearchParams();
-    if (sourceKind) queryParams.set('source_kind', sourceKind);
-    if (sourceDirKey) queryParams.set('source_dir_key', sourceDirKey);
-    // 攜帶 parent_session_id，讓後端能單獨選取子 Agent session（合成
-    // `<parent>__<agent>`），不會與同 id 的獨立 session 混淆。無父層的
-    // session 顯式送空字串（parent_session_id IS NULL 選取）；呼叫端拿
-    // 不到父層時（例如搜尋結果列未帶 parent_session_id）省略參數，讓
-    // 後端維持既有查詢行為。
-    if (parentSessionId !== undefined) {
-      queryParams.set('parent_session_id', parentSessionId || '');
+    const saved = JSON.parse(localStorage.getItem(SESSION_CHAT_PREFERENCES_KEY));
+    for (const key of Object.keys(sessionChatOptions)) {
+      if (typeof saved?.[key] === 'boolean') sessionChat.preferences[key] = saved[key];
     }
-    const queryString = queryParams.toString();
-    const sessionUrl = `/api/${encodeURIComponent(resolvedAssistant)}/session/${encodeURIComponent(sessionId)}${queryString ? `?${queryString}` : ''}`;
-    const res = await fetch(sessionUrl);
-    if (res.status === 404) {
-      const errData = await res.json().catch(() => ({}));
-      const reason = errData.reason;
-      // Map the backend reason code to the right user-facing message. Generic
-      // errors (no reason) fall back to the "cleaned up" message only when we
-      // genuinely believe the file was removed; otherwise show the backend
-      // error text when present, or a generic load-failed message.
-      if (reason === 'no_events_yet') {
-        timelineContainer.innerHTML = `<div class="placeholder-text">${t('drawer_no_events_yet')}</div>`;
-      } else if (reason === 'file_missing') {
-        timelineContainer.innerHTML = `<div class="placeholder-text" style="color: var(--neon-red);">${t('drawer_file_missing')}</div>`;
-      } else if (reason === 'content_unavailable') {
-        timelineContainer.innerHTML = `<div class="placeholder-text" style="color: var(--neon-red);">${t('drawer_content_unavailable')}</div>`;
-      } else if (errData && typeof errData.error === 'string' && errData.error.trim()) {
-        // Backend supplied a specific error (e.g. path validation) without a
-        // recognized reason code. Surface it directly rather than masking it
-        // as a "cleaned up" file, which was the previous misleading behavior.
-        timelineContainer.innerHTML = `<div class="placeholder-text" style="color: var(--neon-red);">${escapeHtml(errData.error)}</div>`;
-      } else {
-        timelineContainer.innerHTML = `<div class="placeholder-text" style="color: var(--neon-red);">${t('drawer_load_failed_cleaned')}</div>`;
-      }
-      return;
-    }
-
-    if (!res.ok) {
-      timelineContainer.innerHTML = `<div class="placeholder-text" style="color: var(--neon-red);">${t('drawer_load_failed')}</div>`;
-      return;
-    }
-
-    const data = await res.json();
-    renderTimeline(data);
-
-  } catch (err) {
-    console.error('獲取會話細節失敗:', err);
-    timelineContainer.innerHTML = `<div class="placeholder-text" style="color: var(--neon-red);">${t('drawer_load_failed')}</div>`;
-  }
-}
-
-// 關閉抽屜
-function closeDrawer() {
-  document.getElementById('timeline-drawer').classList.remove('active');
-}
-
-// =========================================================================
-// 渲染 Session 詳細時間軸 (Timeline) 內容
-// =========================================================================
-function renderTimeline(data) {
-  const metadata = data?.metadata && typeof data.metadata === 'object' ? data.metadata : {};
-  const timeline = Array.isArray(data?.timeline) ? data.timeline : [];
-  const timelineContainer = document.getElementById('timeline-items');
-  timelineContainer.innerHTML = '';
-
-  // 取得最終使用的基礎資訊（API 回傳優先，沒有則 fallback 到列表正確欄位）
-  const finalCwd = metadata.cwd || currentSessionCwd || '-';
-  const displayCwd = abbreviateHomePath(finalCwd) || '-';
-  const finalModel = metadata.selected_model || currentSessionModel || '-';
-  const finalNickname = metadata.agent_nickname || currentSessionAgentNickname || '';
-  const finalRole = metadata.agent_role || currentSessionAgentRole || '';
-
-  // 更新 Metadata 區塊
-  document.getElementById('meta-cwd').textContent = displayCwd;
-  document.getElementById('meta-cwd').title = displayCwd;
-  document.getElementById('meta-branch').textContent = metadata.git_branch || '-';
-  document.getElementById('meta-model').textContent = finalModel;
-  document.getElementById('meta-repo').textContent = metadata.repository || '-';
-  document.getElementById('meta-repo').title = metadata.repository || '';
-
-  const nicknameContainer = document.getElementById('drawer-meta-nickname-container');
-  const roleContainer = document.getElementById('drawer-meta-role-container');
-
-  if (finalNickname) {
-    document.getElementById('meta-nickname').textContent = finalNickname;
-    if (nicknameContainer) nicknameContainer.style.display = 'flex';
-  } else {
-    if (nicknameContainer) nicknameContainer.style.display = 'none';
+  } catch {
+    // 瀏覽器禁止儲存偏好或格式無效時，仍可調整目前頁面的顯示選項。
   }
 
-  if (finalRole) {
-    document.getElementById('meta-role').textContent = finalRole;
-    if (roleContainer) roleContainer.style.display = 'flex';
-  } else {
-    if (roleContainer) roleContainer.style.display = 'none';
+  for (const [key, id] of Object.entries(sessionChatOptions)) {
+    const checkbox = document.getElementById(id);
+    checkbox.checked = sessionChat.preferences[key];
+    checkbox.addEventListener('change', () => {
+      sessionChat.preferences[key] = checkbox.checked;
+      try {
+        localStorage.setItem(SESSION_CHAT_PREFERENCES_KEY, JSON.stringify(sessionChat.preferences));
+      } catch {
+        // 偏好仍保留在目前頁面。
+      }
+      updateSessionChatView();
+    });
   }
 
-  const metaEffort = document.getElementById('meta-effort');
-  if (metaEffort) {
-    if (metadata.reasoning_effort) {
-      metaEffort.textContent = metadata.reasoning_effort;
-      metaEffort.style.display = 'inline-block';
-    } else {
-      metaEffort.style.display = 'none';
-    }
-  }
-
-  // 取得最終使用的 Token 數據（若單一 session events 日誌無 token stats，則使用列表正確累積數據）
-  const finalTotal = metadata.total_tokens || currentSessionTotalTokens || 0;
-  const finalCache = metadata.total_cache_read_tokens || currentSessionCacheTokens || 0;
-  const finalInput = metadata.total_input_tokens || currentSessionInputTokens || 0;
-  const finalOutput = metadata.total_output_tokens || currentSessionOutputTokens || 0;
-  const finalReasoning = metadata.total_reasoning_tokens || currentSessionReasoningTokens || 0;
-
-  document.getElementById('meta-tokens').textContent = formatToken(finalTotal);
-  document.getElementById('meta-cache').textContent = formatToken(finalCache);
-  document.getElementById('meta-compaction').textContent = metadata.compaction_count || 0;
-  document.getElementById('meta-input').textContent = formatToken(finalInput);
-  document.getElementById('meta-output').textContent = formatToken(finalOutput);
-  document.getElementById('meta-reasoning').textContent = formatToken(finalReasoning);
-
-  if (!timeline || timeline.length === 0) {
-    timelineContainer.innerHTML = `<div class="placeholder-text">${t('drawer_no_events')}</div>`;
-    return;
-  }
-
-  // 渲染時間軸物件，使用單一回合序號進行對齊
-  const hasUserPrompts = timeline.some(item => item.event_type === 'UserPrompt');
-  let currentTurnNo = 1;
-  let isFirstPrompt = true;
-
-  timeline.forEach(item => {
-    const timeStr = item.event_data.timestamp ? formatLocalTime(item.event_data.timestamp, true) : '';
-    const div = document.createElement('div');
-    div.className = 'timeline-item-wrapper';
-
-    switch (item.event_type) {
-      case 'UserPrompt': {
-        if (!isFirstPrompt) {
-          currentTurnNo++;
-        }
-        isFirstPrompt = false;
-        const prompt = item.event_data.prompt;
-        const turnNo = item.event_data.turn_no || currentTurnNo;
-        
-        let attachmentsHTML = '';
-        if (item.event_data.attachments && item.event_data.attachments.length > 0) {
-          attachmentsHTML = `<div class="bubble-attachments">`;
-          item.event_data.attachments.forEach(att => {
-            const path = att.filePath || att.path || t('attachment_unknown_filename');
-            const basename = path.split(/[\\/]/).pop();
-            const attType = att.type || 'file';
-            attachmentsHTML += `
-              <div class="attachment-badge" title="${escapeHtml(path)}">
-                <strong>[${escapeHtml(attType)}]</strong> ${escapeHtml(basename)}
-              </div>
-            `;
-          });
-          attachmentsHTML += `</div>`;
-        }
-
-        div.innerHTML = `
-          <div class="timeline-dot"></div>
-          <div class="user-bubble">
-            <div class="bubble-header">
-              <div class="header-left">
-                <span class="turn-no-badge">#${turnNo}</span>
-                <span class="sender">${t('sender_user')}</span>
-                <button class="header-collapse-btn" style="display: none; margin-left: 8px;">
-                  <span class="btn-text">${t('collapse_reply')}</span> <span class="arrow">${iconMarkup('chevron-up', 'toggle-arrow-icon')}</span>
-                </button>
-              </div>
-              <span class="time">${timeStr}</span>
-            </div>
-            <div class="prompt-content-wrapper">
-              <div class="prompt-text collapsed">${escapeHtml(prompt)}</div>
-              <button class="prompt-toggle-btn">
-                <span class="btn-text">${t('expand_reply')}</span> <span class="arrow">${iconMarkup('chevron-down', 'toggle-arrow-icon')}</span>
-              </button>
-            </div>
-            ${attachmentsHTML}
-          </div>
-        `;
-
-        // 綁定提問摺疊按鈕事件
-        const promptText = div.querySelector('.prompt-text');
-        const promptToggleBtn = div.querySelector('.prompt-toggle-btn');
-        const headerCollapseBtn = div.querySelector('.header-collapse-btn');
-
-        const toggleCollapse = (collapse) => {
-          if (collapse) {
-            promptText.classList.remove('expanded');
-            promptText.classList.add('collapsed');
-            promptToggleBtn.classList.remove('expanded');
-            promptToggleBtn.querySelector('.btn-text').textContent = t('expand_reply');
-            setDisclosureIcon(promptToggleBtn.querySelector('.arrow'), false);
-            if (headerCollapseBtn) headerCollapseBtn.style.display = 'none';
-          } else {
-            promptText.classList.remove('collapsed');
-            promptText.classList.add('expanded');
-            promptToggleBtn.classList.add('expanded');
-            promptToggleBtn.querySelector('.btn-text').textContent = t('collapse_reply');
-            setDisclosureIcon(promptToggleBtn.querySelector('.arrow'), true);
-            if (headerCollapseBtn) headerCollapseBtn.style.display = 'inline-flex';
-          }
-        };
-
-        if (promptText && promptToggleBtn) {
-          promptToggleBtn.addEventListener('click', () => {
-            const isCollapsed = promptText.classList.contains('collapsed');
-            toggleCollapse(!isCollapsed);
-          });
-        }
-
-        if (headerCollapseBtn) {
-          headerCollapseBtn.addEventListener('click', () => {
-            toggleCollapse(true); // Collapse it!
-            
-            // Smoothly scroll the container back into view
-            div.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-          });
-        }
-
-        break;
-      }
-
-      case 'AssistantReply': {
-        const replyMarkdown = item.event_data.reply;
-        const model = item.event_data.model;
-        const outTokens = item.event_data.output_tokens;
-        const inTokens = item.event_data.input_tokens;
-        const cacheReadTokens = item.event_data.cache_read_tokens;
-        const cacheWriteTokens = item.event_data.cache_write_tokens;
-        const reasoningTokens = item.event_data.reasoning_tokens;
-        const totalTokens = item.event_data.total_tokens || ((inTokens || outTokens) ? ((inTokens || 0) + (outTokens || 0)) : null);
-        const turnNo = item.event_data.turn_no || currentTurnNo;
-        const reasoningEffort = item.event_data.reasoning_effort;
-        const modelDisplay = reasoningEffort ? `${model} (${t('drawer_effort')}: ${reasoningEffort})` : model;
-
-        const finalAssistantType = metadata.assistant_type || currentSessionAssistantType || currentAssistant;
-        let senderLogoHtml = '';
-        let senderNameText = 'AGENT';
-        if (isSupportedAssistant(finalAssistantType)) {
-          const meta = getAssistantMeta(finalAssistantType);
-          senderLogoHtml = getAssistantLogoHtml(finalAssistantType);
-          senderNameText = meta.senderName;
-        }
-
-        // 如果 content 為空但有 Tool 呼叫，代表助理正在使用工具
-        let replyHtml = '';
-        const toolRequests = item.event_data.tool_requests || [];
-        const hasTools = toolRequests.length > 0;
-
-        if (!replyMarkdown && hasTools) {
-          replyHtml = `<span style="font-style: italic; color: var(--text-muted);">${t('thinking_tools')}</span>`;
-        } else {
-          replyHtml = renderSafeMarkdown(replyMarkdown || '');
-        }
-
-        // 建立詳細 Token 資訊區塊 (in, out, reasoning, cache, total)
-        let tokenBadge = '';
-        if (totalTokens || inTokens || outTokens || cacheReadTokens || reasoningTokens) {
-          tokenBadge = `
-            <div class="turn-token-stats">
-              ${inTokens ? `<span class="token-badge input" title="${escapeHtml(t('token_input_title'))}">${escapeHtml(t('input_tokens_label'))}: ${formatToken(inTokens)}</span>` : ''}
-              ${outTokens ? `<span class="token-badge output" title="${escapeHtml(t('token_output_title'))}">${escapeHtml(t('output_tokens_label'))}: ${formatToken(outTokens)}</span>` : ''}
-              ${reasoningTokens ? `<span class="token-badge reasoning" title="${escapeHtml(t('token_reasoning_title'))}">${escapeHtml(t('reasoning_tokens_label'))}: ${formatToken(reasoningTokens)}</span>` : ''}
-              ${cacheReadTokens ? `<span class="token-badge cache" title="${escapeHtml(t('token_cache_title'))}">${escapeHtml(t('cache_read_label'))}: ${formatToken(cacheReadTokens)}</span>` : ''}
-              ${totalTokens ? `<span class="token-badge total" title="${escapeHtml(t('token_total_title'))}">${escapeHtml(t('total_tokens_label'))}: ${formatToken(totalTokens)}</span>` : ''}
-            </div>
-          `;
-        }
-
-        let copyButtonHtml = '';
-        if (replyMarkdown) {
-          copyButtonHtml = `
-            <button class="copy-markdown-btn" title="${t('copy_markdown_title')}">
-              <span class="btn-text">${t('copy_markdown')}</span>
-            </button>
-          `;
-        }
-
-        div.innerHTML = `
-          <div class="timeline-dot"></div>
-          <div class="assistant-bubble">
-            <div class="bubble-header">
-              <div class="header-left">
-                <span class="turn-no-badge">#${turnNo}</span>
-                <span class="sender">${senderLogoHtml} ${senderNameText} (${escapeHtml(modelDisplay)})</span>
-              </div>
-              <div style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap;">
-                ${copyButtonHtml}
-                <span class="time">${timeStr}</span>
-              </div>
-            </div>
-            ${tokenBadge}
-            <div class="reply-content-wrapper">
-              <div class="reply-content collapsed">${replyHtml}</div>
-              <button class="reply-toggle-btn">
-                <span class="btn-text">${t('expand_reply')}</span> <span class="arrow">${iconMarkup('chevron-down', 'toggle-arrow-icon')}</span>
-              </button>
-            </div>
-          </div>
-        `;
-
-        // 綁定摺疊按鈕事件
-        const replyContent = div.querySelector('.reply-content');
-        const toggleBtn = div.querySelector('.reply-toggle-btn');
-        if (replyContent && toggleBtn) {
-          toggleBtn.addEventListener('click', () => {
-            const isCollapsed = replyContent.classList.contains('collapsed');
-            if (isCollapsed) {
-              replyContent.classList.remove('collapsed');
-              replyContent.classList.add('expanded');
-              toggleBtn.classList.add('expanded');
-              toggleBtn.querySelector('.btn-text').textContent = t('collapse_reply');
-              setDisclosureIcon(toggleBtn.querySelector('.arrow'), true);
-            } else {
-              replyContent.classList.remove('expanded');
-              replyContent.classList.add('collapsed');
-              toggleBtn.classList.remove('expanded');
-              toggleBtn.querySelector('.btn-text').textContent = t('expand_reply');
-              setDisclosureIcon(toggleBtn.querySelector('.arrow'), false);
-            }
-          });
-        }
-
-        // 如果此助理訊息沒有調用任何 Tool，且此會話沒有使用者提問事件，則將回合序號遞增 1
-        if (!hasTools && !hasUserPrompts) {
-          currentTurnNo++;
-        }
-
-        // 綁定複製 Markdown 事件
-        if (replyMarkdown) {
-          const copyBtn = div.querySelector('.copy-markdown-btn');
-          if (copyBtn) {
-            copyBtn.addEventListener('click', () => {
-              navigator.clipboard.writeText(replyMarkdown).then(() => {
-                const btnTextEl = copyBtn.querySelector('.btn-text');
-                const originalText = btnTextEl ? btnTextEl.textContent : 'Copy Markdown';
-                if (btnTextEl) btnTextEl.textContent = t('copy_success');
-                copyBtn.classList.add('copied');
-                
-                setTimeout(() => {
-                  if (btnTextEl) btnTextEl.textContent = originalText;
-                  copyBtn.classList.remove('copied');
-                }, 2000);
-              }).catch((err) => {
-                console.error('Failed to copy text: ', err);
-                showNotification(t('copy_failed'), 'error');
-              });
-            });
-          }
-        }
-
-        break;
-      }
-
-      case 'ToolStep': {
-        const toolName = item.event_data.tool_name;
-        const args = item.event_data.arguments;
-        const result = item.event_data.result;
-
-        const isSuccess = result !== null && result !== undefined;
-        const badgeClass = isSuccess ? 'badge success' : 'badge executing';
-        const badgeText = isSuccess ? t('tool_status_success') : t('tool_status_executing');
-
-        // 格式化 Args & Result 為 Pre 區塊
-        const argsStr = stringifyToolValue(args, '{}');
-        const argsBytes = getUtf8ByteLength(argsStr);
-        
-        let rawResultStr = '';
-        if (result !== null && result !== undefined) {
-          if (Object.prototype.hasOwnProperty.call(result, 'textResultForLlm')) {
-            rawResultStr = stringifyToolValue(result.textResultForLlm);
-          } else if (Object.prototype.hasOwnProperty.call(result, 'content')) {
-            rawResultStr = stringifyToolValue(result.content);
-          } else {
-            rawResultStr = stringifyToolValue(result);
-          }
-        }
-        const outputBytes = getUtf8ByteLength(rawResultStr);
-        const resultStr = rawResultStr || t('no_returned_data');
-        const argsBytesLabel = formatHumanBytes(argsBytes);
-        const outputBytesLabel = formatHumanBytes(outputBytes);
-        const argsBytesTitle = t('tool_args_bytes_title')
-          .replace('{bytes}', argsBytesLabel)
-          .replace('{raw}', formatNumber(argsBytes));
-        const outputBytesTitle = t('tool_output_bytes_title')
-          .replace('{bytes}', outputBytesLabel)
-          .replace('{raw}', formatNumber(outputBytes));
-
-        // 限制顯示長度，防止大日誌撐爆介面
-        const truncatedResultStr = resultStr.length > 1500 ? resultStr.substring(0, 1500) + '\n' + t('data_truncated') : resultStr;
-
-        div.innerHTML = `
-          <div class="timeline-dot"></div>
-          <div class="tool-step-bubble">
-            <div class="tool-header">
-              <div class="tool-info">
-                <span class="tool-name">${escapeHtml(toolName)}</span>
-                <span class="${badgeClass}">${badgeText}</span>
-                <span class="badge data-size args" title="${escapeHtml(argsBytesTitle)}">${t('tool_args_size')}: ${escapeHtml(argsBytesLabel)}</span>
-                <span class="badge data-size output" title="${escapeHtml(outputBytesTitle)}">${t('tool_output_size')}: ${escapeHtml(outputBytesLabel)}</span>
-              </div>
-              <span class="toggle-icon">${iconMarkup('chevron-right', 'tool-toggle-icon')}</span>
-            </div>
-            <div class="tool-details">
-              <div class="detail-section">
-                <span>${t('tool_arguments')}</span>
-                <pre><code>${escapeHtml(argsStr)}</code></pre>
-              </div>
-              <div class="detail-section">
-                <span>${t('tool_result')}</span>
-                <pre><code>${escapeHtml(truncatedResultStr)}</code></pre>
-              </div>
-            </div>
-          </div>
-        `;
-
-        // 綁定點擊展開事件
-        const header = div.querySelector('.tool-header');
-        header.addEventListener('click', () => {
-          const bubble = header.closest('.tool-step-bubble');
-          bubble.classList.toggle('expanded');
-        });
-
-        break;
-      }
-
-      case 'SystemStatus': {
-        let message = item.event_data.message;
-        if (message === '會話開始 (Session Started)') {
-          message = t('session_started');
-        } else if (message === '會話結束 (Session Ended)') {
-          message = t('session_ended');
-        } else if (message === '會話狀態壓縮完成 (Session Compaction Completed)') {
-          message = t('session_compaction');
-        }
-
-        let statusLabel = t('system_status');
-        if (item.event_data.status_type === 'session_compaction') {
-          statusLabel = t('system_compaction');
-        }
-
-        div.innerHTML = `
-          <div class="timeline-dot"></div>
-          <div class="system-bubble">
-            <div class="system-badge">
-              <span class="system-kind">${statusLabel}</span> ${escapeHtml(message)} <span class="time">${timeStr}</span>
-            </div>
-          </div>
-        `;
-        break;
-      }
-    }
-
-    timelineContainer.appendChild(div);
+  const updateSearch = () => {
+    updateSessionChatView();
+    drawer.querySelector('.drawer-body').scrollTop = 0;
+  };
+  search.addEventListener('input', updateSearch);
+  clear.addEventListener('click', () => {
+    search.value = '';
+    search.focus();
+    updateSearch();
   });
+
+  document.getElementById('close-drawer-btn').addEventListener('click', closeDrawer);
+  drawer.addEventListener('cancel', event => {
+    event.preventDefault();
+    closeDrawer();
+  });
+  drawer.addEventListener('pointerdown', event => {
+    const bounds = drawer.getBoundingClientRect();
+    pointerOnBackdrop = event.target === drawer && (
+      event.clientX < bounds.left || event.clientX >= bounds.right
+      || event.clientY < bounds.top || event.clientY >= bounds.bottom
+    );
+  });
+  drawer.addEventListener('click', event => {
+    if (pointerOnBackdrop && event.target === drawer) closeDrawer();
+    pointerOnBackdrop = false;
+  });
+
+  let conversationWidth = 0;
+  const observer = new ResizeObserver(([entry]) => {
+    if (!drawer.open || entry.contentRect.width === conversationWidth) return;
+    conversationWidth = entry.contentRect.width;
+    measureSessionChatPreviews(true);
+  });
+  observer.observe(document.getElementById('timeline-items'));
+  updateSessionChatView();
+}
+
+async function openSessionTimeline(session, trigger = document.activeElement) {
+  const drawer = document.getElementById('timeline-drawer');
+  const search = document.getElementById('timeline-search-input');
+  const timeline = document.getElementById('timeline-items');
+  const title = document.getElementById('drawer-session-name');
+  const assistant = session.assistant_type || currentAssistant;
+
+  sessionChat.request?.abort();
+  const request = new AbortController();
+  sessionChat.request = request;
+  if (!drawer.open || !drawer.contains(trigger)) {
+    sessionChat.trigger = trigger;
+  }
+  sessionChat.rows = null;
+
+  title.textContent = session.session_name || session.session_id;
+  title.title = title.textContent;
+  document.getElementById('drawer-session-id').textContent = session.session_id;
+  document.getElementById('timeline-session-details').open = false;
+  search.value = '';
+  search.disabled = true;
+  timeline.replaceChildren();
+  updateSessionChatView();
+  updateSessionChatSummary(session);
+  setSessionChatStatus(t('drawer_loading'), 'loading');
+
+  if (!drawer.open) drawer.showModal();
+  drawer.querySelector('.drawer-body').scrollTop = 0;
+
+  // 同一個 session ID 可能出現在不同來源，或同時是主會話及合成子代理。
+  const params = new URLSearchParams();
+  if (session.source_kind) params.set('source_kind', session.source_kind);
+  if (session.source_dir_key) params.set('source_dir_key', session.source_dir_key);
+  if (session.parent_session_id !== undefined) {
+    params.set('parent_session_id', session.parent_session_id || '');
+  }
+  const query = params.toString();
+  const url = `/api/${encodeURIComponent(assistant)}/session/${encodeURIComponent(session.session_id)}${query ? `?${query}` : ''}`;
+
+  try {
+    const response = await fetch(url, { signal: request.signal });
+    if (response.status === 404) {
+      const error = await response.json().catch(() => ({}));
+      if (request.signal.aborted) return;
+      const reasonMessage = {
+        no_events_yet: 'drawer_no_events_yet',
+        file_missing: 'drawer_file_missing',
+        content_unavailable: 'drawer_content_unavailable',
+      }[error.reason];
+      const message = reasonMessage
+        ? t(reasonMessage)
+        : (typeof error.error === 'string' && error.error.trim()) || t('drawer_load_failed_cleaned');
+      setSessionChatStatus(message, error.reason === 'no_events_yet' ? 'empty' : 'error');
+      return;
+    }
+
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+    if (request.signal.aborted) return;
+
+    const metadata = data?.metadata || {};
+    const events = Array.isArray(data?.timeline) ? data.timeline : [];
+    updateSessionChatSummary(session, metadata);
+    const fragment = document.createDocumentFragment();
+    sessionChat.rows = events.map((item, index) => createSessionChatRow(
+      item, index, metadata.assistant_type || assistant,
+    )).filter(Boolean);
+    for (const row of sessionChat.rows) fragment.append(row.element);
+    timeline.append(fragment);
+    search.disabled = !sessionChat.rows.some(row => row.searchText);
+    updateSessionChatView();
+  } catch (error) {
+    if (request.signal.aborted) return;
+    console.error('獲取會話細節失敗:', error);
+    setSessionChatStatus(t('drawer_load_failed'), 'error');
+  } finally {
+    if (sessionChat.request === request) sessionChat.request = null;
+  }
+}
+
+function closeDrawer() {
+  const drawer = document.getElementById('timeline-drawer');
+  if (!drawer.open) return;
+
+  sessionChat.request?.abort();
+  sessionChat.request = null;
+  sessionChat.rows = null;
+  document.getElementById('timeline-items').replaceChildren();
+  drawer.close();
+  const trigger = sessionChat.trigger;
+  const sessionKey = trigger?.closest('tr')?.dataset.sessionKey;
+  const focusTarget = trigger?.isConnected
+    ? trigger
+    : sessionKey && document.querySelector(`[data-session-key="${CSS.escape(sessionKey)}"] .session-name-text`);
+  focusTarget?.focus({ preventScroll: true });
+  sessionChat.trigger = null;
+}
+
+function setSessionChatStatus(text, state = 'idle') {
+  const status = document.getElementById('timeline-status');
+  status.dataset.state = state;
+  status.textContent = text;
+}
+
+function updateSessionChatSummary(session, metadata) {
+  const values = {
+    cwd: abbreviateHomePath(metadata?.cwd || session.cwd) || '-',
+    repo: metadata?.repository || '-',
+    branch: metadata?.git_branch || '-',
+    model: metadata?.selected_model || session.model || '-',
+    effort: metadata?.reasoning_effort || session.reasoning_effort || '',
+    nickname: metadata?.agent_nickname || session.agent_nickname || '',
+    role: metadata?.agent_role || session.agent_role || '',
+    input: formatToken(metadata?.total_input_tokens || session.total_input_tokens || 0),
+    output: formatToken(metadata?.total_output_tokens || session.total_output_tokens || 0),
+    reasoning: formatToken(metadata?.total_reasoning_tokens || session.total_reasoning_tokens || 0),
+    cache: formatToken(metadata?.total_cache_read_tokens || session.total_cache_read_tokens || 0),
+    tokens: formatToken(metadata?.total_tokens || session.total_tokens || 0),
+    compaction: metadata ? formatNumber(metadata.compaction_count ?? 0) : '-',
+    cost: formatCost(session.cost_usd),
+  };
+
+  for (const [key, value] of Object.entries(values)) {
+    const element = document.getElementById(`meta-${key}`);
+    element.textContent = value;
+    element.title = value === '-' ? '' : value;
+  }
+  document.getElementById('meta-effort').hidden = !values.effort;
+  for (const key of ['nickname', 'role']) {
+    document.getElementById(`drawer-meta-${key}-container`).hidden = !values[key];
+  }
+}
+
+function updateSessionChatView() {
+  const drawer = document.getElementById('timeline-drawer');
+  const search = document.getElementById('timeline-search-input');
+  const preferences = sessionChat.preferences;
+  const pattern = createSessionChatSearch(search.value);
+  const showDetails = !preferences.chatOnly;
+  const showReasoning = showDetails && preferences.reasoning && !pattern;
+  drawer.dataset.showMetadata = preferences.metadata;
+  document.getElementById('timeline-detail-options').hidden = !showDetails;
+  document.getElementById('timeline-search-clear').hidden = !search.value;
+
+  if (!sessionChat.rows) return;
+  let visibleCount = 0;
+
+  for (const row of sessionChat.rows) {
+    const match = pattern && row.searchText ? pattern.exec(row.searchText) : null;
+    const visible = pattern
+      ? Boolean(match)
+      : row.kind === 'message' || (showDetails && preferences[row.kind]);
+    row.element.hidden = !visible;
+    if (!visible) continue;
+    visibleCount++;
+
+    if (row.reasoning) row.reasoning.hidden = !showReasoning;
+    if (row.preview) {
+      row.preview.excerpt = match ? sessionChatSearchExcerpt(row.searchText, match) : null;
+      row.preview.searchExpanded = pattern ? row.preview.searchExpanded ?? false : null;
+      showSessionChatPreview(row.preview);
+    }
+  }
+
+  if (pattern) {
+    const count = new Intl.NumberFormat(localeForFormatting[currentLang]).format(visibleCount);
+    setSessionChatStatus(visibleCount
+      ? t('drawer_search_results').replace('{count}', count)
+      : t('drawer_search_no_results'), visibleCount ? 'results' : 'empty');
+  } else {
+    const emptyMessage = sessionChat.rows.length ? 'drawer_no_visible_messages' : 'drawer_no_events';
+    setSessionChatStatus(visibleCount ? '' : t(emptyMessage), visibleCount ? 'idle' : 'empty');
+  }
+  measureSessionChatPreviews();
+}
+
+function chatElement(tag, className, text) {
+  const element = document.createElement(tag);
+  if (className) element.className = className;
+  if (text !== undefined) element.textContent = text;
+  return element;
+}
+
+function chatTime(timestamp) {
+  const date = parseUsageTimestamp(timestamp);
+  if (!date) return null;
+  const time = chatElement('time', 'chat-time chat-metadata', formatLocalTime(timestamp));
+  time.dateTime = date.toISOString();
+  time.title = date.toLocaleString(localeForFormatting[currentLang]);
+  return time;
+}
+
+function createSessionChatRow(item, index, assistantType) {
+  const data = item?.event_data || {};
+  const time = chatTime(data.timestamp);
+
+  if (item?.event_type === 'ToolStep') return createChatToolRow(data, time);
+  if (item?.event_type === 'SystemStatus') return createChatSystemRow(data, time);
+  if (item?.event_type === 'Reasoning') {
+    return createChatDetailRow('reasoning', t('drawer_reasoning_text'), data.reasoning, time);
+  }
+  if (item?.event_type !== 'UserPrompt' && item?.event_type !== 'AssistantReply') return null;
+
+  const user = item.event_type === 'UserPrompt';
+  const text = user ? data.prompt_text ?? data.prompt ?? '' : data.reply_text ?? '';
+  if (user && data.sender_role === 'agent') {
+    return createChatDetailRow('system', t('drawer_agent_context'), text, time);
+  }
+
+  const row = chatElement('li', `chat-row chat-row-${user ? 'user' : 'assistant'}`);
+  const message = chatElement('article', 'chat-message');
+  const heading = chatElement('div', 'chat-message-heading');
+  const body = chatElement('div', user ? 'chat-text' : 'reply-content');
+
+  const tokens = user ? null : createChatTokenStats(data);
+  const reasoningText = user ? '' : data.reasoning?.trim();
+  const hasAttachments = user && Array.isArray(data.attachments) && data.attachments.length > 0;
+
+  if (!text.trim() && !hasAttachments) {
+    if (reasoningText) {
+      const reasoningRow = createChatDetailRow('reasoning', t('drawer_reasoning_text'), reasoningText, time);
+      if (tokens) reasoningRow.element.firstElementChild.append(tokens);
+      return reasoningRow;
+    }
+    if (!tokens) return null;
+    row.className = 'chat-row chat-row-detail';
+    heading.append(chatElement('span', 'chat-sender', t('drawer_tokens_only')));
+    if (time) heading.append(time);
+    message.append(heading, tokens);
+    row.append(message);
+    return { kind: 'metadata', element: row };
+  }
+
+  const sender = chatElement('span', 'chat-sender', user ? t('sender_user') : getAssistantMeta(assistantType).senderName);
+  if (!user && isSupportedAssistant(assistantType)) {
+    sender.insertAdjacentHTML('afterbegin', getAssistantLogoHtml(assistantType));
+  }
+  heading.append(sender);
+  if (!user && data.model) {
+    const model = chatElement('span', 'chat-model chat-metadata', data.model);
+    if (data.reasoning_effort) model.title = `${t('drawer_effort')} · ${data.reasoning_effort}`;
+    heading.append(model);
+  }
+  if (time) heading.append(time);
+  if (!user) heading.append(createChatCopyButton(text));
+  message.append(heading);
+
+  if (user) body.textContent = text;
+  else body.innerHTML = renderSafeMarkdown(text);
+  if (text.trim()) message.append(body);
+  const preview = text.trim() ? createSessionChatPreview(body, index) : null;
+  if (preview) message.append(preview.text, preview.button);
+  if (hasAttachments) message.append(createChatAttachments(data.attachments));
+  if (tokens) message.append(tokens);
+  const reasoning = reasoningText
+    ? createChatDetail(t('drawer_reasoning_text'), null, () => chatElement('pre', null, reasoningText))
+    : null;
+  if (reasoning) message.append(reasoning);
+
+  row.append(message);
+  return {
+    kind: 'message',
+    element: row,
+    searchText: normalizeSessionChatText(body.textContent),
+    reasoning,
+    preview,
+  };
+}
+
+function createSessionChatPreview(body, index) {
+  const original = body.textContent.trim().slice(0, 1500);
+  const text = chatElement('div', 'chat-text chat-preview', original);
+  const button = chatElement('button', 'chat-disclosure-button');
+  const preview = {
+    body, text, button, original, long: null, expanded: false, searchExpanded: null, excerpt: null,
+  };
+  body.id = `timeline-message-${index}`;
+  button.type = 'button';
+  button.setAttribute('aria-controls', body.id);
+  button.addEventListener('click', () => {
+    const key = preview.searchExpanded === null ? 'expanded' : 'searchExpanded';
+    preview[key] = !preview[key];
+    showSessionChatPreview(preview);
+    if (!preview[key]) button.scrollIntoView({ block: 'nearest' });
+  });
+  showSessionChatPreview(preview);
+  return preview;
+}
+
+function showSessionChatPreview(preview) {
+  const expanded = preview.searchExpanded ?? preview.expanded;
+  const cropped = preview.long && !expanded;
+  const showExcerpt = cropped && Boolean(preview.excerpt);
+  preview.body.hidden = Boolean(cropped);
+  preview.text.hidden = !cropped;
+  preview.button.hidden = !preview.long;
+  preview.button.setAttribute('aria-expanded', String(Boolean(preview.long && expanded)));
+  const label = t(expanded ? 'drawer_show_less' : 'drawer_show_more');
+  if (preview.button.textContent !== label) preview.button.textContent = label;
+  if (showExcerpt) {
+    const { before, match, after } = preview.excerpt;
+    preview.text.replaceChildren(before, chatElement('mark', null, match), after);
+  } else if (preview.text.textContent !== preview.original || preview.text.childElementCount) {
+    preview.text.textContent = preview.original;
+  }
+  preview.text.classList.toggle('chat-search-excerpt', showExcerpt);
+}
+
+function measureSessionChatPreviews(widthChanged = false) {
+  const previews = [];
+
+  for (const row of sessionChat.rows || []) {
+    if (!row.preview) continue;
+    if (widthChanged) row.preview.long = null;
+    if (row.element.hidden || row.preview.long !== null) continue;
+    row.preview.body.hidden = false;
+    row.preview.text.hidden = true;
+    row.preview.button.hidden = true;
+    previews.push(row.preview);
+  }
+
+  // 先統一顯示內文再量測，避免每則訊息交錯觸發排版。
+  for (const preview of previews) {
+    const lineHeight = Number.parseFloat(getComputedStyle(preview.body).lineHeight);
+    preview.long = preview.body.scrollHeight > lineHeight * 6 + 1;
+  }
+  for (const preview of previews) showSessionChatPreview(preview);
+}
+
+function createChatAttachments(attachments) {
+  const list = chatElement('div', 'bubble-attachments');
+  for (const attachment of attachments) {
+    const path = attachment?.filePath || attachment?.path || t('attachment_unknown_filename');
+    const basename = path.split(/[\\/]/).pop();
+    const badge = chatElement('span', 'attachment-badge', `[${attachment?.type || 'file'}] ${basename}`);
+    badge.title = path;
+    list.append(badge);
+  }
+  return list;
+}
+
+function createChatTokenStats(data) {
+  const stats = chatElement('div', 'turn-token-stats chat-metadata');
+  const fields = [
+    ['input_tokens', 'input_tokens_label', 'input'],
+    ['output_tokens', 'output_tokens_label', 'output'],
+    ['reasoning_tokens', 'reasoning_tokens_label', 'reasoning'],
+    ['cache_read_tokens', 'cache_read_label', 'cache'],
+    ['cache_write_tokens', 'cache_write_label', 'cache'],
+    ['total_tokens', 'total_tokens_label', 'total'],
+  ];
+  for (const [key, label, type] of fields) {
+    const value = data[key];
+    if (typeof value !== 'number' || value === 0) continue;
+    const badge = chatElement('span', `token-badge ${type}`, `${t(label)} ${formatToken(value)}`);
+    badge.title = `${t(label)} ${formatNumber(value)}`;
+    stats.append(badge);
+  }
+  const duration = formatDuration(data.duration_ms);
+  if (duration !== '-') {
+    stats.append(chatElement('span', 'token-badge', `${t('drawer_duration')} ${duration}`));
+  }
+  return stats.childElementCount ? stats : null;
+}
+
+function createChatCopyButton(markdown) {
+  const button = chatElement('button', 'copy-markdown-btn', t('copy_markdown'));
+  button.type = 'button';
+  button.title = t('copy_markdown_title');
+  let resetTimer;
+  button.addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText(markdown);
+      button.textContent = t('copy_success');
+      button.classList.add('copied');
+      clearTimeout(resetTimer);
+      resetTimer = setTimeout(() => {
+        button.textContent = t('copy_markdown');
+        button.classList.remove('copied');
+      }, 2000);
+    } catch (error) {
+      console.error('Failed to copy text:', error);
+      button.textContent = t('copy_failed');
+      clearTimeout(resetTimer);
+      resetTimer = setTimeout(() => { button.textContent = t('copy_markdown'); }, 2000);
+    }
+  });
+  return button;
+}
+
+function createChatDetail(label, time, makeContent) {
+  const detail = chatElement('details', 'chat-detail');
+  const summary = chatElement('summary');
+  summary.append(label);
+  if (time) summary.append(' ', time);
+  detail.append(summary);
+
+  function reveal() {
+    if (!detail.open) return;
+    const body = chatElement('div', 'chat-detail-body');
+    body.append(makeContent());
+    detail.append(body);
+    detail.removeEventListener('toggle', reveal);
+  }
+  detail.addEventListener('toggle', reveal);
+  return detail;
+}
+
+function createChatDetailRow(kind, label, text, time) {
+  if (!text?.trim()) return null;
+  const row = chatElement('li', 'chat-row chat-row-detail');
+  row.append(createChatDetail(label, time, () => chatElement('pre', null, text)));
+  return { kind, element: row };
+}
+
+function createChatSystemRow(data, time) {
+  const knownMessages = {
+    '會話開始 (Session Started)': 'session_started',
+    '會話結束 (Session Ended)': 'session_ended',
+    '會話狀態壓縮完成 (Session Compaction Completed)': 'session_compaction',
+  };
+  const message = Object.hasOwn(knownMessages, data.message) ? t(knownMessages[data.message]) : data.message;
+  const label = {
+    system_prompt: 'drawer_system_instructions',
+    developer_instruction: 'drawer_developer_instructions',
+    compaction: 'system_compaction',
+  }[data.status_type];
+  if (label || message?.length > 160 || message?.includes('\n')) {
+    return createChatDetailRow('system', t(label || 'system_status'), message, time);
+  }
+  if (!message?.trim()) return null;
+
+  const row = chatElement('li', 'chat-row chat-row-detail');
+  const summary = chatElement('div', 'chat-system-status', message);
+  if (time) summary.append(time);
+  row.append(summary);
+  return { kind: 'system', element: row };
+}
+
+function createChatToolRow(data, time) {
+  const status = data.status || (data.result ? 'success' : 'running');
+  const statusLabel = {
+    running: 'tool_status_executing',
+    success: 'tool_status_success',
+    failed: 'tool_status_failed',
+  }[status] || 'tool_status_executing';
+  const label = chatElement('span', 'tool-info');
+  label.append(chatElement('span', 'tool-name', data.tool_name || t('drawer_tools')));
+  const badge = chatElement('span', 'chat-tool-status', t(statusLabel));
+  badge.dataset.status = status;
+  label.append(' ', badge);
+
+  const detail = createChatDetail(label, time, () => {
+    const args = stringifyToolValue(data.arguments, '{}');
+    const result = stringifyToolValue(data.result?.textResultForLlm ?? data.result?.content ?? data.result);
+    const content = document.createDocumentFragment();
+    for (const [text, label, sizeLabel] of [
+      [args, 'tool_arguments', 'tool_args_size'],
+      [result, 'tool_result', 'tool_output_size'],
+    ]) {
+      const section = chatElement('div', 'detail-section');
+      const size = formatHumanBytes(getUtf8ByteLength(text));
+      section.append(
+        chatElement('span', null, `${t(label)} · ${t(sizeLabel)} ${size}`),
+        chatElement('pre', null, text || t('no_returned_data')),
+      );
+      content.append(section);
+    }
+    return content;
+  });
+  const row = chatElement('li', 'chat-row chat-row-detail');
+  row.append(detail);
+  return { kind: 'tools', element: row };
 }
 
 // =========================================================================
@@ -6275,7 +6258,7 @@ function renderModelSessionDrilldown(sessions) {
                   const cwd = session.cwd || t('unknown_cwd');
                   const time = formatLocalTime(session.timestamp, true) || '—';
                   return `
-                    <button type="button" class="model-session-link" data-session-id="${escapeHtml(session.session_id)}" data-assistant-type="${escapeHtml(session.assistant_type || '')}" data-source-kind="${escapeHtml(session.source_kind || '')}" data-source-dir-key="${escapeHtml(session.source_dir_key || '')}" data-parent-session-id="${escapeHtml(session.parent_session_id || '')}" aria-label="${escapeHtml(`${t('open_session')}: ${name}`)}">
+                    <button type="button" class="model-session-link" aria-haspopup="dialog" data-session-id="${escapeHtml(session.session_id)}" data-assistant-type="${escapeHtml(session.assistant_type || '')}" data-source-kind="${escapeHtml(session.source_kind || '')}" data-source-dir-key="${escapeHtml(session.source_dir_key || '')}" data-parent-session-id="${escapeHtml(session.parent_session_id || '')}" aria-label="${escapeHtml(`${t('open_session')}: ${name}`)}">
                       <span class="model-session-primary">
                         <span class="model-session-name-row">
                           <span class="model-session-name">${escapeHtml(name)}</span>
@@ -6426,7 +6409,7 @@ function appendModelSummaryRows(tbody, models, period) {
           total_reasoning_tokens:
             session.session_total_reasoning_tokens ?? session.total_reasoning_tokens,
           cost_usd: session.session_cost_usd ?? session.cost_usd,
-        });
+        }, sessionButton);
       }
     });
 

@@ -4,17 +4,39 @@ import test from 'node:test';
 import {
   buildSessionParentIndex,
   compareSessionRows,
+  createSessionChatSearch,
   filterEntriesBySessionIdentity,
   matchesSessionIdentity,
   nextSessionSearchDisplayState,
   nextSessionSearchRunState,
   nextSessionSearchSearchedFingerprint,
+  normalizeSessionChatText,
   parentSessionIdentityKey,
   rootSessionIdentityKey,
+  sessionChatSearchExcerpt,
   sessionIdentityKey,
   sessionSearchDataFingerprint,
   sessionSearchMatchKey,
 } from '../static/session-utils.js';
+
+test('session chat search finds literal, case-insensitive phrases across whitespace and Unicode variants', () => {
+  const text = normalizeSessionChatText('訊息：ＦＩＸ\n\tCafe\u0301 [v2.0]?');
+  const search = createSessionChatSearch('  fix  CAFÉ [v2.0]?  ');
+
+  assert.equal(search.exec(text)?.[0], 'FIX Café [v2.0]?');
+  assert.equal(search.test('fix café v2x0'), false);
+  assert.equal(createSessionChatSearch(' \n\t '), null);
+});
+
+test('session chat search returns a bounded excerpt around a match beyond the message preview', () => {
+  const text = normalizeSessionChatText('👋'.repeat(1800) + ' 最後一段 ' + '界'.repeat(1800));
+  const match = createSessionChatSearch('最後一段').exec(text);
+  const excerpt = sessionChatSearchExcerpt(text, match);
+
+  assert.equal(excerpt.before, '…' + '👋'.repeat(47) + ' ');
+  assert.equal(excerpt.match, '最後一段');
+  assert.equal(excerpt.after, ' ' + '界'.repeat(47) + '…');
+});
 
 const mixedTimestampSessions = [
   {

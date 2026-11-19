@@ -153,7 +153,7 @@ struct LegacyEventWrapper {
     event_data: serde_json::Value,
 }
 
-fn legacy_timeline(timeline: Vec<TimelineItem>) -> Vec<LegacyEventWrapper> {
+fn legacy_timeline(assistant: &str, timeline: Vec<TimelineItem>) -> Vec<LegacyEventWrapper> {
     timeline
         .into_iter()
         .map(|item| match item {
@@ -169,14 +169,26 @@ fn legacy_timeline(timeline: Vec<TimelineItem>) -> Vec<LegacyEventWrapper> {
                     .and_then(serde_json::Value::as_array)
                     .cloned()
                     .unwrap_or_default();
+                let sender = context
+                    .as_ref()
+                    .and_then(|value| value.get("antigravity_agent_sender"))
+                    .and_then(serde_json::Value::as_str);
+                let prompt_text = if assistant == "antigravity" && sender.is_none() {
+                    crate::antigravity::extract_user_request_text(&prompt)
+                } else {
+                    &prompt
+                };
                 LegacyEventWrapper {
                     event_type: "UserPrompt".to_string(),
                     event_data: serde_json::json!({
                         "timestamp": timestamp,
                         "prompt": prompt,
+                        "prompt_text": prompt_text,
                         "transformed_prompt": None::<String>,
                         "attachments": attachments,
                         "turn_no": turn_no,
+                        "sender_role": sender.map(|_| "agent"),
+                        "sender": sender,
                     }),
                 }
             }
@@ -187,20 +199,22 @@ fn legacy_timeline(timeline: Vec<TimelineItem>) -> Vec<LegacyEventWrapper> {
                 turn_no,
                 model,
                 tokens,
-                duration_ms: _,
+                duration_ms,
                 reasoning_effort,
             } => {
-                let reply = match reasoning {
-                    Some(reasoning) => format!(
+                let legacy_reply = reasoning.as_ref().map(|reasoning| {
+                    format!(
                         "<details><summary>🧠 LLM Reasoning Process</summary>\n{reasoning}\n</details>\n\n{reply}"
-                    ),
-                    None => reply,
-                };
+                    )
+                });
                 LegacyEventWrapper {
                     event_type: "AssistantReply".to_string(),
                     event_data: serde_json::json!({
                         "timestamp": timestamp,
-                        "reply": reply,
+                        "reply": legacy_reply.as_deref().unwrap_or(&reply),
+                        "reply_text": reply,
+                        "reasoning": reasoning,
+                        "duration_ms": duration_ms,
                         "model": model,
                         "reasoning_effort": reasoning_effort,
                         "input_tokens": tokens.as_ref().map(|value| value.input),
@@ -236,6 +250,7 @@ fn legacy_timeline(timeline: Vec<TimelineItem>) -> Vec<LegacyEventWrapper> {
                         "timestamp": timestamp,
                         "tool_name": tool_name,
                         "arguments": arguments,
+                        "status": status,
                         "result": matches!(status.as_str(), "success" | "failed").then(|| {
                             serde_json::json!({
                                 "content": content,
@@ -256,6 +271,13 @@ fn legacy_timeline(timeline: Vec<TimelineItem>) -> Vec<LegacyEventWrapper> {
                     "timestamp": timestamp,
                     "status_type": status_type,
                     "message": message,
+                }),
+            },
+            TimelineItem::Reasoning { timestamp, reasoning } => LegacyEventWrapper {
+                event_type: "Reasoning".to_string(),
+                event_data: serde_json::json!({
+                    "timestamp": timestamp,
+                    "reasoning": reasoning,
                 }),
             },
         })
@@ -399,7 +421,7 @@ pub(crate) fn load_session_details(
                 status_type.as_str(),
                 "subagent_started" | "subagent_completed" | "subagent_failed"
             ),
-            TimelineItem::UserPrompt { .. } => false,
+            TimelineItem::UserPrompt { .. } | TimelineItem::Reasoning { .. } => false,
         })
     {
         return Err(SessionDetailsError::with_reason(
@@ -471,7 +493,7 @@ pub(crate) fn load_session_details(
     Ok(serde_json::json!({
         "session_id": session_id,
         "metadata": metadata,
-        "timeline": legacy_timeline(timeline),
+        "timeline": legacy_timeline(&assistant, timeline),
     }))
 }
 
@@ -480,6 +502,119 @@ mod tests {
     use super::*;
     use crate::session_files::resolve_copilot_cli_subagent_events_path;
     use std::{collections::HashMap, fs};
+
+    #[test]
+    fn chat_metadata_keeps_legacy_prompt_reply_and_tool_fields() {
+        let mut timeline = Vec::new();
+        parse_antigravity_timeline(
+            concat!(
+                r#"{"type":"USER_INPUT","content":"<USER_REQUEST>Human prompt</USER_REQUEST>\n<CONTEXT>Injected metadata</CONTEXT>"}"#,
+                "\n",
+                r#"{"type":"SYSTEM_MESSAGE","content":"[Message] timestamp=2026-07-22T10:00:00Z sender=parent-agent priority=IMMEDIATE content=Agent prompt"}"#,
+            )
+            .as_bytes(),
+            &HashMap::new(),
+            &mut timeline,
+            &mut HashMap::new(),
+            true,
+        );
+        let prompts = legacy_timeline("antigravity", timeline);
+        assert_eq!(prompts[0].event_type, "UserPrompt");
+        assert!(prompts[0].event_data["sender_role"].is_null());
+        assert_eq!(prompts[0].event_data["prompt_text"], "Human prompt");
+        assert!(prompts[0].event_data["prompt"]
+            .as_str()
+            .unwrap()
+            .contains("Injected metadata"));
+        assert_eq!(prompts[1].event_type, "UserPrompt");
+        assert_eq!(prompts[1].event_data["sender_role"], "agent");
+        assert_eq!(prompts[1].event_data["sender"], "parent-agent");
+
+        let events = legacy_timeline(
+            "antigravity",
+            vec![
+                TimelineItem::AgentReply {
+                    timestamp: "2026-07-22T10:00:00Z".to_string(),
+                    reply: "**Done**".to_string(),
+                    reasoning: Some("Recorded reasoning".to_string()),
+                    turn_no: 1,
+                    model: "Fixture model".to_string(),
+                    tokens: None,
+                    duration_ms: Some(1200),
+                    reasoning_effort: None,
+                },
+                TimelineItem::ToolStep {
+                    timestamp: "2026-07-22T10:00:01Z".to_string(),
+                    tool_name: "fixture_tool".to_string(),
+                    arguments: serde_json::json!({ "arg": "value" }),
+                    env: None,
+                    exit_code: Some(2),
+                    stdout: String::new(),
+                    stderr: "Fixture failure".to_string(),
+                    tool_call_id: None,
+                    status: "failed".to_string(),
+                },
+            ],
+        );
+
+        assert_eq!(events[0].event_type, "AssistantReply");
+        let reply = &events[0].event_data;
+        assert_eq!(
+            reply["reply"],
+            "<details><summary>🧠 LLM Reasoning Process</summary>\nRecorded reasoning\n</details>\n\n**Done**"
+        );
+        assert_eq!(reply["reply_text"], "**Done**");
+        assert_eq!(reply["reasoning"], "Recorded reasoning");
+        assert_eq!(reply["duration_ms"], 1200);
+        let tool = &events[1].event_data;
+        assert_eq!(tool["status"], "failed");
+        assert_eq!(tool["result"]["exitCode"], 2);
+    }
+
+    #[test]
+    fn codex_chat_exposes_recorded_instructions_and_reasoning_in_log_order() {
+        let transcript = concat!(
+            r#"{"type":"session_meta","timestamp":"2026-07-22T10:00:00Z","payload":{"base_instructions":{"text":"Base system instructions","provenance":"default"}}}"#,
+            "\n",
+            r#"{"type":"response_item","timestamp":"2026-07-22T10:00:01Z","payload":{"type":"message","role":"system","content":[{"type":"input_text","text":"Explicit system message"}]}}"#,
+            "\n",
+            r#"{"type":"response_item","timestamp":"2026-07-22T10:00:02Z","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"Developer instructions"}]}}"#,
+            "\n",
+            r#"{"type":"response_item","timestamp":"2026-07-22T10:00:03Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"User question"}]}}"#,
+            "\n",
+            r#"{"type":"response_item","timestamp":"2026-07-22T10:00:04Z","payload":{"type":"reasoning","summary":[],"encrypted_content":"opaque"}}"#,
+            "\n",
+            r#"{"type":"response_item","timestamp":"2026-07-22T10:00:05Z","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"First summary"},{"type":"summary_text","text":"Second summary"}],"encrypted_content":"opaque"}}"#,
+            "\n",
+            r#"{"type":"response_item","timestamp":"2026-07-22T10:00:06Z","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Assistant reply"}]}}"#,
+        );
+        let mut timeline = Vec::new();
+        parse_codex_timeline(
+            transcript.as_bytes(),
+            &HashMap::new(),
+            &mut timeline,
+            &mut HashMap::new(),
+        );
+        let events = legacy_timeline("codex", timeline);
+        assert_eq!(events.len(), 7);
+        assert_eq!(events[0].event_data["status_type"], "session_start");
+        assert_eq!(events[1].event_data["status_type"], "system_prompt");
+        assert_eq!(events[1].event_data["message"], "Base system instructions");
+        assert_eq!(events[2].event_data["status_type"], "system_prompt");
+        assert_eq!(events[2].event_data["message"], "Explicit system message");
+        assert_eq!(events[3].event_data["status_type"], "developer_instruction");
+        assert_eq!(events[3].event_data["message"], "Developer instructions");
+        assert_eq!(events[4].event_data["prompt"], "User question");
+        assert_eq!(events[4].event_data["prompt_text"], "User question");
+        assert_eq!(events[5].event_type, "Reasoning");
+        assert_eq!(events[5].event_data["timestamp"], "2026-07-22T10:00:05Z");
+        assert_eq!(
+            events[5].event_data["reasoning"],
+            "First summary\n\nSecond summary"
+        );
+        assert_eq!(events[6].event_data["reply_text"], "Assistant reply");
+        assert_eq!(events[6].event_data["turn_no"], 1);
+    }
 
     /// Regression test: a Copilot CLI subagent synthetic session row must
     /// resolve its drawer events.jsonl via the parent session's directory
