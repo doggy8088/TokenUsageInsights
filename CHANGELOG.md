@@ -4,6 +4,18 @@
 
 ## [未發行]
 
+## [1.8.1] - 2026-11-20
+
+本次更新補上 Gemini 4 Neon 的費用估算，並修正兩張 Codex 每日報表文件截圖的檔案格式。
+
+### 新增與改善
+
+- 新增 Gemini 4 Neon 及 Low、Medium、High、Extra 思考層級的計價規則。每百萬 Token 的標準費率為輸入 3.00、快取輸入 0.15、輸出 15.00 美元。批次 API 費率依序為 1.50、0.075、7.50 美元。[Google Gemini API 定價](https://ai.google.dev/gemini-api/docs/pricing#gemini-4-neon)
+
+### 修正
+
+- 將兩張副檔名為 `.png` 的 Codex 每日報表文件截圖從 JPEG 轉為有效的 PNG。
+
 ## [1.8.0] - 2026-11-20
 
 本次 minor release 將會話詳情改成可搜尋的聊天介面，並在側欄提供四個統計期間快選按鈕。
@@ -1232,7 +1244,8 @@
 - 修正行動版側邊欄遮擋、黑畫面、標題擠壓、圖表導覽索引與年度版面問題。
 - 修正並補齊多個 Gemini、Claude、GPT 與 GPT-OSS 模型的定價規則。
 
-[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.8.0...HEAD
+[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.8.1...HEAD
+[1.8.1]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.8.0...v1.8.1
 [1.8.0]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.7.0...v1.8.0
 [1.7.0]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.6.7...v1.7.0
 [1.6.7]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.6.6...v1.6.7
