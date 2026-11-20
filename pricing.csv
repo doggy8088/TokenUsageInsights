@@ -61,6 +61,11 @@ Gemini 4 Hydrogen (Low),Google AI,1M Tokens,1.50,0.075,7.50,0.75/0.0375/3.75
 Gemini 4 Hydrogen (Medium),Google AI,1M Tokens,1.50,0.075,7.50,0.75/0.0375/3.75
 Gemini 4 Hydrogen (High),Google AI,1M Tokens,1.50,0.075,7.50,0.75/0.0375/3.75
 Gemini 4 Hydrogen (Extra),Google AI,1M Tokens,1.50,0.075,7.50,0.75/0.0375/3.75
+Gemini 4 Neon,Google AI,1M Tokens,3.00,0.15,15.00,1.50/0.075/7.50
+Gemini 4 Neon (Low),Google AI,1M Tokens,3.00,0.15,15.00,1.50/0.075/7.50
+Gemini 4 Neon (Medium),Google AI,1M Tokens,3.00,0.15,15.00,1.50/0.075/7.50
+Gemini 4 Neon (High),Google AI,1M Tokens,3.00,0.15,15.00,1.50/0.075/7.50
+Gemini 4 Neon (Extra),Google AI,1M Tokens,3.00,0.15,15.00,1.50/0.075/7.50
 Gemini 4 Carbon,Google AI,1M Tokens,4.00,0.20,20.00,2.00/0.10/10.00
 Gemini 4 Carbon (Medium),Google AI,1M Tokens,4.00,0.20,20.00,2.00/0.10/10.00
 Gemini 4 Carbon (High),Google AI,1M Tokens,4.00,0.20,20.00,2.00/0.10/10.00
