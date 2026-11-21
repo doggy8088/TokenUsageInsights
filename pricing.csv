@@ -109,6 +109,12 @@ GPT-OSS 120B (Medium),Local/OSS,1M Tokens,0.00,0.00,0.00,N/A
 GPT-6 Astra (<272k),Global,1M Tokens,10.00,1.00,50.00,5.00/0.50/25.00
 GPT-6 Astra (>272k),Global,1M Tokens,20.00,2.00,75.00,10.00/1.00/37.50
 GPT-6 Astra,Global,1M Tokens,10.00,1.00,50.00,5.00/0.50/25.00
+GPT-6.2 Astra (<272k),Global,1M Tokens,8.00,0.40,40.00,4.00/0.20/20.00
+GPT-6.2 Astra (>272k),Global,1M Tokens,16.00,0.80,60.00,8.00/0.40/30.00
+GPT-6.2 Astra,Global,1M Tokens,8.00,0.40,40.00,4.00/0.20/20.00
+GPT-6.2 Sol (<272k),Global,1M Tokens,2.00,0.10,10.00,1.00/0.05/5.00
+GPT-6.2 Sol (>272k),Global,1M Tokens,4.00,0.20,15.00,2.00/0.10/7.50
+GPT-6.2 Sol,Global,1M Tokens,2.00,0.10,10.00,1.00/0.05/5.00
 GPT-6.1 Sol (<272k),Global,1M Tokens,2.00,0.10,10.00,1.00/0.05/5.00
 GPT-6.1 Sol (>272k),Global,1M Tokens,4.00,0.20,15.00,2.00/0.10/7.50
 GPT-6.1 Sol,Global,1M Tokens,2.00,0.10,10.00,1.00/0.05/5.00
@@ -234,6 +240,8 @@ gpt-5.4,Cursor,1M Tokens,2.50,0.25,15.00,N/A
 gpt-5.4-mini,Cursor,1M Tokens,0.75,0.075,4.50,N/A
 gpt-5.5,Cursor,1M Tokens,5.00,0.50,30.00,N/A
 gpt-6-astra,Cursor,1M Tokens,10.00,1.00,50.00,N/A
+gpt-6.2-astra,Cursor,1M Tokens,8.00,0.40,40.00,N/A
+gpt-6.2-sol,Cursor,1M Tokens,2.00,0.10,10.00,N/A
 gpt-6.1-sol,Cursor,1M Tokens,2.00,0.10,10.00,N/A
 gpt-6.1-terra,Cursor,1M Tokens,1.00,0.05,5.00,N/A
 gpt-6-sol,Cursor,1M Tokens,2.00,0.20,10.00,N/A

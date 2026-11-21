@@ -859,6 +859,52 @@ mod tests {
     }
 
     #[test]
+    fn gpt_6_2_sol_and_astra_context_tiers_use_packaged_pricing() {
+        // https://developers.openai.com/api/docs/pricing
+        // 短上下文（<= 272k prompt tokens）：Sol 2.00/0.10/10.00、Astra 8.00/0.40/40.00
+        // 長上下文（> 272k prompt tokens）：Sol 4.00/0.20/15.00、Astra 16.00/0.80/60.00
+        let rules = load_pricing_rules();
+        let cases = [
+            (100_000, "GPT-6.2 Sol", 2.00, 0.10, 10.00),
+            (100_000, "GPT-6.2 Sol (<272k)", 2.00, 0.10, 10.00),
+            (100_000, "gpt-6.2-sol", 2.00, 0.10, 10.00),
+            (100_000, "GPT-6.2 Astra", 8.00, 0.40, 40.00),
+            (100_000, "GPT-6.2 Astra (<272k)", 8.00, 0.40, 40.00),
+            (100_000, "gpt-6.2-astra", 8.00, 0.40, 40.00),
+            (300_000, "GPT-6.2 Sol", 4.00, 0.20, 15.00),
+            (300_000, "GPT-6.2 Sol (>272k)", 4.00, 0.20, 15.00),
+            (300_000, "gpt-6.2-sol", 4.00, 0.20, 15.00),
+            (300_000, "GPT-6.2 Astra", 16.00, 0.80, 60.00),
+            (300_000, "GPT-6.2 Astra (>272k)", 16.00, 0.80, 60.00),
+            (300_000, "gpt-6.2-astra", 16.00, 0.80, 60.00),
+        ];
+
+        for (input, model_name, input_price, cached_price, output_price) in cases {
+            let cost = calculate_usage_cost(&rules, Some(model_name), input, 50_000, 50_000, 0, 0)
+                .unwrap_or_else(|error| panic!("{model_name} should have a pricing rule: {error}"));
+
+            let expected = (input as f64 / 1_000_000.0) * input_price
+                + (50_000.0 / 1_000_000.0) * cached_price
+                + (50_000.0 / 1_000_000.0) * output_price;
+            assert!(
+                (cost - expected).abs() < 1e-9,
+                "unexpected cost for {model_name} with {input} input tokens: {cost} != {expected}"
+            );
+        }
+
+        // 既有 GPT-6 Sol／GPT-6 Astra 的短上下文價格不受影響。
+        for (model_name, expected) in [("gpt-6-sol", 0.71), ("gpt-6-astra", 3.55)] {
+            let cost =
+                calculate_usage_cost(&rules, Some(model_name), 100_000, 50_000, 50_000, 0, 0)
+                    .expect("existing GPT-6 models should keep their pricing rule");
+            assert!(
+                (cost - expected).abs() < 1e-9,
+                "unexpected cost for {model_name}: {cost} != {expected}"
+            );
+        }
+    }
+
+    #[test]
     fn gpt_6_sol_and_luna_context_tiers_use_packaged_pricing() {
         let rules = load_pricing_rules();
 
