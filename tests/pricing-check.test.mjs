@@ -417,6 +417,38 @@ test('parseAntigravityProvider 缺少模型表、部分 Orchestrator 對應或 P
   );
 });
 
+test('parseAntigravityProvider 支援新版 Role／Supported models 的 Orchestrator 表格', () => {
+  const modelsMd = `## Reasoning model
+
+| Model | Free & Google AI Plus | Google AI Pro | Google AI Ultra | Enterprise |
+| --- | --- | --- | --- | --- |
+| [Gemini 4 Carbon](/blog/gemini-4-carbon-in-google-antigravity) | ❌ | ❌ | ✅ | ✅ |
+| [Orchestrator](/docs/models#orchestrator) | ❌ | ✅† | ✅ | ✅‡ |
+
+## Orchestrator
+
+| Role | Responsibilities | Supported models |
+| :-- | :-- | :-- |
+| **Orchestrator Model** (planner) | Explores the codebase, writes the plan, and reviews progress | [**Gemini 4 Carbon**](#gemini-4-carbon) (default), [**Gemini 4 Argon**](/blog/gemini-4-argon-in-google-antigravity), **Claude Opus 5.5** |
+| **Executor Model** | Searches, edits files, runs builds and tests | [**Gemini 4 Hydrogen**](/blog/gemini-4-hydrogen-in-google-antigravity) (default), **Claude Sonnet 5.5** |
+`;
+  const entries = parseAntigravityProvider(modelsMd, antigravityPricingMd);
+  assert.equal(entries.has('orchestrator'), false);
+  assert.equal(entries.get('orchestrator carbon').name, 'Orchestrator (Carbon)');
+  assert.equal(entries.get('orchestrator carbon').output.after, 20);
+  assert.equal(entries.get('orchestrator argon').input.now, 4);
+  assert.equal(entries.has('orchestrator claude opus 5.5'), false);
+  assert.equal(entries.has('orchestrator hydrogen'), false);
+
+  const csv = parseCsv(`h,h,h,h,h,h,h
+Gemini 4 Carbon,Google AI,1M Tokens,4.00,0.20,20.00,N/A
+Orchestrator (Carbon),Google AI,1M Tokens,4.00,0.20,20.00,N/A
+`);
+  const result = compareProvider(csv, entries, [], { priceDeployments: ['Google AI'] });
+  assert.deepEqual(result.missing, ['Orchestrator (Argon)']);
+  assert.deepEqual(result.mismatches, []);
+});
+
 test('parseAntigravityProvider 對未列於 unpricedModels 的一般 Google AI 模型缺價時拋錯', () => {
   const modelsMd = `## Reasoning model
 | Model | Plan |

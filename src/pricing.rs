@@ -1749,7 +1749,13 @@ mod tests {
     fn antigravity_orchestrator_models_use_planner_standard_pricing() {
         let rules = load_pricing_rules();
 
-        for model_name in ["Orchestrator (Carbon)", "Orchestrator (Argon)"] {
+        // Standard (post-introductory) planner rates: Carbon/Argon 4.00/0.20/20.00,
+        // Neon (the default planner) 3.00/0.15/15.00.
+        for (model_name, input_price, cached_price, output_price) in [
+            ("Orchestrator (Carbon)", 4.00, 0.20, 20.00),
+            ("Orchestrator (Argon)", 4.00, 0.20, 20.00),
+            ("Orchestrator (Neon)", 3.00, 0.15, 15.00),
+        ] {
             let input =
                 calculate_usage_cost(&rules, Some(model_name), 1_000_000, 0, 0, 0, 0).unwrap();
             let output =
@@ -1757,17 +1763,16 @@ mod tests {
             let cached =
                 calculate_usage_cost(&rules, Some(model_name), 0, 0, 1_000_000, 0, 0).unwrap();
 
-            // Standard (post-introductory) planner rates: input 4.00, cached input 0.20, output 20.00.
             assert!(
-                (input - 4.00).abs() < 1e-9,
+                (input - input_price).abs() < 1e-9,
                 "unexpected {model_name} input cost: {input}"
             );
             assert!(
-                (output - 20.00).abs() < 1e-9,
+                (output - output_price).abs() < 1e-9,
                 "unexpected {model_name} output cost: {output}"
             );
             assert!(
-                (cached - 0.20).abs() < 1e-9,
+                (cached - cached_price).abs() < 1e-9,
                 "unexpected {model_name} cached input cost: {cached}"
             );
         }

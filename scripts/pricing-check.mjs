@@ -235,6 +235,44 @@ function cleanAntigravityCell(cell) {
     .trim();
 }
 
+// 新版 Antigravity 文件不再列出固定的「選項 → Planner」對應表，而是以
+// 「Role | Responsibilities | Supported models」表格列出可選的 planner，
+// CLI 識別名稱則為 `Orchestrator (Neon)`、`Orchestrator (Carbon)` 等。
+// 此處把每個 Gemini planner 展開成 `Orchestrator (<代號>)` 選項；
+// 模型表中單獨的 `Orchestrator` 只是選擇器，展開後即不再追蹤。
+// Claude 等非 Gemini planner 僅限 App 自訂選擇，沒有對應的 CLI 識別名稱，不展開。
+function addRoleTablePlanners(orchLines, antigravityModels, orchestratorPlanners) {
+  let cols = null;
+  let added = 0;
+  for (let i = 0; i < orchLines.length; i++) {
+    const line = orchLines[i];
+    if (!line.trim().startsWith('|')) { cols = null; continue; }
+    const next = orchLines[i + 1] || '';
+    if (/^\s*\|?\s*:?-{2,}/.test(next) && !cols) {
+      const headers = splitRow(line).map(cleanAntigravityCell);
+      const role = headers.findIndex((h) => /^role$/i.test(h));
+      const supported = headers.findIndex((h) => /supported models/i.test(h));
+      cols = role >= 0 && supported >= 0 ? { role, supported } : null;
+      i++; // 略過分隔列
+      continue;
+    }
+    if (!cols) continue;
+    const cells = splitRow(line);
+    if (!/orchestrator model|planner/i.test(cleanAntigravityCell(cells[cols.role]))) continue;
+    for (const part of (cells[cols.supported] || '').split(',')) {
+      const planner = cleanAntigravityCell(part).replace(/\s*\([^)]*\)\s*$/, '').trim();
+      const codename = planner.match(/^gemini\s+[\d.]+\s+(.+)$/i)?.[1];
+      if (!codename) continue;
+      const optionName = `Orchestrator (${codename})`;
+      const optionKey = csvKey(optionName);
+      if (!antigravityModels.has(optionKey)) antigravityModels.set(optionKey, optionName);
+      if (!orchestratorPlanners.has(optionKey)) orchestratorPlanners.set(optionKey, csvKey(planner));
+      added++;
+    }
+  }
+  if (added > 0 && !orchestratorPlanners.has('orchestrator')) antigravityModels.delete('orchestrator');
+}
+
 function parseAntigravityTables(md, modelsHeading, orchestratorHeading) {
   const antigravityModels = new Map();
   let inModelsTable = false;
@@ -288,6 +326,7 @@ function parseAntigravityTables(md, modelsHeading, orchestratorHeading) {
       }
     }
   }
+  addRoleTablePlanners(orchLines, antigravityModels, orchestratorPlanners);
   const unmappedOrchestrators = [...antigravityModels.entries()]
     .filter(([key]) => /^orchestrator(?:\s|$)/i.test(key) && !orchestratorPlanners.has(key))
     .map(([, name]) => name);

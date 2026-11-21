@@ -7,6 +7,8 @@
 ### 修正
 
 - 補上 GPT-6.2 Sol 與 GPT-6.2 Astra 的計價規則，修正 `gpt-6.2-sol`、`gpt-6.2-astra` 會話出現「找不到可用的模型價格規則」而無法估算成本的問題。每百萬 Token 的短上下文標準費率依序為輸入、快取輸入、輸出：GPT-6.2 Sol 2.00、0.10、10.00 美元，GPT-6.2 Astra 8.00、0.40、40.00 美元。輸入與快取讀取超過 272,000 Token 時改用長上下文費率：GPT-6.2 Sol 4.00、0.20、15.00 美元，GPT-6.2 Astra 16.00、0.80、60.00 美元。[OpenAI API 定價](https://developers.openai.com/api/docs/pricing)
+- 新增 Antigravity `Orchestrator (Neon)` 的計價規則，依預設 planner Gemini 4 Neon 的標準費率計算：每百萬 Token 輸入 3.00、快取輸入 0.15、輸出 15.00 美元。[Antigravity 模型文件](https://antigravity.google/docs/models#orchestrator)
+- 每日定價檢查改為支援 Antigravity 新版 Orchestrator 文件格式（Role／Supported models 表格），修正官方頁面改版後持續回報「解析不到 Antigravity Orchestrator 對應表」的問題。
 
 ## [1.8.1] - 2026-11-20
 
