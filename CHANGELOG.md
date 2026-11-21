@@ -4,9 +4,13 @@
 
 ## [未發行]
 
+## [1.8.2] - 2026-11-22
+
+本次更新補齊 GPT-6.2 Sol、GPT-6.2 Astra 與 Antigravity Orchestrator (Neon) 的費用估算，並讓每日定價檢查能為新收錄的 OpenAI 模型提出定價 PR。
+
 ### 新增與改善
 
-- 每日定價檢查偵測到 OpenAI 新模型時，會依官方標準價表、Batch 價表與模型頁的長上下文門檻自動產生 `pricing.csv` 價格列。產生後先在 workflow 內執行 Node 與 Rust 價格測試，再以固定的 `automation/pricing-update` 分支開 PR 或更新既有 PR。資料不完整的模型與價格差異仍會列在 issue 中。
+- 每日定價檢查偵測到 OpenAI 新模型時，會依官方標準價表、Batch 價表與模型頁的長上下文門檻自動產生 `pricing.csv` 價格列。產生後先執行 Node 與 Rust 定價測試，再重新檢查新增模型是否仍被列為缺漏、是否出現新的價格差異。驗證通過後，使用 `automation/pricing-update` 分支開啟或更新 PR。資料不完整的模型與價格差異仍會列在 issue 中。
 - 定價檢查報告內容有變化時，會在既有 issue 留下 comment 以發送通知；檢查結果沒有待處理項目時，自動關閉 `pricing-drift` issue。
 
 ### 修正
