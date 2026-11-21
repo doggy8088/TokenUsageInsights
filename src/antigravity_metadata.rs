@@ -551,6 +551,8 @@ pub(crate) fn model_label(model_id: &str) -> &str {
         "gemini-4-hydrogen-low" => "Gemini 4 Hydrogen (Low)",
         "gemini-pro-orchestrator" => "Orchestrator (Carbon)",
         "gemini-pro-orchestrator-argon" => "Orchestrator (Argon)",
+        // Verified with `agy models` on 2026-11-22 (default planner on Google AI Pro/Ultra).
+        "gemini-pro-orchestrator-neon" => "Orchestrator (Neon)",
         // Verified from Antigravity Orchestrator session `gen_metadata` and
         // https://antigravity.google/docs/models#orchestrator (execution runs on Gemini 4 Hydrogen).
         "gemini-flash-worker-agy" => "Gemini 4 Hydrogen",
@@ -699,6 +701,7 @@ mod tests {
             ("gemini-4-hydrogen-low", "Gemini 4 Hydrogen (Low)"),
             ("gemini-pro-orchestrator", "Orchestrator (Carbon)"),
             ("gemini-pro-orchestrator-argon", "Orchestrator (Argon)"),
+            ("gemini-pro-orchestrator-neon", "Orchestrator (Neon)"),
             ("gemini-flash-worker-agy", "Gemini 4 Hydrogen"),
             ("claude-opus-5-5-low", "Claude Opus 5.5 (Low)"),
             ("claude-opus-5-5-medium", "Claude Opus 5.5 (Medium)"),

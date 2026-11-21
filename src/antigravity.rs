@@ -376,6 +376,7 @@ mod tests {
             r#"{"type":"PLANNER_RESPONSE","step_index":2,"model_id":"gemini-pro-orchestrator-argon","created_at":"2026-11-15T01:01:00Z","input_tokens":1000000,"cache_read_tokens":1000000,"output_tokens":1000000}"#,
             r#"{"type":"PLANNER_RESPONSE","step_index":3,"model_id":"gemini-flash-worker-agy","created_at":"2026-11-15T01:02:00Z","input_tokens":1000000,"cache_read_tokens":1000000,"output_tokens":1000000}"#,
             r#"{"type":"PLANNER_RESPONSE","step_index":4,"model":"gemini-4-hydrogen-high","created_at":"2026-11-15T01:03:00Z","input_tokens":1000000,"cache_read_tokens":1000000,"output_tokens":1000000}"#,
+            r#"{"type":"PLANNER_RESPONSE","step_index":5,"model_id":"gemini-pro-orchestrator-neon","created_at":"2026-11-15T01:04:00Z","input_tokens":1000000,"cache_read_tokens":1000000,"output_tokens":1000000}"#,
         ]
         .join("\n")
             + "\n";
@@ -389,6 +390,7 @@ mod tests {
             ("Orchestrator (Argon)", 24.20),
             ("Gemini 4 Hydrogen", 9.075),
             ("Gemini 4 Hydrogen (High)", 9.075),
+            ("Orchestrator (Neon)", 18.15),
         ];
         assert_eq!(entries.len(), expected.len());
 
