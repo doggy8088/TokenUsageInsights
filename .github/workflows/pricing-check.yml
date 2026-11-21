@@ -48,8 +48,13 @@ jobs:
         run: |
           node --test tests/pricing-check.test.mjs
           cargo test --locked pricing
-          # 套用後再檢查一次：自動產生的模型不應再被列為缺漏或價格差異。
-          node scripts/pricing-check.mjs > /dev/null
+          # 套用後再檢查一次：自動產生的模型不應再被列為缺漏，也不得產生價格差異。
+          summary=$(node scripts/pricing-check.mjs | tail -n 1)
+          echo "$summary"
+          case "$summary" in
+            *"drift=${{ steps.check.outputs.drift }} "*"generated=0 "*) ;;
+            *) echo "::error::套用後的 pricing.csv 仍有自動產生項目或新的價格差異：$summary"; exit 1 ;;
+          esac
       - name: Open or update pricing update PR
         if: github.event_name != 'pull_request' && steps.check.outputs.applied != '0'
         env:
