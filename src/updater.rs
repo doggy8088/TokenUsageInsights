@@ -5581,10 +5581,7 @@ fn is_auto_update_disabled(args: &[String]) -> bool {
         return true;
     }
     let (yaml_auto, _) = load_update_config();
-    if yaml_auto == Some(false) {
-        return true;
-    }
-    false
+    yaml_auto == Some(false)
 }
 
 #[derive(Debug, PartialEq, Eq)]

@@ -826,10 +826,7 @@ fn is_valid_date(date: &str) -> bool {
         Ok(v) => v,
         Err(_) => return false,
     };
-    if year <= 0 || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
-        return false;
-    }
-    true
+    year > 0 && (1..=12).contains(&month) && (1..=31).contains(&day)
 }
 
 fn is_valid_period(period: &str) -> bool {
