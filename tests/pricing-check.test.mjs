@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   parseCsv, isBaseRow, parsePrice, parseTableProvider, parseGeminiProvider, parseAntigravityProvider, compareProvider, csvKey,
+  parseTieredTable, parseContextThresholdK, formatPrice, openaiDisplayName, buildOpenAIRows, insertCsvRows, buildPrBody,
 } from '../scripts/pricing-check.mjs';
 
 const csv = `模型名稱,部署類型,單位,輸入價格(美金),快取輸入價格(美金),輸出價格(美金),批次 API 價格(美金)
@@ -515,4 +516,113 @@ Claude Opus 5.5,Global,1M Tokens,5.00,,25.00,N/A
   const completeResult = compareProvider(completeCsv, entries, [], { priceDeployments: ['Google AI'] });
   assert.deepEqual(completeResult.mismatches, []);
   assert.deepEqual(completeResult.missing, []);
+});
+
+const openaiTieredMd = `### Standard pricing data
+
+| Model | Short context input | Short context output | Short context cached input | Short context 30m write | Short context 12h write | Long context input | Long context output | Long context cached input | Long context 30m write | Long context 12h write |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| gpt-6.2-astra | $8.00 | $40.00 | $0.40 | $10.00 | $20.00 | $16.00 | $60.00 | $0.80 | $20.00 | $40.00 |
+| gpt-6.2-sol | $2.00 | $10.00 | $0.10 | $2.50 | $5.00 | $4.00 | $15.00 | $0.20 | $5.00 | $10.00 |
+| gpt-5.5 (<272K context length) | $5.00 | $30.00 | $0.50 | - | - | $10.00 | $45.00 | $1.00 | - | - |
+
+| Model | Input | Output | Cached input |
+| --- | --- | --- | --- |
+| gpt-5.4-mini | $0.75 | $4.50 | $0.075 |
+| gpt-5.2-pro | $21.00 | $168.00 | - |
+
+### Batch pricing data
+
+| Model | Short context input | Short context output | Short context cached input | Short context 30m write | Short context 12h write | Long context input | Long context output | Long context cached input | Long context 30m write | Long context 12h write |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| gpt-6.2-astra | $4.00 | $20.00 | $0.20 | $5.00 | $10.00 | $8.00 | $30.00 | $0.40 | $10.00 | $20.00 |
+| gpt-6.2-sol | $1.00 | $5.00 | $0.05 | $1.25 | $2.50 | $2.00 | $7.50 | $0.10 | $2.50 | $5.00 |
+`;
+
+test('parseTieredTable 讀取短／長上下文欄位並略過舊格式列', () => {
+  const standard = parseTieredTable(openaiTieredMd, '### Standard pricing data');
+  assert.deepEqual(standard.get('gpt-6.2-sol'), {
+    id: 'gpt-6.2-sol',
+    short: { input: 2, output: 10, cached: 0.1 },
+    long: { input: 4, output: 15, cached: 0.2 },
+  });
+  assert.deepEqual(standard.get('gpt-5.4-mini'), { id: 'gpt-5.4-mini', short: { input: 0.75, output: 4.5, cached: 0.075 }, long: null });
+  assert.equal(standard.get('gpt-5.2-pro').short.cached, null);
+  assert.equal(standard.has('gpt-5.5'), false);
+  assert.equal(parseTieredTable(openaiTieredMd, '### Batch pricing data').get('gpt-6.2-astra').long.output, 30);
+});
+
+test('parseContextThresholdK、formatPrice 與 openaiDisplayName', () => {
+  assert.equal(parseContextThresholdK('- For requests with more than 272K input tokens, input and cache rates double'), 272);
+  assert.equal(parseContextThresholdK('no threshold here'), null);
+  assert.equal(formatPrice(2), '2.00');
+  assert.equal(formatPrice(0.1), '0.10');
+  assert.equal(formatPrice(0.075), '0.075');
+  assert.equal(formatPrice(0.0375), '0.0375');
+  assert.equal(openaiDisplayName('gpt-6.2-sol'), 'GPT-6.2 Sol');
+  assert.equal(openaiDisplayName('gpt-7'), 'GPT-7');
+  assert.equal(openaiDisplayName('gpt-5.4-mini-high'), 'gpt-5.4-mini-high');
+});
+
+test('buildOpenAIRows 產生與人工補價相同的 GPT-6.2 價格列', () => {
+  const standard = parseTieredTable(openaiTieredMd, '### Standard pricing data');
+  const batch = parseTieredTable(openaiTieredMd, '### Batch pricing data');
+  const sol = buildOpenAIRows({ id: 'gpt-6.2-sol', standard: standard.get('gpt-6.2-sol'), batch: batch.get('gpt-6.2-sol'), thresholdK: 272 });
+  assert.deepEqual(sol.global, [
+    'GPT-6.2 Sol (<272k),Global,1M Tokens,2.00,0.10,10.00,1.00/0.05/5.00',
+    'GPT-6.2 Sol (>272k),Global,1M Tokens,4.00,0.20,15.00,2.00/0.10/7.50',
+    'GPT-6.2 Sol,Global,1M Tokens,2.00,0.10,10.00,1.00/0.05/5.00',
+  ]);
+  assert.deepEqual(sol.cursor, ['gpt-6.2-sol,Cursor,1M Tokens,2.00,0.10,10.00,N/A']);
+  const astra = buildOpenAIRows({ id: 'gpt-6.2-astra', standard: standard.get('gpt-6.2-astra'), batch: batch.get('gpt-6.2-astra'), thresholdK: 272 });
+  assert.equal(astra.global[1], 'GPT-6.2 Astra (>272k),Global,1M Tokens,16.00,0.80,60.00,8.00/0.40/30.00');
+
+  // 沒有長上下文欄位的模型只產生一列；缺 Batch 價時填 N/A。
+  const mini = buildOpenAIRows({ id: 'gpt-5.4-mini', standard: standard.get('gpt-5.4-mini') });
+  assert.deepEqual(mini.global, ['GPT-5.4 Mini,Global,1M Tokens,0.75,0.075,4.50,N/A']);
+
+  // 資料不完整時不自動產生。
+  assert.match(buildOpenAIRows({ id: 'gpt-6.2-sol', standard: standard.get('gpt-6.2-sol') }).reason, /門檻/);
+  assert.match(buildOpenAIRows({ id: 'gpt-5.2-pro', standard: standard.get('gpt-5.2-pro') }).reason, /快取輸入/);
+  assert.match(buildOpenAIRows({ id: 'gpt-x', standard: undefined }).reason, /標準價/);
+});
+
+test('insertCsvRows 將 Global 列放在 GPT 系列最前面、Cursor 列接在最後一個 gpt 列後', () => {
+  const csvText = `h,h,h,h,h,h,h
+Claude Opus 5.5,Global,1M Tokens,5.00,0.50,25.00,N/A
+GPT-6 Astra,Global,1M Tokens,10.00,1.00,50.00,N/A
+gpt-6-astra,Cursor,1M Tokens,10.00,1.00,50.00,N/A
+gpt-6-luna,Cursor,1M Tokens,0.10,0.01,0.50,N/A
+composer-2,Cursor,1M Tokens,1.00,0.10,5.00,N/A
+`;
+  const out = insertCsvRows(csvText, { global: ['NEW-G1', 'NEW-G2'], cursor: ['new-c'] });
+  assert.deepEqual(out.trimEnd().split('\n').slice(1), [
+    'Claude Opus 5.5,Global,1M Tokens,5.00,0.50,25.00,N/A',
+    'NEW-G1',
+    'NEW-G2',
+    'GPT-6 Astra,Global,1M Tokens,10.00,1.00,50.00,N/A',
+    'gpt-6-astra,Cursor,1M Tokens,10.00,1.00,50.00,N/A',
+    'gpt-6-luna,Cursor,1M Tokens,0.10,0.01,0.50,N/A',
+    'new-c',
+    'composer-2,Cursor,1M Tokens,1.00,0.10,5.00,N/A',
+  ]);
+  assert.ok(out.endsWith('N/A\n'));
+  // 產生的列可被 parseCsv 讀回，且經 csvKey 正規化後與官方模型 ID 相符。
+  const sol = buildOpenAIRows({
+    id: 'gpt-6.2-sol',
+    standard: parseTieredTable(openaiTieredMd, '### Standard pricing data').get('gpt-6.2-sol'),
+    thresholdK: 272,
+  });
+  const rows = parseCsv(insertCsvRows(csvText, sol));
+  assert.ok(rows.some((r) => csvKey(r.model) === 'gpt 6.2 sol' && r.deployment === 'Global' && r.cached === 0.1));
+});
+
+test('buildPrBody 列出價格列與官方來源', () => {
+  const body = buildPrBody(
+    [{ id: 'gpt-6.2-sol', name: 'GPT-6.2 Sol', modelPageUrl: 'https://example.test/models/gpt-6.2-sol', global: ['ROW-G'], cursor: ['ROW-C'] }],
+    { providers: [{ name: 'OpenAI', pageUrl: 'https://example.test/pricing', autoAdd: {} }] },
+  );
+  assert.match(body, /### GPT-6\.2 Sol（`gpt-6\.2-sol`）/);
+  assert.match(body, /```csv\nROW-G\nROW-C\n```/);
+  assert.match(body, /<https:\/\/example\.test\/pricing>/);
 });

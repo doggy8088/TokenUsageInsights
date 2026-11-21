@@ -4,6 +4,11 @@
 
 ## [未發行]
 
+### 新增與改善
+
+- 每日定價檢查偵測到 OpenAI 新模型時，會依官方標準價表、Batch 價表與模型頁的長上下文門檻自動產生 `pricing.csv` 價格列。產生後先在 workflow 內執行 Node 與 Rust 價格測試，再以固定的 `automation/pricing-update` 分支開 PR 或更新既有 PR。資料不完整的模型與價格差異仍會列在 issue 中。
+- 定價檢查報告內容有變化時，會在既有 issue 留下 comment 以發送通知；檢查結果沒有待處理項目時，自動關閉 `pricing-drift` issue。
+
 ### 修正
 
 - 補上 GPT-6.2 Sol 與 GPT-6.2 Astra 的計價規則，修正 `gpt-6.2-sol`、`gpt-6.2-astra` 會話出現「找不到可用的模型價格規則」而無法估算成本的問題。每百萬 Token 的短上下文標準費率依序為輸入、快取輸入、輸出：GPT-6.2 Sol 2.00、0.10、10.00 美元，GPT-6.2 Astra 8.00、0.40、40.00 美元。輸入與快取讀取超過 272,000 Token 時改用長上下文費率：GPT-6.2 Sol 4.00、0.20、15.00 美元，GPT-6.2 Astra 16.00、0.80、60.00 美元。[OpenAI API 定價](https://developers.openai.com/api/docs/pricing)

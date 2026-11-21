@@ -10,13 +10,19 @@ on:
       - 'scripts/pricing-*'
       - 'tests/pricing-check.test.mjs'
 
+# 自動開 PR 需要在 Settings > Actions > General 啟用
+# 「Allow GitHub Actions to create and approve pull requests」。
 permissions:
-  contents: read
+  contents: write
   issues: write
+  pull-requests: write
 
 concurrency:
   group: pricing-check
   cancel-in-progress: false
+
+env:
+  UPDATE_BRANCH: automation/pricing-update
 
 jobs:
   check:
@@ -28,24 +34,101 @@ jobs:
           node-version: 22
       - name: Unit tests
         run: node --test tests/pricing-check.test.mjs
-      - name: Check pricing drift
+      - name: Check pricing drift and generate rows for new models
         id: check
-        run: node scripts/pricing-check.mjs --report pricing-report.md
+        run: node scripts/pricing-check.mjs --report pricing-report.md --apply --pr-body pricing-pr.md
+
+      # 新模型的價格列已寫入 pricing.csv：先在本 job 內驗證，再開 PR。
+      # 以 GITHUB_TOKEN 建立的 PR 不會觸發其他 workflow，因此驗證必須在這裡完成。
+      - name: Set up Rust
+        if: github.event_name != 'pull_request' && steps.check.outputs.applied != '0'
+        uses: dtolnay/rust-toolchain@stable
+      - name: Validate generated pricing rows
+        if: github.event_name != 'pull_request' && steps.check.outputs.applied != '0'
+        run: |
+          node --test tests/pricing-check.test.mjs
+          cargo test --locked pricing
+          # 套用後再檢查一次：自動產生的模型不應再被列為缺漏或價格差異。
+          node scripts/pricing-check.mjs > /dev/null
+      - name: Open or update pricing update PR
+        if: github.event_name != 'pull_request' && steps.check.outputs.applied != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MODELS: ${{ steps.check.outputs.applied_models }}
+          BASE_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          title="fix(pricing): 自動新增 ${MODELS// /、} 官方定價規則"
+          number=$(gh pr list --head "$UPDATE_BRANCH" --state open --json number,title --jq '.[0].number // empty')
+          if [ -n "$number" ] && [ "$(gh pr view "$number" --json title --jq .title)" = "$title" ]; then
+            echo "PR #$number 已涵蓋相同模型，不覆寫（保留維護者在該分支上的修改）。"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$UPDATE_BRANCH"
+          git add pricing.csv
+          git commit -F - <<EOF
+          $title
+
+          每日定價檢查在 OpenAI 官方定價文件偵測到 pricing.csv 尚未收錄的
+          新模型（${MODELS// /、}），依官方標準價表、Batch 價表與模型頁的
+          長上下文門檻自動產生價格列，避免這些模型的 Session 無法估算成本。
+
+          變更細節
+          - pricing.csv：新增 Global 短上下文、長上下文與預設規則，以及
+            Cursor 模型 ID 規則；逐列內容請見 PR 說明。
+
+          驗證項目
+          - node --test tests/pricing-check.test.mjs：通過。
+          - cargo test --locked pricing：通過。
+          - 套用後重新執行 scripts/pricing-check.mjs：自動產生的模型不再
+            列為缺漏。
+
+          價格來源
+          https://developers.openai.com/api/docs/pricing
+          EOF
+          git push --force origin "$UPDATE_BRANCH"
+
+          gh label create pricing-drift --description "Automated pricing drift report" --color FBCA04 2>/dev/null || true
+          if [ -n "$number" ]; then
+            gh pr edit "$number" --title "$title" --body-file pricing-pr.md
+          else
+            gh pr create --base "$BASE_BRANCH" --head "$UPDATE_BRANCH" --title "$title" \
+              --body-file pricing-pr.md --label pricing-drift
+          fi
+
       - name: Open or update pricing drift issue
-        if: github.event_name != 'pull_request' && (steps.check.outputs.drift != '0' || steps.check.outputs.added != '0' || steps.check.outputs.errors != '0')
+        if: always() && github.event_name != 'pull_request' && steps.check.outcome == 'success' && (steps.check.outputs.drift != '0' || steps.check.outputs.added != '0' || steps.check.outputs.errors != '0')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           title="定價檢查：偵測到與官方定價文件的差異、新模型或解析錯誤"
           number=$(gh issue list --state open --label pricing-drift --json number --jq '.[0].number // empty')
           if [ -n "$number" ]; then
-            gh issue edit "$number" --body-file pricing-report.md
+            # 內容有變化時另留 comment，讓訂閱者收到通知；只改內文不會發送通知。
+            if [ "$(gh issue view "$number" --json body --jq .body)" != "$(cat pricing-report.md)" ]; then
+              gh issue edit "$number" --body-file pricing-report.md
+              gh issue comment "$number" --body "定價檢查報告已更新（${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}），請查看 issue 內文。"
+            fi
           else
             gh label create pricing-drift --description "Automated pricing drift report" --color FBCA04 2>/dev/null || true
             gh issue create --title "$title" --label pricing-drift --body-file pricing-report.md
+          fi
+      - name: Close resolved pricing drift issue
+        if: github.event_name != 'pull_request' && steps.check.outputs.drift == '0' && steps.check.outputs.added == '0' && steps.check.outputs.errors == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          number=$(gh issue list --state open --label pricing-drift --json number --jq '.[0].number // empty')
+          if [ -n "$number" ]; then
+            gh issue close "$number" --comment "最新的每日定價檢查已無價格差異、待人工處理的新模型或解析錯誤（${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}）。新模型的價格列若已自動產生，請見 \`${UPDATE_BRANCH}\` 分支的 PR。"
           fi
       - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: pricing-report
-          path: pricing-report.md
+          path: |
+            pricing-report.md
+            pricing-pr.md
+          if-no-files-found: ignore

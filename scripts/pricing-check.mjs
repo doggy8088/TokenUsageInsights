@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // 每日定價檢查：直接解析各供應商「官方定價文件」（以官方站台提供的 Markdown 版本為資料來源），
 // 與 pricing.csv 的基礎列（無長上下文分級）比對，回報價格差異、促銷價以及尚未收錄的新模型。
-// 僅產生報告（Markdown），不會直接改寫 pricing.csv，需人工對照官方文件確認後再更新。
+// 預設僅產生報告（Markdown）；設定 autoAdd 的供應商（目前為 OpenAI）可用 --apply 依官方價格表
+// 為新模型產生價格列並寫入 pricing.csv，由 workflow 開 PR 供人工審核。價格差異仍需人工處理。
 // 若某個官方頁面抓取失敗或解析不到任何價格（通常代表頁面改版），會列為錯誤。
 import { readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -406,6 +407,120 @@ export function parseProvider(provider, md) {
   return provider.parser === 'gemini' ? parseGeminiProvider(md) : parseTableProvider(md, provider.sectionHeading);
 }
 
+// ---- 新模型自動產生價格列（目前僅供 OpenAI 使用，見 pricing-sources.json 的 autoAdd） ----
+
+// 只接受單一明確金額（"$2.00"）；"-"、促銷文字或其他格式一律視為無法自動產生。
+function plainPrice(cell) {
+  const m = (cell || '').trim().match(/^\$\s*([\d,]*\.?\d+)$/);
+  return m ? Number(m[1].replace(/,/g, '')) : null;
+}
+
+// 解析 OpenAI 價格表的完整欄位（短上下文與長上下文），以小寫模型 ID 為鍵。
+// 帶有括號備註的列（如 "gpt-5.5 (<272K context length)"）為舊格式，不作自動產生。
+export function parseTieredTable(md, heading) {
+  const lines = sectionLines(md, heading);
+  const entries = new Map();
+  let cols = null;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line.trim().startsWith('|')) { cols = null; continue; }
+    const next = lines[i + 1] || '';
+    if (/^\s*\|?\s*:?-{2,}/.test(next) && !cols) {
+      const headers = splitRow(line);
+      const find = (re) => headers.findIndex((h) => re.test(h));
+      const shortPrefix = headers.some((h) => /^short context/i.test(h)) ? 'short context ' : '';
+      cols = {
+        short: {
+          input: find(new RegExp(`^${shortPrefix}input$`, 'i')),
+          output: find(new RegExp(`^${shortPrefix}output$`, 'i')),
+          cached: find(new RegExp(`^${shortPrefix}cached input$`, 'i')),
+        },
+        long: {
+          input: find(/^long context input$/i),
+          output: find(/^long context output$/i),
+          cached: find(/^long context cached input$/i),
+        },
+      };
+      i++; // 略過分隔列
+      continue;
+    }
+    if (!cols) continue;
+    const cells = splitRow(line);
+    const id = stripMarkup(cells[0] || '').trim().toLowerCase();
+    if (!/^[a-z0-9][a-z0-9.-]*$/.test(id) || entries.has(id)) continue;
+    const pick = (c) => ({
+      input: c.input >= 0 ? plainPrice(cells[c.input]) : null,
+      output: c.output >= 0 ? plainPrice(cells[c.output]) : null,
+      cached: c.cached >= 0 ? plainPrice(cells[c.cached]) : null,
+    });
+    const long = pick(cols.long);
+    entries.set(id, { id, short: pick(cols.short), long: long.input != null || long.output != null ? long : null });
+  }
+  return entries;
+}
+
+// 從官方模型頁讀取長上下文門檻，例如 "more than 272K input tokens" → 272。
+export function parseContextThresholdK(modelMd) {
+  const m = (modelMd || '').match(/more than\s+([\d,]+)\s*K\s+input tokens/i);
+  return m ? Number(m[1].replace(/,/g, '')) : null;
+}
+
+// CSV 慣例：至少兩位小數，需要更多位數時保留原值（0.075、0.0375）。
+export function formatPrice(n) {
+  const fixed = n.toFixed(2);
+  return Number(fixed) === n ? fixed : String(n);
+}
+
+// gpt-6.2-sol → GPT-6.2 Sol；gpt-7 → GPT-7；其他形狀維持官方 ID（計價比對時會正規化名稱）。
+export function openaiDisplayName(id) {
+  const m = id.match(/^gpt-(\d+(?:\.\d+)*)(?:-([a-z]+))?$/);
+  if (!m) return id;
+  return m[2] ? `GPT-${m[1]} ${m[2][0].toUpperCase()}${m[2].slice(1)}` : `GPT-${m[1]}`;
+}
+
+const complete = (p) => p && p.input != null && p.output != null && p.cached != null;
+const batchCell = (p) => (complete(p) ? `${formatPrice(p.input)}/${formatPrice(p.cached)}/${formatPrice(p.output)}` : 'N/A');
+const priceCells = (p) => `${formatPrice(p.input)},${formatPrice(p.cached)},${formatPrice(p.output)}`;
+
+// 依官方價格產生 pricing.csv 價格列；資料不完整時回傳 { reason } 交由人工處理。
+export function buildOpenAIRows({ id, standard, batch, thresholdK, deployment = 'Global', cursor = true }) {
+  if (!standard || !complete(standard.short)) return { reason: '官方標準價缺少輸入、快取輸入或輸出價格' };
+  const name = openaiDisplayName(id);
+  const unit = '1M Tokens';
+  const global = [];
+  if (standard.long) {
+    if (!complete(standard.long)) return { reason: '官方長上下文價格不完整' };
+    if (!thresholdK) return { reason: '官方模型頁找不到長上下文門檻' };
+    global.push(
+      `${name} (<${thresholdK}k),${deployment},${unit},${priceCells(standard.short)},${batchCell(batch?.short)}`,
+      `${name} (>${thresholdK}k),${deployment},${unit},${priceCells(standard.long)},${batchCell(batch?.long)}`,
+    );
+  }
+  global.push(`${name},${deployment},${unit},${priceCells(standard.short)},${batchCell(batch?.short)}`);
+  return {
+    name,
+    global,
+    cursor: cursor ? [`${id},Cursor,${unit},${priceCells(standard.short)},N/A`] : [],
+  };
+}
+
+// 新的 Global 列插在同部署第一個同前綴（如 "GPT-"）列之前，讓最新模型排在該系列最前面；
+// Cursor 列接在最後一個同前綴 Cursor 列之後。找不到位置時附加於檔尾。
+export function insertCsvRows(csvText, { global = [], cursor = [], globalPrefix = 'GPT-', deployment = 'Global' }) {
+  const lines = csvText.replace(/\n$/, '').split('\n');
+  const lower = globalPrefix.toLowerCase();
+  if (global.length) {
+    const at = lines.findIndex((l) => l.startsWith(globalPrefix) && l.split(',')[1] === deployment);
+    lines.splice(at < 0 ? lines.length : at, 0, ...global);
+  }
+  if (cursor.length) {
+    let last = -1;
+    lines.forEach((l, i) => { if (l.toLowerCase().startsWith(lower) && l.split(',')[1] === 'Cursor') last = i; });
+    lines.splice(last < 0 ? lines.length : last + 1, 0, ...cursor);
+  }
+  return `${lines.join('\n')}\n`;
+}
+
 // pricing.csv 依慣例記錄標準牌價：有促銷時以促銷後價格（after）為準，促銷價僅作報告提醒。
 const standardPrice = (p) => (p.after != null ? p.after : p.now);
 const matchesPrice = (local, p) => Math.abs(local - standardPrice(p)) <= EPSILON;
@@ -461,13 +576,43 @@ async function fetchText(url) {
   throw lastError;
 }
 
-export async function run({ csvPath = path.join(root, 'pricing.csv'), reportPath } = {}) {
+// 針對設定 autoAdd 的供應商，為尚未收錄的新模型產生價格列；資料不完整的模型回傳原因，留給人工處理。
+async function buildAutoAddRows(p, md, missing, fetcher) {
+  const standard = parseTieredTable(md, p.sectionHeading);
+  const batch = p.autoAdd.batchSectionHeading ? parseTieredTable(md, p.autoAdd.batchSectionHeading) : new Map();
+  const generated = [];
+  const skipped = [];
+  for (const id of missing) {
+    const key = id.toLowerCase();
+    let thresholdK = null;
+    if (standard.get(key)?.long) {
+      try {
+        thresholdK = parseContextThresholdK(await fetcher(p.autoAdd.modelPageUrl.replace('{id}', encodeURIComponent(key))));
+      } catch {
+        thresholdK = null;
+      }
+    }
+    const result = buildOpenAIRows({ id: key, standard: standard.get(key), batch: batch.get(key), thresholdK });
+    if (result.reason) skipped.push({ id, reason: result.reason });
+    else generated.push({ id, modelPageUrl: p.autoAdd.modelPageUrl.replace('{id}', key).replace(/\.md$/, ''), ...result });
+  }
+  return { generated, skipped };
+}
+
+export async function run({
+  csvPath = path.join(root, 'pricing.csv'),
+  reportPath,
+  apply = false,
+  fetcher = fetchText,
+} = {}) {
   const sources = JSON.parse(readFileSync(path.join(root, 'scripts', 'pricing-sources.json'), 'utf8'));
-  const csvRows = parseCsv(readFileSync(csvPath, 'utf8'));
+  const csvText = readFileSync(csvPath, 'utf8');
+  const csvRows = parseCsv(csvText);
   const lines = ['# 模型定價每日檢查報告', '', '價格來源：各供應商官方定價文件（權威來源）。', ''];
   let drift = 0;
   let errors = 0;
   let added = 0;
+  const generated = [];
 
   for (const p of sources.providers) {
     if (p.pricingPageUrl) {
@@ -476,16 +621,18 @@ export async function run({ csvPath = path.join(root, 'pricing.csv'), reportPath
       lines.push(`## ${p.name}`, '', `官方文件：<${p.pageUrl}>`, '');
     }
     let official;
+    let sourceMd = null;
     try {
       if (p.parser === 'antigravity') {
-        const [modelsMd, pricingMd] = await Promise.all([fetchText(p.sourceUrl), fetchText(p.pricingSourceUrl)]);
+        const [modelsMd, pricingMd] = await Promise.all([fetcher(p.sourceUrl), fetcher(p.pricingSourceUrl)]);
         official = parseAntigravityProvider(modelsMd, pricingMd, {
           modelsHeading: p.modelsSectionHeading,
           orchestratorHeading: p.orchestratorSectionHeading,
           unpricedModels: p.unpricedModels,
         });
       } else {
-        official = parseProvider(p, await fetchText(p.sourceUrl));
+        sourceMd = await fetcher(p.sourceUrl);
+        official = parseProvider(p, sourceMd);
       }
       if (official.size === 0) throw new Error('解析不到任何價格，官方頁面格式可能已變更');
     } catch (err) {
@@ -500,12 +647,20 @@ export async function run({ csvPath = path.join(root, 'pricing.csv'), reportPath
     } else {
       lines.push(`解析到 ${official.size} 個官方模型價格。`, '');
     }
-    const { mismatches, promos, missing } = compareProvider(
+    const { mismatches, promos, missing: allMissing } = compareProvider(
       csvRows.filter((r) => p.deployments.includes(r.deployment)),
       official,
       p.ignoreModels,
       { priceDeployments: p.priceDeployments },
     );
+    let missing = allMissing;
+    let auto = { generated: [], skipped: [] };
+    if (p.autoAdd && sourceMd && allMissing.length) {
+      auto = await buildAutoAddRows(p, sourceMd, allMissing, fetcher);
+      const generatedIds = new Set(auto.generated.map((g) => g.id));
+      missing = allMissing.filter((id) => !generatedIds.has(id));
+      generated.push(...auto.generated);
+    }
     drift += mismatches.length;
     added += missing.length;
     if (mismatches.length) {
@@ -518,26 +673,81 @@ export async function run({ csvPath = path.join(root, 'pricing.csv'), reportPath
       for (const t of promos) lines.push(`- ${t}`);
       lines.push('');
     }
-    if (missing.length) {
-      lines.push('### pricing.csv 尚未收錄的新模型', '');
-      for (const name of missing) lines.push(`- ${name}`);
+    if (auto.generated.length) {
+      lines.push(`### 已依官方價格自動產生價格列${apply ? '（已寫入 pricing.csv）' : ''}`, '');
+      for (const g of auto.generated) lines.push(`- ${g.id}（${g.global.length + g.cursor.length} 筆）`);
       lines.push('');
     }
-    if (!mismatches.length && !missing.length) lines.push('與官方價格一致，無差異。', '');
+    if (missing.length) {
+      lines.push('### pricing.csv 尚未收錄的新模型', '');
+      const reasons = new Map(auto.skipped.map((s) => [s.id, s.reason]));
+      for (const name of missing) lines.push(`- ${name}${reasons.has(name) ? `（無法自動產生：${reasons.get(name)}）` : ''}`);
+      lines.push('');
+    }
+    if (!mismatches.length && !missing.length && !auto.generated.length) lines.push('與官方價格一致，無差異。', '');
+  }
+
+  if (apply && generated.length) {
+    // 一次插入，維持官方價格表的模型順序。
+    writeFileSync(csvPath, insertCsvRows(csvText, {
+      global: generated.flatMap((g) => g.global),
+      cursor: generated.flatMap((g) => g.cursor),
+    }));
   }
 
   const report = lines.join('\n');
   if (reportPath) writeFileSync(reportPath, report);
-  return { report, drift, errors, added };
+  return { report, drift, errors, added, generated };
+}
+
+// 自動更新 PR 的內文：列出每個模型產生的價格列與官方來源，供審核時逐列對照。
+export function buildPrBody(generated, sources = JSON.parse(readFileSync(path.join(root, 'scripts', 'pricing-sources.json'), 'utf8'))) {
+  const pricingPage = sources.providers.find((p) => p.autoAdd)?.pageUrl;
+  const lines = [
+    '## 自動新增模型定價',
+    '',
+    '每日定價檢查在官方定價文件中偵測到 `pricing.csv` 尚未收錄的新模型，並依官方價格表自動產生下列價格列。',
+    '',
+  ];
+  for (const g of generated) {
+    lines.push(`### ${g.name}（\`${g.id}\`）`, '', `- 官方模型頁：<${g.modelPageUrl}>`, '', '```csv', ...g.global, ...g.cursor, '```', '');
+  }
+  lines.push(
+    '## 審核清單',
+    '',
+    `- [ ] 對照官方定價文件（<${pricingPage}>）確認短上下文、長上下文與 Batch 價格`,
+    '- [ ] 確認長上下文門檻與官方模型頁一致',
+    '- [ ] 視需要調整顯示名稱，並在 `CHANGELOG.md` 的未發行區補上紀錄',
+    '',
+    '此 PR 由 Daily Pricing Check workflow 建立；workflow 已在建立前執行 `node --test tests/pricing-check.test.mjs` 與 `cargo test --locked pricing`。',
+    '',
+  );
+  return lines.join('\n');
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  const idx = process.argv.indexOf('--report');
-  const reportPath = idx > -1 ? process.argv[idx + 1] : undefined;
-  const { report, drift, errors, added } = await run({ reportPath });
+  const arg = (name) => {
+    const idx = process.argv.indexOf(name);
+    return idx > -1 ? process.argv[idx + 1] : undefined;
+  };
+  const reportPath = arg('--report');
+  const prBodyPath = arg('--pr-body');
+  const csvPath = arg('--csv');
+  const apply = process.argv.includes('--apply');
+  const { report, drift, errors, added, generated } = await run({
+    reportPath,
+    apply,
+    ...(csvPath ? { csvPath: path.resolve(csvPath) } : {}),
+  });
   console.log(report);
-  console.log(`\ndrift=${drift} added=${added} errors=${errors}`);
+  const applied = apply ? generated.length : 0;
+  console.log(`\ndrift=${drift} added=${added} errors=${errors} generated=${generated.length} applied=${applied}`);
+  if (prBodyPath && applied) writeFileSync(prBodyPath, buildPrBody(generated));
   if (process.env.GITHUB_OUTPUT) {
-    writeFileSync(process.env.GITHUB_OUTPUT, `drift=${drift}\nadded=${added}\nerrors=${errors}\n`, { flag: 'a' });
+    writeFileSync(
+      process.env.GITHUB_OUTPUT,
+      `drift=${drift}\nadded=${added}\nerrors=${errors}\napplied=${applied}\napplied_models=${generated.map((g) => g.id).join(' ')}\n`,
+      { flag: 'a' },
+    );
   }
 }

@@ -29,6 +29,10 @@
       "sourceUrl": "https://developers.openai.com/api/docs/pricing.md",
       "parser": "table",
       "sectionHeading": "### Standard pricing data",
+      "autoAdd": {
+        "batchSectionHeading": "### Batch pricing data",
+        "modelPageUrl": "https://developers.openai.com/api/docs/models/{id}.md"
+      },
       "ignoreModels": [
         "gpt-5.5-pro",
         "gpt-5.4-pro",
@@ -96,5 +100,5 @@
       ]
     }
   ],
-  "_comment2": "ignoreModels：已知且刻意不追蹤的官方模型（多為舊世代）；unpricedModels：僅 Antigravity 使用，已知尚未登上 Google AI Studio 定價表但仍須追蹤收錄完整性的 Google AI 模型（預設為空）。不在此清單也不在 pricing.csv 的官方模型會被視為新模型並觸發通知。"
+  "_comment2": "ignoreModels：已知且刻意不追蹤的官方模型（多為舊世代）；unpricedModels：僅 Antigravity 使用，已知尚未登上 Google AI Studio 定價表但仍須追蹤收錄完整性的 Google AI 模型（預設為空）。不在此清單也不在 pricing.csv 的官方模型會被視為新模型並觸發通知。autoAdd：設定後，該供應商的新模型會依官方標準價表（sectionHeading）、Batch 價表（batchSectionHeading）與官方模型頁（modelPageUrl，{id} 為模型 ID，用於讀取長上下文門檻）自動產生 pricing.csv 價格列，由 workflow 開 PR 供人工審核；資料不完整的模型仍列入 issue。"
 }
