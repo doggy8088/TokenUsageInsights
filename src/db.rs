@@ -10890,7 +10890,11 @@ mod tests {
 
     #[test]
     fn antigravity_app_primary_root_uses_its_own_sync_state_namespace() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        // A panic in another env-mutating test must not poison this one into a
+        // cascade of unrelated failures.
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let old_cli = std::env::var("ANTIGRAVITY_DIR").ok();
         let old_app = std::env::var("ANTIGRAVITY_APP_DIR").ok();
         let base = temp_jsonl_path("antigravity-app-primary").with_extension("");
@@ -10990,7 +10994,9 @@ mod tests {
 
     #[test]
     fn antigravity_app_source_kind_resolves_the_app_root() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let old_cli = std::env::var("ANTIGRAVITY_DIR").ok();
         let old_app = std::env::var("ANTIGRAVITY_APP_DIR").ok();
         let base = temp_jsonl_path("antigravity-app-resolver").with_extension("");
@@ -11021,8 +11027,13 @@ mod tests {
             context(),
         )
         .unwrap();
-        assert!(
-            app_path.starts_with(crate::config::absolute_root(&app)),
+        let expected_app = app
+            .join("brain")
+            .join(session_id)
+            .join(".system_generated/logs/transcript_full.jsonl");
+        assert_eq!(
+            fs::canonicalize(&app_path).unwrap(),
+            fs::canonicalize(&expected_app).unwrap(),
             "App source kind must resolve under the App home: {}",
             app_path.display()
         );
@@ -11035,8 +11046,13 @@ mod tests {
             context(),
         )
         .unwrap();
-        assert!(
-            cli_path.starts_with(crate::config::absolute_root(&cli)),
+        let expected_cli = cli
+            .join("brain")
+            .join(session_id)
+            .join(".system_generated/logs/transcript_full.jsonl");
+        assert_eq!(
+            fs::canonicalize(&cli_path).unwrap(),
+            fs::canonicalize(&expected_cli).unwrap(),
             "CLI source kind must resolve under the CLI home: {}",
             cli_path.display()
         );
@@ -11054,7 +11070,9 @@ mod tests {
 
     #[test]
     fn antigravity_app_split_migration_removes_cli_labelled_app_rows() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let old_app = std::env::var("ANTIGRAVITY_APP_DIR").ok();
         let base = temp_jsonl_path("antigravity-app-migration").with_extension("");
         let app = base.join("antigravity");
