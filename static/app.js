@@ -119,13 +119,13 @@ const assistantAliasMap = {
 const assistantMeta = {
   antigravity: {
     logo: '/static/antigravity.webp',
-    label: 'Antigravity CLI',
+    label: 'Antigravity',
     shortLabel: 'Antigravity',
     alt: 'Antigravity',
     badgeStyle: 'background: rgba(47, 184, 197, 0.13); color: #2fb8c5; border: 1px solid rgba(47, 184, 197, 0.26); display: inline-flex; align-items: center;',
     senderName: 'ANTIGRAVITY',
     highlightColor: '#2fb8c5',
-    nameHighlights: ['Antigravity CLI'],
+    nameHighlights: ['Antigravity'],
   },
   copilot: {
     logo: '/static/githubcopilot.webp',
@@ -4711,6 +4711,12 @@ function getSessionSourceBadge(session) {
   if (session.source_kind === 'copilot-app') {
     return '<span class="badge source-badge" title="GitHub Copilot App">App</span>';
   }
+  if (session.source_kind === 'antigravity-app') {
+    return '<span class="badge source-badge" title="Antigravity App">App</span>';
+  }
+  if (session.assistant_type === 'antigravity') {
+    return '<span class="badge source-badge" title="Antigravity CLI">CLI</span>';
+  }
   if (session.assistant_type === 'copilot') {
     return '<span class="badge source-badge" title="GitHub Copilot CLI">CLI</span>';
   }
@@ -7453,7 +7459,9 @@ function renderAllAgentSourceList(data) {
 
   list.innerHTML = Object.keys(assistantMeta).map(assistant => {
     const meta = getAssistantMeta(assistant);
-    const sources = (assistant === 'copilot' ? [data?.copilot, data?.copilot_app] : [data?.[assistant]])
+    const sources = (assistant === 'copilot' ? [data?.copilot, data?.copilot_app]
+      : assistant === 'antigravity' ? [data?.antigravity, data?.antigravity_app]
+      : [data?.[assistant]])
       .filter(source => source && typeof source === 'object');
     const detected = sources.some(source => source.exists === true);
     const paths = sources
@@ -7504,6 +7512,8 @@ async function loadSetupInfo(assistant = currentAssistant) {
     } else if (resolvedAssistant === 'antigravity') {
       const pathLabel = document.getElementById('lbl-detected-home-antigravity');
       if (pathLabel) pathLabel.textContent = abbreviateHomePath(data.antigravity?.data_path || '');
+      const appPathLabel = document.getElementById('lbl-detected-home-antigravity-app');
+      if (appPathLabel) appPathLabel.textContent = abbreviateHomePath(data.antigravity_app?.data_path || '');
     } else if (resolvedAssistant === 'copilot') {
       const assistantSetup = data[resolvedAssistant] || {};
       const targetScriptPath = assistantSetup.script_path || '';

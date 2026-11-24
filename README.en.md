@@ -1,6 +1,6 @@
 # Token War Room
 
-**Token War Room is a local-first dashboard for AI coding-agent token usage and session reconstruction.** It reads local records from Google Antigravity CLI, GitHub Copilot CLI, GitHub Copilot App, GitHub Copilot Chat (VS Code), Codex Desktop, Codex CLI, Claude Code, Cursor, Grok Build, Pi Coding Agent, OMP, Muse Code, and MiniMax Code, presenting daily, monthly, and yearly token consumption, cache usage, reasoning tokens, estimated costs, model distribution, project-directory distribution, and complete session timelines in one place.
+**Token War Room is a local-first dashboard for AI coding-agent token usage and session reconstruction.** It reads local records from Google Antigravity CLI and Antigravity App, GitHub Copilot CLI, GitHub Copilot App, GitHub Copilot Chat (VS Code), Codex Desktop, Codex CLI, Claude Code, Cursor, Grok Build, Pi Coding Agent, OMP, Muse Code, and MiniMax Code, presenting daily, monthly, and yearly token consumption, cache usage, reasoning tokens, estimated costs, model distribution, project-directory distribution, and complete session timelines in one place.
 
 This project does not call AI provider APIs on your behalf. Its core data sources are local logs, Status Line collector files, and local SQLite.
 
@@ -47,6 +47,7 @@ http://localhost:3003
 | Tool | Additional setup | Default data source | Description |
 | --- | --- | --- | --- |
 | Google Antigravity CLI | Not required | `~/.gemini/antigravity-cli/brain/` / `conversations/` | Reads native session tokens and model metadata; legacy `usage/` files remain supported |
+| Google Antigravity App | Not required | `~/.gemini/antigravity/brain/` / `conversations/` | Reads the desktop app's native sessions; merged with the CLI and labelled CLI or App by source |
 | GitHub Copilot CLI | Required | `~/.copilot/usage/usage-YYYY-MM-DD.jsonl` | Collects token data through `statusline-token.sh` or the Windows `statusline-token.ps1` |
 | GitHub Copilot App | Not required | `~/.copilot/data.db`, `~/.copilot/session-store.db` | The dashboard reads the desktop app's local SQLite databases directly |
 | GitHub Copilot Chat (VS Code) | Not required | VS Code `workspaceStorage/chatSessions` | The dashboard scans local chat sessions from VS Code Stable and Insiders directly |
@@ -70,7 +71,8 @@ Windows uses the following native paths by default:
 | Purpose | Windows default path |
 | --- | --- |
 | SQLite | `%LOCALAPPDATA%\TokenUsageInsights\token_usage_insights.db` |
-| Antigravity | `%USERPROFILE%\.gemini\antigravity-cli` |
+| Antigravity CLI | `%USERPROFILE%\.gemini\antigravity-cli` |
+| Antigravity App | `%USERPROFILE%\.gemini\antigravity` |
 | Copilot | `%USERPROFILE%\.copilot` |
 | Codex | `%USERPROFILE%\.codex` |
 | Claude Code | `%USERPROFILE%\.claude` |
@@ -149,18 +151,22 @@ http://localhost:3003/?agent=copilot&tab=daily&date=2026-08-09&dir=~/projects/To
 
 * * *
 
-## Google Antigravity CLI Local data sources
+## Google Antigravity Local data sources
 
-**Antigravity CLI requires no Status Line setup, hooks, or collector scripts.** After using the CLI, the dashboard reads these native records:
+**Neither Antigravity CLI nor the desktop App requires Status Line setup, hooks, or collector scripts.** After a conversation in either version, the dashboard reads these native records:
 
 ```text
 ~/.gemini/antigravity-cli/brain/<session-id>/.system_generated/logs/transcript_full.jsonl
 ~/.gemini/antigravity-cli/conversations/<session-id>.db
+~/.gemini/antigravity/brain/<session-id>/.system_generated/logs/transcript_full.jsonl
+~/.gemini/antigravity/conversations/<session-id>.db
 ```
+
+CLI and App usage is merged under one **Antigravity** Agent and labelled CLI or App in the session list. A `session_id` present in both homes stays two separate sessions, so nothing is merged away or double counted.
 
 Input, cache-read, and output tokens are read per response. Model metadata from the session database is used to estimate costs. Estimates are not actual Antigravity charges; unknown models or prices prevent reliable estimates and do not mean usage is free.
 
-On Windows, the default root is `%USERPROFILE%\.gemini\antigravity-cli`. Override it with `ANTIGRAVITY_DIR` or additional source settings. When copying historical data, keep both `brain/` and `conversations/`. Legacy `usage/usage-YYYY-MM-DD.jsonl` files remain supported; existing files and settings do not need to be removed.
+On Windows, the default roots are `%USERPROFILE%\.gemini\antigravity-cli` (CLI) and `%USERPROFILE%\.gemini\antigravity` (App). Override them with `ANTIGRAVITY_DIR`, `ANTIGRAVITY_APP_DIR`, or additional source settings. When copying historical data, keep both `brain/` and `conversations/`. Legacy `usage/usage-YYYY-MM-DD.jsonl` files remain supported; existing files and settings do not need to be removed.
 
 * * *
 
@@ -527,6 +533,7 @@ Paths specified by environment variables are authoritative and do not need to be
 | `TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS` | `24` | Auto-update check interval in hours (valid range 1 to 87600) |
 | `TOKEN_USAGE_INSIGHTS_INSTALL_DIR` | Auto-detected | Custom installation directory, used for update targeting and detection |
 | `ANTIGRAVITY_DIR` | `~/.gemini/antigravity-cli` | Antigravity CLI data directory |
+| `ANTIGRAVITY_APP_DIR` | `~/.gemini/antigravity` | Antigravity App (desktop app) data directory |
 | `COPILOT_DIR` | `~/.copilot` | Copilot CLI data directory |
 | `COPILOT_APP_DIR` | Same as `COPILOT_DIR` | Copilot App (desktop app) data directory; should contain `data.db` and `session-store.db` |
 | `VSCODE_USER_DATA_DIR` | Auto-detected by platform | VS Code user-data directory; should contain `User/workspaceStorage` |

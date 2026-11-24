@@ -1,6 +1,6 @@
 # Token 戦情室
 
-**Token 戦情室は、ローカル優先の AI Coding Agent の Token 使用量とセッション復元ダッシュボードです。** Google Antigravity CLI、GitHub Copilot CLI、GitHub Copilot App、GitHub Copilot Chat（VS Code）、Codex Desktop、Codex CLI、Claude Code、Cursor、Grok Build、Pi Coding Agent、OMP、Muse Code、MiniMax Code のローカル記録を読み取り、日別・月別・年別の Token 消費量、キャッシュ使用量、推論 Token、推定コスト、モデル分布、プロジェクトディレクトリ分布、完全な Session タイムラインをまとめて表示します。
+**Token 戦情室は、ローカル優先の AI Coding Agent の Token 使用量とセッション復元ダッシュボードです。** Google Antigravity CLI と Antigravity App、GitHub Copilot CLI、GitHub Copilot App、GitHub Copilot Chat（VS Code）、Codex Desktop、Codex CLI、Claude Code、Cursor、Grok Build、Pi Coding Agent、OMP、Muse Code、MiniMax Code のローカル記録を読み取り、日別・月別・年別の Token 消費量、キャッシュ使用量、推論 Token、推定コスト、モデル分布、プロジェクトディレクトリ分布、完全な Session タイムラインをまとめて表示します。
 
 このプロジェクトが AI プロバイダー API を代わりに呼び出してデータを取得することはありません。主なデータソースはローカルログ、Status Line コレクターファイル、ローカル SQLite です。
 
@@ -47,6 +47,7 @@ http://localhost:3003
 | ツール | 追加設定 | デフォルトのデータソース | 説明 |
 | --- | --- | --- | --- |
 | Google Antigravity CLI | 不要 | `~/.gemini/antigravity-cli/brain/` / `conversations/` | ネイティブ Session の Token とモデル情報を読み取り、従来の `usage/` にも対応 |
+| Google Antigravity App | 不要 | `~/.gemini/antigravity/brain/` / `conversations/` | デスクトップ App のネイティブ Session を読み取り、CLI と統合して「CLI」／「App」で表示 |
 | GitHub Copilot CLI | 必要 | `~/.copilot/usage/usage-YYYY-MM-DD.jsonl` | `statusline-token.sh` または Windows の `statusline-token.ps1` で Token データを収集 |
 | GitHub Copilot App | 不要 | `~/.copilot/data.db`、`~/.copilot/session-store.db` | デスクトップアプリのローカル SQLite をダッシュボードが直接読み取り |
 | GitHub Copilot Chat（VS Code） | 不要 | VS Code `workspaceStorage/chatSessions` | VS Code Stable と Insiders のローカルチャット Session を直接スキャン |
@@ -70,7 +71,8 @@ Windows ではデフォルトで次のネイティブパスを使用します：
 | 用途 | Windows のデフォルトパス |
 | --- | --- |
 | SQLite | `%LOCALAPPDATA%\TokenUsageInsights\token_usage_insights.db` |
-| Antigravity | `%USERPROFILE%\.gemini\antigravity-cli` |
+| Antigravity CLI | `%USERPROFILE%\.gemini\antigravity-cli` |
+| Antigravity App | `%USERPROFILE%\.gemini\antigravity` |
 | Copilot | `%USERPROFILE%\.copilot` |
 | Codex | `%USERPROFILE%\.codex` |
 | Claude Code | `%USERPROFILE%\.claude` |
@@ -149,18 +151,22 @@ http://localhost:3003/?agent=copilot&tab=daily&date=2026-08-09&dir=~/projects/To
 
 * * *
 
-## Google Antigravity CLI ローカルデータソース
+## Google Antigravity ローカルデータソース
 
-**Antigravity CLI は Status Line の設定、Hook、収集スクリプトが不要です。** CLI で会話すると、次のネイティブ記録を直接読み取ります：
+**Antigravity CLI とデスクトップ App はどちらも Status Line の設定、Hook、収集スクリプトが不要です。** どちらかで会話すると、次のネイティブ記録を直接読み取ります：
 
 ```text
 ~/.gemini/antigravity-cli/brain/<session-id>/.system_generated/logs/transcript_full.jsonl
 ~/.gemini/antigravity-cli/conversations/<session-id>.db
+~/.gemini/antigravity/brain/<session-id>/.system_generated/logs/transcript_full.jsonl
+~/.gemini/antigravity/conversations/<session-id>.db
 ```
+
+CLI と App の使用量は同じ **Antigravity** Agent にまとめられ、Session 一覧では「CLI」「App」でソースを表示します。同じ `session_id` が両方に存在する場合は別々の Session として保持され、統合や二重計上は行いません。
 
 各応答の入力、キャッシュ読み取り、出力 Token と Session データベースのモデル情報から費用を推定します。推定値は Antigravity の実際の請求額とは異なります。モデルや料金が不明な場合は正確に推定できず、無料を意味しません。
 
-Windows の既定ディレクトリは `%USERPROFILE%\.gemini\antigravity-cli` です。`ANTIGRAVITY_DIR` または追加データソース設定で変更できます。履歴をコピーする際は `brain/` と `conversations/` を両方保持してください。従来の `usage/usage-YYYY-MM-DD.jsonl` も対応しており、既存の記録や設定を削除する必要はありません。
+Windows の既定ディレクトリは `%USERPROFILE%\.gemini\antigravity-cli`（CLI）と `%USERPROFILE%\.gemini\antigravity`（App）です。`ANTIGRAVITY_DIR`、`ANTIGRAVITY_APP_DIR` または追加データソース設定で変更できます。履歴をコピーする際は `brain/` と `conversations/` を両方保持してください。従来の `usage/usage-YYYY-MM-DD.jsonl` も対応しており、既存の記録や設定を削除する必要はありません。
 
 * * *
 
@@ -527,6 +533,7 @@ cargo build --release --bin token-usage-insights
 | `TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS` | `24` | 自動更新チェックの間隔（時間単位、有効範囲 1 〜 87600） |
 | `TOKEN_USAGE_INSIGHTS_INSTALL_DIR` | 自動検出 | カスタムインストールディレクトリ。更新対象と環境の識別に利用 |
 | `ANTIGRAVITY_DIR` | `~/.gemini/antigravity-cli` | Antigravity CLI データディレクトリ |
+| `ANTIGRAVITY_APP_DIR` | `~/.gemini/antigravity` | Antigravity App（デスクトップアプリ）データディレクトリ |
 | `COPILOT_DIR` | `~/.copilot` | Copilot CLI データディレクトリ |
 | `COPILOT_APP_DIR` | `COPILOT_DIR` と同じ | Copilot App（デスクトップアプリ）のデータディレクトリ。`data.db` と `session-store.db` を含む必要があります |
 | `VSCODE_USER_DATA_DIR` | プラットフォームにより自動検出 | VS Code ユーザーデータディレクトリ。`User/workspaceStorage` を含む必要があります |

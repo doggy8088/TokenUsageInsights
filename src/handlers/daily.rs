@@ -238,6 +238,12 @@ pub async fn get_setup_info(Path(assistant): Path<String>) -> impl IntoResponse 
     let anti_source_script =
         crate::paths::find_resource(&anti_source_relative).unwrap_or(anti_source_relative);
 
+    // The desktop App writes the same layout as the CLI but under its own home.
+    let anti_app_dir = source_root(Harness::AntigravityApp, &["brain", "conversations"]);
+    let anti_app_data_path = antigravity_data_path(&anti_app_dir);
+    let anti_app_exists =
+        anti_app_dir.join("brain").is_dir() || anti_app_dir.join("conversations").is_dir();
+
     let copilot_dir = source_root(Harness::Copilot, &["usage", script_name]);
     let copilot_script = copilot_dir.join(script_name);
     let copilot_source_relative = if cfg!(windows) {
@@ -297,6 +303,15 @@ pub async fn get_setup_info(Path(assistant): Path<String>) -> impl IntoResponse 
                 "antigravity",
                 cfg!(windows),
             ),
+        },
+        antigravity_app: AssistantSetupStatus {
+            dir_path: anti_app_dir.to_string_lossy().into_owned(),
+            data_path: anti_app_data_path.to_string_lossy().into_owned(),
+            exists: anti_app_exists,
+            script_path: "".to_string(),
+            source_script_path: "".to_string(),
+            settings_path: "".to_string(),
+            statusline_command: "".to_string(),
         },
         copilot: AssistantSetupStatus {
             dir_path: copilot_dir.to_string_lossy().into_owned(),
@@ -996,6 +1011,66 @@ mod tests {
             .find(|session| session.source_kind == "copilot-app")
             .unwrap();
         assert_eq!(app_session.model, "GLM5.2");
+    }
+
+    /// The Antigravity App shares `assistant_type='antigravity'` with the CLI.
+    /// The same session id on both collectors must stay two sessions, each
+    /// keeping its own source badge.
+    #[test]
+    fn daily_summary_separates_antigravity_cli_and_app_with_same_session_id() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        for (source_kind, input, name) in [
+            ("antigravity-session", 50, "CLI Session"),
+            ("antigravity-app", 100, "App Session"),
+        ] {
+            conn.execute(
+                "INSERT INTO usage_entries (
+                    assistant_type, source_kind, source_dir_key, timestamp, date,
+                    session_id, turn_no, session_name,
+                    tokens_input, tokens_output, tokens_total,
+                    delta_input, delta_output, delta_total,
+                    model
+                 ) VALUES (
+                    'antigravity', ?1, ?4, '2026-07-20T10:00:00Z', '2026-07-20',
+                    'shared-sess', 1, ?2, ?3, 10, ?3 + 10, ?3, 10, ?3 + 10,
+                    'Gemini 4 Hydrogen'
+                 )",
+                rusqlite::params![source_kind, name, input, format!("dir-{source_kind}")],
+            )
+            .unwrap();
+        }
+
+        let entries =
+            crate::db::get_usage_entries_by_date(&conn, "2026-07-20", "antigravity").unwrap();
+        let (_, sessions, _, _) =
+            aggregate_usage_details(&entries, &PreparedPricingRules::from_rules(Vec::new()));
+
+        assert_eq!(
+            sessions.len(),
+            2,
+            "antigravity-session and antigravity-app with the same session_id must stay separate"
+        );
+        let source_kinds: Vec<&str> = sessions
+            .iter()
+            .map(|session| session.source_kind.as_str())
+            .collect();
+        assert!(
+            source_kinds.contains(&"antigravity-session"),
+            "{source_kinds:?}"
+        );
+        assert!(
+            source_kinds.contains(&"antigravity-app"),
+            "{source_kinds:?}"
+        );
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|session| session.total_input_tokens)
+                .sum::<u64>(),
+            150
+        );
     }
 
     #[test]

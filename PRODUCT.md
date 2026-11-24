@@ -6,7 +6,7 @@ product
 
 ## Users
 
-本產品面向在本機終端使用 AI CLI 助理的開發者與技術使用者，包含 Google Antigravity CLI、GitHub Copilot CLI、Codex CLI 與 Claude Code 的重度使用者。使用情境通常是本機開發工作站、macOS 或 WSL 環境，使用者需要在不中斷工作流的狀況下快速理解 token 消耗、成本、模型使用、快取狀態、工作目錄與完整會話歷史。
+本產品面向在本機終端使用 AI CLI 助理的開發者與技術使用者，包含 Google Antigravity CLI 與 Antigravity App、GitHub Copilot CLI、Codex CLI 與 Claude Code 的重度使用者。使用情境通常是本機開發工作站、macOS 或 WSL 環境，使用者需要在不中斷工作流的狀況下快速理解 token 消耗、成本、模型使用、快取狀態、工作目錄與完整會話歷史。
 
 ## Product Purpose
 

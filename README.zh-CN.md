@@ -1,6 +1,6 @@
 # Token 战情室
 
-**Token 战情室是本地优先的 AI Coding Agent Token 使用量与会话还原看板。** 它会读取本机上的 Google Antigravity CLI、GitHub Copilot CLI、GitHub Copilot App、GitHub Copilot Chat（VS Code）、Codex Desktop、Codex CLI、Claude Code、Cursor、Grok Build、Pi Coding Agent、OMP、Muse Code 与 MiniMax Code 记录，集中呈现每日、月度、年度的 Token 消耗、缓存使用、推理 Token、估算费用、模型分布、项目目录分布与完整 Session 时间轴。
+**Token 战情室是本地优先的 AI Coding Agent Token 使用量与会话还原看板。** 它会读取本机上的 Google Antigravity CLI 与 Antigravity App、GitHub Copilot CLI、GitHub Copilot App、GitHub Copilot Chat（VS Code）、Codex Desktop、Codex CLI、Claude Code、Cursor、Grok Build、Pi Coding Agent、OMP、Muse Code 与 MiniMax Code 记录，集中呈现每日、月度、年度的 Token 消耗、缓存使用、推理 Token、估算费用、模型分布、项目目录分布与完整 Session 时间轴。
 
 本项目不会代你调用 AI 供应商 API 查询数据；核心数据来源是本地日志、Status Line 收集文件与本地 SQLite。
 
@@ -47,6 +47,7 @@ http://localhost:3003
 | 工具 | 是否需要额外设置 | 默认数据源 | 说明 |
 | --- | --- | --- | --- |
 | Google Antigravity CLI | 不需要 | `~/.gemini/antigravity-cli/brain/` / `conversations/` | 直接读取原生会话 Token 与模型信息；兼容旧版 `usage/` 收集文件 |
+| Google Antigravity App | 不需要 | `~/.gemini/antigravity/brain/` / `conversations/` | 直接读取桌面 App 的原生会话；与 CLI 合并显示并以「CLI」／「App」标示来源 |
 | GitHub Copilot CLI | 需要 | `~/.copilot/usage/usage-YYYY-MM-DD.jsonl` | 通过 `statusline-token.sh` 或 Windows `statusline-token.ps1` 收集 Token 数据 |
 | GitHub Copilot App | 不需要 | `~/.copilot/data.db`、`~/.copilot/session-store.db` | 看板直接读取 Copilot 桌面应用的本地 SQLite |
 | GitHub Copilot Chat（VS Code） | 不需要 | VS Code `workspaceStorage/chatSessions` | 看板直接扫描 VS Code Stable 与 Insiders 的本地聊天 Session |
@@ -70,7 +71,8 @@ Windows 默认使用以下原生路径：
 | 用途 | Windows 默认路径 |
 | --- | --- |
 | SQLite | `%LOCALAPPDATA%\TokenUsageInsights\token_usage_insights.db` |
-| Antigravity | `%USERPROFILE%\.gemini\antigravity-cli` |
+| Antigravity CLI | `%USERPROFILE%\.gemini\antigravity-cli` |
+| Antigravity App | `%USERPROFILE%\.gemini\antigravity` |
 | Copilot | `%USERPROFILE%\.copilot` |
 | Codex | `%USERPROFILE%\.codex` |
 | Claude Code | `%USERPROFILE%\.claude` |
@@ -149,18 +151,22 @@ http://localhost:3003/?agent=copilot&tab=daily&date=2026-08-09&dir=~/projects/To
 
 * * *
 
-## Google Antigravity CLI 本地数据来源
+## Google Antigravity 本地数据来源
 
-**Antigravity CLI 无需设置 Status Line、Hook 或安装额外收集脚本。** 使用 CLI 对话后，看板会直接读取原生记录：
+**Antigravity CLI 与桌面 App 都无需设置 Status Line、Hook 或安装额外收集脚本。** 使用任一版本对话后，看板会直接读取原生记录：
 
 ```text
 ~/.gemini/antigravity-cli/brain/<session-id>/.system_generated/logs/transcript_full.jsonl
 ~/.gemini/antigravity-cli/conversations/<session-id>.db
+~/.gemini/antigravity/brain/<session-id>/.system_generated/logs/transcript_full.jsonl
+~/.gemini/antigravity/conversations/<session-id>.db
 ```
+
+CLI 与 App 的用量会归在同一个 **Antigravity** Agent 下，并在会话列表以「CLI」与「App」标示来源；同一 `session_id` 若同时存在于两边，会各自保留为独立会话，不会合并或重复计算。
 
 看板读取每次响应的输入、缓存读取与输出 Token，并从对应会话数据库取得模型信息以估算费用。估算费用不等于 Antigravity 实际扣款；模型或价格无法识别时无法可靠估算，也不代表免费。
 
-Windows 默认目录为 `%USERPROFILE%\.gemini\antigravity-cli`；可用 `ANTIGRAVITY_DIR` 或额外数据来源设置指定其他位置。复制历史数据时请保留 `brain/` 与 `conversations/`。旧版 `usage/usage-YYYY-MM-DD.jsonl` 仍受支持，无需删除现有记录或设置。
+Windows 默认目录为 `%USERPROFILE%\.gemini\antigravity-cli`（CLI）与 `%USERPROFILE%\.gemini\antigravity`（App）；可用 `ANTIGRAVITY_DIR`、`ANTIGRAVITY_APP_DIR` 或额外数据来源设置指定其他位置。复制历史数据时请保留 `brain/` 与 `conversations/`。旧版 `usage/usage-YYYY-MM-DD.jsonl` 仍受支持，无需删除现有记录或设置。
 
 * * *
 
@@ -527,6 +533,7 @@ cargo build --release --bin token-usage-insights
 | `TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS` | `24` | 自动检查更新的间隔周期（小时，有效范围 1 至 87600） |
 | `TOKEN_USAGE_INSIGHTS_INSTALL_DIR` | 自动检测 | 自定义安装目录，作为更新目标与环境识别依据 |
 | `ANTIGRAVITY_DIR` | `~/.gemini/antigravity-cli` | Antigravity CLI 数据目录 |
+| `ANTIGRAVITY_APP_DIR` | `~/.gemini/antigravity` | Antigravity App（桌面应用）数据目录 |
 | `COPILOT_DIR` | `~/.copilot` | Copilot CLI 数据目录 |
 | `COPILOT_APP_DIR` | 同 `COPILOT_DIR` | Copilot App（桌面应用）数据目录，应包含 `data.db` 与 `session-store.db` |
 | `VSCODE_USER_DATA_DIR` | 按平台自动检测 | VS Code 用户数据目录，应包含 `User/workspaceStorage` |

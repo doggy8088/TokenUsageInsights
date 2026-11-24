@@ -76,6 +76,7 @@ pub struct SetupInfoResponse {
     pub workspace_dir: String,
     pub home_dir: String,
     pub antigravity: AssistantSetupStatus,
+    pub antigravity_app: AssistantSetupStatus,
     pub copilot: AssistantSetupStatus,
     pub copilot_app: AssistantSetupStatus,
     pub codex: AssistantSetupStatus,

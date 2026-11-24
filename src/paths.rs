@@ -123,6 +123,21 @@ pub fn copilot_app_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// Resolve the Antigravity desktop App data directory.
+///
+/// Honors `ANTIGRAVITY_APP_DIR`, then falls back to `~/.gemini/antigravity`.
+/// The App writes the same `brain/<session-id>/.system_generated/logs/
+/// transcript_full.jsonl` and `conversations/<session-id>.db` layout as the
+/// CLI, but keeps it in its own directory, so it needs a separate root.
+pub fn antigravity_app_dir() -> PathBuf {
+    if let Some(path) = env_path("ANTIGRAVITY_APP_DIR") {
+        return path;
+    }
+    dirs::home_dir()
+        .map(|h| h.join(".gemini").join("antigravity"))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
 #[cfg(test)]
 mod tests {
     // Only used by the Windows-specific test below; avoids an unused-import

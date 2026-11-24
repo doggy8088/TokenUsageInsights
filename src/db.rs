@@ -411,6 +411,10 @@ const COPILOT_CWD_BACKFILL_MIGRATION_KEY: &str = "migration:copilot_cwd_backfill
 /// native `PARSER_VERSION` re-imports) via `antigravity_metadata::model_label`.
 const ANTIGRAVITY_MODEL_LABEL_MIGRATION_KEY: &str = "migration:antigravity_model_labels_v1";
 
+/// One-time move of Antigravity App rows from the CLI source kind to
+/// `antigravity-app` when the App home had been configured as a CLI extra root.
+const ANTIGRAVITY_APP_SPLIT_MIGRATION_KEY: &str = "migration:antigravity_app_split_v1";
+
 #[derive(Default)]
 enum InitialUserPromptState {
     #[default]
@@ -1466,6 +1470,7 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
     run_parent_session_id_normalization_migration_v2(conn)?;
     run_parent_session_id_normalization_migration_v3(conn)?;
     run_antigravity_model_label_migration_v1(conn)?;
+    run_antigravity_app_split_migration_v1(conn)?;
 
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS search_indexed_files (
@@ -1717,11 +1722,53 @@ fn sync_antigravity_usage_logs_with_cancel(
     root: &Path,
     should_cancel: &(dyn Fn() -> bool + Sync),
 ) -> Result<(), String> {
+    sync_antigravity_usage_logs_from_with_cancel(
+        conn,
+        root,
+        crate::antigravity::SOURCE_KIND,
+        true,
+        should_cancel,
+    )
+}
+
+/// The desktop App writes the same transcript and metadata layout as the CLI
+/// but lives under its own home and its own source kind. It has no statusline
+/// hook, so legacy `usage/*.jsonl` imports (and the CLI's one-time hook
+/// migration) are skipped for this root.
+fn sync_antigravity_app_usage_logs_with_cancel(
+    conn: &mut Connection,
+    root: &Path,
+    should_cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<(), String> {
+    sync_antigravity_usage_logs_from_with_cancel(
+        conn,
+        root,
+        crate::antigravity::APP_SOURCE_KIND,
+        false,
+        should_cancel,
+    )
+}
+
+fn sync_antigravity_usage_logs_from_with_cancel(
+    conn: &mut Connection,
+    root: &Path,
+    source_kind: &str,
+    import_hook_logs: bool,
+    should_cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<(), String> {
     let root = crate::config::absolute_root(root);
-    sync_hook_usage_logs_with_cancel(conn, "antigravity", &root, should_cancel)?;
+    if import_hook_logs {
+        sync_hook_usage_logs_with_cancel(conn, "antigravity", &root, should_cancel)?;
+    }
+    // A distinct sync-state namespace keeps CLI and App fingerprints apart even
+    // when both roots hold an identically named transcript.
+    let state_prefix = if source_kind == crate::antigravity::APP_SOURCE_KIND {
+        "antigravity_app"
+    } else {
+        "antigravity"
+    };
     let source_key = encode_hex(root.as_os_str().as_encoded_bytes());
-    let source_kind = crate::antigravity::SOURCE_KIND;
-    let sync_states = load_sync_state_for_prefix(conn, "antigravity");
+    let sync_states = load_sync_state_for_prefix(conn, state_prefix);
     let subagent_descriptors = crate::antigravity_metadata::index_subagent_descriptor_paths(&root);
     for path in crate::antigravity::find_session_files(&root)? {
         if should_cancel() {
@@ -1757,8 +1804,7 @@ fn sync_antigravity_usage_logs_with_cancel(
             }
             (fingerprint.finish() & i64::MAX as u64) as i64
         };
-        let state_key =
-            source_sync_key("antigravity", &root, &portable_relative_path(&root, &path));
+        let state_key = source_sync_key(state_prefix, &root, &portable_relative_path(&root, &path));
         let legacy_rows: bool = conn
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM usage_entries WHERE assistant_type = 'antigravity'
@@ -1793,6 +1839,7 @@ fn sync_antigravity_usage_logs_with_cancel(
         }
         let name = get_antigravity_session_name(&root, session_id);
         for entry in &mut entries {
+            entry.source_kind = Some(source_kind.to_owned());
             entry.source_dir_key = Some(source_key.clone());
             if entry.session_name.is_none() {
                 entry.session_name = name.clone();
@@ -2939,6 +2986,124 @@ fn run_antigravity_model_label_migration_v1(conn: &Connection) -> Result<(), Str
     Ok(())
 }
 
+/// One-time split of the Antigravity App home away from the CLI collector.
+///
+/// Before the App had its own Harness, the only way to read it was adding
+/// `~/.gemini/antigravity` to `additional_sources.antigravity`, which stored its
+/// rows as `source_kind='antigravity-session'` (CLI). Now that the App is
+/// collected separately with `antigravity-app`, those old rows would be counted
+/// twice. Drop only rows whose registered source directory is the App home; the
+/// App collector re-imports them under the correct source kind on the next sync.
+fn apply_antigravity_app_split_migration_v1(conn: &Connection) -> Result<usize, String> {
+    let app_root = crate::config::absolute_root(&crate::paths::antigravity_app_dir());
+    let mut stale_keys: Vec<String> = Vec::new();
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT source_dir_key, dir_path
+                 FROM usage_source_directories
+                 WHERE assistant_type = 'antigravity' AND source_kind = ?",
+            )
+            .map_err(|error| format!("準備讀取 Antigravity App 來源目錄失敗: {error}"))?;
+        let rows = stmt
+            .query_map(params![crate::antigravity::SOURCE_KIND], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(|error| format!("讀取 Antigravity App 來源目錄失敗: {error}"))?;
+        for row in rows {
+            let (source_key, encoded) =
+                row.map_err(|error| format!("迭代 Antigravity App 來源目錄失敗: {error}"))?;
+            let Some(directory) = decode_registered_path(encoded) else {
+                continue;
+            };
+            if crate::config::absolute_root(&directory) == app_root {
+                stale_keys.push(source_key);
+            }
+        }
+    }
+
+    let mut deleted_rows: usize = 0;
+    for source_key in &stale_keys {
+        deleted_rows += conn
+            .execute(
+                "DELETE FROM usage_entries
+                 WHERE assistant_type = 'antigravity'
+                   AND source_kind = ?1
+                   AND source_dir_key = ?2",
+                params![crate::antigravity::SOURCE_KIND, source_key],
+            )
+            .map_err(|error| format!("清除舊 Antigravity App 標籤資料失敗: {error}"))?;
+        conn.execute(
+            "DELETE FROM usage_source_directories
+             WHERE assistant_type = 'antigravity' AND source_kind = ?1 AND source_dir_key = ?2",
+            params![crate::antigravity::SOURCE_KIND, source_key],
+        )
+        .map_err(|error| format!("清除舊 Antigravity App 來源目錄失敗: {error}"))?;
+        // Additional CLI roots use `antigravity:source:<hex>:...`; the primary
+        // root's short keys are left alone in case the user configured the App
+        // home as ANTIGRAVITY_DIR and later restores a real CLI home.
+        conn.execute(
+            "DELETE FROM sync_state WHERE filename LIKE ?1",
+            params![format!("antigravity:source:{source_key}:%")],
+        )
+        .map_err(|error| format!("清除舊 Antigravity App 同步狀態失敗: {error}"))?;
+    }
+
+    conn.execute(
+        "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time) VALUES (?, 1, 0)",
+        params![ANTIGRAVITY_APP_SPLIT_MIGRATION_KEY],
+    )
+    .map_err(|error| format!("寫入 Antigravity App 拆分遷移狀態失敗: {error}"))?;
+
+    Ok(deleted_rows)
+}
+
+/// 一次性 Antigravity App 來源拆分遷移。
+///
+/// 舊版若把 App 家目錄設為 `additional_sources.antigravity`，其列會以 CLI 的
+/// `antigravity-session` 寫入；改由 `antigravity-app` 收集後會重複計算。
+/// 以 sync_state 標記做一次性閘門，重跑不具副作用。
+fn run_antigravity_app_split_migration_v1(conn: &Connection) -> Result<(), String> {
+    let migration_done: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = ?)",
+            params![ANTIGRAVITY_APP_SPLIT_MIGRATION_KEY],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    if migration_done {
+        return Ok(());
+    }
+
+    conn.execute_batch("SAVEPOINT antigravity_app_split_v1;")
+        .map_err(|error| format!("開啟 Antigravity App 拆分遷移 SAVEPOINT 失敗: {error}"))?;
+
+    let deleted_rows = match apply_antigravity_app_split_migration_v1(conn) {
+        Ok(count) => {
+            conn.execute_batch("RELEASE SAVEPOINT antigravity_app_split_v1;")
+                .map_err(|error| {
+                    format!("提交 Antigravity App 拆分遷移 SAVEPOINT 失敗: {error}")
+                })?;
+            count
+        }
+        Err(error) => {
+            let _ = conn.execute_batch(
+                "ROLLBACK TO SAVEPOINT antigravity_app_split_v1;
+                 RELEASE SAVEPOINT antigravity_app_split_v1;",
+            );
+            return Err(error);
+        }
+    };
+
+    if deleted_rows > 0 {
+        println!(
+            "✅ 遷移：Antigravity App 來源拆分——已清除 {} 筆重複的 CLI 標籤紀錄",
+            deleted_rows
+        );
+    }
+    Ok(())
+}
+
 /// 一次性父層碰撞復原（PRRT_kwDOTOgsec6yUXND）。
 ///
 /// 唯一索引納入「正規化父層」之前，`INSERT OR REPLACE` 會讓獨立 session
@@ -3127,10 +3292,15 @@ fn run_codex_rollout_identity_migration(conn: &mut Connection) -> Result<(), Str
 
 /// Source-scoped cursors prevent equal relative names/sizes on different
 /// computers from hiding new usage. Keep the assistant prefix for migrations.
-fn source_sync_key(assistant: &str, root: &Path, relative_path: &str) -> String {
+///
+/// `scope` is normally the assistant type; the Antigravity App collector passes
+/// its own `antigravity_app` namespace so its primary root gets a short cursor
+/// and its additional roots stay isolated per directory.
+fn source_sync_key(scope: &str, root: &Path, relative_path: &str) -> String {
     let root = crate::config::absolute_root(root);
-    let primary = match assistant {
+    let primary = match scope {
         "antigravity" => get_antigravity_dir(),
+        "antigravity_app" => crate::paths::antigravity_app_dir(),
         "copilot" => get_copilot_dir(),
         "claude" => get_claude_dir(),
         "cursor" => get_cursor_dir(),
@@ -3144,10 +3314,10 @@ fn source_sync_key(assistant: &str, root: &Path, relative_path: &str) -> String 
     // Preserve the primary home's existing cursor, particularly hook offsets:
     // replaying old hook rows can resurrect totals already split into agents.
     if root == crate::config::absolute_root(&primary) {
-        return format!("{assistant}:{relative_path}");
+        return format!("{scope}:{relative_path}");
     }
     format!(
-        "{assistant}:source:{}:{relative_path}",
+        "{scope}:source:{}:{relative_path}",
         encode_hex(root.as_os_str().as_encoded_bytes())
     )
 }
@@ -7614,10 +7784,13 @@ fn sync_configured_sources_with_cancel(
 ) -> Result<(), String> {
     use crate::config::Harness;
     // Preserve collector order: Cursor metadata first; Copilot hook/App rows
-    // before CLI reconciliation. A failed or offline source does not block others.
+    // before CLI reconciliation, and Antigravity CLI before its App so the
+    // one-time hook migration stays on the CLI root. A failed or offline source
+    // does not block others.
     for harness in [
         Harness::Cursor,
         Harness::Antigravity,
+        Harness::AntigravityApp,
         Harness::Copilot,
         Harness::Vscode,
         Harness::CopilotApp,
@@ -7671,6 +7844,9 @@ fn sync_configured_sources_with_cancel(
                 ),
                 Harness::Antigravity => {
                     sync_antigravity_usage_logs_with_cancel(conn, root, should_cancel)
+                }
+                Harness::AntigravityApp => {
+                    sync_antigravity_app_usage_logs_with_cancel(conn, root, should_cancel)
                 }
                 Harness::Copilot => {
                     sync_hook_usage_logs_with_cancel(conn, "copilot", root, should_cancel)
@@ -10710,6 +10886,274 @@ mod tests {
             .unwrap();
         assert_eq!(count, 3);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn antigravity_app_primary_root_uses_its_own_sync_state_namespace() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_cli = std::env::var("ANTIGRAVITY_DIR").ok();
+        let old_app = std::env::var("ANTIGRAVITY_APP_DIR").ok();
+        let base = temp_jsonl_path("antigravity-app-primary").with_extension("");
+        let cli = base.join("antigravity-cli");
+        let app = base.join("antigravity");
+        let relative = "brain/shared/.system_generated/logs/transcript_full.jsonl";
+        let record = "{\"type\":\"PLANNER_RESPONSE\",\"created_at\":\"2026-10-10T01:00:00Z\",\"input_tokens\":12,\"cache_read_tokens\":80,\"output_tokens\":3}\n";
+        // Both roots are the collectors' primary homes and hold an identically
+        // named transcript, so only the cursor namespace keeps them apart.
+        for root in [&cli, &app] {
+            let file = root.join(relative);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(file, record).unwrap();
+        }
+        std::env::set_var("ANTIGRAVITY_DIR", &cli);
+        std::env::set_var("ANTIGRAVITY_APP_DIR", &app);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        sync_antigravity_usage_logs_with_cancel(&mut conn, &cli, &|| false).unwrap();
+        sync_antigravity_app_usage_logs_with_cancel(&mut conn, &app, &|| false).unwrap();
+
+        let kinds: Vec<String> = conn
+            .prepare("SELECT source_kind FROM usage_entries ORDER BY source_kind")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                crate::antigravity::APP_SOURCE_KIND.to_string(),
+                crate::antigravity::SOURCE_KIND.to_string()
+            ]
+        );
+
+        let mut keys: Vec<String> = conn
+            .prepare("SELECT filename FROM sync_state WHERE filename LIKE '%transcript_full.jsonl'")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                format!("antigravity:{relative}"),
+                format!("antigravity_app:{relative}")
+            ]
+        );
+
+        // Re-running the CLI side must not be skipped by the App cursor and
+        // must not replace the App rows.
+        sync_antigravity_usage_logs_with_cancel(&mut conn, &cli, &|| false).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM usage_entries", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+
+        let registered: Vec<(String, String)> = conn
+            .prepare(
+                "SELECT source_kind, dir_path FROM usage_source_directories
+                 WHERE assistant_type = 'antigravity' ORDER BY source_kind",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .unwrap()
+            .map(|row| {
+                let (kind, encoded) = row.unwrap();
+                (
+                    kind,
+                    decode_registered_path(encoded)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(registered.len(), 2);
+        assert_eq!(registered[0].0, crate::antigravity::APP_SOURCE_KIND);
+        assert_eq!(registered[1].0, crate::antigravity::SOURCE_KIND);
+
+        match old_cli {
+            Some(value) => std::env::set_var("ANTIGRAVITY_DIR", value),
+            None => std::env::remove_var("ANTIGRAVITY_DIR"),
+        }
+        match old_app {
+            Some(value) => std::env::set_var("ANTIGRAVITY_APP_DIR", value),
+            None => std::env::remove_var("ANTIGRAVITY_APP_DIR"),
+        }
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn antigravity_app_source_kind_resolves_the_app_root() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_cli = std::env::var("ANTIGRAVITY_DIR").ok();
+        let old_app = std::env::var("ANTIGRAVITY_APP_DIR").ok();
+        let base = temp_jsonl_path("antigravity-app-resolver").with_extension("");
+        let cli = base.join("antigravity-cli");
+        let app = base.join("antigravity");
+        let session_id = "shared-session";
+        for root in [&cli, &app] {
+            let file = root
+                .join("brain")
+                .join(session_id)
+                .join(".system_generated/logs/transcript_full.jsonl");
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(file, "{}\n").unwrap();
+        }
+        std::env::set_var("ANTIGRAVITY_DIR", &cli);
+        std::env::set_var("ANTIGRAVITY_APP_DIR", &app);
+
+        let context = || crate::session_files::SessionFileResolutionContext {
+            copilot_app_source_dir: None,
+            parent_session_id: None,
+            agent_nickname: None,
+        };
+        let app_path = crate::session_files::resolve_session_file_path(
+            "antigravity",
+            session_id,
+            None,
+            crate::antigravity::APP_SOURCE_KIND,
+            context(),
+        )
+        .unwrap();
+        assert!(
+            app_path.starts_with(crate::config::absolute_root(&app)),
+            "App source kind must resolve under the App home: {}",
+            app_path.display()
+        );
+
+        let cli_path = crate::session_files::resolve_session_file_path(
+            "antigravity",
+            session_id,
+            None,
+            crate::antigravity::SOURCE_KIND,
+            context(),
+        )
+        .unwrap();
+        assert!(
+            cli_path.starts_with(crate::config::absolute_root(&cli)),
+            "CLI source kind must resolve under the CLI home: {}",
+            cli_path.display()
+        );
+
+        match old_cli {
+            Some(value) => std::env::set_var("ANTIGRAVITY_DIR", value),
+            None => std::env::remove_var("ANTIGRAVITY_DIR"),
+        }
+        match old_app {
+            Some(value) => std::env::set_var("ANTIGRAVITY_APP_DIR", value),
+            None => std::env::remove_var("ANTIGRAVITY_APP_DIR"),
+        }
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn antigravity_app_split_migration_removes_cli_labelled_app_rows() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_app = std::env::var("ANTIGRAVITY_APP_DIR").ok();
+        let base = temp_jsonl_path("antigravity-app-migration").with_extension("");
+        let app = base.join("antigravity");
+        let cli = base.join("antigravity-cli");
+        fs::create_dir_all(app.join("brain")).unwrap();
+        fs::create_dir_all(cli.join("brain")).unwrap();
+        std::env::set_var("ANTIGRAVITY_APP_DIR", &app);
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // init_db may already have consumed the one-time gate for this process.
+        conn.execute(
+            "DELETE FROM sync_state WHERE filename = ?",
+            params![ANTIGRAVITY_APP_SPLIT_MIGRATION_KEY],
+        )
+        .unwrap();
+
+        let insert_row = |root: &Path, session: &str| {
+            let root = crate::config::absolute_root(root);
+            let key = encode_hex(root.as_os_str().as_encoded_bytes());
+            register_usage_source_directory(
+                &conn,
+                "antigravity",
+                crate::antigravity::SOURCE_KIND,
+                &key,
+                &root,
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO usage_entries (
+                    assistant_type, source_kind, source_dir_key, timestamp, date,
+                    session_id, turn_no, session_name,
+                    tokens_input, tokens_output, tokens_total,
+                    delta_input, delta_output, delta_total
+                 ) VALUES (
+                    'antigravity', ?1, ?2, '2026-07-20T10:00:00Z', '2026-07-20',
+                    ?3, 1, 'Session', 50, 5, 55, 50, 5, 55
+                 )",
+                params![crate::antigravity::SOURCE_KIND, key, session],
+            )
+            .unwrap();
+            key
+        };
+        let app_key = insert_row(&app, "app-session");
+        let cli_key = insert_row(&cli, "cli-session");
+
+        run_antigravity_app_split_migration_v1(&conn).unwrap();
+
+        let remaining: Vec<String> = conn
+            .prepare("SELECT source_dir_key FROM usage_entries ORDER BY source_dir_key")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(remaining, vec![cli_key.clone()]);
+
+        let registered: Vec<String> = conn
+            .prepare("SELECT source_dir_key FROM usage_source_directories")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(registered, vec![cli_key]);
+        let marker: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = ?)",
+                params![ANTIGRAVITY_APP_SPLIT_MIGRATION_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(marker);
+
+        // The gate makes a re-run a no-op even when stale rows reappear.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, session_name,
+                tokens_input, tokens_output, tokens_total,
+                delta_input, delta_output, delta_total
+             ) VALUES (
+                'antigravity', ?1, ?2, '2026-07-20T11:00:00Z', '2026-07-20',
+                'stale-again', 1, 'Session', 1, 1, 2, 1, 1, 2
+             )",
+            params![crate::antigravity::SOURCE_KIND, app_key],
+        )
+        .unwrap();
+        run_antigravity_app_split_migration_v1(&conn).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM usage_entries", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+
+        match old_app {
+            Some(value) => std::env::set_var("ANTIGRAVITY_APP_DIR", value),
+            None => std::env::remove_var("ANTIGRAVITY_APP_DIR"),
+        }
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

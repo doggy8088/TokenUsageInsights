@@ -4,6 +4,27 @@
 
 ## [未發行]
 
+### 新增與改善
+
+- **Antigravity App 原生會話自動收集**：看板現在會直接讀取桌面版 `~/.gemini/antigravity/brain/<session-id>/.system_generated/logs/transcript_full.jsonl` 與 `conversations/<session-id>.db`，與 Antigravity CLI 共用同一套會話解析、模型對應與費用估算邏輯，不需要安裝收集腳本或設定 Status Line。
+- **CLI 與 App 合併呈現並標示來源**：兩種來源的用量歸在同一個 Antigravity Agent 之下，會話列表以「CLI」與「App」標籤區分；同一 `session_id` 若同時存在於兩邊，會各自保留為獨立會話，不會被合併或重複計算。前置作業教學與「全部 Agent」來源清單也會同時顯示 CLI 與 App 的資料路徑。
+- 新增 `ANTIGRAVITY_APP_DIR` 環境變數（預設 `~/.gemini/antigravity`）與 `additional_sources.antigravity_app` 設定鍵，可指定其他電腦或雲端同步的 App 資料目錄。
+
+### 變更
+
+- Agent 顯示名稱由「Antigravity CLI」改為「Antigravity」（比照 GitHub Copilot 使用產品名），五語系介面、分頁提示、匯出／匯入選單與五份 README 同步更新；CLI 與 App 的差異改由來源標籤呈現。
+
+### 資料影響
+
+- 一次性遷移 `migration:antigravity_app_split_v1`：若過去曾把 App 目錄加入 `additional_sources.antigravity`，該目錄以 `antigravity-session` 寫入的會話列與來源登記會在升級後刪除，並由 App 收集器以 `antigravity-app` 重新匯入，避免同一份用量被計兩次。
+- App 收集器使用 `antigravity_app:` 開頭的 `sync_state` 游標，與既有 CLI 的 `antigravity:` 游標互不干擾；既有 CLI 資料與游標不需重建。
+
+### 相容性
+
+- 匯出／匯入、`/api/antigravity/*` 與 `--agent antigravity` 維持不變，兩種來源都會一併涵蓋。
+- 若曾把 App 資料複製到非預設路徑（不是 `~/.gemini/antigravity`）並加進 `additional_sources.antigravity`，遷移無法自動辨識該複本，請手動移除該設定，改列於 `additional_sources.antigravity_app`，以免重複計算。
+- `~/.gemini/antigravity-ide`（Antigravity IDE）目前仍不在收集範圍內。
+
 ## [1.9.0] - 2026-11-25
 
 本次 minor release 新增跨全歷史對話內容關鍵字搜尋功能（SQLite FTS5 trigram 增量索引），並將看板右上角工具列極簡整理為「全域搜尋」與「⋯ 更多選單」。

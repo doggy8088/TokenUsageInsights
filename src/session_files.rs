@@ -559,6 +559,14 @@ pub(crate) fn resolve_session_file_path(
     context: SessionFileResolutionContext<'_>,
 ) -> Result<PathBuf, SessionFileError> {
     match assistant {
+        "antigravity" if source_kind == crate::antigravity::APP_SOURCE_KIND => {
+            resolve_hook_transcript(
+                Harness::AntigravityApp,
+                assistant,
+                session_id,
+                transcript_path_db,
+            )
+        }
         "antigravity" => resolve_hook_transcript(
             Harness::Antigravity,
             assistant,

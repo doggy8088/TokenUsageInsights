@@ -1,4 +1,6 @@
-//! Antigravity CLI's native, per-response token records. No statusline required.
+//! Antigravity's native, per-response token records. No statusline required.
+//! Both the CLI (`~/.gemini/antigravity-cli`) and the desktop App
+//! (`~/.gemini/antigravity`) write the same transcript and metadata layout.
 use crate::antigravity_metadata::{
     apply_subagent_descriptor_fallback, is_valid_session_id, model_label, read_session_metadata,
     SessionMetadata,
@@ -10,8 +12,16 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 pub(crate) const SOURCE_KIND: &str = "antigravity-session";
+/// Desktop App rows share `assistant_type='antigravity'` with the CLI and are
+/// told apart only by this source kind, mirroring `copilot-app`.
+pub(crate) const APP_SOURCE_KIND: &str = "antigravity-app";
 // Bump when parsed fields change so unchanged historical sources are re-imported.
 pub(crate) const PARSER_VERSION: u32 = 5;
+
+/// Native transcripts share the same timeline semantics for CLI and App.
+pub(crate) fn is_native_source_kind(kind: &str) -> bool {
+    kind == SOURCE_KIND || kind == APP_SOURCE_KIND
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AntigravitySystemMessage {

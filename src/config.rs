@@ -3,11 +3,13 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Keys deliberately match dashboard assistant identifiers, with separate
-/// entries for the two Copilot desktop collectors.
+/// entries for the collectors that split one assistant across two data roots:
+/// Copilot CLI/App share a home, while Antigravity CLI/App use distinct homes.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Harness {
     Antigravity,
+    AntigravityApp,
     Copilot,
     CopilotApp,
     Vscode,
@@ -26,6 +28,7 @@ impl Harness {
         use crate::db;
         Some(match self {
             Self::Antigravity => db::get_antigravity_dir(),
+            Self::AntigravityApp => crate::paths::antigravity_app_dir(),
             Self::Copilot => db::get_copilot_dir(),
             Self::CopilotApp => crate::paths::copilot_app_dir(),
             Self::Vscode => return None, // VS Code discovers multiple platform defaults.
@@ -113,8 +116,41 @@ impl SourceConfig {
                 roots.extend(additional.iter().cloned());
             }
         }
-        deduplicate_roots(roots)
+        let roots = deduplicate_roots(roots);
+        if matches!(harness, Harness::Antigravity | Harness::AntigravityApp) {
+            return retain_distinct_antigravity_roots(
+                harness,
+                roots,
+                &crate::db::get_antigravity_dir(),
+                &crate::paths::antigravity_app_dir(),
+            );
+        }
+        roots
     }
+}
+
+/// Antigravity CLI and App keep separate homes, but `additional_sources` is
+/// user supplied and may list the other collector's directory (older docs even
+/// suggested adding the App home under `antigravity`). Importing one directory
+/// under two source kinds would count the same transcript twice, so each
+/// Antigravity harness drops the other's root and keeps every other configured
+/// path untouched.
+fn retain_distinct_antigravity_roots(
+    harness: Harness,
+    roots: Vec<PathBuf>,
+    cli_root: &Path,
+    app_root: &Path,
+) -> Vec<PathBuf> {
+    let excluded = match harness {
+        Harness::Antigravity => app_root,
+        Harness::AntigravityApp => cli_root,
+        _ => return roots,
+    };
+    let excluded = absolute_root(excluded);
+    roots
+        .into_iter()
+        .filter(|root| absolute_root(root) != excluded)
+        .collect()
 }
 
 pub(crate) fn absolute_root(path: &Path) -> PathBuf {
@@ -187,6 +223,7 @@ mod tests {
     fn every_harness_accepts_multiple_roots_and_copilot_shares_app_homes() {
         let keys = [
             "antigravity",
+            "antigravity_app",
             "copilot",
             "copilot_app",
             "vscode",
@@ -250,5 +287,47 @@ mod tests {
             1
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn antigravity_cli_and_app_homes_are_never_scanned_twice() {
+        let base = std::env::temp_dir().join("insights-antigravity-roots");
+        let cli = base.join("antigravity-cli");
+        let app = base.join("antigravity");
+        let other = base.join("cloud/antigravity-cli");
+
+        // The App home listed under the CLI harness is dropped; every other
+        // configured root (e.g. another computer's CLI home) is kept.
+        assert_eq!(
+            retain_distinct_antigravity_roots(
+                Harness::Antigravity,
+                vec![cli.clone(), app.clone(), other.clone()],
+                &cli,
+                &app,
+            ),
+            vec![cli.clone(), other.clone()]
+        );
+
+        // And the CLI home listed under the App harness is dropped as well.
+        assert_eq!(
+            retain_distinct_antigravity_roots(
+                Harness::AntigravityApp,
+                vec![app.clone(), cli.clone(), other.clone()],
+                &cli,
+                &app,
+            ),
+            vec![app.clone(), other.clone()]
+        );
+
+        // Other collectors are unaffected by the Antigravity split.
+        assert_eq!(
+            retain_distinct_antigravity_roots(
+                Harness::Copilot,
+                vec![app.clone(), cli.clone()],
+                &cli,
+                &app,
+            ),
+            vec![app, cli]
+        );
     }
 }

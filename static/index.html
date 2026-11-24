@@ -59,9 +59,9 @@
             </span>
             <span class="assistant-all-label" data-i18n="all_agents_label">全部 Agent</span>
           </button>
-          <button class="assistant-badge-btn active" data-value="antigravity" title="Antigravity CLI" aria-label="Antigravity CLI">
+          <button class="assistant-badge-btn active" data-value="antigravity" title="Antigravity" aria-label="Antigravity">
             <img class="assistant-logo" src="/static/antigravity.webp" alt="Antigravity" />
-            <span class="agent-name-tooltip">Antigravity CLI</span>
+            <span class="agent-name-tooltip">Antigravity</span>
           </button>
           <button class="assistant-badge-btn" data-value="copilot" title="GitHub Copilot" aria-label="GitHub Copilot">
             <img class="assistant-logo" src="/static/githubcopilot.webp" alt="Copilot" />
@@ -1222,16 +1222,17 @@
             <span class="icon-glyph icon-chevron-left" aria-hidden="true"></span>
             <span data-i18n="setup_back_to_sources">返回資料來源</span>
           </button>
-          <h2 id="setup-modal-title" data-i18n="setup_modal_title">Antigravity CLI 本機資料來源</h2>
+          <h2 id="setup-modal-title" data-i18n="setup_modal_title">Antigravity 本機資料來源</h2>
         </div>
         <button class="close-btn" id="close-setup-modal-btn" data-i18n-aria-label="close" aria-label="關閉"><span class="icon-glyph icon-close" aria-hidden="true"></span></button>
       </div>
       <!-- Antigravity native session data -->
       <div class="modal-body" id="setup-body-antigravity" style="display: none;">
-        <p class="modal-text" data-i18n="antigravity_setup_modal_intro">本看板直接讀取 Antigravity CLI 的原生會話記錄，不需要設定 Status Line 或安裝收集腳本。</p>
+        <p class="modal-text" data-i18n="antigravity_setup_modal_intro">本看板直接讀取 Antigravity 的原生會話記錄，不需要設定 Status Line 或安裝收集腳本。CLI 與桌面 App 的用量會合併在同一個 Agent 下，並以「CLI」與「App」標示來源。</p>
         <div class="modal-section">
           <h3 data-i18n="antigravity_source_title">會話記錄位置</h3>
           <p class="modal-text"><span data-i18n="antigravity_source_path">目前偵測到的資料路徑：</span> <code id="lbl-detected-home-antigravity">~/.gemini/antigravity-cli/brain</code></p>
+          <p class="modal-text"><span data-i18n="antigravity_app_source_path">Antigravity App 資料路徑：</span> <code id="lbl-detected-home-antigravity-app">~/.gemini/antigravity/brain</code></p>
           <div class="code-block-container"><pre><code>brain/&lt;session-id&gt;/.system_generated/logs/transcript_full.jsonl
 conversations/&lt;session-id&gt;.db</code></pre></div>
         </div>
@@ -1570,7 +1571,7 @@ cd TokenUsageInsights</code></pre>
           <span data-i18n="import_target_assistant">匯入目標 Agent</span>
           <select id="usage-import-target-assistant" class="premium-select">
             <option value="" data-i18n="import_target_placeholder">請明確選擇目標 Agent</option>
-            <option value="antigravity">Antigravity CLI</option>
+            <option value="antigravity">Antigravity</option>
             <option value="copilot">GitHub Copilot</option>
             <option value="codex">Codex</option>
             <option value="claude">Claude Code</option>
@@ -1658,7 +1659,7 @@ cd TokenUsageInsights</code></pre>
               <span class="global-search-control-label" data-i18n="global_search_assistant_label">Agent：</span>
               <select id="global-search-assistant" class="premium-select-mini">
                 <option value="all" data-i18n="all_agents_label">全部 Agent</option>
-                <option value="antigravity">Antigravity CLI</option>
+                <option value="antigravity">Antigravity</option>
                 <option value="copilot">GitHub Copilot</option>
                 <option value="codex">Codex</option>
                 <option value="claude">Claude Code</option>

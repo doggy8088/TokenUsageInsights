@@ -102,7 +102,7 @@ pub(crate) fn parse_session_timeline_file(
             db_entries,
             &mut timeline,
             &mut metadata,
-            source_kind == crate::antigravity::SOURCE_KIND,
+            crate::antigravity::is_native_source_kind(source_kind),
         ),
         "copilot" => parse_copilot_timeline_filtered(
             reader,
