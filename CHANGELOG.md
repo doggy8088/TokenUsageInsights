@@ -2,7 +2,9 @@
 
 本文件記錄 TokenUsageInsights 各正式版本的實際變更。內容依 Git 標籤間的提交記錄與檔案差異整理，格式參考 [Keep a Changelog](https://keepachangelog.com/zh-TW/1.1.0/)，版本編號遵循 [Semantic Versioning](https://semver.org/lang/zh-TW/)。
 
-## [未發行]
+## [1.10.0] - 2026-11-25
+
+本次 minor release 讓看板同時收集 Antigravity 桌面 App 的原生會話，並與 Antigravity CLI 合併在同一個 Agent 下，以「CLI」與「App」標籤標示來源。
 
 ### 新增與改善
 
