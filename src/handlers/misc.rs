@@ -83,7 +83,13 @@ pub async fn trigger_manual_sync(Path(assistant): Path<String>) -> impl IntoResp
 
     let sync_res = tokio::task::spawn_blocking(|| {
         if let Ok(mut conn) = db::get_db_conn() {
-            db::sync_usage_logs(&mut conn)
+            db::sync_usage_logs(&mut conn)?;
+            if let Err(err) =
+                crate::session_search::sync_search_index_with_cancel(&mut conn, &|| false)
+            {
+                eprintln!("⚠️ 手動同步搜尋索引失敗: {err}");
+            }
+            Ok(())
         } else {
             Err("無法連接至 SQLite 資料庫".to_string())
         }

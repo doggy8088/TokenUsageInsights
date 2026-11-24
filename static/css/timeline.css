@@ -599,3 +599,28 @@ html:has(#timeline-drawer[open]) {
     max-inline-size: 94%;
   }
 }
+
+/* Global search jump target highlight */
+.chat-row-search-target > .chat-message,
+.chat-row-search-target > .chat-detail {
+  outline: 2px solid var(--accent-cyan);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent-cyan) 18%, transparent);
+  animation: search-target-pulse 2.4s ease-out;
+}
+
+@keyframes search-target-pulse {
+  0% {
+    box-shadow: 0 0 0 6px color-mix(in srgb, var(--accent-cyan) 36%, transparent);
+  }
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chat-row-search-target > .chat-message,
+  .chat-row-search-target > .chat-detail {
+    animation: none;
+  }
+}

@@ -181,7 +181,17 @@ fn spawn_usage_sync_task() -> UsageSyncTask {
                 if should_migrate {
                     db::migrate_old_databases(&mut conn)?;
                 }
-                db::sync_usage_logs_with_cancel(&mut conn, &|| *cancel_rx.borrow())
+                db::sync_usage_logs_with_cancel(&mut conn, &|| *cancel_rx.borrow())?;
+                if !*cancel_rx.borrow() {
+                    if let Err(err) =
+                        session_search::sync_search_index_with_cancel(&mut conn, &|| {
+                            *cancel_rx.borrow()
+                        })
+                    {
+                        eprintln!("⚠️ 背景搜尋索引同步失敗: {err}");
+                    }
+                }
+                Ok::<(), String>(())
             })
             .await;
             db::set_sync_in_progress(false);
@@ -345,6 +355,7 @@ async fn main() {
         .route("/api/:assistant/dates", get(get_available_dates))
         .route("/api/:assistant/setup-info", get(get_setup_info))
         .route("/api/:assistant/usage/:date", get(get_usage_details))
+        .route("/api/:assistant/search", get(search_global_content))
         .route(
             "/api/:assistant/usage/:date/session-search",
             get(search_sessions_by_user_prompt),

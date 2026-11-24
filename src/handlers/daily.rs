@@ -128,6 +128,17 @@ pub struct SessionSearchQuery {
 }
 
 #[derive(Deserialize, Default)]
+pub struct GlobalSearchQuery {
+    #[serde(default)]
+    q: String,
+    scopes: Option<String>,
+    date_from: Option<String>,
+    date_to: Option<String>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+}
+
+#[derive(Deserialize, Default)]
 pub struct SessionDetailsQuery {
     source_kind: Option<String>,
     source_dir_key: Option<String>,
@@ -490,6 +501,121 @@ pub async fn search_sessions_by_user_prompt(
     let normalized_query = query.to_lowercase();
     let search_result = tokio::task::spawn_blocking(move || {
         session_search::search_user_prompts(&assistant, &date, &normalized_query)
+    })
+    .await
+    .unwrap_or_else(|_| Err("執行緒執行失敗".to_string()));
+
+    match search_result {
+        Ok(result) => Json(result).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": error })),
+        )
+            .into_response(),
+    }
+}
+
+fn validate_optional_ymd_date(raw: Option<String>) -> Result<Option<String>, String> {
+    let Some(value) = raw else {
+        return Ok(None);
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if chrono::NaiveDate::parse_from_str(trimmed, "%Y-%m-%d").is_err() {
+        return Err("日期格式無效，須為 YYYY-MM-DD。".to_string());
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+/// 跨全歷史對話內容關鍵字搜尋（支援使用者提示詞、AI 回應、工具請求與工具回應）
+pub async fn search_global_content(
+    Path(assistant): Path<String>,
+    Query(params): Query<GlobalSearchQuery>,
+) -> impl IntoResponse {
+    let assistant = normalize_assistant_name(&assistant);
+    if !is_supported_assistant_scope(&assistant) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "不支援的助理類型" })),
+        )
+            .into_response();
+    }
+
+    let query = params.q.trim();
+    if query.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "搜尋關鍵字不可為空。" })),
+        )
+            .into_response();
+    }
+    if query.chars().count() > 256 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "搜尋關鍵字不可超過 256 個字元。" })),
+        )
+            .into_response();
+    }
+
+    let mut scopes = Vec::new();
+    if let Some(raw_scopes) = params.scopes.as_deref() {
+        for part in raw_scopes.split(',') {
+            let scope = part.trim();
+            if scope.is_empty() {
+                continue;
+            }
+            if !session_search::is_valid_search_scope(scope) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": format!("不支援的搜尋範圍: {scope}") })),
+                )
+                    .into_response();
+            }
+            if !scopes.iter().any(|existing| existing == scope) {
+                scopes.push(scope.to_string());
+            }
+        }
+    }
+    if scopes.is_empty() {
+        scopes.push("user_prompt".to_string());
+    }
+
+    let date_from = match validate_optional_ymd_date(params.date_from) {
+        Ok(val) => val,
+        Err(msg) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": msg })),
+            )
+                .into_response();
+        }
+    };
+    let date_to = match validate_optional_ymd_date(params.date_to) {
+        Ok(val) => val,
+        Err(msg) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": msg })),
+            )
+                .into_response();
+        }
+    };
+
+    let search_params = session_search::GlobalSearchParams {
+        assistant,
+        query: query.to_string(),
+        scopes,
+        date_from,
+        date_to,
+        limit: params.limit.unwrap_or(50).clamp(1, 200),
+        offset: params.offset.unwrap_or(0),
+    };
+
+    let search_result = tokio::task::spawn_blocking(move || {
+        let conn = db::get_db_conn()?;
+        session_search::search_global_content(&conn, &search_params)
     })
     .await
     .unwrap_or_else(|_| Err("執行緒執行失敗".to_string()));
@@ -1488,5 +1614,153 @@ mod tests {
                 .unwrap();
         assert!(resolved.ends_with("session-state/parent/events.jsonl"));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn global_search_handler_validates_inputs_and_returns_matches() {
+        if crate::reporting::is_isolated_insights_test_child() {
+            crate::reporting::handler_test_runtime().block_on(global_search_handler_body());
+            return;
+        }
+        let temp_dir = std::env::temp_dir().join(format!(
+            "tui-global-search-handler-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let output = crate::reporting::spawn_isolated_insights_test(
+            "handlers::daily::tests::global_search_handler_validates_inputs_and_returns_matches",
+            &temp_dir,
+        );
+        assert!(
+            output.status.success(),
+            "子行程 handler 測試失敗:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    async fn global_search_handler_body() {
+        let mut conn =
+            Connection::open(crate::db::get_insights_dir().join("token_usage_insights.db"))
+                .unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let codex_root = crate::db::get_insights_dir().join("codex-root");
+        let rollout_dir = codex_root
+            .join("sessions")
+            .join("2026")
+            .join("10")
+            .join("06");
+        fs::create_dir_all(&rollout_dir).unwrap();
+        let rollout = rollout_dir.join("rollout-handler.jsonl");
+        fs::write(
+            &rollout,
+            r#"{"timestamp":"2026-10-06T09:00:00.000Z","type":"session_meta","payload":{"id":"hs1","cwd":"/tmp/h","cli_version":"0.142.5","model":"gpt-5"}}
+{"timestamp":"2026-10-06T09:00:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"尋找 HandlerPromptToken 問題"}}
+{"timestamp":"2026-10-06T09:00:02.000Z","type":"event_msg","payload":{"type":"agent_message","message":"已確認 HandlerReplyToken 解法"}}
+"#,
+        )
+        .unwrap();
+        std::env::set_var("CODEX_DIR", &codex_root);
+
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, timestamp, date, transcript_path,
+                session_id, turn_no, session_name, cwd, model,
+                tokens_input, tokens_output, tokens_total,
+                delta_input, delta_output, delta_total
+            ) VALUES (
+                'codex', 'codex-cli', '2026-10-06 09:00:02', '2026-10-06', ?,
+                'hs1', 1, 'Handler Test Session', '/tmp/h', 'gpt-5',
+                100, 10, 110, 100, 10, 110
+            )",
+            rusqlite::params![rollout.to_string_lossy().into_owned()],
+        )
+        .unwrap();
+        crate::session_search::sync_search_index_with_cancel(&mut conn, &|| false).unwrap();
+        drop(conn);
+
+        // 1. 空白關鍵字 -> 400
+        let empty_resp = super::search_global_content(
+            Path("codex".to_string()),
+            Query(super::GlobalSearchQuery {
+                q: "   ".to_string(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(empty_resp.status().as_u16(), 400);
+
+        // 2. 無效 scope -> 400
+        let bad_scope_resp = super::search_global_content(
+            Path("codex".to_string()),
+            Query(super::GlobalSearchQuery {
+                q: "HandlerPromptToken".to_string(),
+                scopes: Some("user_prompt,invalid_scope".to_string()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(bad_scope_resp.status().as_u16(), 400);
+
+        // 3. 無效日期 -> 400
+        let bad_date_resp = super::search_global_content(
+            Path("codex".to_string()),
+            Query(super::GlobalSearchQuery {
+                q: "HandlerPromptToken".to_string(),
+                date_from: Some("2026/10/06".to_string()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(bad_date_resp.status().as_u16(), 400);
+
+        // 4. 預設 scope 僅搜尋 user_prompt
+        let ok_resp = super::search_global_content(
+            Path("codex".to_string()),
+            Query(super::GlobalSearchQuery {
+                q: "HandlerPromptToken".to_string(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(ok_resp.status().as_u16(), 200);
+        let body = response_json(ok_resp).await;
+        assert_eq!(body["total_matches"], 1);
+        assert_eq!(body["results"][0]["content_kind"], "user_prompt");
+        assert_eq!(body["results"][0]["snippet_match"], "HandlerPromptToken");
+
+        // 5. 不含 agent_reply 時搜不到 HandlerReplyToken，加上後可搜到
+        let miss_reply = super::search_global_content(
+            Path("codex".to_string()),
+            Query(super::GlobalSearchQuery {
+                q: "HandlerReplyToken".to_string(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response_json(miss_reply).await["total_matches"], 0);
+
+        let hit_reply = super::search_global_content(
+            Path("all".to_string()),
+            Query(super::GlobalSearchQuery {
+                q: "HandlerReplyToken".to_string(),
+                scopes: Some("user_prompt,agent_reply".to_string()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .into_response();
+        let hit_body = response_json(hit_reply).await;
+        assert_eq!(hit_body["total_matches"], 1);
+        assert_eq!(hit_body["results"][0]["content_kind"], "agent_reply");
     }
 }

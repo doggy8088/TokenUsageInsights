@@ -643,6 +643,14 @@ function isSidebarToggleShortcut(event) {
     && event.key.toLowerCase() === 'b';
 }
 
+function isGlobalSearchShortcut(event) {
+  const hasExactlyOnePrimaryModifier = event.metaKey !== event.ctrlKey;
+  return hasExactlyOnePrimaryModifier
+    && !event.altKey
+    && !event.shiftKey
+    && event.key.toLowerCase() === 'k';
+}
+
 function toggleSidebar() {
   const appContainer = document.querySelector('.app-container');
   if (!appContainer) return;
@@ -748,13 +756,8 @@ function updateLanguageUI() {
   // Specific dynamic text updates
   updateLanguageToggle();
 
-  const themeBtn = document.getElementById('theme-toggle-btn');
-  if (themeBtn) {
-    const currentTheme = document.documentElement.getAttribute('data-theme') || 'dark';
-    const title = currentTheme === 'dark' ? t('theme_toggle_title_dark') : t('theme_toggle_title_light');
-    themeBtn.title = title;
-    themeBtn.setAttribute('aria-label', title);
-  }
+  const currentTheme = document.documentElement.getAttribute('data-theme') || 'dark';
+  updateThemeButton(currentTheme);
 
   // Update dynamic placeholders/empty state if they are currently displayed
   const emptyContainer = document.getElementById('empty-state-container');
@@ -1488,10 +1491,19 @@ function initApp() {
   });
 
   initSessionDrawer(sessionDrawer);
+  initHeaderMoreMenu();
+  initGlobalSearch();
 
   // 對話抽屜開啟時，由原生 dialog 處理 Escape。
   window.addEventListener('keydown', (e) => {
-    if (sessionDrawer.open) return;
+    const searchDialog = document.getElementById('global-search-dialog');
+    if (isGlobalSearchShortcut(e)) {
+      e.preventDefault();
+      if (sessionDrawer.open) closeDrawer();
+      openGlobalSearchDialog();
+      return;
+    }
+    if (sessionDrawer.open || searchDialog?.open) return;
     if (isSidebarToggleShortcut(e) && !isEditableShortcutTarget(e.target)) {
       e.preventDefault();
       toggleSidebar();
@@ -4968,7 +4980,7 @@ function initSessionDrawer(drawer) {
   updateSessionChatView();
 }
 
-async function openSessionTimeline(session, trigger = document.activeElement) {
+async function openSessionTimeline(session, trigger = document.activeElement, options = null) {
   const drawer = document.getElementById('timeline-drawer');
   const search = document.getElementById('timeline-search-input');
   const timeline = document.getElementById('timeline-items');
@@ -5039,6 +5051,9 @@ async function openSessionTimeline(session, trigger = document.activeElement) {
     timeline.append(fragment);
     search.disabled = !sessionChat.rows.some(row => row.searchText);
     updateSessionChatView();
+    if (options && typeof options.targetItemIndex === 'number') {
+      focusTimelineSearchTarget(options);
+    }
   } catch (error) {
     if (request.signal.aborted) return;
     console.error('獲取會話細節失敗:', error);
@@ -5046,6 +5061,50 @@ async function openSessionTimeline(session, trigger = document.activeElement) {
   } finally {
     if (sessionChat.request === request) sessionChat.request = null;
   }
+}
+
+function focusTimelineSearchTarget(options) {
+  if (!sessionChat.rows) return;
+  const targetRow = sessionChat.rows.find(row => row.itemIndex === options.targetItemIndex);
+  if (!targetRow) return;
+
+  if (targetRow.kind !== 'message') {
+    sessionChat.preferences.chatOnly = false;
+    const chatOnlyCheckbox = document.getElementById(sessionChatOptions.chatOnly);
+    if (chatOnlyCheckbox) chatOnlyCheckbox.checked = false;
+    if (Object.hasOwn(sessionChatOptions, targetRow.kind)) {
+      sessionChat.preferences[targetRow.kind] = true;
+      const kindCheckbox = document.getElementById(sessionChatOptions[targetRow.kind]);
+      if (kindCheckbox) kindCheckbox.checked = true;
+    }
+    updateSessionChatView();
+  }
+
+  if (targetRow.detail) {
+    targetRow.detail.open = true;
+  }
+  if (targetRow.reasoning) {
+    const queryLower = String(options.highlightQuery || '').trim().toLowerCase();
+    const inReplyBody = queryLower && targetRow.searchText
+      ? targetRow.searchText.toLowerCase().includes(queryLower)
+      : false;
+    if (!inReplyBody) {
+      targetRow.reasoning.hidden = false;
+      targetRow.reasoning.open = true;
+    }
+  }
+  if (targetRow.preview) {
+    targetRow.preview.expanded = true;
+    showSessionChatPreview(targetRow.preview);
+  }
+
+  targetRow.element.classList.add('chat-row-search-target');
+  requestAnimationFrame(() => {
+    targetRow.element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  });
+  setTimeout(() => {
+    targetRow.element.classList.remove('chat-row-search-target');
+  }, 3000);
 }
 
 function closeDrawer() {
@@ -5161,6 +5220,12 @@ function chatTime(timestamp) {
 }
 
 function createSessionChatRow(item, index, assistantType) {
+  const row = buildSessionChatRow(item, index, assistantType);
+  if (row) row.itemIndex = index;
+  return row;
+}
+
+function buildSessionChatRow(item, index, assistantType) {
   const data = item?.event_data || {};
   const time = chatTime(data.timestamp);
 
@@ -5380,8 +5445,9 @@ function createChatDetail(label, time, makeContent) {
 function createChatDetailRow(kind, label, text, time) {
   if (!text?.trim()) return null;
   const row = chatElement('li', 'chat-row chat-row-detail');
-  row.append(createChatDetail(label, time, () => chatElement('pre', null, text)));
-  return { kind, element: row };
+  const detail = createChatDetail(label, time, () => chatElement('pre', null, text));
+  row.append(detail);
+  return { kind, element: row, detail };
 }
 
 function createChatSystemRow(data, time) {
@@ -5441,7 +5507,7 @@ function createChatToolRow(data, time) {
   });
   const row = chatElement('li', 'chat-row chat-row-detail');
   row.append(detail);
-  return { kind: 'tools', element: row };
+  return { kind: 'tools', element: row, detail };
 }
 
 // =========================================================================
@@ -7253,7 +7319,14 @@ function updateThemeButton(theme) {
     const isDark = theme === 'dark';
     const title = isDark ? t('theme_toggle_title_dark') : t('theme_toggle_title_light');
     const modeClass = isDark ? 'icon-theme-sun' : 'icon-theme-moon';
-    themeBtn.innerHTML = iconMarkup('theme', modeClass);
+    const iconContainer = document.getElementById('theme-toggle-icon');
+    const labelEl = document.getElementById('theme-toggle-label');
+    if (iconContainer && labelEl) {
+      iconContainer.innerHTML = iconMarkup('theme', modeClass);
+      labelEl.textContent = title;
+    } else {
+      themeBtn.innerHTML = iconMarkup('theme', modeClass);
+    }
     themeBtn.title = title;
     themeBtn.setAttribute('aria-label', title);
     themeBtn.setAttribute('aria-pressed', String(!isDark));
@@ -7809,4 +7882,509 @@ function formatDateTime(dateObj) {
 
 async function updateCodexAuthSwitcher() {
   return Promise.resolve();
+}
+
+// =========================================================================
+// Header "..." More Menu
+// =========================================================================
+function initHeaderMoreMenu() {
+  const trigger = document.getElementById('btn-header-more');
+  const menu = document.getElementById('header-more-menu');
+  if (!trigger || !menu) return;
+
+  const isOpen = () => !menu.hidden;
+  const visibleMenuItems = () => [...menu.querySelectorAll('[role="menuitem"]')]
+    .filter(el => !el.classList.contains('hidden') && !el.disabled && el.offsetParent !== null);
+
+  const closeMenu = ({ restoreFocus = false } = {}) => {
+    if (!isOpen()) return;
+    menu.hidden = true;
+    trigger.setAttribute('aria-expanded', 'false');
+    if (restoreFocus) {
+      trigger.focus({ preventScroll: true });
+    }
+  };
+
+  const openMenu = () => {
+    menu.hidden = false;
+    trigger.setAttribute('aria-expanded', 'true');
+  };
+
+  trigger.addEventListener('click', (event) => {
+    event.stopPropagation();
+    if (isOpen()) {
+      closeMenu();
+    } else {
+      openMenu();
+    }
+  });
+
+  menu.addEventListener('click', (event) => {
+    const actionItem = event.target.closest('.header-menu-item');
+    if (actionItem && menu.contains(actionItem)) {
+      closeMenu();
+    }
+  });
+
+  document.addEventListener('click', (event) => {
+    if (!isOpen()) return;
+    if (!menu.contains(event.target) && !trigger.contains(event.target)) {
+      closeMenu();
+    }
+  });
+
+  document.addEventListener('keydown', (event) => {
+    if (!isOpen()) return;
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      event.stopPropagation();
+      closeMenu({ restoreFocus: true });
+      return;
+    }
+
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp' || event.key === 'Home' || event.key === 'End') {
+      const items = visibleMenuItems();
+      if (!items.length) return;
+      event.preventDefault();
+      const currentIdx = items.indexOf(document.activeElement);
+      let nextIdx = 0;
+      if (event.key === 'Home') nextIdx = 0;
+      else if (event.key === 'End') nextIdx = items.length - 1;
+      else if (event.key === 'ArrowDown') nextIdx = currentIdx < 0 ? 0 : (currentIdx + 1) % items.length;
+      else if (event.key === 'ArrowUp') nextIdx = currentIdx <= 0 ? items.length - 1 : currentIdx - 1;
+      items[nextIdx].focus();
+    }
+  });
+}
+
+// =========================================================================
+// Global Keyword Search Dialog
+// =========================================================================
+const globalSearchState = {
+  debounceTimer: null,
+  abortController: null,
+  results: [],
+  offset: 0,
+  limit: 40,
+  totalMatches: 0,
+  hasMore: false,
+  activeIndex: -1,
+  lastQuery: '',
+};
+
+function openGlobalSearchDialog() {
+  const dialog = document.getElementById('global-search-dialog');
+  const input = document.getElementById('global-search-input');
+  const assistantSelect = document.getElementById('global-search-assistant');
+  if (!dialog || !input) return;
+
+  if (assistantSelect) {
+    const candidate = isSelectableAssistant(currentAssistant) ? currentAssistant : 'all';
+    if ([...assistantSelect.options].some(opt => opt.value === candidate)) {
+      assistantSelect.value = candidate;
+    }
+  }
+
+  if (!dialog.open) {
+    dialog.showModal();
+  }
+  input.focus();
+  input.select();
+}
+
+function closeGlobalSearchDialog() {
+  const dialog = document.getElementById('global-search-dialog');
+  if (!dialog || !dialog.open) return;
+  globalSearchState.abortController?.abort();
+  globalSearchState.abortController = null;
+  dialog.close();
+  document.getElementById('btn-global-search')?.focus({ preventScroll: true });
+}
+
+function getSelectedGlobalSearchScopes() {
+  return [...document.querySelectorAll('input[name="global-search-scope"]:checked')]
+    .map(el => el.value);
+}
+
+function resolveGlobalSearchDateBounds() {
+  const preset = document.getElementById('global-search-date-preset')?.value || 'all';
+  if (preset === '7d' || preset === '30d') {
+    const days = preset === '7d' ? 6 : 29;
+    const now = new Date();
+    const start = new Date(now.getTime() - days * 86400 * 1000);
+    return {
+      dateFrom: getUtcDateString(start),
+      dateTo: getUtcDateString(now),
+    };
+  }
+  if (preset === 'custom') {
+    return {
+      dateFrom: document.getElementById('global-search-date-from')?.value || '',
+      dateTo: document.getElementById('global-search-date-to')?.value || '',
+    };
+  }
+  return { dateFrom: '', dateTo: '' };
+}
+
+function setGlobalSearchStatus(text) {
+  const statusEl = document.getElementById('global-search-status');
+  if (statusEl) statusEl.textContent = text;
+}
+
+function updateGlobalSearchIndexNotice(indexStatus) {
+  const notice = document.getElementById('global-search-index-notice');
+  const noticeText = document.getElementById('global-search-index-text');
+  if (!notice || !noticeText) return;
+  if (indexStatus && indexStatus.indexing && indexStatus.total_sessions > 0) {
+    noticeText.textContent = t('global_search_indexing_progress')
+      .replace('{indexed}', formatNumber(indexStatus.indexed_sessions))
+      .replace('{total}', formatNumber(indexStatus.total_sessions));
+    notice.hidden = false;
+  } else {
+    notice.hidden = true;
+  }
+}
+
+function formatGlobalSearchKindBadge(contentKind, toolName) {
+  const keyMap = {
+    user_prompt: 'search_kind_user_prompt',
+    agent_reply: 'search_kind_agent_reply',
+    tool_request: 'search_kind_tool_request',
+    tool_response: 'search_kind_tool_response',
+  };
+  const label = t(keyMap[contentKind] || 'search_kind_user_prompt');
+  return toolName ? `${label} · ${toolName}` : label;
+}
+
+function renderGlobalSearchResults() {
+  const listEl = document.getElementById('global-search-results');
+  const footerEl = document.getElementById('global-search-footer');
+  if (!listEl) return;
+
+  listEl.replaceChildren();
+  const fragment = document.createDocumentFragment();
+
+  globalSearchState.results.forEach((hit, idx) => {
+    const li = document.createElement('li');
+    li.className = 'search-result-card';
+    if (idx === globalSearchState.activeIndex) li.classList.add('is-active');
+    li.setAttribute('role', 'option');
+    li.setAttribute('aria-selected', String(idx === globalSearchState.activeIndex));
+    li.tabIndex = -1;
+
+    const top = document.createElement('div');
+    top.className = 'search-result-top';
+
+    const agentEl = document.createElement('span');
+    agentEl.className = 'search-result-agent';
+    const meta = getAssistantMeta(hit.assistant_type);
+    const logo = document.createElement('img');
+    logo.src = meta.logo;
+    logo.alt = meta.alt;
+    const agentLabel = document.createElement('span');
+    agentLabel.textContent = meta.shortLabel || meta.label;
+    agentEl.append(logo, agentLabel);
+
+    const badge = document.createElement('span');
+    badge.className = 'search-kind-badge';
+    badge.dataset.kind = hit.content_kind;
+    badge.textContent = formatGlobalSearchKindBadge(hit.content_kind, hit.tool_name);
+
+    const sessionTitle = document.createElement('span');
+    sessionTitle.className = 'search-result-session';
+    sessionTitle.textContent = hit.session_name || hit.session_id;
+    sessionTitle.title = hit.session_name || hit.session_id;
+
+    const timeEl = document.createElement('span');
+    timeEl.className = 'search-result-time';
+    const parsedTime = hit.timestamp ? new Date(hit.timestamp) : null;
+    timeEl.textContent = parsedTime && !Number.isNaN(parsedTime.getTime())
+      ? formatDateTime(parsedTime)
+      : (hit.date || '');
+
+    top.append(agentEl, badge, sessionTitle, timeEl);
+
+    const snippetEl = document.createElement('p');
+    snippetEl.className = 'search-result-snippet';
+    if (hit.snippet_before) {
+      snippetEl.append(document.createTextNode(hit.snippet_before));
+    }
+    if (hit.snippet_match) {
+      const mark = document.createElement('mark');
+      mark.className = 'search-highlight';
+      mark.textContent = hit.snippet_match;
+      snippetEl.append(mark);
+    }
+    if (hit.snippet_after) {
+      snippetEl.append(document.createTextNode(hit.snippet_after));
+    }
+
+    const metaRow = document.createElement('div');
+    metaRow.className = 'search-result-meta';
+    if (hit.cwd) {
+      const cwdEl = document.createElement('span');
+      cwdEl.textContent = abbreviateHomePath(hit.cwd);
+      cwdEl.title = hit.cwd;
+      metaRow.append(cwdEl);
+    }
+    if (hit.turn_no > 0) {
+      const turnEl = document.createElement('span');
+      turnEl.textContent = t('global_search_turn_label').replace('{turn}', formatNumber(hit.turn_no));
+      metaRow.append(turnEl);
+    }
+
+    li.append(top, snippetEl);
+    if (metaRow.childElementCount > 0) li.append(metaRow);
+
+    li.addEventListener('click', () => {
+      openGlobalSearchHit(hit);
+    });
+    fragment.append(li);
+  });
+
+  listEl.append(fragment);
+  if (footerEl) {
+    footerEl.hidden = !globalSearchState.hasMore;
+  }
+}
+
+function openGlobalSearchHit(hit) {
+  if (!hit) return;
+  const query = globalSearchState.lastQuery;
+  closeGlobalSearchDialog();
+  openSessionTimeline(
+    {
+      session_id: hit.session_id,
+      session_name: hit.session_name || hit.session_id,
+      assistant_type: hit.assistant_type,
+      source_kind: hit.source_kind,
+      source_dir_key: hit.source_dir_key,
+      parent_session_id: hit.parent_session_id,
+      cwd: hit.cwd,
+    },
+    document.getElementById('btn-global-search'),
+    {
+      targetItemIndex: hit.item_index,
+      targetContentKind: hit.content_kind,
+      highlightQuery: query,
+    },
+  );
+}
+
+async function runGlobalSearch({ append = false } = {}) {
+  const input = document.getElementById('global-search-input');
+  if (!input) return;
+  const query = input.value.trim();
+
+  if (!query) {
+    globalSearchState.abortController?.abort();
+    globalSearchState.abortController = null;
+    globalSearchState.results = [];
+    globalSearchState.totalMatches = 0;
+    globalSearchState.hasMore = false;
+    globalSearchState.activeIndex = -1;
+    globalSearchState.lastQuery = '';
+    renderGlobalSearchResults();
+    setGlobalSearchStatus(t('global_search_hint_empty'));
+    updateGlobalSearchIndexNotice(null);
+    return;
+  }
+
+  const scopes = getSelectedGlobalSearchScopes();
+  if (scopes.length === 0) {
+    setGlobalSearchStatus(t('global_search_scope_min_one'));
+    return;
+  }
+
+  const assistant = document.getElementById('global-search-assistant')?.value || 'all';
+  const { dateFrom, dateTo } = resolveGlobalSearchDateBounds();
+  const offset = append ? globalSearchState.results.length : 0;
+
+  globalSearchState.abortController?.abort();
+  const controller = new AbortController();
+  globalSearchState.abortController = controller;
+
+  if (!append) {
+    setGlobalSearchStatus(t('global_search_searching'));
+  }
+
+  const params = new URLSearchParams({
+    q: query,
+    scopes: scopes.join(','),
+    limit: String(globalSearchState.limit),
+    offset: String(offset),
+  });
+  if (dateFrom) params.set('date_from', dateFrom);
+  if (dateTo) params.set('date_to', dateTo);
+
+  try {
+    const response = await fetch(`/api/${encodeURIComponent(assistant)}/search?${params.toString()}`, {
+      signal: controller.signal,
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (controller.signal.aborted) return;
+
+    if (!response.ok) {
+      throw new Error(payload?.error || `HTTP ${response.status}`);
+    }
+
+    const incoming = Array.isArray(payload.results) ? payload.results : [];
+    globalSearchState.lastQuery = query;
+    globalSearchState.totalMatches = Number(payload.total_matches) || 0;
+    globalSearchState.hasMore = Boolean(payload.has_more);
+    globalSearchState.results = append
+      ? [...globalSearchState.results, ...incoming]
+      : incoming;
+    globalSearchState.activeIndex = globalSearchState.results.length > 0 && !append ? 0 : globalSearchState.activeIndex;
+
+    renderGlobalSearchResults();
+    updateGlobalSearchIndexNotice(payload.index_status);
+
+    if (globalSearchState.totalMatches === 0) {
+      setGlobalSearchStatus(t('global_search_no_results'));
+    } else {
+      setGlobalSearchStatus(
+        t('global_search_results_count').replace('{count}', formatNumber(globalSearchState.totalMatches)),
+      );
+    }
+  } catch (error) {
+    if (controller.signal.aborted) return;
+    console.error('全域搜尋失敗:', error);
+    setGlobalSearchStatus(t('global_search_error').replace('{error}', error.message || 'Unknown error'));
+  } finally {
+    if (globalSearchState.abortController === controller) {
+      globalSearchState.abortController = null;
+    }
+  }
+}
+
+function scheduleGlobalSearch(immediate = false) {
+  clearTimeout(globalSearchState.debounceTimer);
+  if (immediate) {
+    void runGlobalSearch({ append: false });
+    return;
+  }
+  globalSearchState.debounceTimer = setTimeout(() => {
+    void runGlobalSearch({ append: false });
+  }, 250);
+}
+
+function initGlobalSearch() {
+  const triggerBtn = document.getElementById('btn-global-search');
+  const dialog = document.getElementById('global-search-dialog');
+  const input = document.getElementById('global-search-input');
+  const clearBtn = document.getElementById('btn-global-search-clear');
+  const closeBtn = document.getElementById('btn-global-search-close');
+  const assistantSelect = document.getElementById('global-search-assistant');
+  const datePresetSelect = document.getElementById('global-search-date-preset');
+  const customDatesBox = document.getElementById('global-search-custom-dates');
+  const dateFromInput = document.getElementById('global-search-date-from');
+  const dateToInput = document.getElementById('global-search-date-to');
+  const loadMoreBtn = document.getElementById('btn-global-search-more');
+  const retryBtn = document.getElementById('btn-global-search-retry');
+  const scopeCheckboxes = [...document.querySelectorAll('input[name="global-search-scope"]')];
+
+  if (!triggerBtn || !dialog || !input) return;
+
+  triggerBtn.addEventListener('click', openGlobalSearchDialog);
+  closeBtn?.addEventListener('click', closeGlobalSearchDialog);
+
+  let pointerOnBackdrop = false;
+  dialog.addEventListener('pointerdown', (event) => {
+    const bounds = dialog.getBoundingClientRect();
+    pointerOnBackdrop = event.target === dialog && (
+      event.clientX < bounds.left || event.clientX >= bounds.right
+      || event.clientY < bounds.top || event.clientY >= bounds.bottom
+    );
+  });
+  dialog.addEventListener('click', (event) => {
+    if (pointerOnBackdrop && event.target === dialog) closeGlobalSearchDialog();
+    pointerOnBackdrop = false;
+  });
+  dialog.addEventListener('cancel', (event) => {
+    event.preventDefault();
+    closeGlobalSearchDialog();
+  });
+
+  const syncClearButton = () => {
+    if (clearBtn) clearBtn.hidden = !input.value;
+  };
+
+  input.addEventListener('input', () => {
+    syncClearButton();
+    scheduleGlobalSearch(false);
+  });
+
+  clearBtn?.addEventListener('click', () => {
+    input.value = '';
+    syncClearButton();
+    input.focus();
+    scheduleGlobalSearch(true);
+  });
+
+  scopeCheckboxes.forEach((checkbox) => {
+    checkbox.addEventListener('change', () => {
+      if (getSelectedGlobalSearchScopes().length === 0) {
+        checkbox.checked = true;
+        setGlobalSearchStatus(t('global_search_scope_min_one'));
+        return;
+      }
+      if (input.value.trim()) scheduleGlobalSearch(true);
+    });
+  });
+
+  assistantSelect?.addEventListener('change', () => {
+    if (input.value.trim()) scheduleGlobalSearch(true);
+  });
+
+  datePresetSelect?.addEventListener('change', () => {
+    if (customDatesBox) {
+      customDatesBox.hidden = datePresetSelect.value !== 'custom';
+    }
+    if (input.value.trim()) scheduleGlobalSearch(true);
+  });
+
+  [dateFromInput, dateToInput].forEach((dateEl) => {
+    dateEl?.addEventListener('change', () => {
+      if (input.value.trim()) scheduleGlobalSearch(true);
+    });
+  });
+
+  loadMoreBtn?.addEventListener('click', () => {
+    void runGlobalSearch({ append: true });
+  });
+
+  retryBtn?.addEventListener('click', () => {
+    scheduleGlobalSearch(true);
+  });
+
+  dialog.addEventListener('keydown', (event) => {
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      if (!globalSearchState.results.length) return;
+      event.preventDefault();
+      const total = globalSearchState.results.length;
+      if (event.key === 'ArrowDown') {
+        globalSearchState.activeIndex = (globalSearchState.activeIndex + 1) % total;
+      } else {
+        globalSearchState.activeIndex = globalSearchState.activeIndex <= 0
+          ? total - 1
+          : globalSearchState.activeIndex - 1;
+      }
+      renderGlobalSearchResults();
+      const activeEl = document.querySelector('#global-search-results .search-result-card.is-active');
+      activeEl?.scrollIntoView({ block: 'nearest' });
+      return;
+    }
+
+    if (event.key === 'Enter' && document.activeElement === input) {
+      event.preventDefault();
+      if (globalSearchState.activeIndex >= 0 && globalSearchState.lastQuery === input.value.trim() && globalSearchState.results[globalSearchState.activeIndex]) {
+        openGlobalSearchHit(globalSearchState.results[globalSearchState.activeIndex]);
+      } else {
+        scheduleGlobalSearch(true);
+      }
+    }
+  });
+
+  syncClearButton();
 }

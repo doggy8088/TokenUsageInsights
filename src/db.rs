@@ -1467,6 +1467,72 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
     run_parent_session_id_normalization_migration_v3(conn)?;
     run_antigravity_model_label_migration_v1(conn)?;
 
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS search_indexed_files (
+            session_key TEXT PRIMARY KEY,
+            assistant_type TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            source_kind TEXT NOT NULL,
+            source_dir_key TEXT NOT NULL DEFAULT '',
+            parent_session_id TEXT NOT NULL DEFAULT '',
+            session_name TEXT,
+            cwd TEXT,
+            date TEXT NOT NULL,
+            last_timestamp TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            file_size INTEGER NOT NULL,
+            file_mtime INTEGER NOT NULL,
+            index_version INTEGER NOT NULL DEFAULT 1
+        );
+
+        CREATE TABLE IF NOT EXISTS search_documents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_key TEXT NOT NULL,
+            assistant_type TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            source_kind TEXT NOT NULL,
+            source_dir_key TEXT NOT NULL DEFAULT '',
+            parent_session_id TEXT NOT NULL DEFAULT '',
+            date TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            turn_no INTEGER NOT NULL DEFAULT 0,
+            item_index INTEGER NOT NULL DEFAULT 0,
+            content_kind TEXT NOT NULL,
+            tool_name TEXT,
+            content TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_search_docs_session_key
+            ON search_documents(session_key);
+        CREATE INDEX IF NOT EXISTS idx_search_docs_filter
+            ON search_documents(assistant_type, date, content_kind);
+        CREATE INDEX IF NOT EXISTS idx_search_docs_timestamp
+            ON search_documents(timestamp DESC, id DESC);
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS search_documents_fts USING fts5(
+            content,
+            content='search_documents',
+            content_rowid='id',
+            tokenize='trigram case_sensitive 0'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS trg_search_documents_ai AFTER INSERT ON search_documents BEGIN
+            INSERT INTO search_documents_fts(rowid, content) VALUES (new.id, new.content);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_search_documents_ad AFTER DELETE ON search_documents BEGIN
+            INSERT INTO search_documents_fts(search_documents_fts, rowid, content)
+            VALUES('delete', old.id, old.content);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_search_documents_au AFTER UPDATE ON search_documents BEGIN
+            INSERT INTO search_documents_fts(search_documents_fts, rowid, content)
+            VALUES('delete', old.id, old.content);
+            INSERT INTO search_documents_fts(rowid, content) VALUES (new.id, new.content);
+        END;",
+    )
+    .map_err(|error| format!("建立全域搜尋索引表失敗: {error}"))?;
+
     Ok(())
 }
 
@@ -8199,6 +8265,137 @@ pub fn get_usage_entries_by_date(
     assistant: &str,
 ) -> Result<Vec<UsageDayRecordWithAssistant>, String> {
     query_usage_entries(conn, DateMatch::Exact(date), assistant)
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SearchableSessionMeta {
+    pub assistant_type: String,
+    pub session_id: String,
+    pub source_kind: String,
+    pub source_dir_key: Option<String>,
+    pub parent_session_id: Option<String>,
+    pub transcript_path: Option<String>,
+    pub session_name: Option<String>,
+    pub cwd: Option<String>,
+    pub agent_nickname: Option<String>,
+    pub model: Option<String>,
+    pub date: String,
+    pub last_timestamp: String,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct SearchableSessionKey {
+    assistant_type: String,
+    source_kind: String,
+    source_dir_key: Option<String>,
+    session_id: String,
+    parent_session_id: Option<String>,
+}
+
+fn non_empty_trimmed(value: Option<String>) -> Option<String> {
+    value
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// 彙整 `usage_entries` 中全歷史的唯一會話清單，供全域搜尋增量索引器比對檔案。
+pub(crate) fn list_all_searchable_sessions(
+    conn: &rusqlite::Connection,
+) -> Result<Vec<SearchableSessionMeta>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT assistant_type, session_id, source_kind, source_dir_key,
+                    parent_session_id, transcript_path, session_name, cwd,
+                    agent_nickname, model, date, timestamp
+             FROM usage_entries
+             ORDER BY timestamp ASC, id ASC",
+        )
+        .map_err(|error| format!("準備全域可搜尋會話查詢失敗: {error}"))?;
+
+    let mut rows = stmt
+        .query([])
+        .map_err(|error| format!("查詢全域可搜尋會話失敗: {error}"))?;
+
+    let mut map: HashMap<SearchableSessionKey, SearchableSessionMeta> = HashMap::new();
+
+    while let Some(row) = rows
+        .next()
+        .map_err(|error| format!("讀取全域可搜尋會話資料列失敗: {error}"))?
+    {
+        let assistant_type: String = row.get(0).map_err(|e| e.to_string())?;
+        let raw_session_id: String = row.get(1).map_err(|e| e.to_string())?;
+        let session_id = normalize_session_id(&raw_session_id);
+        let source_kind: String = row
+            .get::<_, Option<String>>(2)
+            .map_err(|e| e.to_string())?
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "legacy".to_string());
+        let source_dir_key = non_empty_trimmed(row.get(3).map_err(|e| e.to_string())?);
+        let parent_session_id = normalize_parent_session_id(row.get(4).map_err(|e| e.to_string())?);
+        let transcript_path = non_empty_trimmed(row.get(5).map_err(|e| e.to_string())?);
+        let session_name = non_empty_trimmed(row.get(6).map_err(|e| e.to_string())?);
+        let cwd = non_empty_trimmed(row.get(7).map_err(|e| e.to_string())?);
+        let agent_nickname = non_empty_trimmed(row.get(8).map_err(|e| e.to_string())?);
+        let model = non_empty_trimmed(row.get(9).map_err(|e| e.to_string())?);
+        let date: String = row.get(10).map_err(|e| e.to_string())?;
+        let timestamp: String = row.get(11).map_err(|e| e.to_string())?;
+
+        let key = SearchableSessionKey {
+            assistant_type: assistant_type.clone(),
+            source_kind: source_kind.clone(),
+            source_dir_key: source_dir_key.clone(),
+            session_id: session_id.clone(),
+            parent_session_id: parent_session_id.clone(),
+        };
+
+        if let Some(existing) = map.get_mut(&key) {
+            if existing.transcript_path.is_none() && transcript_path.is_some() {
+                existing.transcript_path = transcript_path;
+            }
+            if session_name.is_some() {
+                existing.session_name = session_name;
+            }
+            if cwd.is_some() {
+                existing.cwd = cwd;
+            }
+            if agent_nickname.is_some() {
+                existing.agent_nickname = agent_nickname;
+            }
+            if model.is_some() {
+                existing.model = model;
+            }
+            existing.date = date;
+            existing.last_timestamp = timestamp;
+        } else {
+            map.insert(
+                key,
+                SearchableSessionMeta {
+                    assistant_type,
+                    session_id,
+                    source_kind,
+                    source_dir_key,
+                    parent_session_id,
+                    transcript_path,
+                    session_name,
+                    cwd,
+                    agent_nickname,
+                    model,
+                    date,
+                    last_timestamp: timestamp,
+                },
+            );
+        }
+    }
+
+    let mut sessions: Vec<SearchableSessionMeta> = map.into_values().collect();
+    sessions.sort_by(|a, b| {
+        b.last_timestamp
+            .cmp(&a.last_timestamp)
+            .then_with(|| a.assistant_type.cmp(&b.assistant_type))
+            .then_with(|| a.session_id.cmp(&b.session_id))
+    });
+    Ok(sessions)
 }
 
 fn entry_date_from_timestamp(timestamp: &str) -> Option<&str> {

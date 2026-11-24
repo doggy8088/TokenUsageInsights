@@ -20,7 +20,7 @@
     document.documentElement.setAttribute('data-theme', savedTheme);
   </script>
   <!-- CSS Stylesheet -->
-  <link rel="stylesheet" href="/static/styles.css?v=40">
+  <link rel="stylesheet" href="/static/styles.css?v=41">
   <!-- Chart.js for beautiful charts -->
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <!-- Marked.js for rendering markdown response -->
@@ -348,55 +348,136 @@
           </div>
         </div>
         <div class="header-controls" style="display: flex; align-items: center; gap: 10px;">
-          <button id="btn-export-usage-day" class="icon-btn has-tooltip" data-i18n-title="btn_export_day_title" title="匯出目前報表範圍的資料" aria-label="匯出目前報表範圍的資料">
+          <button
+            id="btn-global-search"
+            class="icon-btn has-tooltip"
+            type="button"
+            data-i18n-title="global_search_btn_title"
+            title="全域搜尋對話內容（⌘K / Ctrl+K）"
+            aria-label="全域搜尋對話內容（⌘K / Ctrl+K）"
+          >
             <span class="control-svg-icon" aria-hidden="true">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <path d="M12 3v11" />
-                <path d="M8 10l4 4 4-4" />
-                <path d="M4 20h16" />
+                <circle cx="11" cy="11" r="7" />
+                <path d="m20 20-4.2-4.2" />
               </svg>
             </span>
-            <span class="sr-only" data-i18n="btn_export_day">匯出</span>
+            <span class="sr-only" data-i18n="global_search_title">全域搜尋</span>
           </button>
-          <button id="btn-import-usage-day" class="icon-btn has-tooltip" data-i18n-title="btn_import_day_title" title="匯入檔案中的所有資料" aria-label="匯入檔案中的所有資料">
-            <span class="control-svg-icon" aria-hidden="true">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <path d="M12 21V10" />
-                <path d="M8 14l4-4 4 4" />
-                <path d="M4 4h16" />
-              </svg>
-            </span>
-            <span class="sr-only" data-i18n="btn_import_day">匯入</span>
-          </button>
+
+          <div class="header-more-wrapper">
+            <button
+              id="btn-header-more"
+              class="icon-btn has-tooltip"
+              type="button"
+              aria-haspopup="menu"
+              aria-expanded="false"
+              aria-controls="header-more-menu"
+              data-i18n-title="header_more_btn_title"
+              title="更多功能與設定"
+              aria-label="更多功能與設定"
+            >
+              <span class="control-svg-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true">
+                  <circle cx="5" cy="12" r="1.9" />
+                  <circle cx="12" cy="12" r="1.9" />
+                  <circle cx="19" cy="12" r="1.9" />
+                </svg>
+              </span>
+              <span class="sr-only" data-i18n="header_more_btn_title">更多功能與設定</span>
+            </button>
+
+            <div id="header-more-menu" class="header-more-menu" role="menu" hidden>
+              <div class="header-menu-group">
+                <div class="header-menu-group-label" data-i18n="header_menu_group_data">資料管理</div>
+                <button id="btn-sync-db" class="header-menu-item" role="menuitem" type="button" data-i18n-title="sync_db_title" title="立即手動同步日誌檔到 SQLite 資料庫">
+                  <span class="header-menu-item-icon" aria-hidden="true"><span class="icon-glyph icon-sync"></span></span>
+                  <span class="header-menu-item-label" data-i18n="header_menu_sync_db">立即同步資料庫</span>
+                </button>
+                <button id="btn-export-usage-day" class="header-menu-item" role="menuitem" type="button" data-i18n-title="btn_export_day_title" title="匯出目前報表範圍的資料">
+                  <span class="header-menu-item-icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M12 3v11" />
+                      <path d="M8 10l4 4 4-4" />
+                      <path d="M4 20h16" />
+                    </svg>
+                  </span>
+                  <span class="header-menu-item-label" data-i18n="btn_export_day_title">匯出目前報表範圍的資料</span>
+                </button>
+                <button id="btn-import-usage-day" class="header-menu-item" role="menuitem" type="button" data-i18n-title="btn_import_day_title" title="匯入檔案中的所有資料">
+                  <span class="header-menu-item-icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M12 21V10" />
+                      <path d="M8 14l4-4 4 4" />
+                      <path d="M4 4h16" />
+                    </svg>
+                  </span>
+                  <span class="header-menu-item-label" data-i18n="btn_import_day_title">匯入檔案中的所有資料</span>
+                </button>
+                <button id="btn-import-history" class="header-menu-item" role="menuitem" type="button" data-i18n-title="btn_import_history_title" title="匯入紀錄與撤銷">
+                  <span class="header-menu-item-icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M3 12a9 9 0 1 0 3-6.7" />
+                      <path d="M3 4v6h6" />
+                      <path d="M12 7v5l3 2" />
+                    </svg>
+                  </span>
+                  <span class="header-menu-item-label" data-i18n="btn_import_history_title">匯入紀錄與撤銷</span>
+                </button>
+              </div>
+
+              <div class="header-menu-divider" role="separator"></div>
+
+              <div class="header-menu-group">
+                <div class="header-menu-group-label" data-i18n="header_menu_group_preferences">外觀與語言</div>
+                <button id="theme-toggle-btn" class="header-menu-item" role="menuitem" type="button" data-i18n-title="theme_toggle_title_dark" title="切換主題" aria-label="切換主題">
+                  <span class="header-menu-item-icon" id="theme-toggle-icon" aria-hidden="true"><span class="icon-glyph icon-theme"></span></span>
+                  <span class="header-menu-item-label" id="theme-toggle-label">切換主題</span>
+                </button>
+                <div class="header-menu-select-row">
+                  <label class="header-menu-select-label" for="lang-select">
+                    <span class="header-menu-item-icon" aria-hidden="true">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <circle cx="12" cy="12" r="9" />
+                        <path d="M3 12h18" />
+                        <path d="M12 3a14 14 0 0 1 0 18" />
+                        <path d="M12 3a14 14 0 0 0 0 18" />
+                      </svg>
+                    </span>
+                    <span class="header-menu-item-label" data-i18n="btn_language">語言</span>
+                  </label>
+                  <select id="lang-select" class="lang-select" aria-label="語言" title="語言">
+                    <option value="auto" data-i18n="language_auto">自動</option>
+                    <option value="zh-TW">繁體中文</option>
+                    <option value="zh-CN">简体中文</option>
+                    <option value="en">English</option>
+                    <option value="ja">日本語</option>
+                    <option value="ko">한국어</option>
+                  </select>
+                </div>
+              </div>
+
+              <div class="header-menu-divider" role="separator"></div>
+
+              <div class="header-menu-group">
+                <div class="header-menu-group-label" data-i18n="header_menu_group_help">參考與說明</div>
+                <button id="btn-pricing-sheet" class="header-menu-item" role="menuitem" type="button" data-i18n-title="btn_pricing_sheet" title="費用標準">
+                  <span class="header-menu-item-icon" aria-hidden="true"><span class="icon-glyph icon-currency"></span></span>
+                  <span class="header-menu-item-label" data-i18n="btn_pricing_sheet">費用標準</span>
+                </button>
+                <button id="btn-setup-guide" class="header-menu-item" role="menuitem" type="button" data-i18n-title="setup_guide_title" title="前置作業啟用教學">
+                  <span class="header-menu-item-icon" aria-hidden="true"><span class="icon-glyph icon-help"></span></span>
+                  <span class="header-menu-item-label" data-i18n="setup_guide_title">前置作業啟用教學</span>
+                </button>
+                <a id="github-repo-btn" class="header-menu-item" role="menuitem" href="https://github.com/doggy8088/TokenUsageInsights" target="_blank" rel="noopener noreferrer" data-i18n-title="github_repo_title" title="GitHub Repo">
+                  <span class="header-menu-item-icon" aria-hidden="true"><span class="icon-glyph icon-github"></span></span>
+                  <span class="header-menu-item-label" data-i18n="github_repo_title">GitHub Repo</span>
+                </a>
+              </div>
+            </div>
+          </div>
+
           <input id="usage-day-import-input" type="file" accept="application/json,.json" style="display: none;" />
-          <button id="btn-import-history" class="icon-btn has-tooltip" data-i18n-title="btn_import_history_title" title="匯入紀錄與撤銷" aria-label="匯入紀錄與撤銷">
-            <span class="control-svg-icon" aria-hidden="true">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <path d="M3 12a9 9 0 1 0 3-6.7" />
-                <path d="M3 4v6h6" />
-                <path d="M12 7v5l3 2" />
-              </svg>
-            </span>
-            <span class="sr-only" data-i18n="btn_import_history">匯入紀錄</span>
-          </button>
-          <label class="lang-select-label">
-            <span class="sr-only" data-i18n="btn_language">語言</span>
-            <select id="lang-select" class="lang-select" aria-label="語言" title="語言">
-              <option value="auto" data-i18n="language_auto">自動</option>
-              <option value="zh-TW">繁體中文</option>
-              <option value="zh-CN">简体中文</option>
-              <option value="en">English</option>
-              <option value="ja">日本語</option>
-              <option value="ko">한국어</option>
-            </select>
-          </label>
-          <button id="btn-pricing-sheet" class="icon-btn has-tooltip" data-i18n-title="btn_pricing_sheet" title="費用標準" aria-label="費用標準"><span class="icon-glyph icon-currency" aria-hidden="true"></span></button>
-          <button id="btn-setup-guide" class="icon-btn has-tooltip" data-i18n-title="setup_guide_title" title="前置作業啟用教學" aria-label="前置作業啟用教學"><span class="icon-glyph icon-help" aria-hidden="true"></span></button>
-          <button id="btn-sync-db" class="icon-btn has-tooltip" data-i18n-title="sync_db_title" title="立即手動同步日誌檔到 SQLite 資料庫" aria-label="立即手動同步日誌檔到 SQLite 資料庫"><span class="icon-glyph icon-sync" aria-hidden="true"></span></button>
-          <button id="theme-toggle-btn" class="icon-btn has-tooltip" data-i18n-title="theme_toggle_title_dark" title="切換主題" aria-label="切換主題"><span class="icon-glyph icon-theme" aria-hidden="true"></span></button>
-          <a id="github-repo-btn" class="icon-btn has-tooltip" href="https://github.com/doggy8088/TokenUsageInsights" target="_blank" rel="noopener noreferrer" data-i18n-title="github_repo_title" title="GitHub Repo">
-            <span class="icon-glyph icon-github" aria-hidden="true"></span>
-          </a>
         </div>
       </header>
 
@@ -1524,10 +1605,112 @@ cd TokenUsageInsights</code></pre>
     </div>
   </div>
 
+  <!-- Global Keyword Search Dialog -->
+  <dialog id="global-search-dialog" class="global-search-dialog" aria-labelledby="global-search-title">
+    <div class="global-search-shell">
+      <div class="global-search-header">
+        <h2 id="global-search-title" class="sr-only" data-i18n="global_search_title">全域關鍵字搜尋</h2>
+        <div class="global-search-input-row" role="search">
+          <span class="icon-glyph icon-search global-search-leading-icon" aria-hidden="true"></span>
+          <input
+            id="global-search-input"
+            type="search"
+            maxlength="256"
+            autocomplete="off"
+            spellcheck="false"
+            data-i18n-placeholder="global_search_placeholder"
+            data-i18n-aria-label="global_search_title"
+            placeholder="搜尋歷史提示詞、AI 回應或工具紀錄…"
+            aria-label="搜尋歷史提示詞、AI 回應或工具紀錄"
+          >
+          <button type="button" id="btn-global-search-clear" class="global-search-clear-btn" data-i18n-aria-label="global_search_clear" aria-label="清除關鍵字" hidden>
+            <span class="icon-glyph icon-close" aria-hidden="true"></span>
+          </button>
+          <kbd class="global-search-kbd">ESC</kbd>
+          <button type="button" id="btn-global-search-close" class="close-btn" data-i18n-aria-label="close" aria-label="關閉">
+            <span class="icon-glyph icon-close" aria-hidden="true"></span>
+          </button>
+        </div>
+
+        <div class="global-search-controls">
+          <div class="global-search-scopes" role="group" data-i18n-aria-label="global_search_scope_label" aria-label="搜尋範圍">
+            <span class="global-search-control-label" data-i18n="global_search_scope_label">搜尋範圍：</span>
+            <label class="search-scope-chip">
+              <input type="checkbox" name="global-search-scope" value="user_prompt" checked>
+              <span data-i18n="global_search_scope_user_prompt">使用者提示詞</span>
+            </label>
+            <label class="search-scope-chip">
+              <input type="checkbox" name="global-search-scope" value="agent_reply">
+              <span data-i18n="global_search_scope_agent_reply">AI 回應（含思考過程）</span>
+            </label>
+            <label class="search-scope-chip">
+              <input type="checkbox" name="global-search-scope" value="tool_request">
+              <span data-i18n="global_search_scope_tool_request">工具請求 (Request)</span>
+            </label>
+            <label class="search-scope-chip">
+              <input type="checkbox" name="global-search-scope" value="tool_response">
+              <span data-i18n="global_search_scope_tool_response">工具回應 (Response)</span>
+            </label>
+          </div>
+
+          <div class="global-search-filters">
+            <label class="global-search-filter-field">
+              <span class="global-search-control-label" data-i18n="global_search_assistant_label">Agent：</span>
+              <select id="global-search-assistant" class="premium-select-mini">
+                <option value="all" data-i18n="all_agents_label">全部 Agent</option>
+                <option value="antigravity">Antigravity CLI</option>
+                <option value="copilot">GitHub Copilot</option>
+                <option value="codex">Codex</option>
+                <option value="claude">Claude Code</option>
+                <option value="cursor">Cursor</option>
+                <option value="grok">Grok Build</option>
+                <option value="pi">Pi Coding Agent</option>
+                <option value="omp">OMP</option>
+                <option value="muse">Muse</option>
+                <option value="mcode">MiniMax Code</option>
+              </select>
+            </label>
+
+            <label class="global-search-filter-field">
+              <span class="global-search-control-label" data-i18n="global_search_date_label">時間：</span>
+              <select id="global-search-date-preset" class="premium-select-mini">
+                <option value="all" data-i18n="global_search_date_all">全部時間</option>
+                <option value="7d" data-i18n="global_search_date_7d">最近 7 天</option>
+                <option value="30d" data-i18n="global_search_date_30d">最近 30 天</option>
+                <option value="custom" data-i18n="global_search_date_custom">自訂區間</option>
+              </select>
+            </label>
+
+            <div id="global-search-custom-dates" class="global-search-custom-dates" hidden>
+              <input type="date" id="global-search-date-from" class="premium-date-input" data-i18n-aria-label="global_search_date_from" aria-label="開始日期">
+              <span aria-hidden="true">~</span>
+              <input type="date" id="global-search-date-to" class="premium-date-input" data-i18n-aria-label="global_search_date_to" aria-label="結束日期">
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="global-search-status-bar">
+        <span id="global-search-status" class="global-search-status" aria-live="polite" data-i18n="global_search_hint_empty">輸入關鍵字以搜尋歷史對話紀錄</span>
+        <span id="global-search-index-notice" class="global-search-index-notice" hidden>
+          <span id="global-search-index-text"></span>
+          <button type="button" id="btn-global-search-retry" class="global-search-retry-btn" data-i18n="global_search_retry">重新搜尋</button>
+        </span>
+      </div>
+
+      <div class="global-search-body">
+        <ul id="global-search-results" class="global-search-results" role="listbox" data-i18n-aria-label="global_search_title" aria-label="搜尋結果"></ul>
+        <div id="global-search-footer" class="global-search-footer" hidden>
+          <button type="button" id="btn-global-search-more" class="secondary-btn" data-i18n="global_search_load_more">載入更多</button>
+        </div>
+      </div>
+    </div>
+  </dialog>
+
   <!-- Sidebar Overlay for mobile -->
   <div class="sidebar-overlay" id="sidebar-overlay"></div>
 
   <!-- Frontend Javascript logic -->
-  <script type="module" src="/static/app.js?v=83"></script>
+  <script type="module" src="/static/app.js?v=84"></script>
 </body>
 </html>
